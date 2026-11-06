@@ -1,0 +1,27 @@
+[Unit]
+Description=Open EPM trusted managed-notebook launcher
+Requires=docker.service
+After=docker.service network-online.target
+RequiresMountsFor=/var/lib/openepm/notebooks/current
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/openepm/notebook-launcher.env
+ExecStart=/usr/bin/python3 /usr/lib/openepm/notebook-launcher.pyz
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/openepm /var/lib/openepm/notebooks/current
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

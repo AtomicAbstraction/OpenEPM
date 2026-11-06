@@ -1,0 +1,6 @@
+# Direct, source-reviewed pins. Generate and review requirements-notebook.lock
+# with every transitive wheel hash before an image build is permitted.
+jupyter-server==2.21.1 --hash=sha256:2a6467606af7dbae2e7e31640030025969e15db6a649eae334af90415dc71dca
+jupyterlab==4.6.4 --hash=sha256:15b13f991d3985129c797eb84d9949eeb8b6615e14b444868e642411f2c418b2
+ipython==9.17.1 --hash=sha256:6d1645743cfd1a07eb695d85aa2b5fa66721f8cbae9431d4049f7084bbf06509
+nbformat==5.11.1 --hash=sha256:cc6698fa75f4fab8755ead786317815f13a6fee3b53311c0abb1a8b51d52f7ec

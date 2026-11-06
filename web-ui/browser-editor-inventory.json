@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "registered": [
+    "AdministrationSecurity.tsx",
+    "Analyze.tsx",
+    "Applications.tsx",
+    "AttributeCatalog.tsx",
+    "AttributeValueEditor.tsx",
+    "BuildRules.tsx",
+    "BuildSchedules.tsx",
+    "BuildSequences.tsx",
+    "CapabilityArea.tsx",
+    "DataExport.tsx",
+    "DataLoad.tsx",
+    "GenericWorkflow.tsx",
+    "MemberLists.tsx",
+    "MetadataCreate.tsx",
+    "MetadataMaintenance.tsx",
+    "MetadataMemberGrid.tsx",
+    "MetadataRelationships.tsx",
+    "MetadataSecurityStringEditor.tsx",
+    "Monitor.tsx",
+    "SecurityTagCatalog.tsx",
+    "SemanticAttributes.tsx",
+    "ServerAdministration.tsx",
+    "SupportingDetail.tsx"
+  ],
+  "remaining": [],
+  "nonAuthoritativeControls": [
+    {
+      "file": "GlobalPanels.tsx",
+      "reason": "Global search and task filters do not create a business or configuration draft."
+    }
+  ]
+}

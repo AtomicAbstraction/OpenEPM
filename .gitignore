@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+node_modules/
+web-ui/dist/
+*.tsbuildinfo
+.env
+*.secret
+*.credentials
+*.pem
+*.key
+deploy/macos-pilot/openepm-pilot.env
+deploy/macos-pilot/.runtime/

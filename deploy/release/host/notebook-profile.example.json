@@ -1,0 +1,9 @@
+{
+  "profileId": "openepm-notebook-v1",
+  "image": "registry.example/openepm/notebook@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "network": "openepm_notebook",
+  "baseDomain": "notebooks.example.com",
+  "maximumActive": 10,
+  "idleSeconds": 1800,
+  "storageRoot": "/var/lib/openepm/notebooks/current"
+}

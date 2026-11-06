@@ -1,0 +1,315 @@
+name: openepm-postgres-v2
+
+x-app-image: &app-image
+  build:
+    context: ../..
+    dockerfile: deploy/postgres/Dockerfile
+  image: ${EPM_APPLICATION_IMAGE:-openepm-postgres-v2:local}
+  platform: linux/arm64
+
+x-db-image: &db-image
+  build:
+    context: ../..
+    dockerfile: deploy/postgres/Dockerfile.db
+  image: ${EPM_DATABASE_IMAGE:-openepm-postgres-db:local}
+  platform: linux/arm64
+
+x-db-ready: &db-ready
+  db:
+    condition: service_healthy
+
+services:
+  backup-volume-init:
+    <<: *db-image
+    platform: linux/arm64
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["chown 999:999 /archive /backups && chmod 0700 /archive /backups"]
+    volumes:
+      - epm_pgarchive:/archive
+      - epm_pgbackups:/backups
+
+  db:
+    <<: *db-image
+    platform: linux/arm64
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${EPM_POSTGRES_PASSWORD:?set EPM_POSTGRES_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_timeout=60s
+      - -c
+      - duckdb.enable_external_access=off
+      - -c
+      - duckdb.autoinstall_known_extensions=off
+      - -c
+      - duckdb.autoload_known_extensions=off
+      - -c
+      - duckdb.max_memory=256
+      - -c
+      - "archive_command=(test ! -e /var/lib/postgresql/wal_archive/%f && cp %p /var/lib/postgresql/wal_archive/%f || cmp -s %p /var/lib/postgresql/wal_archive/%f) && sync -f /var/lib/postgresql/wal_archive/%f"
+    volumes:
+      - epm_pgdata:/var/lib/postgresql
+      - epm_pgarchive:/var/lib/postgresql/wal_archive
+      - epm_pgbackups:/var/lib/postgresql/base_backups
+    depends_on:
+      backup-volume-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    <<: *app-image
+    profiles: [setup]
+    command: ["python", "-m", "scripts.initialize_postgres_release"]
+    environment:
+      EPM_POSTGRES_ADMIN_DSN: "host=db port=5432 user=postgres password=${EPM_POSTGRES_PASSWORD:?set EPM_POSTGRES_PASSWORD} dbname=postgres"
+    depends_on: *db-ready
+
+  bootstrap-roles:
+    <<: *app-image
+    profiles: [setup]
+    command: ["python", "-m", "scripts.bootstrap_postgres_service_roles"]
+    environment:
+      EPM_POSTGRES_ADMIN_DSN: "host=db port=5432 user=postgres password=${EPM_POSTGRES_PASSWORD:?set EPM_POSTGRES_PASSWORD} dbname=postgres"
+      EPM_PG_RUNTIME_PASSWORD: ${EPM_PG_RUNTIME_PASSWORD:?set EPM_PG_RUNTIME_PASSWORD}
+      EPM_PG_ACCESS_PASSWORD: ${EPM_PG_ACCESS_PASSWORD:?set EPM_PG_ACCESS_PASSWORD}
+      EPM_PG_WORKER_PASSWORD: ${EPM_PG_WORKER_PASSWORD:?set EPM_PG_WORKER_PASSWORD}
+      EPM_PG_LIFECYCLE_PASSWORD: ${EPM_PG_LIFECYCLE_PASSWORD:?set EPM_PG_LIFECYCLE_PASSWORD}
+      EPM_PG_PROVISION_PASSWORD: ${EPM_PG_PROVISION_PASSWORD:?set EPM_PG_PROVISION_PASSWORD}
+      EPM_PG_SECURITY_PASSWORD: ${EPM_PG_SECURITY_PASSWORD:?set EPM_PG_SECURITY_PASSWORD}
+    depends_on: *db-ready
+
+  bootstrap-operator:
+    <<: *app-image
+    profiles: [setup]
+    command:
+      - python
+      - -m
+      - scripts.bootstrap_postgres_operator
+      - --issuer
+      - ${EPM_PLATFORM_OPERATOR_ISSUER:?set EPM_PLATFORM_OPERATOR_ISSUER}
+      - --subject-id
+      - ${EPM_PLATFORM_OPERATOR_SUBJECT:?set EPM_PLATFORM_OPERATOR_SUBJECT}
+    environment:
+      EPM_POSTGRES_ADMIN_DSN: "host=db port=5432 user=postgres password=${EPM_POSTGRES_PASSWORD:?set EPM_POSTGRES_PASSWORD} dbname=postgres"
+    depends_on: *db-ready
+
+  platform:
+    <<: *app-image
+    profiles: [v2]
+    command: ["python", "-m", "platform_postgres_platform_mcp_http"]
+    restart: unless-stopped
+    environment:
+      EPM_AUTH_MODE: oidc
+      EPM_OIDC_ISSUER: ${EPM_OIDC_ISSUER:-}
+      EPM_OIDC_JWKS_URL: ${EPM_OIDC_JWKS_URL:-}
+      EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS: ${EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS:-}
+      EPM_OIDC_AUD_MCP: ${EPM_OIDC_AUD_MCP:-}
+      EPM_PUBLIC_MCP_ORIGIN: ${EPM_PUBLIC_MCP_ORIGIN:?set EPM_PUBLIC_MCP_ORIGIN}
+      EPM_PUBLIC_WEB_ORIGIN: ${EPM_PUBLIC_WEB_ORIGIN:?set EPM_PUBLIC_WEB_ORIGIN}
+      EPM_PG_BIND_HOST: 0.0.0.0
+      EPM_PG_HEALTH_PORT: 5193
+      EPM_PG_PROVISION_DSN: "host=db port=5432 user=epm_provision_login password=${EPM_PG_PROVISION_PASSWORD:?set EPM_PG_PROVISION_PASSWORD} dbname=postgres"
+    ports: ["127.0.0.1:5193:5193"]
+    depends_on: *db-ready
+    healthcheck:
+      test: ["CMD", "python", "-m", "scripts.check_postgres_mcp_health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  workspace:
+    <<: *app-image
+    profiles: [workspace]
+    command: ["python", "-m", "platform_postgres_workspace_mcp_http"]
+    restart: unless-stopped
+    environment:
+      EPM_AUTH_MODE: oidc
+      EPM_OIDC_ISSUER: ${EPM_OIDC_ISSUER:-}
+      EPM_OIDC_JWKS_URL: ${EPM_OIDC_JWKS_URL:-}
+      EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS: ${EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS:-}
+      EPM_OIDC_AUD_MCP: ${EPM_OIDC_AUD_MCP:-}
+      EPM_PUBLIC_MCP_ORIGIN: ${EPM_PUBLIC_MCP_ORIGIN:?set EPM_PUBLIC_MCP_ORIGIN}
+      EPM_PG_BIND_HOST: 0.0.0.0
+      EPM_PG_HEALTH_PORT: 5192
+      EPM_PG_WORKSPACE_ID: ${EPM_PG_WORKSPACE_ID:?set EPM_PG_WORKSPACE_ID}
+      EPM_RESET_ENDPOINT_INVENTORY_JSON: ${EPM_RESET_ENDPOINT_INVENTORY_JSON:-}
+      EPM_PG_LIFECYCLE_DSN: "host=db port=5432 user=epm_lifecycle_login password=${EPM_PG_LIFECYCLE_PASSWORD:?set EPM_PG_LIFECYCLE_PASSWORD} dbname=postgres"
+      EPM_PG_SECURITY_DSN: "host=db port=5432 user=epm_security_login password=${EPM_PG_SECURITY_PASSWORD:?set EPM_PG_SECURITY_PASSWORD} dbname=postgres"
+      EPM_PG_PREVIEW_SECRET_HEX: ${EPM_PG_PREVIEW_SECRET_HEX:?set EPM_PG_PREVIEW_SECRET_HEX}
+    ports: ["127.0.0.1:5192:5192"]
+    depends_on: *db-ready
+    healthcheck:
+      test: ["CMD", "python", "-m", "scripts.check_postgres_mcp_health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  router:
+    <<: *app-image
+    profiles: [v2]
+    command: ["python", "-m", "platform_postgres_router_mcp_http"]
+    restart: unless-stopped
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    environment:
+      EPM_CAPACITY_TEMP_ROOT: /tmp
+      EPM_AUTH_MODE: oidc
+      EPM_OIDC_ISSUER: ${EPM_OIDC_ISSUER:-}
+      EPM_OIDC_JWKS_URL: ${EPM_OIDC_JWKS_URL:-}
+      EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS: ${EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS:-}
+      EPM_OIDC_AUD_MCP: ${EPM_OIDC_AUD_MCP:-}
+      EPM_PUBLIC_MCP_ORIGIN: ${EPM_PUBLIC_MCP_ORIGIN:?set EPM_PUBLIC_MCP_ORIGIN}
+      EPM_PG_BIND_HOST: 0.0.0.0
+      EPM_PG_HEALTH_PORT: 5194
+      EPM_PG_ACCESS_DSN: "host=db port=5432 user=epm_access_login password=${EPM_PG_ACCESS_PASSWORD:?set EPM_PG_ACCESS_PASSWORD} dbname=postgres"
+      EPM_PG_RUNTIME_DSN: "host=db port=5432 user=epm_runtime_login password=${EPM_PG_RUNTIME_PASSWORD:?set EPM_PG_RUNTIME_PASSWORD} dbname=postgres"
+      EPM_PG_SECURITY_DSN: "host=db port=5432 user=epm_security_login password=${EPM_PG_SECURITY_PASSWORD:?set EPM_PG_SECURITY_PASSWORD} dbname=postgres"
+      EPM_PG_PREVIEW_SECRET_HEX: ${EPM_PG_PREVIEW_SECRET_HEX:?set EPM_PG_PREVIEW_SECRET_HEX}
+    ports: ["127.0.0.1:5194:5194"]
+    depends_on: *db-ready
+    healthcheck:
+      test: ["CMD", "python", "-m", "scripts.check_postgres_mcp_health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  web:
+    <<: *app-image
+    profiles: [v2]
+    command: ["python", "-m", "platform_postgres_web_http"]
+    restart: unless-stopped
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    environment:
+      EPM_RUNTIME_APPLICATION_IMAGE: ${EPM_APPLICATION_IMAGE:-}
+      EPM_CAPACITY_TEMP_ROOT: /tmp
+      EPM_AUTH_MODE: oidc
+      EPM_OIDC_ISSUER: ${EPM_OIDC_ISSUER:-}
+      EPM_OIDC_JWKS_URL: ${EPM_OIDC_JWKS_URL:-}
+      EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS: ${EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS:-}
+      EPM_OIDC_AUD_WEB: ${EPM_OIDC_AUD_WEB:-}
+      EPM_PUBLIC_WEB_ORIGIN: ${EPM_PUBLIC_WEB_ORIGIN:?set EPM_PUBLIC_WEB_ORIGIN}
+      EPM_PUBLIC_MCP_ORIGIN: ${EPM_PUBLIC_MCP_ORIGIN:?set EPM_PUBLIC_MCP_ORIGIN}
+      EPM_PG_BIND_HOST: 0.0.0.0
+      EPM_PG_WEB_PORT: 5195
+      EPM_PG_HEALTH_PORT: 5195
+      EPM_PG_HEALTH_PATH: /
+      EPM_PG_ACCESS_DSN: "host=db port=5432 user=epm_access_login password=${EPM_PG_ACCESS_PASSWORD:?set EPM_PG_ACCESS_PASSWORD} dbname=postgres"
+      EPM_PG_RUNTIME_DSN: "host=db port=5432 user=epm_runtime_login password=${EPM_PG_RUNTIME_PASSWORD:?set EPM_PG_RUNTIME_PASSWORD} dbname=postgres"
+      EPM_PG_LIFECYCLE_DSN: "host=db port=5432 user=epm_lifecycle_login password=${EPM_PG_LIFECYCLE_PASSWORD:?set EPM_PG_LIFECYCLE_PASSWORD} dbname=postgres"
+      EPM_PG_SECURITY_DSN: "host=db port=5432 user=epm_security_login password=${EPM_PG_SECURITY_PASSWORD:?set EPM_PG_SECURITY_PASSWORD} dbname=postgres"
+      EPM_PG_PREVIEW_SECRET_HEX: ${EPM_PG_PREVIEW_SECRET_HEX:?set EPM_PG_PREVIEW_SECRET_HEX}
+    ports: ["127.0.0.1:5195:5195"]
+    depends_on: *db-ready
+    healthcheck:
+      test: ["CMD", "python", "-m", "scripts.check_postgres_mcp_health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  worker:
+    <<: *app-image
+    profiles: [v2]
+    command: ["python", "-m", "scripts.serve_openepm_postgres_worker"]
+    restart: unless-stopped
+    environment:
+      EPM_PG_WORKER_DSN: "host=db port=5432 user=epm_worker_login password=${EPM_PG_WORKER_PASSWORD:?set EPM_PG_WORKER_PASSWORD} dbname=postgres"
+      EPM_PG_RUNTIME_DSN: "host=db port=5432 user=epm_runtime_login password=${EPM_PG_RUNTIME_PASSWORD:?set EPM_PG_RUNTIME_PASSWORD} dbname=postgres"
+      EPM_PG_PREVIEW_SECRET_HEX: ${EPM_PG_PREVIEW_SECRET_HEX:?set EPM_PG_PREVIEW_SECRET_HEX}
+    depends_on: *db-ready
+    healthcheck:
+      test: ["CMD", "python", "-m", "scripts.check_postgres_worker_health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  reset-apply:
+    <<: *app-image
+    profiles: [reset-apply]
+    command: ["python", "-m", "platform_postgres_reset_mcp_http"]
+    restart: "no"
+    environment:
+      EPM_AUTH_MODE: oidc
+      EPM_OIDC_ISSUER: ${EPM_OIDC_ISSUER:-}
+      EPM_OIDC_JWKS_URL: ${EPM_OIDC_JWKS_URL:-}
+      EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS: ${EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS:-}
+      EPM_OIDC_AUD_MCP: ${EPM_OIDC_AUD_MCP:-}
+      EPM_PG_BIND_HOST: 0.0.0.0
+      EPM_PG_RESET_MCP_PORT: 5196
+      EPM_PG_WORKSPACE_ID: ${EPM_PG_WORKSPACE_ID:-}
+      EPM_POSTGRES_ADMIN_DSN: "host=db port=5432 user=postgres password=${EPM_POSTGRES_PASSWORD:?set EPM_POSTGRES_PASSWORD} dbname=postgres"
+      EPM_PG_PREVIEW_SECRET_HEX: ${EPM_PG_PREVIEW_SECRET_HEX:-}
+      EPM_RESET_ENDPOINT_INVENTORY_JSON: ${EPM_RESET_ENDPOINT_INVENTORY_JSON:-}
+      EPM_RESET_APPLY_ENABLED: ${EPM_RESET_APPLY_ENABLED:-}
+      EPM_RESET_REPLACEMENT_READY: ${EPM_RESET_REPLACEMENT_READY:-}
+      EPM_RESET_ENDPOINTS_RETIRED: ${EPM_RESET_ENDPOINTS_RETIRED:-}
+    ports: ["127.0.0.1:5196:5196"]
+    depends_on: *db-ready
+
+  recovery-init:
+    <<: *db-image
+    profiles: [restore-init]
+    platform: linux/arm64
+    user: "0:0"
+    entrypoint: ["/bin/bash", "/usr/local/bin/openepm-restore"]
+    volumes:
+      - epm_pgrecovery:/var/lib/postgresql
+      - epm_pgarchive:/var/lib/postgresql/wal_archive:ro
+      - epm_pgbackups:/var/lib/postgresql/base_backups:ro
+      - ../../scripts/restore_postgres_physical.sh:/usr/local/bin/openepm-restore:ro
+
+  recovery-db:
+    <<: *db-image
+    profiles: [recovery]
+    platform: linux/arm64
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - "test -f /var/lib/postgresql/.openepm-recovery-ready && test -f /var/lib/postgresql/18/docker/PG_VERSION || { echo 'Verified recovery initialization required' >&2; exit 1; }; exec docker-entrypoint.sh postgres"
+    environment:
+      POSTGRES_PASSWORD: ${EPM_POSTGRES_PASSWORD:?set EPM_POSTGRES_PASSWORD}
+    ports: ["127.0.0.1:55499:5432"]
+    volumes:
+      - epm_pgrecovery:/var/lib/postgresql
+      - epm_pgarchive:/var/lib/postgresql/wal_archive:ro
+      - epm_pgbackups:/var/lib/postgresql/base_backups:ro
+
+  backup-export:
+    <<: *db-image
+    profiles: [backup-transfer]
+    platform: linux/arm64
+    user: "0:0"
+    entrypoint: ["/bin/bash", "/usr/local/bin/openepm-export"]
+    volumes:
+      - epm_pgbackups:/var/lib/postgresql/base_backups:ro
+      - epm_pgarchive:/var/lib/postgresql/wal_archive:ro
+      - ../../scripts/export_postgres_recovery_bundle.sh:/usr/local/bin/openepm-export:ro
+
+  backup-import:
+    <<: *db-image
+    profiles: [backup-transfer]
+    platform: linux/arm64
+    user: "0:0"
+    entrypoint: ["/bin/bash", "/usr/local/bin/openepm-import"]
+    volumes:
+      - epm_pgbackups:/var/lib/postgresql/base_backups
+      - epm_pgarchive:/var/lib/postgresql/wal_archive
+      - ../../scripts/import_postgres_recovery_bundle.sh:/usr/local/bin/openepm-import:ro
+
+volumes:
+  epm_pgdata:
+  epm_pgarchive:
+  epm_pgbackups:
+  epm_pgrecovery:

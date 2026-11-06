@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "scope": "all shipped Open EPM browser routes",
+  "routes": [
+    "home",
+    "applications",
+    "work",
+    "server",
+    "overview",
+    "grid",
+    "data",
+    "metadata",
+    "lists",
+    "rules",
+    "flows",
+    "tasks",
+    "monitor",
+    "security",
+    "administration"
+  ],
+  "transport": {
+    "directFetchOwner": "api.ts",
+    "credentials": "same-origin",
+    "cache": "no-store",
+    "endpointPatterns": [
+      "/api/aggregate",
+      "/api/applications${query}",
+      "/api/cancel",
+      "/api/catalog",
+      "/api/export",
+      "/api/job",
+      "/api/metadata-action",
+      "/api/platform/browser/read",
+      "/api/platform/browser/write",
+      "/api/python-build",
+      "/api/python-environment",
+      "/api/python-program",
+      "/api/python-run",
+      "/api/python-schedule",
+      "/api/preview",
+      "/api/read",
+      "/api/rule-action",
+      "/api/security",
+      "/api/session-identity",
+      "/api/source-load",
+      "/api/submit",
+      "/api/task",
+      "/api/task-interrupt",
+      "/api/task-logs",
+      "/api/task-rerun",
+      "/api/tasks",
+      "/api/workspace-application"
+    ]
+  },
+  "persistentBrowserState": [
+    {
+      "owner": "Applications.tsx",
+      "keyPrefix": "openepm:applications:",
+      "classification": "versioned identity-scoped display preference",
+      "contents": "favorite and recent application identifiers only"
+    },
+    {
+      "owner": "Analyze.tsx",
+      "keyPrefix": "openepm:grid-density:",
+      "classification": "identity/workspace/application-scoped display preference",
+      "contents": "comfortable or compact only"
+    }
+  ],
+  "forbiddenBrowserAuthorities": [
+    "credentials",
+    "business data",
+    "metadata",
+    "security grants",
+    "receipts",
+    "drafts",
+    "saved grid definitions"
+  ],
+  "forbiddenApis": [
+    "document.cookie",
+    "indexedDB",
+    "CacheStorage",
+    "serviceWorker",
+    "sessionStorage"
+  ]
+}

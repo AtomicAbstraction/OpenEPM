@@ -1,0 +1,43 @@
+{
+  "asOf": "2026-10-28",
+  "lockQualification": {
+    "platforms": ["linux/amd64", "linux/arm64"],
+    "notebookPackages": 91,
+    "notebookArtifactHashes": 224,
+    "hubPackages": 58,
+    "hubArtifactHashes": 310,
+    "requireHashes": true
+  },
+  "buildQualification": {
+    "hostPlatform": "linux/arm64",
+    "notebook": "arm64-user-image-passed-absolute-retirement-and-lab-kernel-lifecycle-smoke",
+    "hub": "arm64-postgresql-only-image-passed-absolute-retirement-and-postgresql-smoke",
+    "builder": "arm64-development-image-passed-absolute-retirement-scan",
+    "builderImageId": "sha256:a35b7c91047b4c47316ab1617c6c8762f9613fb8abc00806a05f5e3467096b04",
+    "builderImageSizeBytes": 64705138,
+    "builderFilesScanned": 4970,
+    "notebookImageId": "sha256:0b7507a97da4de43c1e18d6d33718d224990059f12cfe539901882e738d79d8c",
+    "notebookImageSizeBytes": 248045259,
+    "notebookFilesScannedAtBuild": 17113,
+    "notebookFilesScannedAsUser": 17110,
+    "notebookFilesScannedAsRoot": 17115,
+    "notebookHistory": "disabled-no-history-file",
+    "notebookTrust": "memory-store-save-reopen-untrusted-passed",
+    "notebookLabSmoke": "server-contents-session-kernel-execute-save-reopen-passed-no-core-or-database-credentials",
+    "hubImageId": "sha256:3c79c15ed1ac1fa55ffb06ef6f2fd6f8e8d2b4750a5a9a3c2ca117d80924f26f",
+    "hubImageSizeBytes": 107267470,
+    "hubFilesScannedAtBuild": 15075,
+    "hubPostgresqlSmoke": "fresh-schema-initialize-repeat-upgrade-and-service-start-passed",
+    "hubPostgresqlSmokeDatabaseImage": "sha256:41ef182bc45cda7e96f4a1f1eda4142f6fd97c99af5706eab7d999caef796b56"
+  },
+  "officialArtifacts": [
+    {"name":"jupyter_server","version":"2.21.1","url":"https://files.pythonhosted.org/packages/source/j/jupyter_server/jupyter_server-2.21.1.tar.gz","sha256":"a8960aa29263f6041283e97d4756b099fb49b767baab6371891ecb1bd40a63df","patchVerified":true},
+    {"name":"nbformat","version":"5.11.1","url":"https://files.pythonhosted.org/packages/31/72/b3446efab8756e7df4b8ec587f8e611cb5a7249e4323db480802f1d3be04/nbformat-5.11.1.tar.gz","sha256":"32d4521c68c6e7d5b29c76defaeed9f42ea733142b9b19f88277ce10390b9c4d","patchVerified":true},
+    {"name":"jupyterhub","version":"6.1.1","url":"https://files.pythonhosted.org/packages/7f/2d/da2a9565b0a6b6fce11aa8e494f576a1e1ad5db54227d1f30044c7ed63d7/jupyterhub-6.1.1.tar.gz","sha256":"1d7b6713b31ebd76d61a13c202f9323e66c4e8cf731adc5d3052bb6ee6178a95","patchVerified":true,"initialWheelAuditFindingCount":14,"patchedLiveTargetFindingCount":0,"imageStillBlocked":false},
+    {"name":"sqlalchemy","version":"2.1.6","adaptation":"deterministic-postgresql-only-source-transform","sourceFilesBefore":270,"sourceTreeSha256Before":"54efd2c0f7f9c5d4c1a1bdeae5c34964012e2cf2b435d5c83055d5e24a9b7a96","sourceFilesAfter":183,"sourceTreeSha256After":"5ad39a2cc47ac88dbe9bb54d40a3f0da12d0beb830e3497e601563cb211c6187","recordRepaired":true},
+    {"name":"alembic","version":"1.20.1","adaptation":"deterministic-postgresql-only-source-transform","sourceFilesBefore":97,"sourceTreeSha256Before":"3da0757502b7d5ad6b2cb8080f7d23a15e2640b7a509d8a549addac21423e54a","sourceFilesAfter":74,"sourceTreeSha256After":"aab1fcacdc704d42d49b950f32345e35d6c2b6715696b61a8aadcb0a4d091e33","recordRepaired":true},
+    {"name":"ipython","version":"9.17.1","url":"https://files.pythonhosted.org/packages/2d/1e/65b59cf518c106aa755e7f7da3099027738687a862ec785060702a481320/ipython-9.17.1-py3-none-any.whl","sha256":"6d1645743cfd1a07eb695d85aa2b5fa66721f8cbae9431d4049f7084bbf06509","historyDisabled":true},
+    {"name":"jupyterlab","version":"4.6.4","url":"https://files.pythonhosted.org/packages/3b/e4/072bc0d3c6d45d414062a06af7ee81c02a2c12d769c358ec9919f9995ffd/jupyterlab-4.6.4-py3-none-any.whl","sha256":"15b13f991d3985129c797eb84d9949eeb8b6615e14b444868e642411f2c418b2"},
+    {"name":"notebook-user-runtime","adaptation":"deterministic-whole-tree-retirement-transform","siteFilesBefore":12931,"siteTreeSha256Before":"dd14a358c43576fb3f91b533942653030f11c4a21f920423ef1995ee3015cf08","siteFilesAfter":12819,"siteTreeSha256After":"5a5bffe0f66f54f5e8b815eb0c620176015def9bd4deff7acd6173097ef06855","jupyterShareFilesBefore":462,"jupyterShareSha256Before":"46abd66cf2466a4f0687368eda805099471401934428184a3f966ef1000d97c7","jupyterShareFilesAfter":462,"jupyterShareSha256After":"ae367e83b069831adb72354ba62c12794923c3242ef2147af262d0e6510244f3","allDistributionRecordsRepaired":true,"reviewedDelta":"Pinned JupyterHub 6.1.1 single-user and its locked PostgreSQL/OIDC/Traefik dependencies add 1161 files; previous notebook image did not contain jupyterhub."}
+  ]
+}

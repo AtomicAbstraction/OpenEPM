@@ -1,0 +1,37 @@
+.work-items {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.work-items article {
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 11px;
+}
+
+.work-items article > span {
+  color: var(--purple);
+  font-size: 8px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.work-items article strong {
+  display: block;
+  font-size: 11px;
+  margin: 5px 0;
+}
+
+.work-items article p,
+.work-items article time {
+  color: var(--muted);
+  display: block;
+  font-size: 9px;
+  margin: 0;
+}
+
+.work-items article time {
+  margin-top: 7px;
+}

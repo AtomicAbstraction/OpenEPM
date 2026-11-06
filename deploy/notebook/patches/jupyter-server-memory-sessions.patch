@@ -1,0 +1,281 @@
+--- a/jupyter_server/services/sessions/sessionmanager.py
++++ b/jupyter_server/services/sessions/sessionmanager.py
+@@ -3,24 +3,17 @@
+ # Copyright (c) Jupyter Development Team.
+ # Distributed under the terms of the Modified BSD License.
+ import os
+-import pathlib
+ import uuid
+ from typing import Any, NewType, cast
+
+ KernelName = NewType("KernelName", str)
+ ModelName = NewType("ModelName", str)
+
+-try:
+-    import sqlite3
+-except ImportError:
+-    # fallback on pysqlite2 if Python was build without sqlite
+-    from pysqlite2 import dbapi2 as sqlite3  # type:ignore[no-redef]
+-
+ from dataclasses import dataclass, fields
+
+ from jupyter_core.utils import ensure_async
+ from tornado import web
+-from traitlets import Instance, TraitError, Unicode, validate
++from traitlets import Instance, Integer
+ from traitlets.config.configurable import LoggingConfigurable
+
+ from jupyter_server.traittypes import InstanceFromClasses
+@@ -161,37 +154,13 @@
+ class SessionManager(LoggingConfigurable):
+     """A session manager."""
+
+-    database_filepath = Unicode(
+-        default_value=":memory:",
+-        help=(
+-            "The filesystem path to SQLite Database file "
+-            "(e.g. /path/to/session_database.db). By default, the session "
+-            "database is stored in-memory (i.e. `:memory:` setting from sqlite3) "
+-            "and does not persist when the current Jupyter Server shuts down."
+-        ),
++    max_sessions = Integer(
++        default_value=128,
++        min=1,
++        max=1024,
++        help="Maximum bounded session records held by this user server.",
+     ).tag(config=True)
+
+-    @validate("database_filepath")
+-    def _validate_database_filepath(self, proposal):
+-        """Validate a database file path."""
+-        value = proposal["value"]
+-        if value == ":memory:":
+-            return value
+-        path = pathlib.Path(value)
+-        if path.exists():
+-            # Verify that the database path is not a directory.
+-            if path.is_dir():
+-                msg = "`database_filepath` expected a file path, but the given path is a directory."
+-                raise TraitError(msg)
+-            # Verify that database path is an SQLite 3 Database by checking its header.
+-            with open(value, "rb") as f:
+-                header = f.read(100)
+-
+-            if not header.startswith(b"SQLite format 3") and header != b"":
+-                msg = "The given file is not an SQLite database file."
+-                raise TraitError(msg)
+-        return value
+-
+     kernel_manager = Instance("jupyter_server.services.kernels.kernelmanager.MappingKernelManager")
+     contents_manager = InstanceFromClasses(
+         [
+@@ -204,47 +173,13 @@
+         """Initialize a record list."""
+         super().__init__(*args, **kwargs)
+         self._pending_sessions = KernelSessionRecordList()
++        self._sessions: dict[str, dict[str, Any]] = {}
+
+-    # Session database initialized below
+-    _cursor = None
+-    _connection = None
+     _columns = {"session_id", "path", "name", "type", "kernel_id"}
+
+-    @property
+-    def cursor(self):
+-        """Start a cursor and create a database called 'session'"""
+-        if self._cursor is None:
+-            self._cursor = self.connection.cursor()
+-            self._cursor.execute(
+-                """CREATE TABLE IF NOT EXISTS session
+-                (session_id, path, name, type, kernel_id)"""
+-            )
+-        return self._cursor
+-
+-    @property
+-    def connection(self):
+-        """Start a database connection"""
+-        if self._connection is None:
+-            # Set isolation level to None to autocommit all changes to the database.
+-            self._connection = sqlite3.connect(self.database_filepath, isolation_level=None)
+-            self._connection.row_factory = sqlite3.Row
+-        return self._connection
+-
+-    def close(self):
+-        """Close the sqlite connection"""
+-        if self._cursor is not None:
+-            self._cursor.close()
+-            self._cursor = None
+-
+-    def __del__(self):
+-        """Close connection once SessionManager closes"""
+-        self.close()
+-
+     async def session_exists(self, path):
+         """Check to see if the session of a given name exists"""
+-        exists = False
+-        self.cursor.execute("SELECT * FROM session WHERE path=?", (path,))
+-        row = self.cursor.fetchone()
++        row = next((value for value in self._sessions.values() if value["path"] == path), None)
+         if row is not None:
+             # Note, although we found a row for the session, the associated kernel may have
+             # been culled or died unexpectedly.  If that's the case, we should delete the
+@@ -253,8 +188,8 @@
+             # we'll return false, since, at that point, the session doesn't exist anyway.
+             model = await self.row_to_model(row, tolerate_culled=True)
+             if model is not None:
+-                exists = True
+-        return exists
++                return True
++        return False
+
+     def new_session_id(self) -> str:
+         """Create a uuid for a new session"""
+@@ -361,8 +296,7 @@
+         """Saves the items for the session with the given session_id
+
+         Given a session_id (and any other of the arguments), this method
+-        creates a row in the sqlite session database that holds the information
+-        for a session.
++        creates one bounded process-memory record for a session.
+
+         Parameters
+         ----------
+@@ -382,23 +316,29 @@
+         model : dict
+             a dictionary of the session model
+         """
+-        self.cursor.execute(
+-            "INSERT INTO session VALUES (?,?,?,?,?)",
+-            (session_id, path, name, type, kernel_id),
+-        )
++        if session_id in self._sessions:
++            raise web.HTTPError(409, "Session already exists: %s" % session_id)
++        if len(self._sessions) >= self.max_sessions:
++            raise web.HTTPError(429, "Session record limit reached")
++        self._sessions[session_id] = {
++            "session_id": session_id,
++            "path": path,
++            "name": name,
++            "type": type,
++            "kernel_id": kernel_id,
++        }
+         result = await self.get_session(session_id=session_id)
+         return result
+
+     async def get_session(self, **kwargs):
+         """Returns the model for a particular session.
+
+-        Takes a keyword argument and searches for the value in the session
+-        database, then returns the rest of the session's info.
++        Takes a keyword argument and searches process-memory records.
+
+         Parameters
+         ----------
+         **kwargs : dict
+-            must be given one of the keywords and values from the session database
++            must be given one of the keywords and values from the session record
+             (i.e. session_id, path, name, type, kernel_id)
+
+         Returns
+@@ -411,21 +351,12 @@
+             msg = "must specify a column to query"
+             raise TypeError(msg)
+
+-        conditions = []
+         for column in kwargs:
+             if column not in self._columns:
+                 msg = f"No such column: {column}"
+                 raise TypeError(msg)
+-            conditions.append("%s=?" % column)
+-
+-        query = "SELECT * FROM session WHERE %s" % (" AND ".join(conditions))  # noqa: S608
+-
+-        self.cursor.execute(query, list(kwargs.values()))
+-        try:
+-            row = self.cursor.fetchone()
+-        except KeyError:
+-            # The kernel is missing, so the session just got deleted.
+-            row = None
++        row = next((value for value in self._sessions.values()
++                    if all(value[key] == expected for key, expected in kwargs.items())), None)
+
+         if row is None:
+             q = []
+@@ -449,7 +380,7 @@
+         Parameters
+         ----------
+         session_id : str
+-            a uuid that identifies a session in the sqlite3 database
++            a uuid that identifies a process-memory session record
+         **kwargs : str
+             the key must correspond to a column title in session database,
+             and the value replaces the current value in the session
+@@ -461,19 +392,14 @@
+             # no changes
+             return
+
+-        sets = []
+         for column in kwargs:
+             if column not in self._columns:
+                 raise TypeError("No such column: %r" % column)
+-            sets.append("%s=?" % column)
+-        query = "UPDATE session SET %s WHERE session_id=?" % (", ".join(sets))  # noqa: S608
+-        self.cursor.execute(query, [*list(kwargs.values()), session_id])
++        self._sessions[session_id].update(kwargs)
+
+         if hasattr(self.kernel_manager, "update_env"):
+-            self.cursor.execute(
+-                "SELECT path, name, kernel_id FROM session WHERE session_id=?", [session_id]
+-            )
+-            path, name, kernel_id = self.cursor.fetchone()
++            record = self._sessions[session_id]
++            path, name, kernel_id = record["path"], record["name"], record["kernel_id"]
+             self.kernel_manager.update_env(kernel_id=kernel_id, env=self.get_kernel_env(path, name))
+
+     async def kernel_culled(self, kernel_id: str) -> bool:
+@@ -481,7 +407,7 @@
+         return kernel_id not in self.kernel_manager
+
+     async def row_to_model(self, row, tolerate_culled=False):
+-        """Takes sqlite database session row and turns it into a dictionary"""
++        """Turn a process-memory session record into a public model."""
+         kernel_culled: bool = await ensure_async(self.kernel_culled(row["kernel_id"]))
+         if kernel_culled:
+             # The kernel was culled or died without deleting the session.
+@@ -491,7 +417,7 @@
+             # If caller wishes to tolerate culled kernels, log a warning
+             # and return None.  Otherwise, raise KeyError with a similar
+             # message.
+-            self.cursor.execute("DELETE FROM session WHERE session_id=?", (row["session_id"],))
++            self._sessions.pop(row["session_id"], None)
+             msg = (
+                 "Kernel '{kernel_id}' appears to have been culled or died unexpectedly, "
+                 "invalidating session '{session_id}'. The session has been removed.".format(
+@@ -518,12 +444,9 @@
+
+     async def list_sessions(self):
+         """Returns a list of dictionaries containing all the information from
+-        the session database"""
+-        c = self.cursor.execute("SELECT * FROM session")
++        process-memory session records"""
+         result = []
+-        # We need to use fetchall() here, because row_to_model can delete rows,
+-        # which messes up the cursor if we're iterating over rows.
+-        for row in c.fetchall():
++        for row in list(self._sessions.values()):
+             try:
+                 model = await self.row_to_model(row)
+                 result.append(model)
+@@ -532,10 +455,10 @@
+         return result
+
+     async def delete_session(self, session_id):
+-        """Deletes the row in the session database with given session_id"""
++        """Delete the process-memory record with the given session_id."""
+         record = KernelSessionRecord(session_id=session_id)
+         self._pending_sessions.update(record)
+         session = await self.get_session(session_id=session_id)
+         await ensure_async(self.kernel_manager.shutdown_kernel(session["kernel"]["id"]))
+-        self.cursor.execute("DELETE FROM session WHERE session_id=?", (session_id,))
++        self._sessions.pop(session_id, None)
+         self._pending_sessions.remove(record)

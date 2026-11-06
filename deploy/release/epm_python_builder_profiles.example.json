@@ -1,0 +1,10 @@
+{
+  "profiles": [
+    {
+      "environmentId": "openepm-python-1",
+      "environmentVersion": 1,
+      "image": "registry.example.invalid/openepm/builder@sha256:REPLACE_WITH_64_HEX_DIGEST",
+      "network": "openepm_sandbox"
+    }
+  ]
+}

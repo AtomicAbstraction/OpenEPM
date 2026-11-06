@@ -1,0 +1,135 @@
+FROM python:3.14-slim@sha256:35caba83af2fe6da9a5d922f9b0156f21d1246a48278c58a08bd253303ba42e8 AS source-patch
+
+WORKDIR /build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends patch \
+    && rm -rf /var/lib/apt/lists/*
+ADD --checksum=sha256:a8960aa29263f6041283e97d4756b099fb49b767baab6371891ecb1bd40a63df \
+    https://files.pythonhosted.org/packages/65/3d/3c9f8bce5d5448107bd285cd80185e76c9c871d076b580dfd90997e52904/jupyter_server-2.21.1.tar.gz \
+    ./jupyter_server.tar.gz
+ADD --checksum=sha256:32d4521c68c6e7d5b29c76defaeed9f42ea733142b9b19f88277ce10390b9c4d \
+    https://files.pythonhosted.org/packages/31/72/b3446efab8756e7df4b8ec587f8e611cb5a7249e4323db480802f1d3be04/nbformat-5.11.1.tar.gz \
+    ./nbformat.tar.gz
+ADD --checksum=sha256:1d7b6713b31ebd76d61a13c202f9323e66c4e8cf731adc5d3052bb6ee6178a95 \
+    https://files.pythonhosted.org/packages/7f/2d/da2a9565b0a6b6fce11aa8e494f576a1e1ad5db54227d1f30044c7ed63d7/jupyterhub-6.1.1.tar.gz \
+    ./jupyterhub.tar.gz
+COPY deploy/notebook/compatibility-contract.json deploy/notebook/verify_jupyter_patch.py ./notebook/
+COPY deploy/notebook/patches/ ./notebook/patches/
+RUN python ./notebook/verify_jupyter_patch.py jupyter_server ./jupyter_server.tar.gz --destination ./patched-server \
+    && python ./notebook/verify_jupyter_patch.py nbformat ./nbformat.tar.gz --destination ./patched-format \
+    && python ./notebook/verify_jupyter_patch.py jupyterhub ./jupyterhub.tar.gz --destination ./patched-hub
+
+FROM python:3.14-slim@sha256:35caba83af2fe6da9a5d922f9b0156f21d1246a48278c58a08bd253303ba42e8 AS sdk-wheel
+WORKDIR /source
+COPY openepm/ ./openepm/
+COPY scripts/build_openepm_sdk_wheel.py ./scripts/build_openepm_sdk_wheel.py
+RUN python ./scripts/build_openepm_sdk_wheel.py --source-root /source --destination /wheel
+
+FROM python:3.14-slim@sha256:35caba83af2fe6da9a5d922f9b0156f21d1246a48278c58a08bd253303ba42e8 AS cpython-build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       build-essential ca-certificates libbz2-dev libffi-dev libgdbm-dev \
+       liblzma-dev libncursesw5-dev libreadline-dev libssl-dev \
+       libuuid1 uuid-dev xz-utils zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+ADD --checksum=sha256:e02d9ac21cebda6e46435369744a92c65cc7cd8669697694122cf97ffacd1e53 \
+    https://www.python.org/ftp/python/3.14.9/Python-3.14.9.tar.xz /tmp/Python.tar.xz
+RUN mkdir /tmp/Python \
+    && tar -xf /tmp/Python.tar.xz -C /tmp/Python --strip-components=1 \
+    && rm -rf /tmp/Python/Modules/_sqlite /tmp/Python/Lib/sqlite3 \
+    && sed -i '/[Ss][Qq][Ll][Ii][Tt][Ee]/d' \
+       /tmp/Python/Modules/Setup /tmp/Python/Modules/Setup.stdlib.in \
+       /tmp/Python/Python/stdlib_module_names.h \
+       /tmp/Python/Include/internal/pycore_unicodeobject.h \
+       /tmp/Python/Include/internal/pycore_pyerrors.h \
+    && cd /tmp/Python \
+    && ./configure --prefix=/opt/python --enable-shared --without-ensurepip \
+       --disable-test-modules --with-lto=no \
+    && make -j2 \
+    && make install \
+    && rm -rf /opt/python/lib/python3.14/test /opt/python/lib/python3.14/ensurepip \
+       /opt/python/lib/python3.14/idlelib /opt/python/lib/python3.14/tkinter \
+       /opt/python/lib/python3.14/turtledemo /opt/python/lib/python3.14/turtle.py
+
+FROM python:3.14-slim@sha256:35caba83af2fe6da9a5d922f9b0156f21d1246a48278c58a08bd253303ba42e8 AS packages-base
+WORKDIR /build
+COPY --from=sdk-wheel /wheel/openepm_sdk-0.1.0-py3-none-any.whl ./openepm_sdk-0.1.0-py3-none-any.whl
+COPY deploy/notebook/requirements-notebook.lock ./requirements.lock
+COPY deploy/notebook/requirements-hub.lock ./requirements-hub.lock
+COPY deploy/notebook/adapt_postgresql_only_orm.py ./adapt_postgresql_only_orm.py
+RUN python -m pip install --no-cache-dir --require-hashes -r requirements.lock \
+    && python -m pip install --no-cache-dir --require-hashes -r requirements-hub.lock \
+    && python -m pip install --no-cache-dir --no-deps ./openepm_sdk-0.1.0-py3-none-any.whl \
+    && find /usr/local/lib/python3.14/site-packages -type d -name __pycache__ -prune -exec rm -rf '{}' + \
+    && python ./adapt_postgresql_only_orm.py /usr/local/lib/python3.14/site-packages
+COPY --from=source-patch /build/patched-server/jupyter_server-2.21.1/jupyter_server/services/sessions/sessionmanager.py \
+    /usr/local/lib/python3.14/site-packages/jupyter_server/services/sessions/sessionmanager.py
+COPY --from=source-patch /build/patched-format/nbformat-5.11.1/nbformat/sign.py \
+    /usr/local/lib/python3.14/site-packages/nbformat/sign.py
+COPY --from=source-patch /build/patched-hub/jupyterhub-6.1.1/jupyterhub/app.py \
+    /usr/local/lib/python3.14/site-packages/jupyterhub/app.py
+COPY --from=source-patch /build/patched-hub/jupyterhub-6.1.1/jupyterhub/dbutil.py \
+    /usr/local/lib/python3.14/site-packages/jupyterhub/dbutil.py
+COPY --from=source-patch /build/patched-hub/jupyterhub-6.1.1/jupyterhub/orm.py \
+    /usr/local/lib/python3.14/site-packages/jupyterhub/orm.py
+COPY --from=source-patch /build/patched-hub/jupyterhub-6.1.1/jupyterhub/alembic/versions/ \
+    /usr/local/lib/python3.14/site-packages/jupyterhub/alembic/versions/
+COPY deploy/notebook/adapt_notebook_user_runtime.py ./adapt_notebook_user_runtime.py
+
+FROM packages-base AS packages
+RUN find /usr/local/lib/python3.14/site-packages -type d -name __pycache__ -prune -exec rm -rf '{}' + \
+    && python ./adapt_notebook_user_runtime.py \
+       /usr/local/lib/python3.14/site-packages /usr/local/share/jupyter \
+    && python -m py_compile \
+       /usr/local/lib/python3.14/site-packages/IPython/core/history.py \
+       /usr/local/lib/python3.14/site-packages/jupyter_server/services/sessions/sessionmanager.py \
+       /usr/local/lib/python3.14/site-packages/nbformat/sign.py \
+       /usr/local/lib/python3.14/site-packages/jupyterhub/singleuser/app.py \
+    && rm -rf \
+    /usr/local/lib/python3.14/site-packages/jupyterhub/tests \
+    /usr/local/lib/python3.14/site-packages/jupyterhub/__pycache__ \
+    /usr/local/lib/python3.14/site-packages/jupyterhub/alembic/versions/__pycache__ \
+    /usr/local/lib/python3.14/site-packages/jupyter_server/services/sessions/__pycache__ \
+    /usr/local/lib/python3.14/site-packages/nbformat/__pycache__ \
+    /usr/local/lib/python3.14/site-packages/IPython/core/__pycache__
+COPY deploy/notebook/ipython_config.py /etc/ipython/ipython_config.py
+COPY scripts/check_notebook_runtime_retirement.py /usr/local/bin/openepm-notebook-runtime-check
+COPY scripts/retire_runtime_packages.sh scripts/prune_python_runtime.py /usr/local/libexec/openepm/
+
+FROM packages AS build
+RUN mv /usr/local/lib/python3.14/site-packages /tmp/site-packages \
+    && rm -rf /usr/local/bin/python* /usr/local/include/python3.14 \
+       /usr/local/lib/python3.14 /usr/local/lib/libpython3.14* \
+    && rm -f /usr/local/bin/idle* /usr/local/bin/pydoc*
+COPY --from=cpython-build /opt/python/ /usr/local/
+RUN rm -rf /usr/local/lib/python3.14/site-packages \
+    && mv /tmp/site-packages /usr/local/lib/python3.14/site-packages \
+    && ln -s python3 /usr/local/bin/python \
+    && mkdir -p /home/openepm/work /home/openepm/.local/share/jupyter/runtime \
+    && chown -R 10001:10001 /home/openepm \
+    && PYTHONDONTWRITEBYTECODE=1 python - <<'PY'
+from IPython.core.history import HistoryManager
+from nbformat.sign import MemorySignatureStore, NotebookNotary
+from jupyterhub.singleuser.app import SingleUserNotebookApp
+
+assert hasattr(HistoryManager, "enabled")
+notary = NotebookNotary()
+assert isinstance(notary.store, MemorySignatureStore)
+assert SingleUserNotebookApp.__name__ == "SingleUserNotebookApp"
+assert SingleUserNotebookApp.name == "jupyter-server"
+PY
+RUN touch /etc/openepm-image-build \
+    && bash /usr/local/libexec/openepm/retire_runtime_packages.sh app \
+    && python /usr/local/libexec/openepm/prune_python_runtime.py \
+    && rm -rf /build /usr/local/libexec/openepm /etc/openepm-image-build \
+    && rm -f /etc/.pwd.lock /etc/gshadow /etc/passwd- /etc/security/opasswd \
+       /etc/shadow /var/cache/debconf/passwords.dat /var/lib/dpkg/lock \
+       /var/lib/dpkg/lock-frontend /var/lib/dpkg/triggers/Lock /var/log/btmp \
+    && chmod 0555 /usr/local/bin/openepm-notebook-runtime-check \
+    && python /usr/local/bin/openepm-notebook-runtime-check --probe-current-runtime /
+
+FROM build
+ENV HOME=/home/openepm IPYTHONDIR=/etc/ipython PYTHONDONTWRITEBYTECODE=1
+USER 10001:10001
+WORKDIR /home/openepm/work
+CMD ["jupyterhub-singleuser"]
