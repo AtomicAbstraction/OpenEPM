@@ -1,0 +1,80 @@
+{
+  "format": "openepm-browser-server-contract-fixtures-v1",
+  "applicationPage": {
+    "applications": [
+      {
+        "workspaceId": "ws",
+        "workspaceName": "Workspace",
+        "applicationId": "app",
+        "name": "Plan",
+        "kind": "Multidimensional",
+        "status": "active"
+      }
+    ],
+    "nextAfter": null
+  },
+  "taskList": {
+    "tasks": [
+      {
+        "taskId": "c:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sequence": 7,
+        "taskClass": "Business",
+        "sourceFamily": "Job",
+        "sourceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "function": "facts.numeric.batch",
+        "resourceClass": "write",
+        "status": "Succeeded",
+        "interruptible": false,
+        "rerunSupported": true,
+        "createdAt": "2026-11-02T00:00:00+00:00",
+        "updatedAt": "2026-11-02T00:00:01+00:00"
+      }
+    ],
+    "nextSequence": 7,
+    "hasMore": false
+  },
+  "taskRead": {
+    "taskId": "c:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sequence": 7,
+    "taskClass": "Business",
+    "sourceFamily": "Job",
+    "sourceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "function": "facts.numeric.batch",
+    "resourceClass": "write",
+    "status": "Succeeded",
+    "interruptible": false,
+    "rerunSupported": true,
+    "createdAt": "2026-11-02T00:00:00+00:00",
+    "updatedAt": "2026-11-02T00:00:01+00:00",
+    "events": [
+      {
+        "event": 2,
+        "status": "Succeeded",
+        "claimGeneration": 1,
+        "receiptRevision": 3,
+        "errorCode": null,
+        "occurredAt": "2026-11-02T00:00:01+00:00"
+      }
+    ],
+    "nextEvent": 2,
+    "hasMoreEvents": false
+  },
+  "taskLogs": {
+    "taskId": "c:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "lifecycle": {
+      "events": [
+        {
+          "event": 2,
+          "status": "Succeeded",
+          "claimGeneration": 1,
+          "receiptRevision": 3,
+          "errorCode": null,
+          "occurredAt": "2026-11-02T00:00:01+00:00"
+        }
+      ],
+      "nextEvent": 2,
+      "hasMore": false
+    },
+    "sourceLog": null
+  }
+}

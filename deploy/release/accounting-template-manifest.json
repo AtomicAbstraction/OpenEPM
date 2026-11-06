@@ -1,0 +1,25 @@
+{
+  "format": "openepm-accounting-template-manifest-v1",
+  "releasePolicy": {
+    "accountingCorrectnessClaimed": false,
+    "ifrsCertificationClaimed": false,
+    "usGaapCertificationClaimed": false,
+    "unreviewedExamplesInstallableAsTemplates": false,
+    "independentReviewRequiredBeforeTemplateAddition": true
+  },
+  "shippedTemplates": [],
+  "developmentExamples": [
+    {"path": "examples/user_authored_combined_oci_tax_expression.py", "sha256": "48afee3c0459d2efc6752dd9760cb952b78909523f2bb7267c2da9c282303919"},
+    {"path": "examples/user_authored_consolidation_expression.py", "sha256": "caf1831c0a08389560944b1fac9d529f9f587367509ee3dabfa2fa7d035959ca"},
+    {"path": "examples/user_authored_cross_currency_ic_residual_expression.py", "sha256": "6709a404040b0599e05884713110a1c0c7a5851cbc1965255b1a98d0513fe701"},
+    {"path": "examples/user_authored_fixed_asset_unrealized_expression.py", "sha256": "4be33a7e6dc3820358ad0855179f018835ce25b060cfb847d624b65b880698b0"},
+    {"path": "examples/user_authored_ic_residual_expression.py", "sha256": "fda3de6ef4c5ed23f59a14de8aa5364edc83681141592404c48a4be0433d0e65"},
+    {"path": "examples/user_authored_loss_of_control_disposal_expression.py", "sha256": "fab451b16837da8f46d6fa94667e1355ae8b3059f8324d32b5d5a7920bf64ee7"},
+    {"path": "examples/user_authored_multicurrency_loss_of_control_disposal_expression.py", "sha256": "4cb21b411cdcb467678849ea083653d9f7ad27aa9f001d4e956c0464fa793f8d"},
+    {"path": "examples/user_authored_retained_control_disposal_expression.py", "sha256": "7cdad49438659998bb0f536ffc8b3037df0d7c99280b4a1b757f86d5d71ce02e"},
+    {"path": "examples/user_authored_step_acquisition_oci_expression.py", "sha256": "718a22dd314bf872c794e85fc5f89b5e14770d3b201e15c3bb785276b49b121f"},
+    {"path": "examples/user_authored_tax_effect_expression.py", "sha256": "cfeacec2ba8dfa005f6fd4b3841704257f6b5d05d8ff9032cd4be03b82ee93b6"}
+  ],
+  "p15Status": "open-independent-review-required",
+  "nextGate": "Add a template only with a versioned applicability/effective-date/election/input/journal/golden-case package and content-addressed independent qualified review."
+}

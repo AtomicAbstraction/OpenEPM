@@ -1,0 +1,73 @@
+#!/bin/sh
+# Fixed controller contract for the optional managed-notebook deployment.
+set -eu
+
+EX_CONFIG=78
+
+fail() { printf 'notebook-mode-contract: %s\n' "$1" >&2; exit "$EX_CONFIG"; }
+
+[ "$#" -eq 2 ] || fail 'usage: notebook-mode-contract ENV_FILE validate|runtime|plan'
+env_file=$1
+action=$2
+[ -f "$env_file" ] && [ -r "$env_file" ] && [ ! -L "$env_file" ] ||
+    fail 'release environment file is unavailable or symbolic'
+
+value() {
+    key=$1
+    count=$(sed -n "s/^${key}=//p" "$env_file" | awk 'END { print NR }')
+    [ "$count" = 1 ] || fail "$key must occur exactly once"
+    sed -n "s/^${key}=//p" "$env_file"
+}
+
+mode=$(value EPM_NOTEBOOK_MODE)
+case "$mode" in disabled|managed) ;; *) fail 'EPM_NOTEBOOK_MODE must be disabled or managed' ;; esac
+case "$action" in validate|runtime|plan) ;; *) fail 'unsupported action' ;; esac
+
+if [ "$action" = plan ]; then
+    printf 'notebook_mode=%s\n' "$mode"
+    if [ "$mode" = disabled ]; then
+        printf '%s\n' 'requires_launcher=0' 'identity_barrier=0' \
+            'compose_profile=' 'pull_services=' 'start_services='
+    else
+        printf '%s\n' 'requires_launcher=1' 'identity_barrier=1' \
+            'compose_profile=notebooks' 'pull_services=hub' 'start_services=hub'
+    fi
+    exit 0
+fi
+
+# Disabled is intentionally complete here: no notebook image, Hub option,
+# launcher path or notebook secret may be inspected by this branch.
+[ "$mode" = managed ] || exit 0
+
+image=$(value EPM_NOTEBOOK_IMAGE)
+hub_image=$(value EPM_HUB_IMAGE)
+for item in "$image" "$hub_image"; do
+    printf '%s\n' "$item" | grep -Eq '^[^@[:space:]]+@sha256:[a-f0-9]{64}$' ||
+        fail 'managed notebook images must be immutable sha256 references'
+done
+
+base_domain=$(value EPM_NOTEBOOK_BASE_DOMAIN)
+printf '%s\n' "$base_domain" | grep -Eq '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$' ||
+    fail 'EPM_NOTEBOOK_BASE_DOMAIN must be a lower-case DNS hostname'
+for key in EPM_HUB_PUBLIC_URL EPM_HUB_OIDC_ISSUER EPM_HUB_OIDC_AUTHORIZE_URL \
+    EPM_HUB_OIDC_TOKEN_URL EPM_HUB_OIDC_USERINFO_URL
+do
+    item=$(value "$key")
+    case "$item" in https://*) ;; *) fail "$key must use HTTPS" ;; esac
+done
+[ -n "$(value EPM_HUB_OIDC_CLIENT_ID)" ] || fail 'Hub OIDC client ID is required'
+
+secrets_dir=$(value EPM_SECRETS_DIR)
+socket_dir=$(value EPM_NOTEBOOK_SOCKET_DIR)
+case "$secrets_dir" in /*) ;; *) fail 'EPM_SECRETS_DIR must be absolute' ;; esac
+case "$socket_dir" in /*) ;; *) fail 'EPM_NOTEBOOK_SOCKET_DIR must be absolute' ;; esac
+for name in hub_database_url hub_cookie_secret hub_oidc_client_secret notebook_control_key
+do
+    path=$secrets_dir/$name
+    [ -f "$path" ] && [ ! -L "$path" ] && [ -s "$path" ] ||
+        fail "managed notebook secret is unavailable, symbolic or empty: $path"
+done
+if [ "$action" = runtime ]; then
+    [ -S "$socket_dir/notebook-launcher.sock" ] ||
+        fail 'trusted notebook launcher socket is unavailable'
+fi

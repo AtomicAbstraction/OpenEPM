@@ -1,0 +1,7 @@
+# Pinned direct runtime dependencies for the PostgreSQL MCP and worker services.
+psycopg[binary]==3.3.6
+mcp==2.3.0
+uvicorn==0.54.0
+cryptography==50.0.2
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1

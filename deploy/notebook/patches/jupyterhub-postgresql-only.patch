@@ -1,0 +1,296 @@
+diff -urN --exclude=tests --exclude=*.pyc --exclude=__pycache__ a/jupyterhub/alembic/versions/1cebaf56856c_session_id.py b/jupyterhub/alembic/versions/1cebaf56856c_session_id.py
+--- a/jupyterhub/alembic/versions/1cebaf56856c_session_id.py	2026-10-20 21:49:36
++++ b/jupyterhub/alembic/versions/1cebaf56856c_session_id.py	2026-10-28 17:12:40
+@@ -38,6 +38,5 @@
+ 
+ 
+ def downgrade():
+-    # sqlite cannot downgrade because of limited ALTER TABLE support (no DROP COLUMN)
+     for table in tables:
+         op.drop_column(table, 'session_id')
+diff -urN --exclude=tests --exclude=*.pyc --exclude=__pycache__ a/jupyterhub/alembic/versions/3ec6993fe20c_encrypted_auth_state.py b/jupyterhub/alembic/versions/3ec6993fe20c_encrypted_auth_state.py
+--- a/jupyterhub/alembic/versions/3ec6993fe20c_encrypted_auth_state.py	2026-10-20 21:49:36
++++ b/jupyterhub/alembic/versions/3ec6993fe20c_encrypted_auth_state.py	2026-10-28 17:12:40
+@@ -35,21 +35,12 @@
+     op.drop_table('hubs')
+ 
+     # drop some columns no longer in use
+-    try:
+-        op.drop_column('users', 'auth_state')
+-        # mysql cannot drop _server_id without also dropping
+-        # implicitly created foreign key
+-        if op.get_context().dialect.name == 'mysql':
+-            op.drop_constraint('users_ibfk_1', 'users', type_='foreignkey')
+-        op.drop_column('users', '_server_id')
+-    except sa.exc.OperationalError:
+-        # this won't be a problem moving forward, but downgrade will fail
+-        if op.get_context().dialect.name == 'sqlite':
+-            logger.warning(
+-                "sqlite cannot drop columns. Leaving unused old columns in place."
+-            )
+-        else:
+-            raise
++    op.drop_column('users', 'auth_state')
++    # mysql cannot drop _server_id without also dropping
++    # implicitly created foreign key
++    if op.get_context().dialect.name == 'mysql':
++        op.drop_constraint('users_ibfk_1', 'users', type_='foreignkey')
++    op.drop_column('users', '_server_id')
+ 
+     op.add_column('users', sa.Column('encrypted_auth_state', sa.types.LargeBinary))
+ 
+diff -urN --exclude=tests --exclude=*.pyc --exclude=__pycache__ a/jupyterhub/alembic/versions/56cc5a70207e_token_tracking.py b/jupyterhub/alembic/versions/56cc5a70207e_token_tracking.py
+--- a/jupyterhub/alembic/versions/56cc5a70207e_token_tracking.py	2026-10-20 21:49:36
++++ b/jupyterhub/alembic/versions/56cc5a70207e_token_tracking.py	2026-10-28 17:12:40
+@@ -38,27 +38,12 @@
+             'oauth_access_tokens',
+             sa.Column('last_activity', sa.DateTime(), nullable=True),
+         )
+-        if op.get_context().dialect.name == 'sqlite':
+-            logger.warning(
+-                "sqlite cannot use ALTER TABLE to create foreign keys. Upgrade will be incomplete."
+-            )
+-        else:
+-            op.create_foreign_key(
+-                None,
+-                'oauth_access_tokens',
+-                'oauth_clients',
+-                ['client_id'],
+-                ['identifier'],
+-                ondelete='CASCADE',
+-            )
+-            op.create_foreign_key(
+-                None,
+-                'oauth_codes',
+-                'oauth_clients',
+-                ['client_id'],
+-                ['identifier'],
+-                ondelete='CASCADE',
+-            )
++        op.create_foreign_key(
++            None, 'oauth_access_tokens', 'oauth_clients', ['client_id'],
++            ['identifier'], ondelete='CASCADE')
++        op.create_foreign_key(
++            None, 'oauth_codes', 'oauth_clients', ['client_id'],
++            ['identifier'], ondelete='CASCADE')
+ 
+ 
+ def downgrade():
+diff -urN --exclude=tests --exclude=*.pyc --exclude=__pycache__ a/jupyterhub/alembic/versions/af4cbdb2d13c_services.py b/jupyterhub/alembic/versions/af4cbdb2d13c_services.py
+--- a/jupyterhub/alembic/versions/af4cbdb2d13c_services.py	2026-10-20 21:49:36
++++ b/jupyterhub/alembic/versions/af4cbdb2d13c_services.py	2026-10-28 17:12:40
+@@ -21,5 +21,4 @@
+ 
+ 
+ def downgrade():
+-    # sqlite cannot downgrade because of limited ALTER TABLE support (no DROP COLUMN)
+     op.drop_column('api_tokens', 'service_id')
+diff -urN --exclude=tests --exclude=*.pyc --exclude=__pycache__ a/jupyterhub/alembic/versions/eeb276e51423_auth_state.py b/jupyterhub/alembic/versions/eeb276e51423_auth_state.py
+--- a/jupyterhub/alembic/versions/eeb276e51423_auth_state.py	2026-10-20 21:49:36
++++ b/jupyterhub/alembic/versions/eeb276e51423_auth_state.py	2026-10-28 17:12:40
+@@ -24,5 +24,4 @@
+ 
+ 
+ def downgrade():
+-    # sqlite cannot downgrade because of limited ALTER TABLE support (no DROP COLUMN)
+     op.drop_column('users', 'auth_state')
+diff -urN --exclude=tests --exclude=*.pyc --exclude=__pycache__ a/jupyterhub/app.py b/jupyterhub/app.py
+--- a/jupyterhub/app.py	2026-10-20 21:49:36
++++ b/jupyterhub/app.py	2026-10-28 17:12:40
+@@ -48,6 +48,7 @@
+     List,
+     Set,
+     Tuple,
++    TraitError,
+     Unicode,
+     Union,
+     default,
+@@ -140,16 +141,11 @@
+         {'JupyterHub': {'generate_certs': True}},
+         "generate certificates used for internal ssl",
+     ),
+-    'no-db': (
+-        {'JupyterHub': {'db_url': 'sqlite:///:memory:'}},
+-        "disable persisting state database to disk",
+-    ),
+     'upgrade-db': (
+         {'JupyterHub': {'upgrade_db': True}},
+         """Automatically upgrade the database if needed on startup.
+ 
+-        Only safe if the database has been backed up.
+-        Only SQLite database files will be backed up automatically.
++        Only safe if the PostgreSQL control database has been backed up.
+         """,
+     ),
+     'no-ssl': (
+@@ -1554,16 +1550,15 @@
+     ).tag(config=True)
+ 
+     db_url = Unicode(
+-        'sqlite:///jupyterhub.sqlite',
+-        help="url for the database. e.g. `sqlite:///jupyterhub.sqlite`",
++        '',
++        help="Required PostgreSQL SQLAlchemy URL for isolated Hub state.",
+     ).tag(config=True)
+ 
+     @observe('db_url')
+     def _db_url_changed(self, change):
+         new = change['new']
+-        if '://' not in new:
+-            # assume sqlite, if given as a plain filename
+-            self.db_url = f'sqlite:///{new}'
++        if new and not new.startswith(('postgresql://', 'postgresql+psycopg://')):
++            raise TraitError('JupyterHub.db_url must select the PostgreSQL control database')
+ 
+     db_kwargs = Dict(help="""Include any kwargs to pass to the database connection.
+         See sqlalchemy.create_engine for details.
+@@ -1573,8 +1568,7 @@
+         False,
+         help="""Upgrade the database automatically on start.
+ 
+-        Only safe if database is regularly backed up.
+-        Only SQLite databases will be backed up to a local file automatically.
++        Only safe if the PostgreSQL control database is regularly backed up.
+     """,
+     ).tag(config=True)
+     reset_db = Bool(False, help="Purge and reset the database.").tag(config=True)
+@@ -2059,8 +2053,6 @@
+         except OperationalError as e:
+             self.log.error("Failed to connect to db: %s", db_log_url)
+             self.log.debug("Database error was:", exc_info=True)
+-            if self.db_url.startswith('sqlite:///'):
+-                self._check_db_path(self.db_url.split(':///', 1)[1])
+             self.log.critical(
+                 '\n'.join(
+                     [
+diff -urN --exclude=tests --exclude=*.pyc --exclude=__pycache__ a/jupyterhub/dbutil.py b/jupyterhub/dbutil.py
+--- a/jupyterhub/dbutil.py	2026-10-20 21:49:36
++++ b/jupyterhub/dbutil.py	2026-10-28 17:12:40
+@@ -4,10 +4,8 @@
+ # Distributed under the terms of the Modified BSD License.
+ # Based on pgcontents.utils.migrate, used under the Apache license.
+ import os
+-import shutil
+ import sys
+ from contextlib import contextmanager
+-from datetime import datetime
+ from subprocess import check_call
+ from tempfile import TemporaryDirectory
+ from urllib.parse import urlparse
+@@ -22,7 +20,7 @@
+ ALEMBIC_DIR = os.path.join(_here, 'alembic')
+ 
+ 
+-def write_alembic_ini(alembic_ini='alembic.ini', db_url='sqlite:///jupyterhub.sqlite'):
++def write_alembic_ini(alembic_ini='alembic.ini', db_url=None):
+     """Write a complete alembic.ini from our template.
+ 
+     Parameters
+@@ -30,7 +28,7 @@
+     alembic_ini : str
+         path to the alembic.ini file that should be written.
+     db_url : str
+-        The SQLAlchemy database url, e.g. `sqlite:///jupyterhub.sqlite`.
++        The required PostgreSQL SQLAlchemy database URL.
+     """
+     with open(ALEMBIC_INI_TEMPLATE_PATH) as f:
+         alembic_ini_tpl = f.read()
+@@ -59,7 +57,7 @@
+     Parameters
+     ----------
+     db_url : str
+-        The SQLAlchemy database url, e.g. `sqlite:///jupyterhub.sqlite`.
++        The required PostgreSQL SQLAlchemy database URL.
+ 
+     Returns
+     -------
+@@ -77,7 +75,7 @@
+     """Upgrade the given database to revision.
+ 
+     db_url: str
+-        The SQLAlchemy database url, e.g. `sqlite:///jupyterhub.sqlite`.
++        The required PostgreSQL SQLAlchemy database URL.
+     revision: str [default: head]
+         The alembic revision to upgrade to.
+     """
+@@ -85,27 +83,10 @@
+         check_call(['alembic', '-c', alembic_ini, 'upgrade', revision])
+ 
+ 
+-def backup_db_file(db_file, log=None):
+-    """Backup a database file if it exists"""
+-    timestamp = datetime.now().strftime('.%Y-%m-%d-%H%M%S')
+-    backup_db_file = db_file + timestamp
+-    for i in range(1, 10):
+-        if not os.path.exists(backup_db_file):
+-            break
+-        backup_db_file = f'{db_file}.{timestamp}.{i}'
+-    #
+-    if os.path.exists(backup_db_file):
+-        raise OSError(f"backup db file already exists: {backup_db_file}")
+-    if log:
+-        log.info("Backing up %s => %s", db_file, backup_db_file)
+-    shutil.copy(db_file, backup_db_file)
+-
+-
+ def upgrade_if_needed(db_url, *, db_kwargs=None, backup=True, log=None):
+     """Upgrade a database if needed
+ 
+-    If the database is sqlite, a backup file will be created with a timestamp.
+-    Other database systems should perform their own backups prior to calling this.
++    The operator must complete a PostgreSQL backup before calling this.
+     """
+     # run check-db-revision first
+     engine = create_engine(db_url, **db_kwargs or {})
+@@ -127,10 +108,6 @@
+     else:
+         db_log_url = db_url
+     log.info("Upgrading %s", db_log_url)
+-    # we need to upgrade, backup the database
+-    if backup and db_url.startswith('sqlite:///'):
+-        db_file = db_url.split(':///', 1)[1]
+-        backup_db_file(db_file, log=log)
+     upgrade(db_url)
+ 
+ 
+diff -urN --exclude=tests --exclude=*.pyc --exclude=__pycache__ a/jupyterhub/orm.py b/jupyterhub/orm.py
+--- a/jupyterhub/orm.py	2026-10-20 21:49:36
++++ b/jupyterhub/orm.py	2026-10-28 17:13:02
+@@ -42,7 +42,6 @@
+     relationship,
+     sessionmaker,
+ )
+-from sqlalchemy.pool import StaticPool
+ from sqlalchemy.types import LargeBinary, Text, TypeDecorator
+ from tornado.log import app_log
+ 
+@@ -1602,25 +1601,14 @@
+ 
+ 
+ def new_session_factory(
+-    url="sqlite:///:memory:", reset=False, expire_on_commit=False, **kwargs
++    url=None, reset=False, expire_on_commit=False, **kwargs
+ ):
+     """Create a new session at url"""
+-    if url.startswith('sqlite'):
+-        kwargs.setdefault('connect_args', {'check_same_thread': False})
+-
+-    elif url.startswith('mysql'):
+-        kwargs.setdefault('pool_recycle', 60)
+-
++    if not url or not url.startswith(('postgresql://', 'postgresql+psycopg://')):
++        raise ValueError('Hub state requires an explicit PostgreSQL URL')
+     kwargs.setdefault("future", True)
+ 
+-    if url.endswith(':memory:'):
+-        # If we're using an in-memory database, ensure that only one connection
+-        # is ever created.
+-        kwargs.setdefault('poolclass', StaticPool)
+-
+     engine = create_engine(url, **kwargs)
+-    if url.startswith('sqlite'):
+-        register_foreign_keys(engine)
+ 
+     # enable pessimistic disconnect handling
+     register_ping_connection(engine)
+

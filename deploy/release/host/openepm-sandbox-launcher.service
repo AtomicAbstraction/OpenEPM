@@ -1,0 +1,29 @@
+[Unit]
+Description=Open EPM trusted gVisor sandbox launcher
+Requires=docker.service
+After=docker.service network-online.target systemd-tmpfiles-setup.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/openepm/sandbox-launcher.env
+ExecStart=/usr/bin/python3 /usr/lib/openepm/sandbox-launcher.pyz
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+# The stable tmpfiles-owned directory is bind-mounted into the worker. The
+# service replaces only the socket, so launcher restarts retain the directory
+# inode already visible to the running container.
+ReadWritePaths=/run/openepm-sandbox
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

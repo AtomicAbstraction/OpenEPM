@@ -1,0 +1,419 @@
+name: openepm
+
+x-no-privilege: &no-privilege
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  init: true
+  restart: unless-stopped
+  pids_limit: 256
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "5"}
+
+x-core-image: &core-image
+  image: ${EPM_APPLICATION_IMAGE:?set an immutable application image reference with @sha256 digest}
+  platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+  mem_limit: ${EPM_CORE_MEMORY_LIMIT:-2g}
+  cpus: ${EPM_CORE_CPU_LIMIT:-2.0}
+
+x-db-image: &db-image
+  image: ${EPM_DATABASE_IMAGE:?set an immutable qualified database image reference with @sha256 digest}
+  platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+  mem_limit: ${EPM_DATABASE_MEMORY_LIMIT:-4g}
+  cpus: ${EPM_DATABASE_CPU_LIMIT:-4.0}
+  pids_limit: 512
+
+x-oidc-environment: &oidc-environment
+  EPM_AUTH_MODE: oidc
+  EPM_OIDC_ISSUER: ${EPM_OIDC_ISSUER:?set the exact HTTPS OIDC issuer}
+  EPM_OIDC_JWKS_URL: ${EPM_OIDC_JWKS_URL:?set the exact HTTPS OIDC JWKS URL}
+  EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS: ${EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS:-}
+  EPM_OIDC_AUD_MCP: ${EPM_OIDC_AUD_MCP:?set the MCP access-token audience}
+  EPM_OIDC_AUD_WEB: ${EPM_OIDC_AUD_WEB:?set the browser access-token audience}
+
+x-telemetry-environment: &telemetry-environment
+  EPM_TELEMETRY_OTLP_ENDPOINT: http://telemetry-collector:4318
+
+x-control-bootstrap: &control-bootstrap
+  <<: *no-privilege
+  image: ${EPM_OPERATIONS_IMAGE:?set an immutable operations image reference with @sha256 digest}
+  platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+  restart: "no"
+  read_only: true
+  tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+  networks: [control]
+  depends_on: {control-db: {condition: service_healthy}}
+
+services:
+  telemetry-collector:
+    <<: *no-privilege
+    image: ${EPM_OTEL_COLLECTOR_IMAGE:?set an immutable OpenTelemetry collector image reference with @sha256 digest}
+    platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+    command: ["--config=/etc/openepm/otel-collector.yaml"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    volumes:
+      - ../operations/otel-collector.yaml:/etc/openepm/otel-collector.yaml:ro
+      - epm_pgdata:/var/lib/openepm/metrics/epm_pgdata:ro
+      - epm_control_pgdata:/var/lib/openepm/metrics/epm_control_pgdata:ro
+    networks: [application, database]
+    mem_limit: ${EPM_TELEMETRY_MEMORY_LIMIT:-512m}
+    cpus: ${EPM_TELEMETRY_CPU_LIMIT:-1.0}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:13133/"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+  proxy:
+    <<: *no-privilege
+    image: ${EPM_PROXY_IMAGE:?set an immutable proxy image reference with @sha256 digest}
+    platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+    command: ["--configFile=/etc/traefik/traefik.yaml"]
+    ports:
+      - "80:80"
+      - "443:443"
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    volumes:
+      - ../proxy/traefik.yaml:/etc/traefik/traefik.yaml:ro
+      - ${EPM_PROXY_CONFIG_DIR:?set the rendered proxy configuration directory}:/var/lib/openepm/proxy:ro
+      - ${EPM_TLS_DIR:?set the TLS material directory}:/run/openepm/tls:ro
+    networks:
+      edge: {}
+      application: {}
+    mem_limit: ${EPM_PROXY_MEMORY_LIMIT:-256m}
+    cpus: ${EPM_PROXY_CPU_LIMIT:-1.0}
+
+  browser-session-store:
+    <<: *no-privilege
+    image: ${EPM_BROWSER_SESSION_STORE_IMAGE:?set an immutable session-store image reference with @sha256 digest}
+    platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+    user: "999:1000"
+    command: ["valkey-server", "/run/secrets/browser_session_store_config"]
+    read_only: true
+    tmpfs: ["/data:rw,noexec,nosuid,nodev,size=160m,uid=999,gid=1000,mode=0770"]
+    secrets: [browser_session_store_config]
+    networks: [application]
+    mem_limit: ${EPM_SESSION_STORE_MEMORY_LIMIT:-512m}
+    cpus: ${EPM_SESSION_STORE_CPU_LIMIT:-1.0}
+    healthcheck:
+      test: ["CMD-SHELL", "test \"$$(valkey-cli ping 2>/dev/null)\" = 'NOAUTH Authentication required.'"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+
+  browser-gateway:
+    <<: *no-privilege
+    image: ${EPM_BROWSER_GATEWAY_IMAGE:?set an immutable browser-gateway image reference with @sha256 digest}
+    platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+    command:
+      - --config=/run/secrets/browser_gateway_config
+      - --alpha-config=/run/secrets/browser_gateway_alpha_config
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    secrets: [browser_gateway_config, browser_gateway_alpha_config,
+      keycloak_web_client_secret]
+    networks: [application]
+    mem_limit: ${EPM_BROWSER_GATEWAY_MEMORY_LIMIT:-256m}
+    cpus: ${EPM_BROWSER_GATEWAY_CPU_LIMIT:-1.0}
+    depends_on:
+      browser-session-store: {condition: service_healthy}
+      web: {condition: service_healthy}
+      platform: {condition: service_healthy}
+
+  db:
+    <<: [*no-privilege, *db-image]
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/epm_postgres_password
+    secrets: [epm_postgres_password]
+    volumes:
+      - epm_pgdata:/var/lib/postgresql
+      - epm_pgarchive:/var/lib/postgresql/wal_archive
+      - epm_pgbackups:/var/lib/postgresql/base_backups
+    networks: [database]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+
+  control-db:
+    <<: [*no-privilege, *db-image]
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/control_postgres_password
+    secrets: [control_postgres_password]
+    volumes: ["epm_control_pgdata:/var/lib/postgresql"]
+    networks: [control]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+
+  platform:
+    <<: [*no-privilege, *core-image]
+    command: ["python", "-m", "platform_postgres_platform_mcp_http"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    secrets: [epm_provision_dsn, oidc_client_secret,
+      keycloak_directory_client_secret]
+    environment:
+      <<: [*oidc-environment, *telemetry-environment]
+      EPM_TELEMETRY_SERVICE_NAME: openepm-platform
+      EPM_PUBLIC_MCP_ORIGIN: https://${EPM_PUBLIC_HOST:?set the public host}
+      EPM_PUBLIC_WEB_ORIGIN: https://${EPM_PUBLIC_HOST:?set the public host}
+      EPM_PG_BIND_HOST: 0.0.0.0
+      EPM_PG_HEALTH_PORT: "5193"
+      EPM_PG_PROVISION_DSN_FILE: /run/secrets/epm_provision_dsn
+      EPM_KEYCLOAK_DIRECTORY_URL: ${EPM_KEYCLOAK_DIRECTORY_URL:-https://identity:8443}
+      EPM_KEYCLOAK_DIRECTORY_CLIENT_SECRET_FILE: /run/secrets/keycloak_directory_client_secret
+    networks: [application, database]
+    depends_on:
+      db: {condition: service_healthy}
+      telemetry-collector: {condition: service_healthy}
+    healthcheck: &mcp-health
+      test: ["CMD", "python", "-m", "scripts.check_postgres_mcp_health"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
+
+  workspace:
+    <<: [*no-privilege, *core-image]
+    # A fixed-workspace listener is opt-in: a pristine release has no workspace
+    # ID yet, and every tool fails closed without one.  Start it after the
+    # operator creates the first workspace and sets EPM_PG_WORKSPACE_ID.
+    profiles: ["workspace"]
+    command: ["python", "-m", "platform_postgres_workspace_mcp_http"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    secrets: [epm_lifecycle_dsn, epm_security_dsn, epm_preview_secret, oidc_client_secret]
+    environment:
+      <<: *oidc-environment
+      EPM_PUBLIC_MCP_ORIGIN: https://${EPM_PUBLIC_HOST:?set the public host}
+      EPM_PG_BIND_HOST: 0.0.0.0
+      EPM_PG_HEALTH_PORT: "5192"
+      EPM_PG_WORKSPACE_ID: ${EPM_PG_WORKSPACE_ID:-}
+      EPM_PG_LIFECYCLE_DSN_FILE: /run/secrets/epm_lifecycle_dsn
+      EPM_PG_SECURITY_DSN_FILE: /run/secrets/epm_security_dsn
+      EPM_PG_PREVIEW_SECRET_FILE: /run/secrets/epm_preview_secret
+    networks: [application, database]
+    depends_on: {db: {condition: service_healthy}}
+    healthcheck: *mcp-health
+
+  router:
+    <<: [*no-privilege, *core-image]
+    command: ["python", "-m", "platform_postgres_router_mcp_http"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    secrets: [epm_access_dsn, epm_runtime_dsn, epm_security_dsn, epm_preview_secret, oidc_client_secret,
+      epm_python_builder_profiles]
+    environment:
+      <<: [*oidc-environment, *telemetry-environment]
+      EPM_TELEMETRY_SERVICE_NAME: openepm-router
+      EPM_CAPACITY_TEMP_ROOT: /tmp
+      EPM_PUBLIC_MCP_ORIGIN: https://${EPM_PUBLIC_HOST:?set the public host}
+      EPM_PG_BIND_HOST: 0.0.0.0
+      EPM_PG_HEALTH_PORT: "5194"
+      EPM_PG_ACCESS_DSN_FILE: /run/secrets/epm_access_dsn
+      EPM_PG_RUNTIME_DSN_FILE: /run/secrets/epm_runtime_dsn
+      EPM_PG_SECURITY_DSN_FILE: /run/secrets/epm_security_dsn
+      EPM_PG_PREVIEW_SECRET_FILE: /run/secrets/epm_preview_secret
+      EPM_PYTHON_BUILDER_PROFILES_FILE: /run/secrets/epm_python_builder_profiles
+    networks: [application, database, sandbox]
+    depends_on:
+      db: {condition: service_healthy}
+      telemetry-collector: {condition: service_healthy}
+    healthcheck: *mcp-health
+
+  web:
+    <<: [*no-privilege, *core-image]
+    command: ["python", "-m", "platform_postgres_web_http"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    secrets: [epm_access_dsn, epm_runtime_dsn, epm_lifecycle_dsn,
+      epm_security_dsn, epm_preview_secret, oidc_client_secret]
+    environment:
+      <<: [*oidc-environment, *telemetry-environment]
+      EPM_TELEMETRY_SERVICE_NAME: openepm-web
+      EPM_CAPACITY_TEMP_ROOT: /tmp
+      EPM_PUBLIC_WEB_ORIGIN: https://${EPM_PUBLIC_HOST:?set the public host}
+      EPM_PUBLIC_MCP_ORIGIN: https://${EPM_PUBLIC_HOST:?set the public host}
+      EPM_PG_BIND_HOST: 0.0.0.0
+      EPM_PG_WEB_PORT: "5195"
+      EPM_PG_HEALTH_PORT: "5195"
+      EPM_PG_ACCESS_DSN_FILE: /run/secrets/epm_access_dsn
+      EPM_PG_RUNTIME_DSN_FILE: /run/secrets/epm_runtime_dsn
+      EPM_PG_LIFECYCLE_DSN_FILE: /run/secrets/epm_lifecycle_dsn
+      EPM_PG_SECURITY_DSN_FILE: /run/secrets/epm_security_dsn
+      EPM_PG_PREVIEW_SECRET_FILE: /run/secrets/epm_preview_secret
+    networks: [application, database]
+    depends_on:
+      db: {condition: service_healthy}
+      telemetry-collector: {condition: service_healthy}
+    healthcheck: *mcp-health
+
+  worker:
+    <<: [*no-privilege, *core-image]
+    command: ["python", "-m", "scripts.serve_openepm_postgres_worker"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m"]
+    # The Python coordinator credential is a distinct, narrowly granted role.
+    # The capability key and approved-profile document are deployment-owned;
+    # neither is mounted into a builder sandbox.
+    secrets: [epm_worker_dsn, epm_runtime_dsn, epm_preview_secret,
+      epm_python_coordinator_dsn, epm_python_build_capability_key,
+      epm_python_builder_profiles, epm_sandbox_control_key]
+    environment:
+      <<: *telemetry-environment
+      EPM_TELEMETRY_SERVICE_NAME: openepm-worker
+      EPM_PG_WORKER_DSN_FILE: /run/secrets/epm_worker_dsn
+      EPM_PG_RUNTIME_DSN_FILE: /run/secrets/epm_runtime_dsn
+      EPM_PG_PREVIEW_SECRET_FILE: /run/secrets/epm_preview_secret
+      EPM_PYTHON_COORDINATOR_DSN_FILE: /run/secrets/epm_python_coordinator_dsn
+      EPM_PYTHON_BUILD_CAPABILITY_KEY_FILE: /run/secrets/epm_python_build_capability_key
+      EPM_PYTHON_BUILDER_PROFILES_FILE: /run/secrets/epm_python_builder_profiles
+      EPM_SANDBOX_CONTROL_KEY_FILE: /run/secrets/epm_sandbox_control_key
+      EPM_SANDBOX_CONTROL_SOCKET: /run/openepm-sandbox/sandbox-launcher.sock
+      EPM_WORKER_HEARTBEAT_FILE: /tmp/openepm-worker-heartbeat
+    volumes:
+      - ${EPM_SANDBOX_SOCKET_DIR:-/run/openepm-sandbox}:/run/openepm-sandbox:ro
+    networks: [database]
+    depends_on:
+      db: {condition: service_healthy}
+      telemetry-collector: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-m", "scripts.check_postgres_worker_health"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
+      start_period: 20s
+
+  python-build-broker:
+    <<: [*no-privilege, *core-image]
+    profiles: ["python-build"]
+    command: ["python", "-m", "scripts.serve_openepm_python_build_broker"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
+    secrets: [epm_runtime_dsn, epm_python_coordinator_dsn,
+      epm_python_build_capability_key, epm_python_builder_profiles]
+    environment:
+      EPM_PG_RUNTIME_DSN_FILE: /run/secrets/epm_runtime_dsn
+      EPM_PYTHON_COORDINATOR_DSN_FILE: /run/secrets/epm_python_coordinator_dsn
+      EPM_PYTHON_BUILD_CAPABILITY_KEY_FILE: /run/secrets/epm_python_build_capability_key
+      EPM_PYTHON_BUILDER_PROFILES_FILE: /run/secrets/epm_python_builder_profiles
+      EPM_PYTHON_BUILD_BROKER_PORT: "5198"
+    networks:
+      database: {}
+      sandbox:
+        ipv4_address: ${EPM_PYTHON_BUILD_BROKER_IP:-172.30.252.2}
+    depends_on: {db: {condition: service_healthy}}
+
+  builder:
+    <<: *no-privilege
+    profiles: ["python-build"]
+    image: ${EPM_BUILDER_IMAGE:?set an immutable builder image reference with @sha256 digest}
+    platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+    runtime: runsc
+    user: "10001:10001"
+    read_only: true
+    tmpfs: ["/workspace:rw,noexec,nosuid,nodev,size=16m", "/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    networks: [sandbox]
+
+  operations:
+    <<: *no-privilege
+    profiles: ["operations"]
+    image: ${EPM_OPERATIONS_IMAGE:?set an immutable operations image reference with @sha256 digest}
+    platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+    restart: "no"
+    environment:
+      <<: *telemetry-environment
+      EPM_TELEMETRY_SERVICE_NAME: openepm-operations
+      EPM_NOTEBOOK_MODE: ${EPM_NOTEBOOK_MODE:?set disabled or managed}
+      EPM_IDENTITY_MODE: ${EPM_IDENTITY_MODE:?set bundled}
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m"]
+    secrets: [epm_admin_dsn, control_admin_dsn, hub_admin_dsn, identity_admin_dsn,
+      backup_encryption_key, epm_runtime_password,
+      epm_access_password, epm_worker_password, epm_lifecycle_password,
+      epm_provision_password, epm_security_password,
+      epm_python_coordinator_password, browser_gateway_config,
+      browser_gateway_alpha_config, browser_session_store_config]
+    volumes:
+      - epm_pgarchive:/var/lib/openepm/archive:ro
+      - epm_pgbackups:/var/lib/openepm/backups
+      - ${EPM_BACKUP_EXPORT_DIR:?set an independent backup export directory}:/var/lib/openepm/export
+      - /var/lib/openepm/notebooks:/var/lib/openepm/notebooks
+      - /etc/openepm:/var/lib/openepm/protected-config/source:ro
+      - /var/lib/openepm/recovered-config:/var/lib/openepm/protected-config/restore
+    networks: [database, control]
+    depends_on:
+      telemetry-collector: {condition: service_healthy}
+    mem_limit: ${EPM_OPERATIONS_MEMORY_LIMIT:-1g}
+    cpus: ${EPM_OPERATIONS_CPU_LIMIT:-2.0}
+
+networks:
+  edge: {}
+  application: {internal: true}
+  database: {internal: true}
+  control: {internal: true}
+  notebook-runtime:
+    external: true
+    name: ${EPM_NOTEBOOK_NETWORK_NAME:?set the fixed managed-notebook network name}
+  sandbox:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${EPM_PYTHON_BUILD_SANDBOX_SUBNET:-172.30.252.0/28}
+
+volumes:
+  epm_pgdata: {}
+  epm_pgarchive: {}
+  epm_pgbackups: {}
+  epm_control_pgdata: {}
+
+secrets:
+  epm_postgres_password: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_postgres_password"}
+  control_postgres_password: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/control_postgres_password"}
+  epm_provision_dsn: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_provision_dsn"}
+  epm_lifecycle_dsn: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_lifecycle_dsn"}
+  epm_security_dsn: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_security_dsn"}
+  epm_access_dsn: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_access_dsn"}
+  epm_runtime_dsn: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_runtime_dsn"}
+  epm_worker_dsn: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_worker_dsn"}
+  epm_python_coordinator_dsn: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_python_coordinator_dsn"}
+  epm_python_coordinator_password: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_python_coordinator_password"}
+  epm_python_build_capability_key: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_python_build_capability_key"}
+  epm_python_builder_profiles: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_python_builder_profiles.json"}
+  epm_sandbox_control_key: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_sandbox_control_key"}
+  epm_admin_dsn: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_admin_dsn"}
+  control_admin_dsn: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/control_admin_dsn"}
+  hub_admin_dsn: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/hub_admin_dsn"}
+  identity_admin_dsn: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/identity_admin_dsn"}
+  epm_preview_secret: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_preview_secret"}
+  oidc_client_secret: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/oidc_client_secret"}
+  hub_database_url: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/hub_database_url"}
+  hub_cookie_secret: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/hub_cookie_secret"}
+  hub_oidc_client_secret: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/hub_oidc_client_secret"}
+  notebook_control_key: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/notebook_control_key"}
+  keycloak_database_url: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/keycloak_database_url"}
+  keycloak_database_username: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/keycloak_database_username"}
+  keycloak_database_password: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/keycloak_database_password"}
+  keycloak_bootstrap_config: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/keycloak_bootstrap_config.json"}
+  keycloak_admin_username: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/keycloak_admin_username"}
+  keycloak_admin_password: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/keycloak_admin_password"}
+  keycloak_directory_client_secret: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/keycloak_directory_client_secret"}
+  keycloak_web_client_secret: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/keycloak_web_client_secret"}
+  browser_gateway_config: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/browser_gateway.cfg"}
+  browser_gateway_alpha_config: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/browser_gateway_alpha.yaml"}
+  browser_session_store_config: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/browser_session_store.conf"}
+  keycloak_initial_admin_password: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/keycloak_initial_admin_password"}
+  backup_encryption_key: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/backup_encryption_key"}
+  epm_runtime_password: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_runtime_password"}
+  epm_access_password: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_access_password"}
+  epm_worker_password: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_worker_password"}
+  epm_lifecycle_password: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_lifecycle_password"}
+  epm_provision_password: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_provision_password"}
+  epm_security_password: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/epm_security_password"}

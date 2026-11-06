@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+
+[ "$(id -u)" = 0 ] || { printf '%s\n' 'installer must run as root' >&2; exit 78; }
+[ "$#" = 4 ] || {
+    printf '%s\n' 'usage: install-notebook-launcher ARTIFACT.pyz SHA256 PROFILE.json CONTROL_KEY' >&2
+    exit 64
+}
+artifact=$1
+expected=$2
+profile=$3
+key=$4
+release_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+for command in python3 docker runsc systemctl systemd-tmpfiles sha256sum install; do
+    command -v "$command" >/dev/null 2>&1 || {
+        printf 'required command unavailable: %s\n' "$command" >&2; exit 78; }
+done
+printf '%s  %s\n' "$expected" "$artifact" | sha256sum -c - >/dev/null
+docker info --format '{{json .Runtimes}}' | grep -Eq '"runsc"' || {
+    printf '%s\n' 'Docker runsc runtime is unavailable' >&2; exit 78; }
+for path in "$profile" "$key"; do
+    [ -f "$path" ] && [ ! -L "$path" ] || exit 78
+done
+[ "$(wc -c < "$key" | tr -d ' ')" -ge 32 ] || exit 78
+
+install -d -o root -g root -m 0755 /usr/lib/openepm /etc/openepm /etc/openepm/secrets
+install -o root -g root -m 0555 "$artifact" /usr/lib/openepm/notebook-launcher.pyz
+install -o root -g root -m 0444 "$profile" /etc/openepm/notebook-profile.json
+install -o root -g root -m 0400 "$key" /etc/openepm/secrets/notebook_control_key
+install -o root -g root -m 0444 "$release_dir/host/notebook-launcher.env.example" /etc/openepm/notebook-launcher.env
+install -o root -g root -m 0444 "$release_dir/host/openepm-notebook-launcher.service" /etc/systemd/system/openepm-notebook-launcher.service
+install -o root -g root -m 0444 "$release_dir/host/openepm-notebook-storage.conf" /usr/lib/tmpfiles.d/openepm-notebook-storage.conf
+systemd-tmpfiles --create /usr/lib/tmpfiles.d/openepm-notebook-storage.conf
+systemctl daemon-reload
+systemctl enable --now openepm-notebook-launcher.service

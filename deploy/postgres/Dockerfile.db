@@ -1,0 +1,21 @@
+FROM pgduckdb/pgduckdb@sha256:44c88eb9207971af1d7f9804a37429b1bb36f413cd8d7118c81e1288ddde85d1 AS db-build
+USER 0:0
+COPY scripts/retire_runtime_packages.sh /usr/local/libexec/openepm/retire_runtime_packages.sh
+COPY --chmod=0555 scripts/check_runtime_retirement.sh /usr/local/bin/openepm-runtime-check
+COPY --chmod=0555 scripts/backup_postgres_physical.sh /usr/local/bin/openepm-backup
+RUN touch /etc/openepm-image-build \
+    && bash /usr/local/libexec/openepm/retire_runtime_packages.sh db \
+    && rm -rf /usr/local/libexec/openepm /etc/openepm-image-build \
+    && bash /usr/local/bin/openepm-runtime-check
+
+FROM scratch
+COPY --from=db-build / /
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/18/bin \
+    GOSU_VERSION=1.19 LANG=en_US.utf8 PG_MAJOR=18 PG_VERSION=18.1-1.pgdg12+2 \
+    PGDATA=/var/lib/postgresql/18/docker
+USER postgres
+VOLUME /var/lib/postgresql
+EXPOSE 5432
+STOPSIGNAL SIGINT
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["postgres"]

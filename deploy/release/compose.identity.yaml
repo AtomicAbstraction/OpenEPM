@@ -1,0 +1,148 @@
+x-identity-runtime-controls: &identity-runtime-controls
+  pids_limit: ${EPM_IDENTITY_PID_LIMIT:-512}
+  mem_limit: ${EPM_IDENTITY_MEMORY_LIMIT:-2g}
+  cpus: ${EPM_IDENTITY_CPU_LIMIT:-2.0}
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "5"}
+
+x-bootstrap-runtime-controls: &bootstrap-runtime-controls
+  pids_limit: ${EPM_BOOTSTRAP_PID_LIMIT:-128}
+  mem_limit: ${EPM_BOOTSTRAP_MEMORY_LIMIT:-512m}
+  cpus: ${EPM_BOOTSTRAP_CPU_LIMIT:-1.0}
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "5"}
+
+services:
+  identity:
+    <<: *identity-runtime-controls
+    image: ${EPM_IDENTITY_IMAGE:?set an immutable Keycloak image reference with @sha256 digest}
+    platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+    profiles: ["bundled-identity"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=64m", "/opt/keycloak/data:rw,noexec,nosuid,nodev,size=64m"]
+    secrets: [keycloak_database_url, keycloak_database_username,
+      keycloak_database_password, keycloak_admin_username, keycloak_admin_password,
+      keycloak_internal_tls_certificate, keycloak_internal_tls_private_key]
+    environment:
+      KC_HOSTNAME: https://${EPM_IDENTITY_PUBLIC_HOST:?set the public identity hostname}
+      KC_DB_URL_FILE: /run/secrets/keycloak_database_url
+      KC_DB_USERNAME_FILE: /run/secrets/keycloak_database_username
+      KC_DB_PASSWORD_FILE: /run/secrets/keycloak_database_password
+      KC_BOOTSTRAP_ADMIN_USERNAME_FILE: /run/secrets/keycloak_admin_username
+      KC_BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/keycloak_admin_password
+      KC_HTTPS_CERTIFICATE_FILE: /run/secrets/keycloak_internal_tls_certificate
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /run/secrets/keycloak_internal_tls_private_key
+    networks: [application, control]
+    depends_on: {control-db: {condition: service_healthy}}
+    healthcheck:
+      test: ["CMD", "/bin/bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/9000; printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; grep -q 'HTTP/1.1 200 OK' <&3"]
+      interval: 10s
+      timeout: 4s
+      retries: 30
+      start_period: 20s
+
+  control-bootstrap-bundled-disabled:
+    <<: *bootstrap-runtime-controls
+    image: ${EPM_OPERATIONS_IMAGE:?set an immutable operations image reference with @sha256 digest}
+    platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+    profiles: ["operations", "bundled-identity"]
+    command: ["openepm-control-bootstrap", "--identity-mode", "bundled", "--notebook-mode", "disabled"]
+    restart: "no"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    secrets: [control_admin_dsn, keycloak_database_url, keycloak_database_username, keycloak_database_password]
+    networks: [control]
+    depends_on: {control-db: {condition: service_healthy}}
+
+  control-bootstrap-bundled-managed:
+    <<: *bootstrap-runtime-controls
+    image: ${EPM_OPERATIONS_IMAGE:?set an immutable operations image reference with @sha256 digest}
+    platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+    profiles: ["operations", "bundled-identity", "notebooks"]
+    command: ["openepm-control-bootstrap", "--identity-mode", "bundled", "--notebook-mode", "managed"]
+    restart: "no"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    secrets: [control_admin_dsn, hub_database_url, keycloak_database_url,
+      keycloak_database_username, keycloak_database_password]
+    networks: [control]
+    depends_on: {control-db: {condition: service_healthy}}
+
+  keycloak-bootstrap-disabled:
+    <<: *bootstrap-runtime-controls
+    image: ${EPM_OPERATIONS_IMAGE:?set an immutable operations image reference with @sha256 digest}
+    platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+    profiles: ["bundled-identity"]
+    command: ["openepm-keycloak-bootstrap", "--notebook-mode", "disabled"]
+    restart: "no"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    secrets: [keycloak_bootstrap_config, keycloak_admin_username,
+      keycloak_admin_password, keycloak_directory_client_secret,
+      keycloak_web_client_secret, keycloak_initial_admin_password,
+      keycloak_internal_ca_certificate]
+    environment:
+      SSL_CERT_FILE: /run/secrets/keycloak_internal_ca_certificate
+    networks: [application]
+    depends_on: {identity: {condition: service_healthy}}
+
+  keycloak-bootstrap-managed:
+    <<: *bootstrap-runtime-controls
+    image: ${EPM_OPERATIONS_IMAGE:?set an immutable operations image reference with @sha256 digest}
+    platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+    profiles: ["bundled-identity", "notebooks"]
+    command: ["openepm-keycloak-bootstrap", "--notebook-mode", "managed"]
+    restart: "no"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    secrets: [keycloak_bootstrap_config, keycloak_admin_username,
+      keycloak_admin_password, keycloak_directory_client_secret,
+      keycloak_web_client_secret, keycloak_initial_admin_password,
+      hub_oidc_client_secret, keycloak_internal_ca_certificate]
+    environment:
+      SSL_CERT_FILE: /run/secrets/keycloak_internal_ca_certificate
+    networks: [application]
+    depends_on: {identity: {condition: service_healthy}}
+
+  proxy:
+    secrets: [keycloak_internal_ca_certificate]
+
+  platform:
+    secrets: [keycloak_internal_ca_certificate]
+    environment:
+      SSL_CERT_FILE: /run/secrets/keycloak_internal_ca_certificate
+      EPM_KEYCLOAK_DIRECTORY_CA_FILE: /run/secrets/keycloak_internal_ca_certificate
+
+  workspace:
+    secrets: [keycloak_internal_ca_certificate]
+    environment:
+      SSL_CERT_FILE: /run/secrets/keycloak_internal_ca_certificate
+
+  router:
+    secrets: [keycloak_internal_ca_certificate]
+    environment:
+      SSL_CERT_FILE: /run/secrets/keycloak_internal_ca_certificate
+
+  web:
+    secrets: [keycloak_internal_ca_certificate]
+    environment:
+      SSL_CERT_FILE: /run/secrets/keycloak_internal_ca_certificate
+
+secrets:
+  keycloak_internal_tls_certificate: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/keycloak_internal_tls_certificate"}
+  keycloak_internal_tls_private_key: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/keycloak_internal_tls_private_key"}
+  keycloak_internal_ca_certificate: {file: "${EPM_SECRETS_DIR:?set the secrets directory}/keycloak_internal_ca_certificate"}

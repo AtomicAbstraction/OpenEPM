@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openepm.invalid/schema/release-manifest-v2.json",
+  "title": "Open EPM final release manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "status", "release", "sourceCommit", "schemaMigration", "architectures", "images", "sdk", "source", "sourceBinding", "sourceSbom", "resolvedReleasePolicy", "sourceCompliance", "artifacts", "qualificationSummary"],
+  "properties": {
+    "format": {"const": "openepm-release-manifest-v2"},
+    "status": {"const": "final-qualified"},
+    "release": {"type": "string", "minLength": 1, "maxLength": 128},
+    "sourceCommit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+    "schemaMigration": {"type": "string", "pattern": "^[0-9]{4}_[a-z0-9_]+\\.sql$"},
+    "architectures": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["linux/amd64", "linux/arm64"]}},
+    "images": {
+      "type": "object", "additionalProperties": false,
+      "required": ["application", "database", "operations", "builder", "notebook", "hub", "identity", "proxy", "browser_gateway", "browser_session_store", "telemetry_collector"],
+      "properties": {
+        "application": {"$ref": "#/$defs/image"}, "database": {"$ref": "#/$defs/image"},
+        "operations": {"$ref": "#/$defs/image"}, "builder": {"$ref": "#/$defs/image"},
+        "notebook": {"$ref": "#/$defs/image"}, "hub": {"$ref": "#/$defs/image"},
+        "identity": {"$ref": "#/$defs/image"}, "proxy": {"$ref": "#/$defs/image"},
+        "browser_gateway": {"$ref": "#/$defs/image"},
+        "browser_session_store": {"$ref": "#/$defs/image"},
+        "telemetry_collector": {"$ref": "#/$defs/image"}
+      }
+    },
+    "sdk": {"$ref": "#/$defs/sdk"},
+    "source": {"$ref": "#/$defs/artifact"},
+    "sourceBinding": {"$ref": "#/$defs/artifact"},
+    "sourceSbom": {"$ref": "#/$defs/artifact"},
+    "resolvedReleasePolicy": {"$ref": "#/$defs/artifact"},
+    "sourceCompliance": {"$ref": "#/$defs/artifact"},
+    "artifacts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["configuration", "inventory", "sbom", "licenses", "checksums", "signature", "provenance"],
+      "properties": {
+        "configuration": {"$ref": "#/$defs/artifact"}, "inventory": {"$ref": "#/$defs/artifact"}, "sbom": {"$ref": "#/$defs/artifact"},
+        "licenses": {"$ref": "#/$defs/artifact"}, "checksums": {"$ref": "#/$defs/artifact"},
+        "signature": {"$ref": "#/$defs/artifact"}, "provenance": {"$ref": "#/$defs/artifact"}
+      }
+    },
+    "qualificationSummary": {"$ref": "#/$defs/artifact"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "artifact": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}},
+    "image": {"type": "object", "additionalProperties": false, "required": ["reference", "digests"], "properties": {"reference": {"type": "string", "minLength": 1}, "digests": {"type": "object", "minProperties": 1, "maxProperties": 2, "additionalProperties": false, "properties": {"linux/amd64": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}, "linux/arm64": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}}}}},
+    "sdk": {
+      "type": "object", "additionalProperties": false,
+      "required": ["package", "source", "signing", "artifacts", "publicKey"],
+      "properties": {
+        "package": {"type": "object"}, "source": {"type": "object"}, "signing": {"type": "object"},
+        "artifacts": {"type": "object", "additionalProperties": false, "required": ["wheel", "manifest", "signature", "checksums"], "properties": {"wheel": {"$ref": "#/$defs/artifact"}, "manifest": {"$ref": "#/$defs/artifact"}, "signature": {"$ref": "#/$defs/artifact"}, "checksums": {"$ref": "#/$defs/artifact"}}},
+        "publicKey": {"$ref": "#/$defs/artifact"}
+      }
+    }
+  }
+}

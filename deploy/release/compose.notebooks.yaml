@@ -1,0 +1,56 @@
+x-hub-runtime-controls: &hub-runtime-controls
+  pids_limit: ${EPM_HUB_PID_LIMIT:-512}
+  mem_limit: ${EPM_HUB_MEMORY_LIMIT:-1g}
+  cpus: ${EPM_HUB_CPU_LIMIT:-2.0}
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "5"}
+
+services:
+  # Kernels remain on the protected internal notebook network.  Public Open
+  # EPM and identity hostnames resolve only to the existing TLS proxy, never to
+  # database or core-service containers, so SDK traffic follows the same
+  # authenticated public MCP boundary as every other client.
+  proxy:
+    networks:
+      notebook-runtime:
+        aliases:
+          - ${EPM_PUBLIC_HOST:?set the public Open EPM hostname}
+          - ${EPM_IDENTITY_PUBLIC_HOST:?set the public identity hostname}
+
+  hub:
+    <<: *hub-runtime-controls
+    image: ${EPM_HUB_IMAGE:?set an immutable JupyterHub image reference with @sha256 digest}
+    platform: ${EPM_PLATFORM:?set linux/amd64 or linux/arm64}
+    profiles: ["notebooks"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    init: true
+    restart: unless-stopped
+    labels:
+      org.openepm.managed-notebook-hub: "true"
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
+    secrets: [hub_database_url, hub_cookie_secret, hub_oidc_client_secret, notebook_control_key]
+    environment:
+      EPM_HUB_DATABASE_URL_FILE: /run/secrets/hub_database_url
+      EPM_HUB_COOKIE_SECRET_FILE: /run/secrets/hub_cookie_secret
+      EPM_HUB_OIDC_CLIENT_SECRET_FILE: /run/secrets/hub_oidc_client_secret
+      EPM_NOTEBOOK_CONTROL_KEY_FILE: /run/secrets/notebook_control_key
+      EPM_HUB_PUBLIC_URL: ${EPM_HUB_PUBLIC_URL:?set the public HTTPS Hub URL}
+      EPM_HUB_OIDC_ISSUER: ${EPM_HUB_OIDC_ISSUER:?set the HTTPS OIDC issuer}
+      EPM_HUB_OIDC_CLIENT_ID: ${EPM_HUB_OIDC_CLIENT_ID:?set the Hub OIDC client ID}
+      EPM_HUB_OIDC_AUTHORIZE_URL: ${EPM_HUB_OIDC_AUTHORIZE_URL:?set the HTTPS authorization endpoint}
+      EPM_HUB_OIDC_TOKEN_URL: ${EPM_HUB_OIDC_TOKEN_URL:?set the HTTPS token endpoint}
+      EPM_HUB_OIDC_USERINFO_URL: ${EPM_HUB_OIDC_USERINFO_URL:?set the HTTPS userinfo endpoint}
+      EPM_NOTEBOOK_IMAGE: ${EPM_NOTEBOOK_IMAGE:?set an immutable notebook image reference with @sha256 digest}
+      EPM_NOTEBOOK_PROFILE_ID: ${EPM_NOTEBOOK_PROFILE_ID:-openepm-notebook-v1}
+      EPM_NOTEBOOK_BASE_DOMAIN: ${EPM_NOTEBOOK_BASE_DOMAIN:?set the per-user notebook base domain}
+      EPM_NOTEBOOK_MAX_ACTIVE: ${EPM_NOTEBOOK_MAX_ACTIVE:-10}
+      EPM_NOTEBOOK_IDLE_SECONDS: ${EPM_NOTEBOOK_IDLE_SECONDS:-1800}
+      EPM_NOTEBOOK_CONTROL_SOCKET: /run/openepm/notebook-launcher.sock
+    volumes:
+      - ${EPM_PROXY_CONFIG_DIR:?set the rendered proxy configuration directory}:/var/lib/openepm/proxy
+      - ${EPM_NOTEBOOK_SOCKET_DIR:-/run/openepm}/notebook-launcher.sock:/run/openepm/notebook-launcher.sock:rw
+    networks: [application, control, notebook-runtime]
+    depends_on: {control-db: {condition: service_healthy}}

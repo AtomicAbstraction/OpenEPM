@@ -1,0 +1,66 @@
+{
+  "format": "openepm-notebook-compatibility-v1",
+  "status": "source-pinned-patch-verified-image-unbuilt",
+  "components": {
+    "jupyter_server": {
+      "version": "2.21.1",
+      "sourceArtifact": "jupyter_server-2.21.1.tar.gz",
+      "sourceSha256": "a8960aa29263f6041283e97d4756b099fb49b767baab6371891ecb1bd40a63df",
+      "targetPath": "jupyter_server/services/sessions/sessionmanager.py",
+      "targetSha256Before": "765c4cbddfe93db39cefeeb29b49e0f6ce72798449ab08af134e23acbb94c8f7",
+      "targetSha256After": "4c951264eb6e9e789d9bc070e45f790059b1cc8f05918e7bf80e1d6a5e223f53",
+      "requiredAdaptation": "patches/jupyter-server-memory-sessions.patch",
+      "forbiddenFallback": true
+    },
+    "jupyterhub": {
+      "version": "6.1.1",
+      "wheelSha256": "ae20ed7b3d7cef1dd5d51e28723fd53853d69f732e7a9e84a73136acab454248",
+      "sourceArtifact": "jupyterhub-6.1.1.tar.gz",
+      "sourceSha256": "1d7b6713b31ebd76d61a13c202f9323e66c4e8cf731adc5d3052bb6ee6178a95",
+      "requiredAdaptation": "patches/jupyterhub-postgresql-only.patch",
+      "targets": [
+        {"path":"jupyterhub/app.py","before":"7fc2bddcf532c6e0d844b092577c2a53e5455d37db5d89a6a8ddf67ee919f01d","after":"176250818e557980c53b8cf0021e47053638cbdae8c81d1ece586072ed2f200e"},
+        {"path":"jupyterhub/dbutil.py","before":"ddbc84c66d01c38a9330f87691fa604baf2da6987ac0c769a431a34365908cf7","after":"d58dd33f07aba9ad6c4b01290e67a7e17a6136cc29a62a97270743c61986d4f0"},
+        {"path":"jupyterhub/orm.py","before":"c409df91bf98315f13fdac81b02596b018df1764390a8c04a129d352582b576f","after":"e40a331f9e4b7d6750a640c9c98c28af95b81e0211dce32fac1168b3c95d74aa"},
+        {"path":"jupyterhub/alembic/versions/3ec6993fe20c_encrypted_auth_state.py","before":"63433c141c81bcf68efdcfbd8427f7b61bbf083c55bbecfb8d8dae32a4c554e8","after":"2a338f985437965e54798f2b439c7692c735ba622fff648baf237a9602bef1f7"},
+        {"path":"jupyterhub/alembic/versions/56cc5a70207e_token_tracking.py","before":"0471e4214e83d42dcd10b0ad10f72ad27921c415678bc075d5dbed6e03db67c8","after":"2f4bab4dfdb3726b5359df751cf1ae1b779197e942f06b23cd3a5605851eebad"},
+        {"path":"jupyterhub/alembic/versions/1cebaf56856c_session_id.py","before":"cb8c168c7b425c651418ac8a15ea8e6583455a95cfdb189bb154d012cffd8fd9","after":"7f35a043b85d2584ea59878f1167d842df3c6a9fb893a1511081fdba330d2c21"},
+        {"path":"jupyterhub/alembic/versions/af4cbdb2d13c_services.py","before":"305417a35e2391cf1f36940aad329f010dfc2fbdaadb836f1b6fc033d833152a","after":"cab96e722beafe2e6801bdff9d0cc3ea6c0eb6e96a6b5b2d3fcc18c1e7f59acc"},
+        {"path":"jupyterhub/alembic/versions/eeb276e51423_auth_state.py","before":"f9a0252ce803ab01f87d83094f978e59033ee3290e3fc8e859ee323a907271f7","after":"2b0417bbbfb4731e293f089f6a10ebbfdef1c49248ed8989bb168d9acdc0c042"}
+      ],
+      "database": "separate-postgresql-control-database",
+      "businessDatabaseAccess": false
+    },
+    "ipython": {
+      "version": "9.17.1",
+      "wheelSha256": "6d1645743cfd1a07eb695d85aa2b5fa66721f8cbae9431d4049f7084bbf06509",
+      "persistentHistory": false
+    },
+    "nbformat": {
+      "version": "5.11.1",
+      "wheelSha256": "cc6698fa75f4fab8755ead786317815f13a6fee3b53311c0abb1a8b51d52f7ec",
+      "sourceArtifact": "nbformat-5.11.1.tar.gz",
+      "sourceSha256": "32d4521c68c6e7d5b29c76defaeed9f42ea733142b9b19f88277ce10390b9c4d",
+      "targetPath": "nbformat/sign.py",
+      "targetSha256Before": "6b588f0e9d9a3ed862f288a0a0c97e8f8b7ba3506ef7fe46658dbd20f5deafaf",
+      "targetSha256After": "f07f3503b6eac0951be7e3b377ad638a2b275b6c06809a84691f80a246ddd499",
+      "requiredAdaptation": "patches/nbformat-memory-signatures.patch",
+      "signatureStore": "process-memory-only",
+      "unknownOutputsAfterRestart": "untrusted"
+    }
+  },
+  "buildRules": {
+    "patchMustApplyWithoutFuzz": true,
+    "patchedSourceHashMustBeRecorded": true,
+    "dependencyLockRequired": true,
+    "retirementVerifier": "scripts/check_notebook_runtime_retirement.py --probe-current-runtime /",
+    "failClosedWhenIsolationRuntimeUnavailable": true,
+    "sourceVerification": "deploy/notebook/verify_jupyter_patch.py"
+  },
+  "additionalPins": {
+    "jupyterlab": {
+      "version": "4.6.4",
+      "wheelSha256": "15b13f991d3985129c797eb84d9949eeb8b6615e14b444868e642411f2c418b2"
+    }
+  }
+}

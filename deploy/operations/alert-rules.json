@@ -1,0 +1,11 @@
+{
+  "format": "openepm-operational-alert-rules-v1",
+  "rules": [
+    {"id": "authentication-failure-surge", "signal": "http.server.authentication.failures", "windowSeconds": 300, "threshold": 25, "severity": "high", "runbook": "authentication-failure"},
+    {"id": "worker-queue-starvation", "signal": "openepm.queue.oldest_age_seconds", "windowSeconds": 300, "threshold": 300, "severity": "high", "runbook": "worker-starvation"},
+    {"id": "migration-failure", "signal": "openepm.migration.failure", "windowSeconds": 60, "threshold": 1, "severity": "critical", "runbook": "migration-failure"},
+    {"id": "persistent-disk-pressure", "signal": "system.filesystem.utilization", "windowSeconds": 300, "threshold": 0.85, "severity": "high", "runbook": "disk-pressure"},
+    {"id": "recovery-failure", "signal": "openepm.recovery.failure", "windowSeconds": 60, "threshold": 1, "severity": "critical", "runbook": "recovery-failure"},
+    {"id": "signing-key-unavailable", "signal": "openepm.signing_key.available", "windowSeconds": 60, "threshold": 0, "severity": "critical", "runbook": "signing-key-unavailable"}
+  ]
+}

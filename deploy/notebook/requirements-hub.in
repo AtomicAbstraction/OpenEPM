@@ -1,0 +1,5 @@
+# Direct pin only. The generated release lock must enumerate and hash every
+# transitive dependency and the PostgreSQL Hub database driver.
+jupyterhub==6.1.1 --hash=sha256:ae20ed7b3d7cef1dd5d51e28723fd53853d69f732e7a9e84a73136acab454248
+oauthenticator==17.4.0 --hash=sha256:2b59a8d71f0e2822fad243837eb325b4d12b365c6aedfd3cc88f73e9f00486e8
+jupyterhub-traefik-proxy[yaml]==2.1.0 --hash=sha256:7b25a659bc56c0c9061c4646039184283e855cde42312ea3da39998a050a3c79

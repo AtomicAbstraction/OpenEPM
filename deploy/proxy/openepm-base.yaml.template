@@ -1,0 +1,79 @@
+# Rendered by the release installer after strict hostname validation.
+# JupyterHub writes only jupyterhub.yaml beside this file.
+tls:
+  certificates:
+    - certFile: /run/openepm/tls/tls.crt
+      keyFile: /run/openepm/tls/tls.key
+
+http:
+  serversTransports:
+    identity-internal:
+      rootCAs: [/run/secrets/keycloak_internal_ca_certificate]
+  middlewares:
+    platform-prefix:
+      stripPrefix: {prefixes: ["/api/platform"]}
+    workspace-prefix:
+      stripPrefix: {prefixes: ["/api/workspace"]}
+    application-prefix:
+      stripPrefix: {prefixes: ["/api/application"]}
+    security-headers:
+      headers:
+        contentTypeNosniff: true
+        frameDeny: true
+        referrerPolicy: no-referrer
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+  routers:
+    platform:
+      rule: "Host(`__EPM_PUBLIC_HOST__`) && PathPrefix(`/api/platform`)"
+      entryPoints: [websecure]
+      middlewares: [platform-prefix, security-headers]
+      service: platform
+      tls: {}
+    browser-platform:
+      rule: "Host(`__EPM_PUBLIC_HOST__`) && PathPrefix(`/api/platform/browser`)"
+      priority: 200
+      entryPoints: [websecure]
+      middlewares: [security-headers]
+      service: browser-gateway
+      tls: {}
+    workspace:
+      rule: "Host(`__EPM_PUBLIC_HOST__`) && PathPrefix(`/api/workspace`)"
+      entryPoints: [websecure]
+      middlewares: [workspace-prefix, security-headers]
+      service: workspace
+      tls: {}
+    application:
+      rule: "Host(`__EPM_PUBLIC_HOST__`) && PathPrefix(`/api/application`)"
+      entryPoints: [websecure]
+      middlewares: [application-prefix, security-headers]
+      service: application
+      tls: {}
+    web:
+      rule: "Host(`__EPM_PUBLIC_HOST__`)"
+      entryPoints: [websecure]
+      middlewares: [security-headers]
+      service: browser-gateway
+      tls: {}
+    identity:
+      rule: "Host(`__EPM_IDENTITY_PUBLIC_HOST__`)"
+      entryPoints: [websecure]
+      middlewares: [security-headers]
+      service: identity
+      tls: {}
+  services:
+    platform:
+      loadBalancer: {servers: [{url: "http://platform:5193"}]}
+    workspace:
+      loadBalancer: {servers: [{url: "http://workspace:5192"}]}
+    application:
+      loadBalancer: {servers: [{url: "http://router:5194"}]}
+    web:
+      loadBalancer: {servers: [{url: "http://web:5195"}]}
+    browser-gateway:
+      loadBalancer: {servers: [{url: "http://browser-gateway:4180"}]}
+    identity:
+      loadBalancer:
+        serversTransport: identity-internal
+        servers: [{url: "https://identity:8443"}]
+
