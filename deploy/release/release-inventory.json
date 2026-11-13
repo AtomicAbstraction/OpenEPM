@@ -1,0 +1,145 @@
+{
+  "format": "openepm-release-inventory-v2",
+  "profile": {
+    "composeProfiles": [
+      "v2",
+      "python-build",
+      "bundled-identity"
+    ],
+    "services": [
+      "db",
+      "control-db",
+      "proxy",
+      "browser-session-store",
+      "telemetry-collector",
+      "platform",
+      "router",
+      "web",
+      "worker",
+      "python-build-broker",
+      "identity",
+      "browser-gateway"
+    ],
+    "databases": [
+      "application-postgres",
+      "control-postgres",
+      "keycloak"
+    ],
+    "roles": [
+      "epm_runtime",
+      "epm_runtime_login",
+      "epm_access",
+      "epm_access_login",
+      "epm_worker",
+      "epm_worker_login",
+      "epm_lifecycle",
+      "epm_lifecycle_login",
+      "epm_provision",
+      "epm_provision_login",
+      "epm_security",
+      "epm_security_login",
+      "epm_python_coordinator",
+      "epm_python_coordinator_login"
+    ],
+    "secrets": [
+      "epm_postgres_password",
+      "control_postgres_password",
+      "epm_provision_dsn",
+      "epm_lifecycle_dsn",
+      "epm_security_dsn",
+      "epm_access_dsn",
+      "epm_runtime_dsn",
+      "epm_worker_dsn",
+      "epm_python_coordinator_dsn",
+      "epm_python_coordinator_password",
+      "epm_python_build_capability_key",
+      "epm_python_builder_profiles.json",
+      "epm_sandbox_control_key",
+      "epm_admin_dsn",
+      "control_admin_dsn",
+      "epm_preview_secret",
+      "oidc_client_secret",
+      "keycloak_directory_client_secret",
+      "keycloak_web_client_secret",
+      "browser_gateway.cfg",
+      "browser_gateway_alpha.yaml",
+      "browser_session_store.conf",
+      "backup_encryption_key",
+      "epm_runtime_password",
+      "epm_access_password",
+      "epm_worker_password",
+      "epm_lifecycle_password",
+      "epm_provision_password",
+      "epm_security_password",
+      "keycloak_database_url",
+      "keycloak_database_username",
+      "keycloak_database_password",
+      "keycloak_bootstrap_config.json",
+      "keycloak_admin_username",
+      "keycloak_admin_password",
+      "keycloak_initial_admin_password",
+      "keycloak_internal_tls_certificate",
+      "keycloak_internal_tls_private_key",
+      "keycloak_internal_ca_certificate"
+    ],
+    "healthDependencies": {
+      "db": [],
+      "control-db": [],
+      "telemetry-collector": [],
+      "identity": [
+        "control-db"
+      ],
+      "platform": [
+        "db",
+        "identity-jwks",
+        "telemetry-collector"
+      ],
+      "router": [
+        "db",
+        "identity-jwks",
+        "telemetry-collector"
+      ],
+      "web": [
+        "db",
+        "identity-jwks",
+        "telemetry-collector"
+      ],
+      "worker": [
+        "db",
+        "python-coordinator",
+        "sandbox-launcher",
+        "telemetry-collector"
+      ],
+      "python-build-broker": [
+        "db",
+        "python-coordinator"
+      ],
+      "browser-session-store": [],
+      "browser-gateway": [
+        "browser-session-store",
+        "web",
+        "platform"
+      ],
+      "proxy": [
+        "browser-gateway",
+        "identity"
+      ]
+    }
+  },
+  "optionalProfiles": {
+    "workspace": {
+      "services": [
+        "workspace"
+      ],
+      "requiredEnvironment": [
+        "EPM_PG_WORKSPACE_ID"
+      ],
+      "healthDependencies": {
+        "workspace": [
+          "db",
+          "identity-jwks"
+        ]
+      }
+    }
+  }
+}

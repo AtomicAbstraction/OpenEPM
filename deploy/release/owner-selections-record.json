@@ -1,0 +1,90 @@
+{
+  "format": "openepm-recorded-owner-selections-v1",
+  "status": "owner-decisions-recorded-external-legal-review-pending",
+  "releaseExecutable": false,
+  "decisionPacketSha256": "43876f6863c9995ceade50ade57d51fdc024f7dab24a4bc4a02af8d9bf39cdeb",
+  "sourceInputs": [
+    556,
+    558,
+    559,
+    560,
+    561,
+    562,
+    563,
+    564,
+    566,
+    567,
+    568,
+    569,
+    570,
+    571,
+    573,
+    574
+  ],
+  "ownerSelections": {
+    "p24-sdk-license": {
+      "optionId": "proprietary-all-rights-reserved",
+      "effect": "Private, approval-only and proprietary; no public redistribution rights."
+    },
+    "p24-sdk-version": {
+      "optionId": "0.1.0",
+      "effect": "First immutable private SDK identity."
+    },
+    "p24-sdk-registry-namespace": {
+      "optionId": "private-signed-release-bundle",
+      "effect": "The source-bound wheel is delivered inside the signed private release bundle and is not published to public PyPI."
+    },
+    "release-signing-rotation-revocation": {
+      "optionId": "90-day-overlap",
+      "parameters": {
+        "rotation owner": "project owner until delegated to a release-security administrator",
+        "maximum key age": "90 days",
+        "overlap duration": "14 days",
+        "revocation publication URL/artifact": "signed public HTTPS revocation-list artifact; exact URI is bound before external release",
+        "emergency revocation SLA": "4 hours",
+        "offline key custody and recovery": "two encrypted recovery copies in separate secure locations; exact custody ceremony remains outside source control"
+      }
+    },
+    "release-registry-destination-credentials": {
+      "optionId": "oidc-workload-identity",
+      "parameters": {
+        "registry hostname": "ghcr.io",
+        "organization namespace": "atomicabstraction",
+        "project-owned repository names": [
+          "openepm-core",
+          "openepm-database",
+          "openepm-builder",
+          "openepm-identity",
+          "openepm-proxy",
+          "openepm-operations"
+        ],
+        "publisher identity": "approved GitHub Actions release workflow in the private AtomicAbstraction Open EPM repository",
+        "credential issuer/storage": "short-lived GitHub-issued workflow credentials; no permanent registry credential on the development MacBook",
+        "push scope": "push only to the exact listed private Open EPM repositories; upstream runtime images remain read-only digest-pinned and no package-publication, deletion or organization-administration authority is granted",
+        "rotation/revocation owner": "project owner until delegated",
+        "immutable digest/tag retention": "digests are authoritative; retain current, rollback and evidence-required milestones under the evidence-aware retention policy"
+      }
+    }
+  },
+  "externalLegalDecisionsPending": [
+    "license-certifi",
+    "license-cffi"
+  ],
+  "operationalBindingsPending": [
+    "exact public revocation-list URI",
+    "out-of-repository custody ceremony",
+    "private GitHub repository and protected release workflow creation",
+    "publisher environment protection and audit configuration",
+    "complete final-image and base-component dependency/license inventory"
+  ],
+  "publicationAuthorized": false,
+  "boundary": "This record preserves decisions already made by the owner. It is not a legal attestation, credential, registry publication, hosted release or complete resolved-release-policy envelope.",
+  "retiredLegalDecisions": [
+    "license-bleach",
+    "license-json5",
+    "license-jupyter-builder",
+    "license-parso",
+    "license-prometheus-client",
+    "license-python-dateutil"
+  ]
+}

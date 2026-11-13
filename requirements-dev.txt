@@ -1,0 +1,9 @@
+# Development and qualification tooling. Runtime dependencies stay in
+# requirements-postgres.txt and requirements-postgres.lock.
+-r requirements-postgres-dev.txt
+pytest==9.2.0
+pytest-cov==7.1.0
+ruff==0.17.3
+mypy==2.4.1
+pip-audit==2.10.1
+PyYAML==6.0.3

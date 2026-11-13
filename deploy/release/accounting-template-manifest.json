@@ -1,0 +1,25 @@
+{
+  "format": "openepm-accounting-template-manifest-v1",
+  "releasePolicy": {
+    "accountingCorrectnessClaimed": false,
+    "ifrsCertificationClaimed": false,
+    "usGaapCertificationClaimed": false,
+    "unreviewedExamplesInstallableAsTemplates": false,
+    "independentReviewRequiredBeforeTemplateAddition": true
+  },
+  "shippedTemplates": [],
+  "developmentExamples": [
+    {"path": "examples/user_authored_combined_oci_tax_expression.py", "sha256": "90cb6de32ec83b948664388238c8f2b9663e8d5a4203f5f682f9311715f1edf7"},
+    {"path": "examples/user_authored_consolidation_expression.py", "sha256": "364cb34a13946c8142ff127b5d8a0ddd047b29dc8748e41bf9f87c8a9769b96b"},
+    {"path": "examples/user_authored_cross_currency_ic_residual_expression.py", "sha256": "c9297d92341fce80f7a45b7d7bb9cb44cd4cb7d70a9a80623e08e700c541eb7a"},
+    {"path": "examples/user_authored_fixed_asset_unrealized_expression.py", "sha256": "98817222ace5ecd18512ab39a59bcc1a0a344de57b5f0d10f590f09287b507d6"},
+    {"path": "examples/user_authored_ic_residual_expression.py", "sha256": "cee1e85499a035abdd4b33aac7a26072009eb796ea68b6082e7d1e84671b63cb"},
+    {"path": "examples/user_authored_loss_of_control_disposal_expression.py", "sha256": "07635aca62c207f313f4667fde746cb45812c62510c1667b623ee4bb266b65de"},
+    {"path": "examples/user_authored_multicurrency_loss_of_control_disposal_expression.py", "sha256": "12f3914ba61214c42b4ecdb183a701cb6a2e858ac37286fd3c84a35e2d2a5363"},
+    {"path": "examples/user_authored_retained_control_disposal_expression.py", "sha256": "b14410c55e8ce9451623f0f73e6e8362ddeb23173464970430744d76704fc438"},
+    {"path": "examples/user_authored_step_acquisition_oci_expression.py", "sha256": "c10c4be52db6b1edcf4b55b254787e2ecaf8679492fea725c2c5cd40bf8e162a"},
+    {"path": "examples/user_authored_tax_effect_expression.py", "sha256": "d24513190c7169cc972e4a2fb12e83ead9e1d966b5646da8be9e525ae4e76bdd"}
+  ],
+  "p15Status": "open-independent-review-required",
+  "nextGate": "Add a template only with current applicability/effective-date/election/input/journal/golden-case content and a content-addressed independent qualified review."
+}

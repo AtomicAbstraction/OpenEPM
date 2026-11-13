@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 2,
+  "registered": [
+    "AdministrationSecurity.tsx",
+    "Analyze.tsx",
+    "ApplicationDecisions.tsx",
+    "Applications.tsx",
+    "AttributeCatalog.tsx",
+    "AttributeValueEditor.tsx",
+    "BuildRules.tsx",
+    "BuildSchedules.tsx",
+    "BuildSequences.tsx",
+    "CapabilityArea.tsx",
+    "DataExport.tsx",
+    "DataLoad.tsx",
+    "GenericWorkflow.tsx",
+    "MemberLists.tsx",
+    "MetadataCreate.tsx",
+    "MetadataHierarchyEditor.tsx",
+    "MetadataMaintenance.tsx",
+    "MetadataMemberGrid.tsx",
+    "MetadataRelationships.tsx",
+    "MetadataSecurityStringEditor.tsx",
+    "Monitor.tsx",
+    "NativeSelectionEditor.tsx",
+    "PythonDefinitionEditor.tsx",
+    "PythonProgramTest.tsx",
+    "SecurityTagCatalog.tsx",
+    "SemanticAttributes.tsx",
+    "ServerAdministration.tsx",
+    "SupportingDetail.tsx"
+  ],
+  "remaining": [],
+  "nonAuthoritativeControls": [
+    {
+      "file": "GlobalPanels.tsx",
+      "reason": "Global search and task filters do not create a business or configuration draft."
+    },
+    {
+      "file": "MetadataWorkspace.tsx",
+      "reason": "Workspace search, status filters and route selection are presentation-only controls. Business edits remain in the registered metadata editors and all transitions use the shared unsaved-work guard."
+    },
+    {
+      "file": "MyWork.tsx",
+      "reason": "Activity search and paging only select among authorized read-only workflow records; no business draft is created."
+    },
+    {
+      "file": "CalculatedMembers.tsx",
+      "reason": "Inventory filtering only; authored Python is owned by the registered PythonDefinitionEditor and transitions use the shared unsaved-work guard."
+    },
+    {
+      "file": "ApplicationPurge.tsx",
+      "reason": "Application selection and destructive lifecycle confirmation operate on an exact server-prepared target; no editable business draft is created. Retry identity grants no server authority."
+    },
+    {
+      "file": "PythonRuleEditor.tsx",
+      "reason": "Shared controlled source-code renderer only. Each editable parent owns and registers the authoritative draft; read-only callers cannot create one, and this component never persists a separate business draft."
+    }
+  ],
+  "sharedControls": [
+    {
+      "file": "ParameterFields.tsx",
+      "draftOwners": [
+        "BuildRules.tsx",
+        "BuildSequences.tsx",
+        "CapabilityArea.tsx",
+        "MemberLists.tsx",
+        "PythonProgramTest.tsx"
+      ],
+      "reason": "Shared controlled parameter renderer. The listed parent editors own the submitted values and register unsaved work; transient input text in this renderer never grants server authority or persists a separate business draft."
+    }
+  ]
+}

@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "scope": "all shipped Open EPM browser routes",
+  "routes": [
+    "home",
+    "applications",
+    "work",
+    "server",
+    "overview",
+    "grid",
+    "data",
+    "metadata",
+    "lists",
+    "rules",
+    "flows",
+    "tasks",
+    "monitor",
+    "security",
+    "administration"
+  ],
+  "transport": {
+    "directFetchOwner": "api.ts",
+    "credentials": "same-origin",
+    "cache": "no-store",
+    "endpointPatterns": [
+      "/api/aggregate",
+      "/api/application-purge",
+      "/api/applications${query}",
+      "/api/cancel",
+      "/api/catalog",
+      "/api/export",
+      "/api/job",
+      "/api/operation-admission",
+      "/api/platform/browser/read",
+      "/api/platform/browser/write",
+      "/api/preview",
+      "/api/python-build",
+      "/api/python-environment",
+      "/api/python-program",
+      "/api/python-run",
+      "/api/read",
+      "/api/security",
+      "/api/session-identity",
+      "/api/source-load",
+      "/api/submit",
+      "/api/task",
+      "/api/task-logs",
+      "/api/tasks",
+      "/api/workspace-application"
+    ]
+  },
+  "persistentBrowserState": [
+    {
+      "owner": "Applications.tsx",
+      "keyPrefix": "openepm:applications:",
+      "classification": "versioned identity-scoped display preference",
+      "contents": "favorite and recent application identifiers only"
+    },
+    {
+      "owner": "Analyze.tsx",
+      "keyPrefix": "openepm:grid-density:",
+      "classification": "identity/workspace/application-scoped display preference",
+      "contents": "comfortable or compact only"
+    },
+    {
+      "owner": "ApplicationPurge.tsx",
+      "keyPrefix": "openepm:application-purge:",
+      "classification": "identity/workspace-scoped replay metadata",
+      "contents": "Exact pending purge request identity only; target application ID and incarnation, manifest digest, function and idempotency key. No inventory, business data, source, history or credentials. Server authority is rechecked on every retry.",
+      "fields": [
+        "workspaceId",
+        "idempotencyKey",
+        "program.languageVersion",
+        "program.function",
+        "program.arguments.applicationId",
+        "program.arguments.createdAt",
+        "program.arguments.manifestDigest"
+      ],
+      "retention": "Removed on acknowledged terminal completion or definite failure; retained only for uncertain request reconciliation."
+    }
+  ],
+  "forbiddenBrowserAuthorities": [
+    "credentials",
+    "business data",
+    "metadata",
+    "security grants",
+    "receipts",
+    "drafts",
+    "saved grid definitions"
+  ],
+  "forbiddenApis": [
+    "document.cookie",
+    "indexedDB",
+    "CacheStorage",
+    "serviceWorker",
+    "sessionStorage"
+  ]
+}

@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools==84.1.0", "wheel==0.47.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openepm-sdk"
+version = "0.1.0"
+description = "Database-neutral Python application-expression SDK for Open EPM"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools]
+packages = ["openepm"]
+include-package-data = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "unit: deterministic test with no external service",
+    "integration: requires a disposable PostgreSQL service",
+    "postgres: requires EPM_TEST_POSTGRES_DISPOSABLE=1",
+    "qualification: frozen-artifact or host qualification, not a merge gate",
+    "slow: exceeds the ordinary unit-test budget",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [
+    "web-ui/node_modules",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+# Start with rules that catch real breakage, not formatting churn.  The
+# remediation plan ratchets this set after the first green CI baseline.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.11"
+# Start with the dependency-free HTTPS transport, which is the security
+# boundary that most needs a typed contract.  Expand to the model/client only
+# after their dynamic dictionary boundaries are annotated; a permanently red
+# whole-package job would be ignored.
+files = ["openepm/transport.py", "openepm/oidc.py"]
+follow_imports = "skip"
+ignore_missing_imports = true
+warn_unused_ignores = true
+

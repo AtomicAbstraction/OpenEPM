@@ -1,0 +1,229 @@
+{
+  "coverage": {
+    "exactEvidenceGroups": 2,
+    "externalLegalDecisions": 2,
+    "packages": 2
+  },
+  "decisionPacketSha256": "43876f6863c9995ceade50ade57d51fdc024f7dab24a4bc4a02af8d9bf39cdeb",
+  "evidenceGroups": [
+    {
+      "classifications": [
+        "custom-or-unmatched"
+      ],
+      "detectedStandardExpressions": [],
+      "exactText": "\nExcept when otherwise stated (look for LICENSE files in directories or\ninformation at the beginning of each file) all software and\ndocumentation is licensed as follows: \n\n    MIT No Attribution\n\n    Permission is hereby granted, free of charge, to any person \n    obtaining a copy of this software and associated documentation \n    files (the \"Software\"), to deal in the Software without \n    restriction, including without limitation the rights to use, \n    copy, modify, merge, publish, distribute, sublicense, and/or \n    sell copies of the Software, and to permit persons to whom the \n    Software is furnished to do so.\n\n    THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS \n    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, \n    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL \n    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER \n    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING \n    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER \n    DEALINGS IN THE SOFTWARE.\n\n",
+      "normalizedSha256": "e7243e6fa37b33b51386a92e094fdbed43c3f995190e0cd1172c654620df5a98",
+      "occurrences": [
+        {
+          "architecture": "linux/amd64",
+          "package": "cffi",
+          "path": "cffi-2.1.1.dist-info/licenses/LICENSE",
+          "target": "linux-amd64-cp314",
+          "version": "2.1.1"
+        },
+        {
+          "architecture": "linux/arm64",
+          "package": "cffi",
+          "path": "cffi-2.1.1.dist-info/licenses/LICENSE",
+          "target": "linux-arm64-cp314",
+          "version": "2.1.1"
+        }
+      ],
+      "rawSha256": "5ba24ddc57067f9249add644c3afc41a5d6dc37e23433ef759d95df370b0af63"
+    },
+    {
+      "classifications": [
+        "custom-or-unmatched"
+      ],
+      "detectedStandardExpressions": [],
+      "exactText": "This package contains a modified version of ca-bundle.crt:\n\nca-bundle.crt -- Bundle of CA Root Certificates\n\nThis is a bundle of X.509 certificates of public Certificate Authorities\n(CA). These were automatically extracted from Mozilla's root certificates\nfile (certdata.txt).  This file can be found in the mozilla source tree:\nhttps://hg.mozilla.org/mozilla-central/file/tip/security/nss/lib/ckfw/builtins/certdata.txt\nIt contains the certificates in PEM format and therefore\ncan be directly used with curl / libcurl / php_curl, or with\nan Apache+mod_ssl webserver for SSL client authentication.\nJust configure this file as the SSLCACertificateFile.#\n\n***** BEGIN LICENSE BLOCK *****\nThis Source Code Form is subject to the terms of the Mozilla Public License,\nv. 2.0. If a copy of the MPL was not distributed with this file, You can obtain\none at http://mozilla.org/MPL/2.0/.\n\n***** END LICENSE BLOCK *****\n@(#) $RCSfile: certdata.txt,v $ $Revision: 1.80 $ $Date: 2011/11/03 15:11:58 $\n",
+      "normalizedSha256": "aa67fe9676d89b38755f1240131f6bcba56718d76b8ea3313127b275f72601ff",
+      "occurrences": [
+        {
+          "architecture": "linux/amd64",
+          "package": "certifi",
+          "path": "certifi-2026.10.23.dist-info/licenses/LICENSE",
+          "target": "linux-amd64-cp314",
+          "version": "2026.10.23"
+        },
+        {
+          "architecture": "linux/arm64",
+          "package": "certifi",
+          "path": "certifi-2026.10.23.dist-info/licenses/LICENSE",
+          "target": "linux-arm64-cp314",
+          "version": "2026.10.23"
+        }
+      ],
+      "rawSha256": "e93716da6b9c0d5a4a1df60fe695b370f0695603d21f6f83f053e42cfc10caf7"
+    }
+  ],
+  "format": "openepm-external-license-review-bundle-v1",
+  "packages": [
+    {
+      "architectures": [
+        {
+          "architecture": "linux/amd64",
+          "evidenceFiles": [
+            {
+              "classifications": [
+                "custom-or-unmatched"
+              ],
+              "copyrightHolders": [],
+              "detectedStandardExpressions": [],
+              "normalizedSha256": "aa67fe9676d89b38755f1240131f6bcba56718d76b8ea3313127b275f72601ff",
+              "path": "certifi-2026.10.23.dist-info/licenses/LICENSE",
+              "rawSha256": "e93716da6b9c0d5a4a1df60fe695b370f0695603d21f6f83f053e42cfc10caf7"
+            }
+          ],
+          "licenseClassifiers": [
+            "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)"
+          ],
+          "licenseExpression": null,
+          "licenseFreeText": "MPL-2.0",
+          "metadataPath": "certifi-2026.10.23.dist-info/METADATA",
+          "metadataSha256": "e463e38f7fe7da36a11e6d3fecc5dfa5b97be8c8022620400750d79ae7d842bc",
+          "target": "linux-amd64-cp314",
+          "wheelFilename": "certifi-2026.10.23-py3-none-any.whl",
+          "wheelSha256": "e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1"
+        },
+        {
+          "architecture": "linux/arm64",
+          "evidenceFiles": [
+            {
+              "classifications": [
+                "custom-or-unmatched"
+              ],
+              "copyrightHolders": [],
+              "detectedStandardExpressions": [],
+              "normalizedSha256": "aa67fe9676d89b38755f1240131f6bcba56718d76b8ea3313127b275f72601ff",
+              "path": "certifi-2026.10.23.dist-info/licenses/LICENSE",
+              "rawSha256": "e93716da6b9c0d5a4a1df60fe695b370f0695603d21f6f83f053e42cfc10caf7"
+            }
+          ],
+          "licenseClassifiers": [
+            "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)"
+          ],
+          "licenseExpression": null,
+          "licenseFreeText": "MPL-2.0",
+          "metadataPath": "certifi-2026.10.23.dist-info/METADATA",
+          "metadataSha256": "e463e38f7fe7da36a11e6d3fecc5dfa5b97be8c8022620400750d79ae7d842bc",
+          "target": "linux-arm64-cp314",
+          "wheelFilename": "certifi-2026.10.23-py3-none-any.whl",
+          "wheelSha256": "e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1"
+        }
+      ],
+      "customClausesOrScopeSelectors": [
+        "this package contains a modified version of ca-bundle.crt:\n\nca-bundle.crt -- bundle of ca root certificates\n\nthis is a bundle of x.509 certificates of public certificate authorities\n(ca). these were automatically extracted from mozilla's root certificates\nfile (certdata.txt). this file can be found in the mozilla source tree:\nhttps://hg.mozilla.org/mozilla-central/file/tip/security/nss/lib/ckfw/builtins/certdata.txt\nit contains the certificates in pem format and therefore\ncan be directly used with curl / libcurl / php_curl, or with\nan apache+mod_ssl webserver for ssl client authentication.\njust configure this file as the sslcacertificatefile.#\n\n***** begin license block *****\nthis source code form is subject to the terms of the mozilla public license,\nv. 2.0. if a copy of the mpl was not distributed with this file, you can obtain\none at http://mozilla.org/mpl/2.0/.\n\n***** end license block *****\n@(#) $rcsfile: certdata.txt,v $ $revision: 1.80 $ $date: 2011/11/03 15:11:58 $"
+      ],
+      "decisionId": "license-certifi",
+      "detectedStandardComponents": [],
+      "evidenceGroupRawSha256": [
+        "e93716da6b9c0d5a4a1df60fe695b370f0695603d21f6f83f053e42cfc10caf7"
+      ],
+      "name": "certifi",
+      "requiredAttributionText": [],
+      "reviewFlags": [
+        "custom-or-unmatched-license-text"
+      ],
+      "reviewQuestion": "Which SPDX expression and AND/OR relationship governs the package, given the bundled texts and legacy classifier/free-text metadata?",
+      "version": "2026.10.23"
+    },
+    {
+      "architectures": [
+        {
+          "architecture": "linux/amd64",
+          "evidenceFiles": [
+            {
+              "classifications": [
+                "custom-or-unmatched"
+              ],
+              "copyrightHolders": [
+                "THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER"
+              ],
+              "detectedStandardExpressions": [],
+              "normalizedSha256": "e7243e6fa37b33b51386a92e094fdbed43c3f995190e0cd1172c654620df5a98",
+              "path": "cffi-2.1.1.dist-info/licenses/LICENSE",
+              "rawSha256": "5ba24ddc57067f9249add644c3afc41a5d6dc37e23433ef759d95df370b0af63"
+            }
+          ],
+          "licenseClassifiers": [],
+          "licenseExpression": "MIT-0",
+          "licenseFreeText": null,
+          "metadataPath": "cffi-2.1.1.dist-info/METADATA",
+          "metadataSha256": "558bafb9093a8e790175d9ecff9688382981d744877dad86fd6770db0f4dc918",
+          "target": "linux-amd64-cp314",
+          "wheelFilename": "cffi-2.1.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+          "wheelSha256": "b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96"
+        },
+        {
+          "architecture": "linux/arm64",
+          "evidenceFiles": [
+            {
+              "classifications": [
+                "custom-or-unmatched"
+              ],
+              "copyrightHolders": [
+                "THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER"
+              ],
+              "detectedStandardExpressions": [],
+              "normalizedSha256": "e7243e6fa37b33b51386a92e094fdbed43c3f995190e0cd1172c654620df5a98",
+              "path": "cffi-2.1.1.dist-info/licenses/LICENSE",
+              "rawSha256": "5ba24ddc57067f9249add644c3afc41a5d6dc37e23433ef759d95df370b0af63"
+            }
+          ],
+          "licenseClassifiers": [],
+          "licenseExpression": "MIT-0",
+          "licenseFreeText": null,
+          "metadataPath": "cffi-2.1.1.dist-info/METADATA",
+          "metadataSha256": "558bafb9093a8e790175d9ecff9688382981d744877dad86fd6770db0f4dc918",
+          "target": "linux-arm64-cp314",
+          "wheelFilename": "cffi-2.1.1-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+          "wheelSha256": "58acb8ab8e295e6c5ea12f888cbb13cf21511ef2a3303a23f4325c29d17fe5c1"
+        }
+      ],
+      "customClausesOrScopeSelectors": [
+        "except when otherwise stated (look for license files in directories or\ninformation at the beginning of each file) all software and\ndocumentation is licensed as follows:\n\nmit no attribution\n\npermission is hereby granted, free of charge, to any person\nobtaining a copy of this software and associated documentation\nfiles (the \"software\"), to deal in the software without\nrestriction, including without limitation the rights to use,\ncopy, modify, merge, publish, distribute, sublicense, and/or\nsell copies of the software, and to permit persons to whom the\nsoftware is furnished to do so.\n\nthe software is provided \"as is\", without warranty of any kind, express\nor implied, including but not limited to the warranties of merchantability,\nfitness for a particular purpose and noninfringement. in no event shall\n{{COPYRIGHT}}\nliability, whether in an action of contract, tort or otherwise, arising\nfrom, out of or in connection with the software or the use or other\ndealings in the software."
+      ],
+      "decisionId": "license-cffi",
+      "detectedStandardComponents": [],
+      "evidenceGroupRawSha256": [
+        "5ba24ddc57067f9249add644c3afc41a5d6dc37e23433ef759d95df370b0af63"
+      ],
+      "name": "cffi",
+      "requiredAttributionText": [
+        "THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER"
+      ],
+      "reviewFlags": [
+        "custom-or-unmatched-license-text",
+        "metadata-expression-without-matched-text"
+      ],
+      "reviewQuestion": "Does the metadata expression cover every shipped file, and how should the unmatched scope/component text alter the release obligations?",
+      "version": "2.1.1"
+    }
+  ],
+  "residualDossierSha256": "9bae92ad5af318421850f360d27cc5a4b264711f3f4666eeda0e8a406917c4c5",
+  "retiredPackages": [
+    "bleach",
+    "json5",
+    "jupyter-builder",
+    "parso",
+    "prometheus-client",
+    "python-dateutil"
+  ],
+  "scopeStatus": "current-target-wheel-provenance-verified-external-attestation-required",
+  "sourceCompliancePermitted": false,
+  "status": "unreviewed-no-selection",
+  "targetWheelProvenance": {
+    "evidencePath": "docs/qualifications/calculation-engine-w12-target-wheel-provenance-2026-11-10.json",
+    "evidenceSha256": "c357c628214323504d3780475428b50143fa38bb544fabe754e6985e5b616ba6",
+    "lockSha256": "5901c2d0a3787e37fade607b1404a7f748b487d3807f5209909615e283c2e341",
+    "lockedPackages": 43,
+    "verifiedWheels": 86,
+    "architectures": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "residualPackageEvidenceExactMatch": true
+  },
+  "trustedPolicy": false
+}

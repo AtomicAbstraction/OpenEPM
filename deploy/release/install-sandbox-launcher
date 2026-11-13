@@ -1,0 +1,50 @@
+#!/bin/sh
+# Install only the trusted host launcher. This is not the full product installer.
+set -eu
+
+[ "$(id -u)" = 0 ] || { printf '%s\n' 'installer must run as root' >&2; exit 78; }
+[ "$#" = 4 ] || {
+    printf '%s\n' 'usage: install-sandbox-launcher ARTIFACT.pyz SHA256 PROFILES.json CONTROL_KEY' >&2
+    exit 64
+}
+artifact=$1
+expected=$2
+profiles=$3
+key=$4
+
+for command in python3 docker runsc systemctl systemd-tmpfiles sha256sum install; do
+    command -v "$command" >/dev/null 2>&1 || {
+        printf 'required command unavailable: %s\n' "$command" >&2; exit 78; }
+done
+printf '%s  %s\n' "$expected" "$artifact" | sha256sum -c - >/dev/null
+docker info --format '{{json .Runtimes}}' | grep -Eq '"runsc"' || {
+    printf '%s\n' 'Docker runsc runtime is unavailable' >&2; exit 78; }
+[ -f "$profiles" ] && [ ! -L "$profiles" ] || exit 78
+[ -f "$key" ] && [ ! -L "$key" ] || exit 78
+[ "$(wc -c < "$key" | tr -d ' ')" -ge 32 ] || exit 78
+
+install -d -o root -g root -m 0755 /usr/lib/openepm /etc/openepm /etc/openepm/secrets
+install -o root -g root -m 0555 "$artifact" /usr/lib/openepm/sandbox-launcher.pyz
+install -o root -g root -m 0444 "$profiles" /etc/openepm/secrets/epm_python_builder_profiles.json
+install -o root -g root -m 0400 "$key" /etc/openepm/secrets/epm_sandbox_control_key
+install -o root -g root -m 0444 "$(dirname "$0")/host/sandbox-launcher.env.example" /etc/openepm/sandbox-launcher.env
+install -o root -g root -m 0444 "$(dirname "$0")/host/openepm-sandbox-launcher.service" /etc/systemd/system/openepm-sandbox-launcher.service
+install -o root -g root -m 0444 "$(dirname "$0")/host/openepm-sandbox-storage.conf" /usr/lib/tmpfiles.d/openepm-sandbox-storage.conf
+systemd-tmpfiles --create /usr/lib/tmpfiles.d/openepm-sandbox-storage.conf
+systemctl daemon-reload
+# `enable --now` starts an inactive unit but leaves an already-running process
+# untouched. Profiles are loaded only during process startup, so a verified
+# installation must reload the deployment-owned allow-list unconditionally.
+systemctl enable openepm-sandbox-launcher.service >/dev/null
+systemctl restart openepm-sandbox-launcher.service
+attempt=0
+while [ "$attempt" -lt 50 ]; do
+    if systemctl is-active --quiet openepm-sandbox-launcher.service \
+            && [ -S /run/openepm-sandbox/sandbox-launcher.sock ]; then
+        exit 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+printf '%s\n' 'trusted sandbox launcher did not become ready' >&2
+exit 69

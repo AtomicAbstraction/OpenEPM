@@ -1,0 +1,31 @@
+.parameter-fields,
+.parameter-fields fieldset {
+  min-width: 0;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.parameter-fields legend {
+  padding: 0 6px;
+  font-weight: 600;
+}
+.parameter-field {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.parameter-field small,
+.parameter-fields > p {
+  color: var(--muted);
+}
+.parameter-fields :is(input, select, textarea) {
+  min-width: 0;
+  width: 100%;
+}
+.parameter-fields summary {
+  cursor: pointer;
+}
+.parameter-fields details[open] summary {
+  margin-bottom: 8px;
+}

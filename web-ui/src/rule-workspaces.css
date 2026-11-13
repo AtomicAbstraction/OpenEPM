@@ -1,0 +1,130 @@
+/* A catalogue opens one focused rule, sequence or schedule workspace. */
+.rule-workspace-actions,
+.rule-editor-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.rule-workspace-actions {
+  justify-content: flex-end;
+}
+.rule-workspace-empty {
+  display: grid;
+  gap: 6px;
+  padding: 28px 20px;
+  margin: 16px 0 0;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  background: var(--surface-soft);
+}
+.rule-workspace-empty p,
+.rule-editor-heading p {
+  margin: 0;
+  color: var(--muted);
+}
+.rule-editor-frame {
+  border: 0;
+  border-top: 1px solid var(--line);
+  min-width: 0;
+  margin: 22px 0 0;
+  padding: 22px 0 0;
+}
+.rule-editor-heading {
+  margin-bottom: 16px;
+}
+.rule-editor-heading h3 {
+  margin: 4px 0;
+}
+.rule-editor-heading small {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+.rule-editor-single {
+  max-width: 1040px;
+}
+.rule-editor-single > .governed-action-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+.rule-editor-frame .governed-action-grid {
+  margin: 0;
+}
+.rule-editor-frame .governed-action-card {
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
+}
+.rule-editor-frame
+  .governed-action-grid:has(> .governed-action-card:only-child) {
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 1040px;
+}
+.rule-editor-frame .governed-action-card > h4 {
+  font-size: 15px;
+  margin: 0;
+}
+.rule-editor-frame .governed-action-card > button {
+  justify-self: start;
+  width: auto;
+}
+.rule-editor-frame .governed-action-card > .authority-note {
+  text-align: left;
+}
+.rule-composer-disclosure,
+.rule-source-disclosure {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+}
+.rule-composer-disclosure > summary,
+.rule-source-disclosure > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.rule-composer-disclosure[open] > summary,
+.rule-source-disclosure[open] > summary {
+  margin-bottom: 12px;
+}
+.rule-source-disclosure {
+  margin-top: 16px;
+}
+.rule-editor-frame .review-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+@media (max-width: 650px) {
+  :is(
+      [aria-labelledby="rule-explorer-heading"],
+      [aria-labelledby="sequence-explorer-heading"],
+      [aria-labelledby="generic-schedule-heading"]
+    )
+    > .section-heading-row {
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  :is(
+      [aria-labelledby="rule-explorer-heading"],
+      [aria-labelledby="sequence-explorer-heading"],
+      [aria-labelledby="generic-schedule-heading"]
+    )
+    > .section-heading-row
+    > div:first-child {
+    flex-basis: 100%;
+  }
+  .rule-workspace-actions {
+    justify-content: flex-start;
+  }
+  .rule-editor-frame {
+    padding-top: 18px;
+  }
+  .rule-editor-frame .governed-action-card > button {
+    width: 100%;
+  }
+}

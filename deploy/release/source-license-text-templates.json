@@ -1,0 +1,404 @@
+{
+  "format": "openepm-reviewed-license-text-templates-v1",
+  "normalization": "openepm-license-text-normalization-v1",
+  "reviewBoundary": "Exact hashes correspond to manually inspected standard license texts in the verified 266-wheel corpus; this set does not approve package policy.",
+  "templates": [
+    {
+      "id": "mit-1",
+      "expression": "MIT",
+      "normalizedSha256": "f129baf70502dbf1d8bfab07581c9bfdf1d27b83d0fcb47d75dadd8c5a553073",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-2",
+      "expression": "MIT",
+      "normalizedSha256": "5e9d8349a034acd32a6aeeb22eec5b089253855d778765f54356f5150a3898b3",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-3",
+      "expression": "MIT",
+      "normalizedSha256": "35b3cac1e85eb3e55428897110a4f11015bfa4fa3d5b1d2df93ec19ec2a76921",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-4",
+      "expression": "MIT",
+      "normalizedSha256": "fe29fa598226217faf27a93a03d51ea4af39202735c239aa8be8197920c6d0b7",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-5",
+      "expression": "MIT",
+      "normalizedSha256": "dcc0c89dee8145c9d1709b1cd477ee7ddc6dee739a426268e9fdbeb27d967891",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-6",
+      "expression": "MIT",
+      "normalizedSha256": "0b0484eb73c499a3a004645eb543e78522d62e85da2365b9d1b3379a81ff2b48",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-7",
+      "expression": "MIT",
+      "normalizedSha256": "d5b0cbcd2095f092ba888af617cbdf4f20aec2620d014ced69d35fe233c7d81b",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-8",
+      "expression": "MIT",
+      "normalizedSha256": "2e97bedf32e6822b6475c80b1b5839524451586e16873b7c1594e6749a6c9d09",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-9",
+      "expression": "MIT",
+      "normalizedSha256": "6ec4ab8e5312081095c1334d83bca27e0005381ae9ffc5e934e461f713ebb88d",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-10",
+      "expression": "MIT",
+      "normalizedSha256": "72bbbf3391590eaaadd8e189d37a6c51964afb35c2a6d2d1849c0a241c51ca0c",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-11",
+      "expression": "MIT",
+      "normalizedSha256": "8919697523c9b24444c6f8b8749264a7ef9ef0c5b1424645dbf9ed31ada92061",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-12",
+      "expression": "MIT",
+      "normalizedSha256": "ba09a15d0f0761619288e006383be43fa34a2ad66230c0fe7b4f9dbec83c7d59",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-13",
+      "expression": "MIT",
+      "normalizedSha256": "c74633b6d1e78f5f2262b663f221b1d8cee09c6d33e1274f175c99edf853d709",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-14",
+      "expression": "MIT",
+      "normalizedSha256": "cb72ef73542a76dbe0e92cb65faf4bc0ec0151d3c0402d976404ab17b74c7bf1",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-15",
+      "expression": "MIT",
+      "normalizedSha256": "df6a6ff0779e87c06589623e35b0a0ca6d9138e3777a8b3ae500434980f417e3",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-16",
+      "expression": "MIT",
+      "normalizedSha256": "577519b16a7bacadf75aa8e9e3effefe20ae2b4df5cc9d67bf906bed6a7aac42",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-17",
+      "expression": "MIT",
+      "normalizedSha256": "e1b52bc49de0b683ae839fc0849f9f59e3b338922842602f9a9920617bbbe541",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-18",
+      "expression": "MIT",
+      "normalizedSha256": "0fa03d2366983a2c42ad26408bf19f0550963611b3a23a31271b01b06c75a52a",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "mit-19",
+      "expression": "MIT",
+      "normalizedSha256": "77102827f0d511fe35d3752918e055cad8dacf9826062279b2e36d1a686f66c8",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-2-clause-1",
+      "expression": "BSD-2-Clause",
+      "normalizedSha256": "4f9e59ff99f74f1ebabc57d9ff27b8a8e7d5923c042bbb997d46b2f50094845e",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-2-clause-2",
+      "expression": "BSD-2-Clause",
+      "normalizedSha256": "8951fdbdc18a32098d096a6d18993ea69da905a07eb283fe8bf426cce75d2086",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-2-clause-3",
+      "expression": "BSD-2-Clause",
+      "normalizedSha256": "6308bffcf192ab72c9ce9ac1e6f8980cd1efb5ee3aa8ef942004a138306b415d",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-2-clause-4",
+      "expression": "BSD-2-Clause",
+      "normalizedSha256": "59629af6be6c73051487123d9249826ea6ac83df4d37818c1cd340a6e1b99055",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-2-clause-5",
+      "expression": "BSD-2-Clause",
+      "normalizedSha256": "00d048a683e1335591c4ec1db250801c34f018ede2e20d481df8673fb7453bab",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-2-clause-6",
+      "expression": "BSD-2-Clause",
+      "normalizedSha256": "e69c2f9fe807bfd90b72275321e9ded92f83e1ff56ecfe65b1cbe6720d5c8ea8",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-1",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "1b54019454ea65a39574b59363f5647aebb51235d5206997b0d844bc4a633fc6",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-2",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "e362c12d3d47b2cca24379934c6e670c9ddab54651419573b44eabbbe2219d4b",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-3",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "91b5cd32ab34f7ba17a2b54ff13f65ea0e1586b43b7eb6a93cbd13521dedd639",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-4",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "44454b391d9a27e6044260e5e76e3a04202b58dcc9620a45f4675c9d8d65f765",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-5",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "ebbce5b6317f1a838c3fc370dc9020c40f431a848cf4aa4e6eb6953ad555c41f",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-6",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "1f5ea14bd4661cbf54724ec9340e5cccb432891f2bd626e7cfb7caa39d0e43a9",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-7",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "aa1559038890a44ec7a98f61566aeed9d13a1906c7f7c18b29a70e3afa1c1523",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-8",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "1ff26523962064fc5e1df9403ae9e30f1363a2ff6dc136c351219012cbfd1137",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-9",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "7bbe41365eb531b26339872dd223b329729df0d63944a2d35e80efa45595ce66",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-10",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "c0fcb3e85baaabf3f07de67e03f3bff6bf106a0f323b77d3048faff12369b783",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-11",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "0a8ffc5a80d4ca2bf64c69c549f80159d0e7115eaeb10635f47875551a83e815",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-12",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "c256e7e3e105ff9f70ea700538d62778ea1f4d7494169ce0ca9d3c5df5ea5a9c",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-13",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "8a0f070508db63dcb5bd8d0ee508ebe4f0dfefe6ff474e16da53eaf011da1bcf",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-14",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "46c5da579e28ba230abec3bba26abfe8c2158db5224141b87d43590d506a2d5f",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-15",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "30ba0f41b6d022337893ce856a70580c38595d7bac3799ad5148a025f8311330",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-16",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "a6bf82a0bfbe8d94f31479af82ee2e87fa28e3a4f3bc34fa79621cbb14b2682b",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-18",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "193116d26c3c5f822b249641ca5eb2781261a9e2d184bca49271fe725eeab418",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-19",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "c66694a14bd678540d8ab4269da078834a875739b578974f67fe53b27fa7d0ca",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-20",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "8e24f689c7f6802e9328cbd5e95a9a12318e5248eb5349b0918177b02f74fd8d",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-21",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "34efddec6f695e63ecd27533b049d705b769690f8c563e6ebf6d3ee3787fde58",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-22",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "3d1df0ba1ac90ce2a8b3eae4b40f63eb3953953ddccefba9d47e792fa3403f35",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-23",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "6048763cd9c348e0aec519b8f9e2d782166e460f05d7832fb15094eff0110ec0",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-24",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "0198e47fae3d7f9032b5cd7bf5ffd2d1f05e701d82ba841e27884e6540f345ea",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-25",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "f40e907bd3f77187f8537ccecd905b0b9a00a4e7e2cd2a561a6774ea6f871451",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "bsd-3-clause-26",
+      "expression": "BSD-3-Clause",
+      "normalizedSha256": "ad9625512f313976b33ab8245b24d0d461899fffa30a1104a6ba6e5fd8d1b4c6",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "apache-2.0-1",
+      "expression": "Apache-2.0",
+      "normalizedSha256": "a02820c9dc07cdb77e5619c76b2c52a8743ff566289e3088378d7a81ec089832",
+      "noticeRule": "preserve-if-bundled"
+    },
+    {
+      "id": "apache-2.0-2",
+      "expression": "Apache-2.0",
+      "normalizedSha256": "a426da25a5601bf4bd621e2edeed4289a010bf1a2561c2d06510b0313552a296",
+      "noticeRule": "preserve-if-bundled"
+    },
+    {
+      "id": "apache-2.0-3",
+      "expression": "Apache-2.0",
+      "normalizedSha256": "b9d8ef08e5add1cd5ced65af5fe0b0174c69019d1fd915d667da2a4bd9278cfc",
+      "noticeRule": "preserve-if-bundled"
+    },
+    {
+      "id": "apache-2.0-4",
+      "expression": "Apache-2.0",
+      "normalizedSha256": "d98ff255c9c8b9abe3b97b935778a180335fcd360860052b3dde2a70941af0b4",
+      "noticeRule": "preserve-if-bundled"
+    },
+    {
+      "id": "apache-2.0-5",
+      "expression": "Apache-2.0",
+      "normalizedSha256": "72a8b2e90ac5b858c20684fd4cb7791683601ea1ae2d81db1c993de909149d95",
+      "noticeRule": "preserve-if-bundled"
+    },
+    {
+      "id": "apache-2.0-6",
+      "expression": "Apache-2.0",
+      "normalizedSha256": "cb8c14f0cd58fc357d818a0944824b319add4a7930cea03a453bec576c1f3cde",
+      "noticeRule": "preserve-if-bundled"
+    },
+    {
+      "id": "apache-2.0-7",
+      "expression": "Apache-2.0",
+      "normalizedSha256": "91515e1d9bab3ece7ef5d31fd4ac3c576819f5b1721008414ea95f6140ba1929",
+      "noticeRule": "preserve-if-bundled"
+    },
+    {
+      "id": "apache-2.0-8",
+      "expression": "Apache-2.0",
+      "normalizedSha256": "8dfcadc88b773d892bfd1fb87a948fdc4538893a005b8577577b7885a32cfee2",
+      "noticeRule": "preserve-if-bundled"
+    },
+    {
+      "id": "mpl-2.0-1",
+      "expression": "MPL-2.0",
+      "normalizedSha256": "0870e636ac188414b5dbe6663e92c6c509ee4bd92b90c7743aaa525df156efed",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "psf-2.0-1",
+      "expression": "PSF-2.0",
+      "normalizedSha256": "aee8f0007ec05774e54030f6b6589e6f169ff55ca4e7c8a7b37d991cb93c1729",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "psf-2.0-2",
+      "expression": "PSF-2.0",
+      "normalizedSha256": "04d691449f7c8bb01737b1443bb16025c83fb4f4fc270b85a4c1deb74d436c47",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "isc-1",
+      "expression": "ISC",
+      "normalizedSha256": "727cc3ad0a8eb47fbec13b638a5a21dd8658b06bbe5566a4d1cd3cf0fded18d7",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "isc-2",
+      "expression": "ISC",
+      "normalizedSha256": "fc7d3a0e2ca14834f0a9ffbf12b9a6912fb1a72965038a32c03178f60aaf7bbe",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "isc-3",
+      "expression": "ISC",
+      "normalizedSha256": "1c5511ac719190171e09f1791d5ec3b216cff493afe79ed91c822003e6c9c152",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "isc-4",
+      "expression": "ISC",
+      "normalizedSha256": "b2b5e502fd598de4c86122fc85658a3b650e1b4ec451854cea0120d3d170bcef",
+      "noticeRule": "not-required"
+    },
+    {
+      "id": "lgpl-3.0-only-1",
+      "expression": "LGPL-3.0-only",
+      "normalizedSha256": "fb9123f71dd8ecfe2287f150c61170b49627df77f05b953f3590019925d4e1e8",
+      "noticeRule": "not-required"
+    }
+  ]
+}
+

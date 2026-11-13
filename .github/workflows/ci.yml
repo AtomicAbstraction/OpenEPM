@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-boundary:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m ruff check .
+      - run: python -m mypy
+      - name: Verify deterministic public-root closure
+        run: python scripts/build_openepm_public_root.py --output /tmp/openepm-public-root.tar.gz --source-date-epoch 0
+
+  web:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run format:check
+      - run: npm run build
+      - name: Install managed Chromium qualification runtime
+        run: |
+          npm install --global playwright@1.58.2
+          playwright install --with-deps chromium
+      - name: Qualify compiled Rules workspace
+        run: npm run browser:rules
+
+  dependency-audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: python -m pip install pip-audit==2.10.1
+      - run: python -m pip_audit -r requirements-postgres.lock

@@ -1,0 +1,37 @@
+{
+  "format": "openepm-public-repository-v1",
+  "sourcePackageManifest": "deploy/release/source-package.manifest.json",
+  "repositoryPaths": [
+    ".dockerignore",
+    ".github/ISSUE_TEMPLATE",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".gitignore",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "INSTALL.md",
+    "LICENSE",
+    "Makefile",
+    "README.md",
+    "SECURITY.md",
+    "deploy/release/public-repository.manifest.json",
+    "deploy/release/public-ci.yml",
+    "requirements-dev.txt",
+    "requirements-postgres-dev.txt",
+    "requirements-postgres.txt",
+    "tests/check_packaged_rules_workspace.mjs"
+  ],
+  "repositoryOverlays": {
+    ".github/workflows/ci.yml": "deploy/release/public-ci.yml"
+  },
+  "requiredAbsent": [
+    ".agents",
+    ".aws",
+    ".codex",
+    ".entire",
+    ".epm-runtime",
+    "AGENTS.md",
+    "PROJECT_INPUTS.md",
+    "docs/brand",
+    "docs/discussion-notes"
+  ]
+}

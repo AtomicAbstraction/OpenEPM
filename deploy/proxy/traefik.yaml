@@ -1,0 +1,36 @@
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      aliasHeadersStrategy: reject
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+    http:
+      aliasHeadersStrategy: reject
+      tls: {}
+  auth_api:
+    address: ":8080"
+    http:
+      aliasHeadersStrategy: reject
+
+providers:
+  file:
+    directory: /var/lib/openepm/proxy
+    watch: true
+
+api:
+  dashboard: true
+  insecure: false
+
+ping:
+  entryPoint: auth_api
+
+accessLog: {}
+log:
+  level: INFO
+

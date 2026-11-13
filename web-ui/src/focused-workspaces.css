@@ -1,0 +1,382 @@
+/* Focused, URL-addressable workspaces share one compact navigation pattern. */
+.workspace-section-nav,
+.workspace-tabs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 5px;
+  margin: 0 0 12px;
+  background: #efedf5;
+  border: 1px solid #e0dce9;
+  border-radius: 9px;
+}
+.workspace-section-nav button,
+.workspace-tabs button {
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #665d76;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  padding: 9px 13px;
+  cursor: pointer;
+}
+.workspace-section-nav button:hover,
+.workspace-tabs button:hover {
+  background: #f8f6fc;
+  color: #493c65;
+}
+.workspace-section-nav button[aria-current="page"],
+.workspace-tabs button[aria-current="page"],
+.workspace-tabs button[aria-selected="true"] {
+  background: #fff;
+  border-color: #e1dce9;
+  color: #5e3fbd;
+  box-shadow: 0 1px 3px #3223500c;
+}
+.workspace-function-reference ul {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  gap: 0 24px;
+}
+.workspace-function-reference li {
+  border-top: 1px solid #ece8f2;
+  padding: 12px 0;
+  overflow-wrap: anywhere;
+  color: #65577d;
+  font-size: 11px;
+}
+.capability-page > .capability-activity {
+  margin-top: 0;
+}
+.capability-page .governed-action-card,
+.capability-page .program-inspector {
+  min-width: 0;
+}
+.capability-page .python-program-grid {
+  min-width: 650px;
+}
+.python-execution {
+  grid-template-columns: minmax(0, 1fr);
+}
+.artifact-inspector {
+  min-width: 0;
+}
+.program-code {
+  min-width: 0;
+  max-width: 100%;
+  max-height: 360px;
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #faf9fd;
+  font-size: 12px;
+  line-height: 1.65;
+}
+.python-program-detail dl {
+  display: grid;
+  gap: 8px;
+  margin: 16px 0;
+}
+.python-program-detail dd {
+  min-width: 0;
+  margin: 0 0 8px;
+}
+.execution-status-card {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 14px 16px;
+  background: #f8f6fc;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  overflow-wrap: anywhere;
+}
+.execution-status-card > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.capability-page .python-source-editor {
+  width: 100%;
+  min-height: 250px;
+  font-size: 12px;
+  line-height: 1.65;
+  tab-size: 2;
+}
+.capability-page .python-authoring-fields {
+  gap: 16px;
+}
+.capability-page .python-authoring-fields label {
+  min-width: 0;
+}
+.capability-page .python-authoring-fields input,
+.capability-page .python-authoring-fields select,
+.capability-page .python-authoring-fields textarea {
+  min-width: 0;
+  max-width: 100%;
+}
+.workspace-list-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: end;
+  margin: 18px 0;
+}
+.workspace-list-toolbar label {
+  display: grid;
+  gap: 6px;
+  font-size: 11px;
+  color: #655a76;
+}
+.workspace-list-toolbar input {
+  min-width: 220px;
+}
+.workspace-list-toolbar > span {
+  margin-left: auto;
+  font-size: 11px;
+  color: #70647e;
+}
+.workspace-window-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  margin: 14px 0;
+}
+.workspace-window-controls span {
+  margin-right: auto;
+  color: #70647e;
+}
+.workspace-window-controls button {
+  padding: 7px 11px;
+}
+.workflow-activity-filter {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 16px;
+  font-size: 11px;
+  color: #655a76;
+}
+.workflow-activity-filter input {
+  width: 100%;
+  min-width: 0;
+}
+@media (max-width: 700px) {
+  .workspace-section-nav,
+  .workspace-tabs {
+    gap: 3px;
+    padding: 4px;
+  }
+  .workspace-section-nav button,
+  .workspace-tabs button {
+    flex: 1 1 auto;
+    padding: 9px 10px;
+    font-size: 11px;
+  }
+  .capability-page .python-authoring-fields {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .capability-page .reviewed-inline-actions,
+  .capability-page .reviewed-inline-action {
+    flex-wrap: wrap;
+  }
+  .workspace-list-toolbar label,
+  .workspace-list-toolbar input {
+    width: 100%;
+    min-width: 0;
+  }
+  .workspace-list-toolbar > span {
+    margin-left: 0;
+  }
+}
+
+.workspace-object-id {
+  display: block;
+  font-weight: 400;
+  font-size: 10px;
+  color: #70647e;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+}
+.workspace-editor-heading {
+  border-top: 1px solid #e6e0ed;
+  padding-top: 20px;
+  margin: 20px 0 16px;
+}
+.workspace-editor-heading small {
+  color: #70647e;
+  font-size: 9px;
+  letter-spacing: 0.09em;
+}
+.workspace-editor-heading h3 {
+  margin: 6px 0 0;
+  font-size: 17px;
+}
+.guided-page .guided-layout > *,
+.guided-page .timeline-list li > * {
+  min-width: 0;
+}
+.guided-page .timeline-list li {
+  grid-template-columns: minmax(120px, 0.6fr) minmax(0, 1fr) minmax(90px, auto);
+}
+.guided-page .timeline-list li > *,
+.guided-page .assignment-card p,
+.guided-page .workflow-destination p {
+  overflow-wrap: anywhere;
+}
+.guided-page .workspace-window-controls {
+  flex-wrap: wrap;
+}
+.guided-page .workspace-window-controls button {
+  font-size: 10px;
+}
+.guided-page .progress-label {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+@media (max-width: 700px) {
+  .guided-page .timeline-list li {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 7px;
+  }
+  .guided-page .timeline-list small {
+    font-size: 11px;
+  }
+}
+
+.workspace-create-disclosure {
+  margin: 18px 0;
+  border: 1px solid #e1dce9;
+  border-radius: 7px;
+}
+.workspace-create-disclosure > summary {
+  padding: 13px 16px;
+  color: #5f4885;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+  background: #f8f6fc;
+}
+.workspace-create-disclosure > .program-inspector {
+  border: 0;
+  margin: 0;
+}
+
+/* Python authoring and execution share bounded fields and explicit action rows. */
+.python-workspace .section-heading-row {
+  align-items: start;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.python-workspace .section-heading-row > div {
+  min-width: 0;
+}
+.python-workspace .section-heading-row :is(h2, h3) {
+  margin: 6px 0;
+}
+.python-workspace .section-heading-row p {
+  margin: 0;
+  color: var(--muted);
+}
+.python-workspace .section-heading-row > button,
+.python-workspace .section-heading-row > .reviewed-inline-actions {
+  flex-shrink: 0;
+}
+.python-workspace > .program-inspector {
+  border-top: 1px solid var(--line);
+  margin-top: 20px;
+  padding-top: 20px;
+}
+.python-workspace .workspace-create-disclosure > .python-authoring {
+  padding: 20px;
+}
+.python-workspace .python-authoring-fields:has(input[type="datetime-local"]) {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  max-width: 1120px;
+}
+.python-workspace .python-authoring-fields > button {
+  align-self: end;
+  justify-self: start;
+  width: auto;
+}
+.python-workspace .execution-status-fields {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  max-width: 880px;
+  align-items: end;
+}
+.python-workspace .reviewed-inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.python-workspace .reviewed-inline-actions > .review-check {
+  flex-basis: 100%;
+  margin: 0;
+}
+.python-workspace .authority-summary {
+  max-width: 1120px;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.python-workspace .authority-scope {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  margin: 0;
+  padding: 12px 14px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.python-workspace .authority-scope legend {
+  color: var(--muted);
+  font-size: 12px;
+}
+.python-workspace .authority-scope label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.python-workspace .python-program-grid :is(th, td):not(:nth-child(2)) {
+  text-align: left;
+}
+.python-workspace
+  .python-schedules
+  .python-program-grid
+  :is(th, td):is(:nth-child(3), :nth-child(5)) {
+  text-align: right;
+}
+@media (max-width: 700px) {
+  .python-workspace .section-heading-row {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .python-workspace .section-heading-row > div:first-child {
+    flex-basis: 100%;
+  }
+  .python-workspace .workspace-create-disclosure > .python-authoring {
+    padding: 16px;
+  }
+  .python-workspace .python-authoring-fields,
+  .python-workspace .python-authoring-fields:has(input[type="datetime-local"]) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .python-workspace .python-authoring-fields > button {
+    width: 100%;
+  }
+}

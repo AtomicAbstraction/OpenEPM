@@ -1,0 +1,317 @@
+{
+  "format": "openepm-owner-decision-packet-v1",
+  "status": "decisions-pending",
+  "approvalsRecorded": false,
+  "generatedFrom": {
+    "sourceCommit": "280def64d9a16d61c00f8916f9e21b218f102a08",
+    "provenanceSha256": "4f6ea53b375abfb619cd15348dd0c036788cef605699fa64b9263cad4d9df8e8",
+    "reviewMatrixSha256": "a55d892e09928488c135f15f6013adad65262364cda5cb9c400d56aad0971288",
+    "partialPolicySha256": "fe11b2cd6e145fb1435a8d081abed0cc56030fbd9d2ee6b429406c1b50e1fb29",
+    "residualDossierSha256": "9bae92ad5af318421850f360d27cc5a4b264711f3f4666eeda0e8a406917c4c5"
+  },
+  "legalReviewRequired": [
+    {
+      "id": "license-certifi",
+      "decisionType": "external-legal-review",
+      "package": "certifi",
+      "version": "2026.10.23",
+      "evidence": {
+        "residualDossierSha256": "64ca6de1b9be68056ca6570d19d5c82c7e5a3317e88a7cf9549fbbe1d2b0a33e",
+        "rawLicenseEvidenceSha256": [
+          "e93716da6b9c0d5a4a1df60fe695b370f0695603d21f6f83f053e42cfc10caf7"
+        ]
+      },
+      "question": "Determine whether MPL-2.0 governs the modified certificate bundle and identify any certificate-source attribution obligations.",
+      "safeDefault": "Keep this package unresolved and block trusted source compliance.",
+      "options": [
+        {
+          "id": "legal-reviewed-policy",
+          "recommendedProcess": true,
+          "effect": "Record a counsel-reviewed SPDX expression, file scopes, attribution and NOTICE obligations.",
+          "candidateExpressions": [
+            "MPL-2.0 with reviewed bundle attributions",
+            "custom/file-scoped expression supplied by legal review"
+          ]
+        },
+        {
+          "id": "replace-or-exclude",
+          "recommendedProcess": false,
+          "effect": "Replace the dependency or exclude its feature, then regenerate locks, wheel evidence and the complete license review."
+        }
+      ],
+      "unlocks": [
+        "P27 trusted source-license policy",
+        "P27 deterministic source SPDX and notices",
+        "P23/P27 final artifact compliance gate"
+      ],
+      "selectedOption": null
+    },
+    {
+      "id": "license-cffi",
+      "decisionType": "external-legal-review",
+      "package": "cffi",
+      "version": "2.1.1",
+      "evidence": {
+        "residualDossierSha256": "64ca6de1b9be68056ca6570d19d5c82c7e5a3317e88a7cf9549fbbe1d2b0a33e",
+        "rawLicenseEvidenceSha256": [
+          "5ba24ddc57067f9249add644c3afc41a5d6dc37e23433ef759d95df370b0af63"
+        ]
+      },
+      "question": "Confirm whether MIT-0 metadata covers all shipped files despite the bundled scope-and-exception language.",
+      "safeDefault": "Keep this package unresolved and block trusted source compliance.",
+      "options": [
+        {
+          "id": "legal-reviewed-policy",
+          "recommendedProcess": true,
+          "effect": "Record a counsel-reviewed SPDX expression, file scopes, attribution and NOTICE obligations.",
+          "candidateExpressions": [
+            "MIT-0 for the complete wheel",
+            "file-scoped expressions for exceptions supplied by legal review"
+          ]
+        },
+        {
+          "id": "replace-or-exclude",
+          "recommendedProcess": false,
+          "effect": "Replace the dependency or exclude its feature, then regenerate locks, wheel evidence and the complete license review."
+        }
+      ],
+      "unlocks": [
+        "P27 trusted source-license policy",
+        "P27 deterministic source SPDX and notices",
+        "P23/P27 final artifact compliance gate"
+      ],
+      "selectedOption": null
+    }
+  ],
+  "ownerProductDecisions": [
+    {
+      "id": "p24-sdk-license",
+      "decisionType": "owner-product-and-legal-confirmation",
+      "question": "Which license boundary governs the current private openepm-sdk package?",
+      "safeDefault": "Keep the SDK private and proprietary until the owner explicitly selects a future public license and legal review confirms the shipped notice text.",
+      "options": [
+        {
+          "id": "proprietary-all-rights-reserved",
+          "recommendedProcess": true,
+          "effect": "Keep the current SDK private, approval-only and proprietary with an all-rights-reserved notice; grant no public redistribution rights."
+        },
+        {
+          "id": "apache-2.0",
+          "recommendedProcess": false,
+          "effect": "Use Apache-2.0 and ship its license; preserve any applicable NOTICE content."
+        },
+        {
+          "id": "mit",
+          "recommendedProcess": false,
+          "effect": "Use MIT and ship the selected copyright and permission notice."
+        },
+        {
+          "id": "other-reviewed",
+          "recommendedProcess": false,
+          "effect": "Use another owner-specified, legally reviewed SPDX expression and notices."
+        }
+      ],
+      "unlocks": [
+        "P24 SDK wheel license metadata",
+        "P24 public SDK release envelope",
+        "P27 SDK license/SBOM coverage"
+      ],
+      "selectedOption": null
+    },
+    {
+      "id": "p24-sdk-version",
+      "decisionType": "owner-versioning",
+      "question": "What first immutable private SDK version should be included in the signed release bundle?",
+      "safeDefault": "Keep the current 0.1.0 candidate private and unpublished.",
+      "options": [
+        {
+          "id": "0.1.0",
+          "recommendedProcess": true,
+          "effect": "Publish the current pre-1.0 API as explicitly unstable under semantic versioning."
+        },
+        {
+          "id": "1.0.0",
+          "recommendedProcess": false,
+          "effect": "Declare the current public API stable and require compatibility discipline from the first release."
+        },
+        {
+          "id": "owner-version",
+          "recommendedProcess": false,
+          "effect": "Use another exact PEP 440 version and rebuild every digest-bound SDK artifact."
+        }
+      ],
+      "evidence": {
+        "currentCandidateVersion": "0.1.0"
+      },
+      "unlocks": [
+        "P24 immutable SDK artifact identity",
+        "P24 compatibility baseline",
+        "P27 release manifest SDK binding"
+      ],
+      "selectedOption": null
+    },
+    {
+      "id": "p24-sdk-registry-namespace",
+      "decisionType": "owner-naming",
+      "question": "Which private distribution boundary owns openepm-sdk?",
+      "safeDefault": "Keep the SDK inside the signed private release bundle; do not publish to an external package registry.",
+      "options": [
+        {
+          "id": "private-signed-release-bundle",
+          "recommendedProcess": true,
+          "effect": "Distribute the exact source-bound SDK wheel only inside the private signed Open EPM release bundle; installers do not contact public PyPI."
+        },
+        {
+          "id": "public-pypi-openepm-sdk",
+          "recommendedProcess": false,
+          "effect": "Publish `openepm-sdk` to the verified organization-owned PyPI project after namespace availability and ownership are proven."
+        },
+        {
+          "id": "private-python-index",
+          "recommendedProcess": false,
+          "effect": "Publish only to an organization-owned private Python index; installers require configured index trust."
+        },
+        {
+          "id": "owner-registry",
+          "recommendedProcess": false,
+          "effect": "Use another exact organization-owned registry/project coordinate and bind it into provenance."
+        }
+      ],
+      "unlocks": [
+        "P24 install coordinates",
+        "P24 immutable SDK namespace",
+        "P27 distribution provenance"
+      ],
+      "selectedOption": null
+    }
+  ],
+  "ownerSecurityOperationsDecisions": [
+    {
+      "id": "release-signing-rotation-revocation",
+      "decisionType": "owner-security-policy",
+      "question": "What signing-key lifecycle and revocation policy governs SDK and release artifacts?",
+      "safeDefault": "Keep signing offline/manual and block production publication until a rotation owner, revocation channel and trust-update process are named.",
+      "options": [
+        {
+          "id": "90-day-overlap",
+          "recommendedProcess": true,
+          "effect": "Rotate active Ed25519 signing keys at most every 90 days, publish old/new public keys during a bounded overlap, revoke immediately on compromise, and retain signed revocation history."
+        },
+        {
+          "id": "180-day-overlap",
+          "recommendedProcess": false,
+          "effect": "Rotate at most every 180 days with the same overlap/revocation controls; lower operational load but longer exposure."
+        },
+        {
+          "id": "event-driven",
+          "recommendedProcess": false,
+          "effect": "Rotate on personnel, custody, algorithm or compromise events; requires an explicit maximum age chosen by the owner before production."
+        }
+      ],
+      "requiredParameters": [
+        "rotation owner",
+        "maximum key age",
+        "overlap duration",
+        "revocation publication URL/artifact",
+        "emergency revocation SLA",
+        "offline key custody and recovery"
+      ],
+      "unlocks": [
+        "P24 SDK signature trust policy",
+        "P23/P27 artifact signing and provenance",
+        "upgrade verification and compromised-key rejection tests"
+      ],
+      "selectedOption": null
+    },
+    {
+      "id": "release-registry-destination-credentials",
+      "decisionType": "owner-operations-and-secrets",
+      "question": "Which organization-owned OCI registry receives the project-owned multi-architecture images, which upstream runtime images remain independently digest-pinned, and how are publisher credentials bounded?",
+      "safeDefault": "Do not push images; keep candidate artifacts local and unsigned until an organization-owned namespace and secret boundary are configured.",
+      "options": [
+        {
+          "id": "oidc-workload-identity",
+          "recommendedProcess": true,
+          "effect": "Use short-lived OIDC/workload credentials scoped to push exact Open EPM repositories; builders receive no registry-admin or pull-secret management rights."
+        },
+        {
+          "id": "scoped-robot-account",
+          "recommendedProcess": false,
+          "effect": "Use a dedicated short-lived or regularly rotated robot token scoped only to exact repositories; store it in the release secret manager, never source/Compose/transcripts."
+        },
+        {
+          "id": "owner-registry-boundary",
+          "recommendedProcess": false,
+          "effect": "Use another registry/auth mechanism only after documenting host, namespace, immutable-tag/digest policy, credential issuer, scope, rotation and audit."
+        }
+      ],
+      "requiredParameters": [
+        "registry hostname",
+        "organization namespace",
+        "project-owned repository names",
+        "publisher identity",
+        "credential issuer/storage",
+        "push scope",
+        "rotation/revocation owner",
+        "immutable digest/tag retention"
+      ],
+      "unlocks": [
+        "P27 immutable registry digests for the complete inventory-derived runtime per architecture",
+        "P27 multi-architecture release manifest",
+        "P23 clean-host install and provenance qualification"
+      ],
+      "selectedOption": null
+    }
+  ],
+  "retiredLegalDecisions": [
+    {
+      "id": "license-bleach",
+      "package": "bleach",
+      "version": "6.4.0",
+      "reason": "Hosted Jupyter dependency removed from executable release inputs; historical license evidence remains in source history.",
+      "selectedOption": null
+    },
+    {
+      "id": "license-json5",
+      "package": "json5",
+      "version": "0.17.3",
+      "reason": "Hosted Jupyter dependency removed from executable release inputs; historical license evidence remains in source history.",
+      "selectedOption": null
+    },
+    {
+      "id": "license-jupyter-builder",
+      "package": "jupyter-builder",
+      "version": "1.2.4",
+      "reason": "Hosted Jupyter dependency removed from executable release inputs; historical license evidence remains in source history.",
+      "selectedOption": null
+    },
+    {
+      "id": "license-parso",
+      "package": "parso",
+      "version": "0.8.7",
+      "reason": "Hosted Jupyter dependency removed from executable release inputs; historical license evidence remains in source history.",
+      "selectedOption": null
+    },
+    {
+      "id": "license-prometheus-client",
+      "package": "prometheus-client",
+      "version": "0.26.0",
+      "reason": "Hosted Jupyter dependency removed from executable release inputs; historical license evidence remains in source history.",
+      "selectedOption": null
+    },
+    {
+      "id": "license-python-dateutil",
+      "package": "python-dateutil",
+      "version": "3.0.0",
+      "reason": "Hosted Jupyter dependency removed from executable release inputs; historical license evidence remains in source history.",
+      "selectedOption": null
+    }
+  ],
+  "dependencyScope": {
+    "lockPath": "requirements-postgres.lock",
+    "lockSha256": "5901c2d0a3787e37fade607b1404a7f748b487d3807f5209909615e283c2e341",
+    "status": "target-source-and-image-inventory-regeneration-required",
+    "trustedSourceCompliance": false,
+    "boundary": "Retained exact evidence is unreviewed historical input. Current builder/runtime dependency and license evidence must be regenerated from the target release; removal is not a legal approval."
+  }
+}

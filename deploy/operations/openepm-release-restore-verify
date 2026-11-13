@@ -1,0 +1,3 @@
+#!/usr/local/bin/python
+from scripts.openepm_release_operations import main
+main("restore-verify")

@@ -1,0 +1,35 @@
+{
+  "name": "openepm-web-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "browser:rules": "node ../tests/check_packaged_rules_workspace.mjs",
+    "build": "tsc -b && vite build",
+    "check": "tsc -b --pretty false",
+    "dev": "vite --host 127.0.0.1",
+    "format:check": "prettier --check src package.json vite.config.ts tsconfig.json tsconfig.app.json tsconfig.node.json index.html",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "monaco-editor": "0.57.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.3",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "axe-core": "^4.11.0",
+    "jsdom": "29.0.1",
+    "prettier": "3.6.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.5",
+    "vitest": "5.0.5"
+  },
+  "overrides": {
+    "dompurify": "3.4.17"
+  }
+}

@@ -1,0 +1,1083 @@
+#!/bin/sh
+# Host-light Open EPM release controller. Installation consumes only a release
+# Compose file, immutable images and operator-supplied configuration/secrets.
+set -eu
+set -f
+
+EX_USAGE=64
+EX_UNAVAILABLE=69
+EX_CONFIG=78
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+compose_file=${EPM_RELEASE_COMPOSE_FILE:-"$script_dir/compose.yaml"}
+identity_compose_file=${EPM_RELEASE_IDENTITY_COMPOSE_FILE:-"$script_dir/compose.identity.yaml"}
+env_file=${EPM_RELEASE_ENV_FILE:-"$script_dir/openepm.env"}
+release_manifest=${EPM_RELEASE_MANIFEST_FILE:-"$script_dir/release-manifest.json"}
+release_manifest_signature=${EPM_RELEASE_MANIFEST_SIGNATURE_FILE:-"$script_dir/release-manifest.sig"}
+release_inventory=${EPM_RELEASE_INVENTORY_FILE:-"$script_dir/release-inventory.json"}
+signing_root=${EPM_SIGNING_OFFLINE_ROOT_FILE:-/etc/openepm/trust/offline-root-public.pem}
+signing_policy=${EPM_SIGNING_TRUST_POLICY_FILE:-"$script_dir/signing-trust-policy.json"}
+signing_policy_signature=${EPM_SIGNING_TRUST_POLICY_SIGNATURE_FILE:-"$script_dir/signing-trust-policy.sig"}
+signing_sequence_state=${EPM_SIGNING_TRUST_SEQUENCE_STATE_FILE:-/var/lib/openepm/signing-trust-policy-sequence}
+bootstrap_verifier="$script_dir/verify_openepm_release_bootstrap.py"
+project_name=${EPM_RELEASE_PROJECT_NAME:-openepm}
+sandbox_socket=${EPM_SANDBOX_CONTROL_SOCKET:-/run/openepm-sandbox/sandbox-launcher.sock}
+install_started_services=0
+
+usage() {
+    printf '%s\n' 'usage: epmctl doctor|up|status|logs|stop|install|upgrade|backup|restore|activate-restored|renew-certificates --staging-dir DIR|uninstall'
+}
+
+fail() {
+    code=$1
+    shift
+    printf 'epmctl: %s\n' "$*" >&2
+    exit "$code"
+}
+
+architecture() {
+    machine=$(uname -m)
+    case "$machine" in
+        x86_64|amd64) printf '%s\n' amd64 ;;
+        aarch64|arm64) printf '%s\n' arm64 ;;
+        *) fail "$EX_CONFIG" "unsupported host architecture: $machine" ;;
+    esac
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || fail "$EX_CONFIG" "required command is unavailable: $1"
+}
+
+require_compose() {
+    require_command docker
+    docker info >/dev/null 2>&1 || fail "$EX_CONFIG" 'Docker daemon is unavailable'
+    if docker compose version >/dev/null 2>&1; then
+        compose_frontend=docker
+    elif command -v docker-compose >/dev/null 2>&1 && docker-compose version >/dev/null 2>&1; then
+        compose_frontend=docker-compose
+    else
+        fail "$EX_CONFIG" 'Docker Compose v2 is unavailable'
+    fi
+}
+
+require_release_config() {
+    [ -f "$compose_file" ] || fail "$EX_CONFIG" "release Compose file is unavailable: $compose_file"
+    [ -f "$env_file" ] || fail "$EX_CONFIG" "release environment file is unavailable: $env_file"
+    [ -r "$env_file" ] || fail "$EX_CONFIG" "release environment file is not readable: $env_file"
+    if grep -Eq '^EPM_(NOTEBOOK|HUB)_' "$env_file"; then
+        fail "$EX_CONFIG" 'retired Jupyter configuration must be removed before using this release'
+    fi
+    [ -f "$identity_compose_file" ] && [ -r "$identity_compose_file" ] ||
+        fail "$EX_CONFIG" "bundled-identity Compose overlay is unavailable: $identity_compose_file"
+}
+
+release_value() {
+    sed -n "s/^${1}=//p" "$env_file"
+}
+
+inventory_field() {
+    field=$1
+    require_command python3
+    python3 -c '
+import json, sys
+path, field = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    value = json.load(stream)
+if value.get("format") != "openepm-release-inventory-v2":
+    raise ValueError("unsupported release inventory")
+profile = value["profile"]
+items = profile[field]
+if not isinstance(items, list) or not items or len(items) != len(set(items)):
+    raise ValueError("invalid inventory field")
+print(" ".join(items))
+' "$release_inventory" "$field" 2>/dev/null ||
+        fail "$EX_CONFIG" "release inventory field is invalid: $field"
+}
+
+keycloak_initial_subject() {
+    result=$1
+    prefix='{"format":"openepm-keycloak-bootstrap-result-v1","initialAdministratorSubject":"'
+    suffix='"}'
+    case "$result" in "$prefix"*"$suffix") ;; *) return 1 ;; esac
+    subject=${result#"$prefix"}
+    subject=${subject%"$suffix"}
+    [ "$result" = "$prefix$subject$suffix" ] || return 1
+    printf '%s\n' "$subject" | grep -Eq \
+        '^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$' || return 1
+    printf '%s\n' "$subject"
+}
+
+configured_identity_mode() {
+    mode=$(release_value EPM_IDENTITY_MODE)
+    case "$mode" in bundled) printf '%s\n' "$mode" ;;
+        *) fail "$EX_CONFIG" 'EPM_IDENTITY_MODE must be bundled; external identity profiles are retired' ;;
+    esac
+}
+
+
+configured_encryption_at_rest_mode() {
+    mode=$(release_value EPM_ENCRYPTION_AT_REST_MODE)
+    case "$mode" in
+        deployment-volume) printf '%s\n' "$mode" ;;
+        none) fail "$EX_CONFIG" 'EPM_ENCRYPTION_AT_REST_MODE=none is not permitted for production' ;;
+        *) fail "$EX_CONFIG" 'EPM_ENCRYPTION_AT_REST_MODE must explicitly be deployment-volume or none' ;;
+    esac
+}
+
+require_encrypted_persistent_volumes() {
+    [ "$(configured_encryption_at_rest_mode)" = deployment-volume ] ||
+        fail "$EX_CONFIG" 'deployment-volume encryption mode is required'
+    require_command lsb_release
+    require_command findmnt
+    require_command lsblk
+    require_command cryptsetup
+    require_command dmsetup
+    require_command realpath
+    [ "$(lsb_release -is 2>/dev/null)" = Ubuntu ] ||
+        fail "$EX_CONFIG" 'deployment-volume encryption verification requires an Ubuntu host'
+    paths=$(release_value EPM_ENCRYPTED_VOLUME_PATHS)
+    [ -n "$paths" ] || fail "$EX_CONFIG" 'EPM_ENCRYPTED_VOLUME_PATHS is required'
+    docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null) ||
+        fail "$EX_CONFIG" 'Docker root directory is unavailable'
+    backup_root=$(release_value EPM_BACKUP_EXPORT_DIR)
+    required_roots="$docker_root $backup_root $(release_value EPM_SECRETS_DIR) $(release_value EPM_TLS_DIR) $(release_value EPM_PROXY_CONFIG_DIR)"
+    for required in $required_roots; do
+        case " $paths " in *" $required "*) ;;
+            *) fail "$EX_CONFIG" "encrypted-volume inventory omits persistent path: $required" ;;
+        esac
+    done
+    seen=''
+    for path in $paths; do
+        case "$path" in /*) ;; *) fail "$EX_CONFIG" 'encrypted-volume paths must be absolute' ;; esac
+        case "$path" in *[!A-Za-z0-9_./-]*|*/../*|*/..)
+            fail "$EX_CONFIG" "encrypted-volume path is not canonical and bounded: $path" ;;
+        esac
+        [ -d "$path" ] && [ ! -L "$path" ] ||
+            fail "$EX_CONFIG" "encrypted-volume path is unavailable or symbolic: $path"
+        [ "$(realpath -e -- "$path" 2>/dev/null)" = "$path" ] ||
+            fail "$EX_CONFIG" "encrypted-volume path must be its canonical absolute path: $path"
+        case " $seen " in *" $path "*) fail "$EX_CONFIG" "duplicate encrypted-volume path: $path" ;; esac
+        seen="$seen $path"
+        source=$(findmnt --noheadings --output SOURCE --target "$path" 2>/dev/null | tr -d ' ')
+        case "$source" in /dev/mapper/*) ;; *)
+            fail "$EX_CONFIG" "persistent path is not backed by an explicit dm-crypt mapper: $path" ;;
+        esac
+        [ "$(lsblk --noheadings --output TYPE "$source" 2>/dev/null | tr -d ' ')" = crypt ] ||
+            fail "$EX_CONFIG" "persistent path backing device is not dm-crypt: $path"
+        mapper=${source#/dev/mapper/}
+        cryptsetup status "$mapper" 2>/dev/null | grep -Eq '^[[:space:]]*type:[[:space:]]*LUKS(1|2)?[[:space:]]*$' ||
+            fail "$EX_CONFIG" "persistent path mapper is not an active LUKS device: $path"
+        dmsetup table "$mapper" --target crypt 2>/dev/null | grep -q . ||
+            fail "$EX_CONFIG" "persistent path mapper has no active dm-crypt target: $path"
+    done
+    printf 'encryption_at_rest=deployment-volume\nencrypted_volume_paths=%s\n' "$(printf '%s\n' "$paths" | wc -w | tr -d ' ')"
+}
+
+require_https_value() {
+    key=$1
+    value=$(release_value "$key")
+    printf '%s\n' "$value" | grep -Eq \
+        '^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[^[:space:]@#]*)?$' ||
+        fail "$EX_CONFIG" "$key must be an absolute credential-free HTTPS URL"
+}
+
+validate_mode_configuration() {
+    identity_mode=$(configured_identity_mode)
+    require_https_value EPM_OIDC_ISSUER
+    require_https_value EPM_OIDC_JWKS_URL
+    for key in EPM_OIDC_AUD_MCP EPM_OIDC_AUD_WEB; do
+        value=$(release_value "$key")
+        printf '%s\n' "$value" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$' ||
+            fail "$EX_CONFIG" "$key must be a non-empty bounded audience identifier"
+    done
+    [ "$(release_value EPM_OIDC_AUD_MCP)" != "$(release_value EPM_OIDC_AUD_WEB)" ] ||
+        fail "$EX_CONFIG" 'MCP and browser OIDC audiences must be distinct'
+    identity_host=$(release_value EPM_IDENTITY_PUBLIC_HOST)
+    printf '%s\n' "$identity_host" | grep -Eq '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$' ||
+        fail "$EX_CONFIG" 'EPM_IDENTITY_PUBLIC_HOST must be a lower-case DNS hostname'
+    [ "$(release_value EPM_OIDC_ISSUER)" = "https://$identity_host/realms/openepm" ] ||
+        fail "$EX_CONFIG" 'bundled EPM_OIDC_ISSUER must use the configured identity host and openepm realm'
+    [ "$(release_value EPM_OIDC_JWKS_URL)" = \
+      'https://identity:8443/realms/openepm/protocol/openid-connect/certs' ] ||
+        fail "$EX_CONFIG" 'bundled EPM_OIDC_JWKS_URL must use the internal HTTPS identity endpoint'
+    [ "$(release_value EPM_KEYCLOAK_DIRECTORY_URL)" = 'https://identity:8443' ] ||
+        fail "$EX_CONFIG" 'bundled Keycloak directory must use the internal HTTPS identity endpoint'
+    [ -z "$(release_value EPM_OIDC_ALLOW_INTERNAL_HTTP_JWKS)" ] ||
+        fail "$EX_CONFIG" 'portable bundled identity does not allow cleartext JWKS transport'
+    operator_issuer=$(release_value EPM_PLATFORM_OPERATOR_ISSUER)
+    [ "$operator_issuer" = "$(release_value EPM_OIDC_ISSUER)" ] ||
+        fail "$EX_CONFIG" 'platform operator issuer must equal the configured EPM OIDC issuer'
+}
+
+file_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
+file_uid() {
+    stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null
+}
+
+require_sandbox_config() {
+    secrets_dir=$(release_value EPM_SECRETS_DIR)
+    [ -n "$secrets_dir" ] || fail "$EX_CONFIG" 'EPM_SECRETS_DIR is required'
+    sandbox_profiles=${EPM_SANDBOX_PROFILES_FILE:-"$secrets_dir/epm_python_builder_profiles.json"}
+    sandbox_key=${EPM_SANDBOX_CONTROL_KEY_FILE:-"$secrets_dir/epm_sandbox_control_key"}
+    for path in "$sandbox_profiles" "$sandbox_key"; do
+        [ -f "$path" ] && [ ! -L "$path" ] || fail "$EX_CONFIG" "sandbox configuration is unavailable or symbolic: $path"
+        [ "$(file_uid "$path")" = 0 ] || fail "$EX_CONFIG" "sandbox configuration must be root-owned: $path"
+    done
+    case "$(file_mode "$sandbox_profiles")" in 400|440|444|600|640|644) ;; *) fail "$EX_CONFIG" 'sandbox profile permissions are too broad' ;; esac
+    case "$(file_mode "$sandbox_key")" in 400|600) ;; *) fail "$EX_CONFIG" 'sandbox control-key permissions are too broad' ;; esac
+    [ "$(wc -c < "$sandbox_key" | tr -d ' ')" -ge 32 ] || fail "$EX_CONFIG" 'sandbox control key is shorter than 32 bytes'
+}
+
+require_secret_files() {
+    secrets_dir=$(release_value EPM_SECRETS_DIR)
+    [ -d "$secrets_dir" ] && [ ! -L "$secrets_dir" ] ||
+        fail "$EX_CONFIG" "secrets directory is unavailable or symbolic: $secrets_dir"
+    for name in $(inventory_field secrets); do
+        path=$secrets_dir/$name
+        [ -f "$path" ] && [ ! -L "$path" ] ||
+            fail "$EX_CONFIG" "required secret is unavailable or symbolic in release inventory: $path"
+        [ "$(file_uid "$path")" = 0 ] || fail "$EX_CONFIG" "secret must be root-owned: $path"
+        case "$(file_mode "$path")" in 400|440|600|640) ;;
+            *) fail "$EX_CONFIG" "secret permissions are too broad: $path" ;; esac
+        [ -s "$path" ] || fail "$EX_CONFIG" "required secret is empty: $path"
+    done
+}
+
+prepare_directories() {
+    tls_dir=$(release_value EPM_TLS_DIR)
+    proxy_dir=$(release_value EPM_PROXY_CONFIG_DIR)
+    export_dir=$(release_value EPM_BACKUP_EXPORT_DIR)
+    socket_dir=$(release_value EPM_SANDBOX_SOCKET_DIR)
+    [ -n "$tls_dir" ] || fail "$EX_CONFIG" 'EPM_TLS_DIR is required'
+    [ -n "$proxy_dir" ] || fail "$EX_CONFIG" 'EPM_PROXY_CONFIG_DIR is required'
+    [ -n "$export_dir" ] || fail "$EX_CONFIG" 'EPM_BACKUP_EXPORT_DIR is required'
+    [ -n "$socket_dir" ] || socket_dir=/run/openepm
+    [ -d "$tls_dir" ] && [ ! -L "$tls_dir" ] ||
+        fail "$EX_CONFIG" "TLS directory is unavailable or symbolic: $tls_dir"
+    for certificate in tls.crt tls.key; do
+        [ -f "$tls_dir/$certificate" ] && [ ! -L "$tls_dir/$certificate" ] ||
+            fail "$EX_CONFIG" "TLS material is unavailable or symbolic: $tls_dir/$certificate"
+    done
+    mkdir -p -m 0700 "$export_dir" "$socket_dir" ||
+        fail "$EX_CONFIG" 'cannot prepare release data directories'
+    mkdir -p -m 0755 "$proxy_dir" ||
+        fail "$EX_CONFIG" 'cannot prepare proxy configuration directory'
+    [ ! -L "$export_dir" ] && [ ! -L "$socket_dir" ] && [ ! -L "$proxy_dir" ] ||
+        fail "$EX_CONFIG" 'release data directories must not be symbolic links'
+    # The backup/restore tooling runs as the fixed operations UID (10001) inside
+    # its read-only container.  The export root must be writable by that UID, or
+    # every backup/restore/upgrade fails on a clean install.
+    chown 10001:10001 "$export_dir" ||
+        fail "$EX_CONFIG" 'cannot assign the backup export directory to the operations service'
+    chmod 0700 "$export_dir" ||
+        fail "$EX_CONFIG" 'cannot protect the backup export directory'
+    public_host=$(release_value EPM_PUBLIC_HOST)
+    printf '%s\n' "$public_host" | grep -Eq '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$' ||
+        fail "$EX_CONFIG" 'EPM_PUBLIC_HOST must be a lower-case DNS hostname'
+    identity_host=$(release_value EPM_IDENTITY_PUBLIC_HOST)
+    [ "$identity_host" != "$public_host" ] ||
+        fail "$EX_CONFIG" 'application and identity public hostnames must be distinct'
+    proxy_template=$script_dir/../proxy/openepm-base.yaml.template
+    [ -f "$proxy_template" ] || fail "$EX_CONFIG" 'proxy route template is unavailable'
+    sed -e "s/__EPM_PUBLIC_HOST__/$public_host/g" \
+        -e "s/__EPM_IDENTITY_PUBLIC_HOST__/$identity_host/g" \
+        "$proxy_template" > "$proxy_dir/openepm-base.yaml.tmp" ||
+        fail "$EX_CONFIG" 'cannot render proxy route configuration'
+    chmod 0644 "$proxy_dir/openepm-base.yaml.tmp" ||
+        fail "$EX_CONFIG" 'cannot protect proxy route configuration'
+    mv "$proxy_dir/openepm-base.yaml.tmp" "$proxy_dir/openepm-base.yaml" ||
+        fail "$EX_CONFIG" 'cannot publish proxy route configuration'
+}
+
+require_launcher_active() {
+    require_command systemctl
+    systemctl is-active --quiet openepm-sandbox-launcher.service ||
+        fail "$EX_UNAVAILABLE" 'trusted sandbox launcher service is not active'
+    [ -S "$sandbox_socket" ] || fail "$EX_UNAVAILABLE" "trusted sandbox launcher socket is unavailable: $sandbox_socket"
+}
+
+
+
+
+require_no_external_sandboxes() {
+    active_builds=$(docker ps -q --filter label=openepm.python-build=true 2>/dev/null) ||
+        fail "$EX_UNAVAILABLE" 'cannot inspect active Python build sandboxes'
+    [ -z "$active_builds" ] ||
+        fail "$EX_CONFIG" 'restored activation requires all Python build sandboxes to finish or be cancelled'
+}
+
+validate_release_images() {
+    keys="EPM_APPLICATION_IMAGE EPM_DATABASE_IMAGE EPM_OPERATIONS_IMAGE EPM_BUILDER_IMAGE EPM_PROXY_IMAGE EPM_BROWSER_GATEWAY_IMAGE EPM_BROWSER_SESSION_STORE_IMAGE EPM_IDENTITY_IMAGE EPM_OTEL_COLLECTOR_IMAGE"
+    for key in $keys
+    do
+        value=$(sed -n "s/^${key}=//p" "$env_file")
+        count=$(printf '%s\n' "$value" | sed '/^$/d' | wc -l | tr -d ' ')
+        [ "$count" = 1 ] || fail "$EX_CONFIG" "$key must occur exactly once in the release environment"
+        printf '%s\n' "$value" | grep -Eq '^[^@[:space:]]+@sha256:[a-f0-9]{64}$' ||
+            fail "$EX_CONFIG" "$key must be an immutable image reference with a sha256 digest"
+    done
+}
+
+validate_release_manifest() {
+    [ -f "$release_manifest" ] && [ -r "$release_manifest" ] ||
+        fail "$EX_CONFIG" "release manifest is unavailable: $release_manifest"
+    for trust_file in "$release_manifest_signature" "$signing_root" "$signing_policy" "$signing_policy_signature" "$bootstrap_verifier"; do
+        [ -f "$trust_file" ] && [ -r "$trust_file" ] && [ ! -L "$trust_file" ] ||
+            fail "$EX_CONFIG" "release trust material is unavailable or symbolic: $trust_file"
+    done
+    [ -f "$release_inventory" ] && [ -r "$release_inventory" ] && [ ! -L "$release_inventory" ] ||
+        fail "$EX_CONFIG" "release inventory is unavailable or symbolic: $release_inventory"
+    operations_image=$(release_value EPM_OPERATIONS_IMAGE)
+    bundle_dir=$(CDPATH= cd -- "$(dirname -- "$release_manifest")" && pwd)
+    signing_policy_dir=$(CDPATH= cd -- "$(dirname -- "$signing_policy")" && pwd)
+    signing_policy_name=$(basename -- "$signing_policy")
+    manifest_name=$(basename -- "$release_manifest")
+    env_dir=$(CDPATH= cd -- "$(dirname -- "$env_file")" && pwd)
+    [ "$bundle_dir" = "$env_dir" ] ||
+        fail "$EX_CONFIG" 'release manifest and environment must share one immutable bundle directory'
+    host_arch=linux/$(architecture)
+    # Establish publisher trust and the verifier image identity on the host
+    # before executing any code supplied by that image.  The full verifier
+    # still performs the complete artifact/evidence contract below.
+    require_command python3
+    configured_minimum=${EPM_MINIMUM_TRUST_POLICY_SEQUENCE:-}
+    printf '%s\n' "$configured_minimum" | grep -Eq '^[1-9][0-9]*$' ||
+        fail "$EX_CONFIG" 'EPM_MINIMUM_TRUST_POLICY_SEQUENCE must be supplied by the approved release channel'
+    minimum_sequence=$configured_minimum
+    if [ -e "$signing_sequence_state" ]; then
+        [ -f "$signing_sequence_state" ] && [ -r "$signing_sequence_state" ] && [ ! -L "$signing_sequence_state" ] ||
+            fail "$EX_CONFIG" 'stored trust-policy sequence is unavailable or symbolic'
+        stored_sequence=$(cat "$signing_sequence_state")
+        printf '%s\n' "$stored_sequence" | grep -Eq '^[1-9][0-9]*$' ||
+            fail "$EX_CONFIG" 'stored trust-policy sequence is invalid'
+        if [ "$stored_sequence" -gt "$minimum_sequence" ]; then
+            minimum_sequence=$stored_sequence
+        fi
+    fi
+    authenticated_sequence=$(python3 "$bootstrap_verifier" \
+        --manifest "$release_manifest" \
+        --manifest-signature "$release_manifest_signature" \
+        --inventory "$release_inventory" \
+        --architecture "$host_arch" \
+        --selected-operations "$operations_image" \
+        --trusted-root-public-key "$signing_root" \
+        --trust-policy "$signing_policy" \
+        --trust-policy-signature "$signing_policy_signature" \
+        --minimum-trust-policy-sequence "$minimum_sequence" 2>/dev/null) ||
+        fail "$EX_CONFIG" 'host release bootstrap verification failed'
+    printf '%s\n' "$authenticated_sequence" | grep -Eq '^[1-9][0-9]*$' ||
+        fail "$EX_CONFIG" 'host release bootstrap returned an invalid policy sequence'
+    docker run --rm --read-only --network none --user 10001:10001 \
+        -v "$bundle_dir:/release:ro" \
+        -v "$release_manifest_signature:/run/openepm-trust/release-manifest.sig:ro" \
+        -v "$signing_root:/run/openepm-trust/offline-root-public.pem:ro" \
+        -v "$signing_policy_dir:/run/openepm-trust/policy:ro" \
+        -v "$signing_policy_signature:/run/openepm-trust/signing-trust-policy.sig:ro" \
+        "$operations_image" \
+        python -m scripts.validate_release_manifest \
+        --manifest "/release/$manifest_name" \
+        --environment "/release/$(basename -- "$env_file")" \
+        --host-architecture "$host_arch" \
+        --manifest-signature /run/openepm-trust/release-manifest.sig \
+        --trusted-root-public-key /run/openepm-trust/offline-root-public.pem \
+        --trust-policy "/run/openepm-trust/policy/$signing_policy_name" \
+        --trust-policy-signature /run/openepm-trust/signing-trust-policy.sig \
+        --minimum-trust-policy-sequence "$minimum_sequence" >/dev/null ||
+        fail "$EX_CONFIG" 'release manifest validation failed'
+    python3 -c '
+import os, pathlib, sys, tempfile
+path = pathlib.Path(sys.argv[1])
+sequence = sys.argv[2]
+path.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+descriptor, temporary = tempfile.mkstemp(prefix=".trust-sequence-", dir=path.parent)
+try:
+    os.fchmod(descriptor, 0o640)
+    with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+        stream.write(sequence + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+' "$signing_sequence_state" "$authenticated_sequence" >/dev/null 2>&1 ||
+        fail "$EX_CONFIG" 'authenticated trust-policy sequence could not be persisted'
+}
+
+compose_call() {
+    require_compose
+    require_release_config
+    validate_mode_configuration
+    validate_release_images
+    validate_release_manifest
+    configured_identity_mode >/dev/null
+    if [ "$compose_frontend" = docker ]; then
+        docker compose --project-name "$project_name" --env-file "$env_file" -f "$compose_file" -f "$identity_compose_file" "$@"
+        return
+    fi
+    docker-compose --project-name "$project_name" --env-file "$env_file" -f "$compose_file" -f "$identity_compose_file" "$@"
+}
+
+compose_project_call() {
+    target_project=$1
+    shift
+    require_compose
+    require_release_config
+    validate_mode_configuration
+    validate_release_images
+    configured_identity_mode >/dev/null
+    if [ "$compose_frontend" = docker ]; then
+        docker compose --project-name "$target_project" --env-file "$env_file" -f "$compose_file" -f "$identity_compose_file" "$@"
+        return
+    fi
+    docker-compose --project-name "$target_project" --env-file "$env_file" -f "$compose_file" -f "$identity_compose_file" "$@"
+}
+
+compose() {
+    compose_call "$@"
+}
+
+install_failed() {
+    message=$1
+    if [ "$install_started_services" = 1 ]; then
+        compose_call stop >/dev/null 2>&1 || true
+        printf '%s\n' 'epmctl: newly started services were stopped; persistent volumes were preserved' >&2
+    else
+        printf '%s\n' 'epmctl: an existing running stack was left unchanged' >&2
+    fi
+    fail "$EX_UNAVAILABLE" "$message"
+}
+
+operations_run() {
+    compose_call --profile operations run --rm -T operations "$@"
+}
+
+require_release_tool() {
+    tool=$1
+    operations_run test -x "/usr/local/bin/$tool" >/dev/null 2>&1 ||
+        fail "$EX_UNAVAILABLE" "operations image does not contain the qualified $tool tool"
+}
+
+validate_browser_gateway_configuration() {
+    issuer=$(release_value EPM_OIDC_ISSUER)
+    web_origin=https://$(release_value EPM_PUBLIC_HOST)
+    operations_run python -m scripts.validate_release_manifest --browser-gateway \
+        --issuer "$issuer" --web-origin "$web_origin" ||
+        fail "$EX_CONFIG" 'browser gateway/session configuration differs from the fixed release contract'
+}
+
+valid_bundle_name() {
+    printf '%s\n' "$1" | grep -Eq '^openepm-base-[0-9]{8}T[0-9]{6}Z-[0-9]+$'
+}
+
+restore_marker_path() {
+    bundle=$1
+    target=$2
+    printf '%s/.%s.%s.restore-ready\n' \
+        "$(release_value EPM_BACKUP_EXPORT_DIR)" "$bundle" "$target"
+}
+
+release_manifest_sha256() {
+    require_command sha256sum
+    digest=$(sha256sum "$release_manifest") ||
+        fail "$EX_UNAVAILABLE" 'cannot digest the release manifest'
+    printf '%s\n' "${digest%% *}"
+}
+
+restore_marker_content() {
+    bundle=$1
+    target=$2
+    identity_mode=$(configured_identity_mode)
+    printf '%s\n' \
+        'format=openepm-restored-target-v2' \
+        "bundle=$bundle" \
+        "target_project=$target" \
+        "prior_project=$project_name" \
+        "release_manifest_sha256=$(release_manifest_sha256)" \
+        "identity_mode=$identity_mode"
+}
+
+write_restore_marker() {
+    bundle=$1
+    target=$2
+    marker=$(restore_marker_path "$bundle" "$target")
+    [ ! -e "$marker" ] && [ ! -L "$marker" ] ||
+        fail "$EX_CONFIG" 'restore-ready marker already exists'
+    temporary=$marker.tmp.$$
+    umask 077
+    restore_marker_content "$bundle" "$target" > "$temporary" || {
+        rm -f "$temporary"; fail "$EX_UNAVAILABLE" 'cannot prepare restore-ready marker'; }
+    chmod 0600 "$temporary" || {
+        rm -f "$temporary"; fail "$EX_UNAVAILABLE" 'cannot protect restore-ready marker'; }
+    mv "$temporary" "$marker" || {
+        rm -f "$temporary"; fail "$EX_UNAVAILABLE" 'cannot publish restore-ready marker'; }
+}
+
+validate_restore_marker() {
+    bundle=$1
+    target=$2
+    marker=$(restore_marker_path "$bundle" "$target")
+    [ -f "$marker" ] && [ ! -L "$marker" ] ||
+        fail "$EX_CONFIG" 'verified restore-ready marker is unavailable'
+    [ "$(file_mode "$marker")" = 600 ] ||
+        fail "$EX_CONFIG" 'restore-ready marker permissions are invalid'
+    expected=$(restore_marker_content "$bundle" "$target")
+    [ "$(cat "$marker")" = "$expected" ] ||
+        fail "$EX_CONFIG" 'restore-ready marker differs from current release or modes'
+}
+
+cleanup_failed_restore_target() {
+    target=$1
+    bundle=$2
+    marker=$(restore_marker_path "$bundle" "$target")
+    # The target project was required to be absent before restore, so its
+    # containers, anonymous/named project volumes and marker are run-owned.
+    # Never touch the active source project or the independently retained
+    # encrypted recovery bundle.
+    rm -f -- "$marker" "$marker.tmp.$$"
+    compose_project_call "$target" down -v --remove-orphans
+}
+
+project_profiles() {
+    configured_identity_mode >/dev/null
+    first=1
+    for profile in $(inventory_field composeProfiles); do
+        [ "$first" = 1 ] || printf ' '
+        printf '%s %s' '--profile' "$profile"
+        first=0
+    done
+    printf '\n'
+}
+
+project_services() {
+    configured_identity_mode >/dev/null
+    inventory_field services
+}
+
+upgrade_mutable_services() {
+    for service in $(project_services); do
+        case "$service" in db|control-db|identity) ;;
+            *) printf '%s\n' "$service" ;;
+        esac
+    done
+}
+
+pull_release_images() {
+    # Profiles come from the same authority used to start current and restored
+    # releases.  Operations is one-shot and therefore added only for pulling.
+    # shellcheck disable=SC2046
+    compose_call $(project_profiles) --profile operations pull
+}
+
+verify_release_health_boundaries() {
+    # Keep process reachability, dependency readiness and authentication
+    # denial as distinct evidence.  A response from a live listener is not
+    # sufficient readiness, and readiness must not stand in for the explicit
+    # unsigned-access security assertion.
+    compose_call exec -T platform python -m scripts.check_postgres_mcp_health liveness ||
+        return 1
+    compose_call exec -T platform python -m scripts.check_postgres_mcp_health readiness ||
+        return 2
+    compose_call exec -T platform python -m scripts.check_postgres_mcp_health unsigned-denial ||
+        return 3
+}
+
+start_current_release() {
+    # Values are produced only from fixed functions, never caller text.
+    # shellcheck disable=SC2046
+    compose_call $(project_profiles) up -d --wait --wait-timeout 300 \
+        $(project_services)
+}
+
+start_target_release() {
+    target=$1
+    # shellcheck disable=SC2046
+    compose_project_call "$target" $(project_profiles) up -d --wait \
+        --wait-timeout 300 $(project_services)
+}
+
+backup_release() {
+    doctor_local
+    require_secret_files
+    prepare_directories
+    # The marker prevents the container utility from mistaking an anonymous
+    # or internal path for the operator's independently mounted destination.
+    marker=$(release_value EPM_BACKUP_EXPORT_DIR)/.openepm-host-visible
+    : > "$marker" || fail "$EX_CONFIG" 'cannot prepare the backup export destination'
+    chmod 0600 "$marker" || fail "$EX_CONFIG" 'cannot protect the backup export marker'
+    require_release_tool openepm-release-backup
+    output=$(operations_run /usr/local/bin/openepm-release-backup) ||
+        fail "$EX_UNAVAILABLE" 'verified backup/export failed; no complete bundle was reported'
+    bundle=$(printf '%s\n' "$output" | sed -n 's/^bundle=//p')
+    valid_bundle_name "$bundle" ||
+        fail "$EX_UNAVAILABLE" 'backup tool did not return a valid completed bundle identity'
+    [ -d "$(release_value EPM_BACKUP_EXPORT_DIR)/$bundle" ] ||
+        fail "$EX_UNAVAILABLE" 'backup bundle is not visible at the independent export destination'
+    printf 'backup=complete\nbundle=%s\nsource_project=%s\n' "$bundle" "$project_name"
+}
+
+restore_release() {
+    [ "$#" -eq 1 ] || fail "$EX_USAGE" 'restore requires exactly one recovery bundle name'
+    bundle=$1
+    valid_bundle_name "$bundle" || fail "$EX_USAGE" 'restore bundle name is invalid'
+    target=${EPM_RESTORE_TARGET_PROJECT:-}
+    [ -n "$target" ] || fail "$EX_CONFIG" 'EPM_RESTORE_TARGET_PROJECT is required'
+    case "$target" in *[!a-z0-9_-]*|'') fail "$EX_CONFIG" 'restore target project name is invalid' ;; esac
+    [ "$target" != "$project_name" ] ||
+        fail "$EX_CONFIG" 'restore refuses to target the active source project'
+    doctor_local
+    require_secret_files
+    prepare_directories
+    [ -d "$(release_value EPM_BACKUP_EXPORT_DIR)/$bundle" ] ||
+        fail "$EX_CONFIG" 'requested recovery bundle is unavailable'
+    [ -f "$(release_value EPM_BACKUP_EXPORT_DIR)/.openepm-host-visible" ] ||
+        fail "$EX_CONFIG" 'backup export destination is not operator-marked'
+    require_release_tool openepm-release-restore
+    require_release_tool openepm-release-restore-verify
+    [ -z "$(compose_project_call "$target" ps -a -q 2>/dev/null)" ] ||
+        fail "$EX_CONFIG" 'restore target already has containers; a fresh target is required'
+    compose_project_call "$target" --profile operations pull operations db control-db ||
+        fail "$EX_UNAVAILABLE" 'restore target image pull failed'
+    if ! compose_project_call "$target" up -d --wait --wait-timeout 300 db control-db; then
+        cleanup_failed_restore_target "$target" "$bundle" ||
+            fail "$EX_UNAVAILABLE" 'restore database startup failed and target cleanup failed'
+        fail "$EX_UNAVAILABLE" 'fresh restore target databases did not become healthy; target cleaned'
+    fi
+    if ! compose_project_call "$target" --profile operations run --rm -T operations \
+        /usr/local/bin/openepm-release-restore "$bundle"; then
+        cleanup_failed_restore_target "$target" "$bundle" ||
+            fail "$EX_UNAVAILABLE" 'restore import failed and target cleanup failed'
+        fail "$EX_UNAVAILABLE" 'verified restore import failed; source unchanged and target cleaned'
+    fi
+    if ! compose_project_call "$target" --profile operations run --rm -T operations \
+        /usr/local/bin/openepm-release-restore-verify "$bundle"; then
+        cleanup_failed_restore_target "$target" "$bundle" ||
+            fail "$EX_UNAVAILABLE" 'restore verification failed and target cleanup failed'
+        fail "$EX_UNAVAILABLE" 'restored target verification failed; target cleaned'
+    fi
+    write_restore_marker "$bundle" "$target"
+    printf 'restore=verified\nbundle=%s\ntarget_project=%s\nsource_project=%s\n' \
+        "$bundle" "$target" "$project_name"
+}
+
+activate_restored_release() {
+    [ "$#" -eq 1 ] || fail "$EX_USAGE" 'activate-restored requires exactly one recovery bundle name'
+    bundle=$1
+    valid_bundle_name "$bundle" || fail "$EX_USAGE" 'activate-restored bundle name is invalid'
+    target=${EPM_RESTORE_TARGET_PROJECT:-}
+    case "$target" in *[!a-z0-9_-]*|'') fail "$EX_CONFIG" 'restore target project name is invalid' ;; esac
+    [ "$target" != "$project_name" ] || fail "$EX_CONFIG" 'restored target must differ from prior project'
+    doctor_local
+    require_secret_files
+    validate_restore_marker "$bundle" "$target"
+    require_no_external_sandboxes
+    [ -n "$(compose_call ps --status running -q 2>/dev/null)" ] ||
+        fail "$EX_CONFIG" 'prior release must be running for reversible activation'
+    target_services=$(compose_project_call "$target" ps --status running --services 2>/dev/null | sort)
+    [ "$target_services" = "$(printf 'control-db\ndb')" ] ||
+        fail "$EX_CONFIG" 'restored target must contain only its verified database services before activation'
+    marker=$(restore_marker_path "$bundle" "$target")
+    activated=${marker%.restore-ready}.activated
+    [ ! -e "$activated" ] && [ ! -L "$activated" ] ||
+        fail "$EX_CONFIG" 'restored activation marker already exists'
+
+    compose_call stop || fail "$EX_UNAVAILABLE" 'cannot stop the prior release for restored activation'
+    if ! start_target_release "$target"; then
+        compose_project_call "$target" stop >/dev/null 2>&1 || true
+        if ! start_current_release; then
+            fail "$EX_UNAVAILABLE" 'restored activation and prior-release rollback both failed; manual recovery required'
+        fi
+        fail "$EX_UNAVAILABLE" 'restored activation failed; prior release was restarted'
+    fi
+    if ! compose_project_call "$target" exec -T platform \
+            python -m scripts.check_postgres_mcp_health; then
+        compose_project_call "$target" stop >/dev/null 2>&1 || true
+        if ! start_current_release; then
+            fail "$EX_UNAVAILABLE" 'restored health check and prior-release rollback both failed; manual recovery required'
+        fi
+        fail "$EX_UNAVAILABLE" 'restored health check failed; prior release was restarted'
+    fi
+    if ! mv "$marker" "$activated"; then
+        compose_project_call "$target" stop >/dev/null 2>&1 || true
+        if ! start_current_release; then
+            fail "$EX_UNAVAILABLE" 'activation-marker publication and prior-release rollback both failed; manual recovery required'
+        fi
+        fail "$EX_UNAVAILABLE" 'activation-marker publication failed; prior release was restarted'
+    fi
+    printf 'activation=verified\nbundle=%s\ntarget_project=%s\nprior_project=%s\n' \
+        "$bundle" "$target" "$project_name"
+}
+
+upgrade_release() {
+    doctor
+    require_launcher_active
+    require_secret_files
+    prepare_directories
+    identity_mode=$(configured_identity_mode)
+    [ -n "$(compose_call ps --status running -q 2>/dev/null)" ] ||
+        fail "$EX_CONFIG" 'upgrade requires an existing running release'
+    require_release_tool openepm-release-upgrade-preflight
+    operations_run /usr/local/bin/openepm-release-upgrade-preflight ||
+        fail "$EX_UNAVAILABLE" 'upgrade compatibility preflight failed'
+    # A verified independent recovery bundle is mandatory before migration.
+    backup_release >/dev/null || fail "$EX_UNAVAILABLE" 'pre-upgrade backup failed'
+    # Stop every inventory-defined request, publication and mutable
+    # service before changing schema.  Database and identity services remain
+    # available for the bounded migration/control operations below.
+    # shellcheck disable=SC2046
+    compose_call stop $(upgrade_mutable_services) ||
+        fail "$EX_UNAVAILABLE" 'upgrade could not quiesce mutable services'
+    pull_release_images || fail "$EX_UNAVAILABLE" 'upgrade image pull failed'
+    validate_browser_gateway_configuration
+    compose_call --profile operations run --rm -T control-bootstrap ||
+        fail "$EX_UNAVAILABLE" 'isolated control-plane database bootstrap failed'
+    compose_call --profile bundled-identity up -d --wait --wait-timeout 300 identity ||
+        fail "$EX_UNAVAILABLE" 'bundled identity service did not become healthy'
+    compose_call --profile bundled-identity run --rm -T keycloak-bootstrap ||
+        fail "$EX_UNAVAILABLE" 'bundled identity realm/client bootstrap failed'
+    operations_run sh -euc \
+        'export EPM_POSTGRES_ADMIN_DSN="$(cat /run/secrets/epm_admin_dsn)"; exec python -m scripts.apply_postgres_migrations' ||
+        fail "$EX_UNAVAILABLE" 'upgrade migration failed; inspect before restarting services'
+    operations_run sh -euc \
+        'export EPM_POSTGRES_ADMIN_DSN="$(cat /run/secrets/epm_admin_dsn)" EPM_PG_RUNTIME_PASSWORD="$(cat /run/secrets/epm_runtime_password)" EPM_PG_ACCESS_PASSWORD="$(cat /run/secrets/epm_access_password)" EPM_PG_WORKER_PASSWORD="$(cat /run/secrets/epm_worker_password)" EPM_PG_LIFECYCLE_PASSWORD="$(cat /run/secrets/epm_lifecycle_password)" EPM_PG_PROVISION_PASSWORD="$(cat /run/secrets/epm_provision_password)" EPM_PG_SECURITY_PASSWORD="$(cat /run/secrets/epm_security_password)"; exec python -m scripts.bootstrap_postgres_service_roles' ||
+        fail "$EX_UNAVAILABLE" 'upgrade service-role bootstrap failed'
+    operations_run sh -euc \
+        'export EPM_POSTGRES_ADMIN_DSN="$(cat /run/secrets/epm_admin_dsn)"; exec python -m scripts.bootstrap_postgres_python_coordinator --password-file /run/secrets/epm_python_coordinator_password' ||
+        fail "$EX_UNAVAILABLE" 'upgrade Python-coordinator bootstrap failed'
+    start_current_release ||
+        fail "$EX_UNAVAILABLE" 'upgraded services did not become healthy'
+    verify_release_health_boundaries ||
+        fail "$EX_UNAVAILABLE" 'post-upgrade liveness, readiness, or unsigned-denial gate failed'
+    printf '%s\n' 'upgrade=complete' 'pre_upgrade_backup=verified' 'volumes=preserved'
+}
+
+install_release() {
+    doctor
+    require_launcher_active
+    require_secret_files
+    prepare_directories
+    identity_mode=$(configured_identity_mode)
+
+    operator_issuer=$(release_value EPM_PLATFORM_OPERATOR_ISSUER)
+    case "$operator_issuer" in https://*) ;; *) fail "$EX_CONFIG" 'a verified HTTPS EPM_PLATFORM_OPERATOR_ISSUER is required' ;; esac
+
+    if [ -n "$(compose_call ps --status running -q 2>/dev/null)" ]; then
+        install_started_services=0
+    else
+        install_started_services=1
+    fi
+    pull_release_images || install_failed 'immutable release image pull failed'
+    validate_browser_gateway_configuration
+    compose_call up -d --wait --wait-timeout 180 db control-db ||
+        install_failed 'database services did not become healthy'
+    compose_call --profile operations run --rm -T control-bootstrap ||
+        install_failed 'isolated control-plane database bootstrap failed'
+    compose_call --profile bundled-identity up -d --wait --wait-timeout 300 identity ||
+        install_failed 'bundled identity service did not become healthy'
+    keycloak_bootstrap_output=$(compose_call --profile bundled-identity run --rm -T \
+        keycloak-bootstrap) ||
+        install_failed 'bundled identity realm/client bootstrap failed'
+    operator_subject=$(keycloak_initial_subject "$keycloak_bootstrap_output") ||
+        install_failed 'bundled identity bootstrap returned an invalid initial administrator subject'
+    operations_run sh -euc \
+        'export EPM_POSTGRES_ADMIN_DSN="$(cat /run/secrets/epm_admin_dsn)"; exec python -m scripts.apply_postgres_migrations' ||
+        install_failed 'controlled database migration failed'
+    operations_run sh -euc \
+        'export EPM_POSTGRES_ADMIN_DSN="$(cat /run/secrets/epm_admin_dsn)" EPM_PG_RUNTIME_PASSWORD="$(cat /run/secrets/epm_runtime_password)" EPM_PG_ACCESS_PASSWORD="$(cat /run/secrets/epm_access_password)" EPM_PG_WORKER_PASSWORD="$(cat /run/secrets/epm_worker_password)" EPM_PG_LIFECYCLE_PASSWORD="$(cat /run/secrets/epm_lifecycle_password)" EPM_PG_PROVISION_PASSWORD="$(cat /run/secrets/epm_provision_password)" EPM_PG_SECURITY_PASSWORD="$(cat /run/secrets/epm_security_password)"; exec python -m scripts.bootstrap_postgres_service_roles' ||
+        install_failed 'controlled service-role bootstrap failed'
+    operations_run sh -euc \
+        'export EPM_POSTGRES_ADMIN_DSN="$(cat /run/secrets/epm_admin_dsn)"; exec python -m scripts.bootstrap_postgres_python_coordinator --password-file /run/secrets/epm_python_coordinator_password' ||
+        install_failed 'controlled Python-coordinator bootstrap failed'
+    operations_run sh -euc \
+        'export EPM_POSTGRES_ADMIN_DSN="$(cat /run/secrets/epm_admin_dsn)"; exec python -m scripts.bootstrap_postgres_operator --issuer "$1" --subject-id "$2"' \
+        openepm-bootstrap "$operator_issuer" "$operator_subject" ||
+        install_failed 'controlled platform-operator bootstrap failed'
+    start_current_release ||
+        install_failed 'release services did not become healthy'
+    verify_release_health_boundaries ||
+        install_failed 'liveness, readiness, or unsigned-denial gate failed'
+    printf '%s\n' 'install=complete' 'volumes=preserved' \
+        'liveness=verified' 'readiness=verified' \
+        'unsigned_access=denied'
+}
+
+uninstall_release() {
+    require_release_config
+    compose_call stop
+    compose_call rm -f
+    printf '%s\n' 'uninstall=services-removed' 'volumes=preserved'
+}
+
+doctor_local() {
+    arch=$(architecture)
+    require_compose
+    require_command runsc
+    runsc --version >/dev/null 2>&1 || fail "$EX_CONFIG" 'gVisor runsc is not executable'
+    require_release_config
+    validate_mode_configuration
+    validate_release_images
+    validate_release_manifest
+    docker info --format '{{json .Runtimes}}' | grep -Eq '"runsc"' ||
+        fail "$EX_CONFIG" 'Docker runsc runtime is unavailable'
+    require_encrypted_persistent_volumes
+    require_sandbox_config
+    printf 'architecture=%s\n' "$arch"
+    printf 'docker=available\ncompose=available\nrunsc=available\nsandbox_config=secure\n'
+    printf 'compose_file=%s\nenv_file=%s\n' "$compose_file" "$env_file"
+}
+
+doctor() {
+    doctor_local
+}
+
+certificate_validity_seconds() {
+    seconds=$(release_value EPM_CERTIFICATE_MINIMUM_VALIDITY_SECONDS)
+    [ -n "$seconds" ] || seconds=604800
+    case "$seconds" in *[!0-9]*|'')
+        fail "$EX_CONFIG" 'EPM_CERTIFICATE_MINIMUM_VALIDITY_SECONDS must be an integer' ;;
+    esac
+    [ "$seconds" -ge 3600 ] && [ "$seconds" -le 31536000 ] ||
+        fail "$EX_CONFIG" 'certificate minimum validity must be between one hour and one year'
+    printf '%s\n' "$seconds"
+}
+
+require_certificate_file() {
+    path=$1
+    [ -f "$path" ] && [ ! -L "$path" ] && [ -r "$path" ] ||
+        fail "$EX_CONFIG" "certificate staging file is unavailable or symbolic: $path"
+    [ "$(file_uid "$path")" = 0 ] ||
+        fail "$EX_CONFIG" "certificate staging file must be root-owned: $path"
+    case "$(file_mode "$path")" in 400|440|600|640) ;;
+        *) fail "$EX_CONFIG" "certificate staging permissions are too broad: $path" ;;
+    esac
+    [ -s "$path" ] || fail "$EX_CONFIG" "certificate staging file is empty: $path"
+}
+
+certificate_public_key_digest() {
+    kind=$1
+    path=$2
+    case "$kind" in
+        certificate)
+            openssl x509 -in "$path" -pubkey -noout 2>/dev/null |
+                openssl pkey -pubin -outform DER 2>/dev/null | sha256sum |
+                sed 's/[[:space:]].*$//' ;;
+        private-key)
+            openssl pkey -in "$path" -pubout -outform DER 2>/dev/null |
+                sha256sum | sed 's/[[:space:]].*$//' ;;
+        *) return 1 ;;
+    esac
+}
+
+require_certificate_hostname() {
+    certificate=$1
+    hostname=$2
+    openssl x509 -in "$certificate" -noout -checkhost "$hostname" >/dev/null 2>&1 ||
+        fail "$EX_CONFIG" "certificate does not identify required hostname: $hostname"
+}
+
+validate_certificate_staging() {
+    staging=$1
+    [ -d "$staging" ] && [ ! -L "$staging" ] ||
+        fail "$EX_CONFIG" "certificate staging directory is unavailable or symbolic: $staging"
+    [ "$(file_uid "$staging")" = 0 ] ||
+        fail "$EX_CONFIG" 'certificate staging directory must be root-owned'
+    case "$(file_mode "$staging")" in 700|750) ;;
+        *) fail "$EX_CONFIG" 'certificate staging directory permissions are too broad' ;;
+    esac
+    for name in tls.crt tls.key keycloak_internal_tls_certificate \
+        keycloak_internal_tls_private_key keycloak_internal_ca_certificate
+    do
+        require_certificate_file "$staging/$name"
+    done
+    require_command openssl
+    require_command sha256sum
+    validity=$(certificate_validity_seconds)
+    for certificate in tls.crt keycloak_internal_tls_certificate \
+        keycloak_internal_ca_certificate
+    do
+        openssl x509 -in "$staging/$certificate" -noout >/dev/null 2>&1 ||
+            fail "$EX_CONFIG" "invalid staged certificate: $certificate"
+        openssl x509 -in "$staging/$certificate" -noout -checkend "$validity" \
+            >/dev/null 2>&1 ||
+            fail "$EX_CONFIG" "staged certificate expires inside the required validity window: $certificate"
+    done
+    for key in tls.key keycloak_internal_tls_private_key; do
+        openssl pkey -in "$staging/$key" -check -noout >/dev/null 2>&1 ||
+            fail "$EX_CONFIG" "invalid staged private key: $key"
+    done
+    public_certificate=$(certificate_public_key_digest certificate "$staging/tls.crt") ||
+        fail "$EX_CONFIG" 'cannot read staged public certificate key'
+    public_private=$(certificate_public_key_digest private-key "$staging/tls.key") ||
+        fail "$EX_CONFIG" 'cannot read staged public private key'
+    [ -n "$public_certificate" ] && [ "$public_certificate" = "$public_private" ] ||
+        fail "$EX_CONFIG" 'staged public certificate and private key do not match'
+    internal_certificate=$(certificate_public_key_digest certificate \
+        "$staging/keycloak_internal_tls_certificate") ||
+        fail "$EX_CONFIG" 'cannot read staged internal certificate key'
+    internal_private=$(certificate_public_key_digest private-key \
+        "$staging/keycloak_internal_tls_private_key") ||
+        fail "$EX_CONFIG" 'cannot read staged internal private key'
+    [ -n "$internal_certificate" ] && [ "$internal_certificate" = "$internal_private" ] ||
+        fail "$EX_CONFIG" 'staged internal certificate and private key do not match'
+    openssl verify -CAfile "$staging/keycloak_internal_ca_certificate" \
+        "$staging/keycloak_internal_tls_certificate" >/dev/null 2>&1 ||
+        fail "$EX_CONFIG" 'staged internal certificate is not trusted by the staged CA'
+    require_certificate_hostname "$staging/tls.crt" "$(release_value EPM_PUBLIC_HOST)"
+    require_certificate_hostname "$staging/tls.crt" "$(release_value EPM_IDENTITY_PUBLIC_HOST)"
+    require_certificate_hostname "$staging/keycloak_internal_tls_certificate" identity
+}
+
+verify_presented_public_certificate() {
+    expected_certificate=$1
+    public_host=$(release_value EPM_PUBLIC_HOST)
+    expected=$(openssl x509 -in "$expected_certificate" -noout \
+        -fingerprint -sha256 2>/dev/null | sed -n '1p')
+    observed=$(openssl s_client -connect 127.0.0.1:443 -servername "$public_host" \
+        -showcerts </dev/null 2>/dev/null | openssl x509 -noout \
+        -fingerprint -sha256 2>/dev/null | sed -n '1p')
+    [ -n "$expected" ] && [ "$expected" = "$observed" ]
+}
+
+copy_certificate_set() {
+    source_dir=$1
+    target_tls=$2
+    target_secrets=$3
+    install -m 0400 "$source_dir/tls.crt" "$target_tls/tls.crt.new" &&
+    install -m 0400 "$source_dir/tls.key" "$target_tls/tls.key.new" &&
+    install -m 0400 "$source_dir/keycloak_internal_tls_certificate" \
+        "$target_secrets/keycloak_internal_tls_certificate.new" &&
+    install -m 0400 "$source_dir/keycloak_internal_tls_private_key" \
+        "$target_secrets/keycloak_internal_tls_private_key.new" &&
+    install -m 0400 "$source_dir/keycloak_internal_ca_certificate" \
+        "$target_secrets/keycloak_internal_ca_certificate.new" || return 1
+    mv "$target_tls/tls.crt.new" "$target_tls/tls.crt" &&
+    mv "$target_tls/tls.key.new" "$target_tls/tls.key" &&
+    mv "$target_secrets/keycloak_internal_tls_certificate.new" \
+        "$target_secrets/keycloak_internal_tls_certificate" &&
+    mv "$target_secrets/keycloak_internal_tls_private_key.new" \
+        "$target_secrets/keycloak_internal_tls_private_key" &&
+    mv "$target_secrets/keycloak_internal_ca_certificate.new" \
+        "$target_secrets/keycloak_internal_ca_certificate"
+}
+
+certificate_renewal_interrupted() {
+    trap - HUP INT TERM
+    if [ -n "${certificate_rollback_dir:-}" ]; then
+        copy_certificate_set "$certificate_rollback_dir" \
+            "$certificate_tls_dir" "$certificate_secrets_dir" >/dev/null 2>&1 || true
+        start_current_release >/dev/null 2>&1 || true
+        rm -rf -- "$certificate_rollback_dir" >/dev/null 2>&1 || true
+    fi
+    printf '%s\n' 'epmctl: certificate renewal interrupted; prior material restoration attempted' >&2
+    exit "$EX_UNAVAILABLE"
+}
+
+renew_certificates() {
+    [ "$#" -eq 2 ] && [ "$1" = --staging-dir ] ||
+        fail "$EX_USAGE" 'renew-certificates requires --staging-dir DIR'
+    staging=$2
+    case "$staging" in /*) ;; *) fail "$EX_CONFIG" 'certificate staging directory must be absolute' ;; esac
+    require_command id
+    [ "$(id -u)" = 0 ] || fail "$EX_CONFIG" 'certificate renewal must run as root'
+    doctor_local
+    require_secret_files
+    prepare_directories
+    require_command install
+    validate_certificate_staging "$staging"
+    require_no_external_sandboxes
+    [ -n "$(compose_call ps --status running -q 2>/dev/null)" ] ||
+        fail "$EX_CONFIG" 'certificate renewal requires a running release'
+    tls_dir=$(release_value EPM_TLS_DIR)
+    secrets_dir=$(release_value EPM_SECRETS_DIR)
+    rollback=$(mktemp -d "$tls_dir/.openepm-certificate-rollback.XXXXXX") ||
+        fail "$EX_UNAVAILABLE" 'cannot create protected certificate rollback directory'
+    chmod 0700 "$rollback" || fail "$EX_UNAVAILABLE" 'cannot protect certificate rollback directory'
+    return_code=0
+    if ! {
+        for name in tls.crt tls.key; do
+            install -m 0400 "$tls_dir/$name" "$rollback/$name" || return_code=$?
+            [ "${return_code:-0}" -eq 0 ] || break
+        done
+        [ "${return_code:-0}" -eq 0 ] && for name in \
+            keycloak_internal_tls_certificate \
+            keycloak_internal_tls_private_key keycloak_internal_ca_certificate
+        do
+            install -m 0400 "$secrets_dir/$name" "$rollback/$name" || return_code=$?
+            [ "${return_code:-0}" -eq 0 ] || break
+        done
+        [ "${return_code:-0}" -eq 0 ]
+    }; then
+        rm -rf -- "$rollback"
+        fail "$EX_UNAVAILABLE" 'cannot preserve current certificate material'
+    fi
+    certificate_rollback_dir=$rollback
+    certificate_tls_dir=$tls_dir
+    certificate_secrets_dir=$secrets_dir
+    trap certificate_renewal_interrupted HUP INT TERM
+    compose_call stop || {
+        trap - HUP INT TERM
+        rm -rf -- "$rollback"
+        fail "$EX_UNAVAILABLE" 'cannot stop the release for certificate maintenance'; }
+    if ! copy_certificate_set "$staging" "$tls_dir" "$secrets_dir"; then
+        copy_certificate_set "$rollback" "$tls_dir" "$secrets_dir" ||
+            fail "$EX_UNAVAILABLE" 'certificate promotion and rollback both failed; release remains stopped'
+        start_current_release >/dev/null 2>&1 ||
+            fail "$EX_UNAVAILABLE" 'certificate promotion failed and prior release could not restart'
+        trap - HUP INT TERM
+        rm -rf -- "$rollback"
+        fail "$EX_UNAVAILABLE" 'certificate promotion failed; prior material restored'
+    fi
+    if ! start_current_release || ! compose_call exec -T platform \
+            python -m scripts.check_postgres_mcp_health || \
+            ! verify_presented_public_certificate "$tls_dir/tls.crt"; then
+        compose_call stop >/dev/null 2>&1 || true
+        copy_certificate_set "$rollback" "$tls_dir" "$secrets_dir" ||
+            fail "$EX_UNAVAILABLE" 'renewed release failed and certificate rollback failed; release remains stopped'
+        if ! start_current_release || ! compose_call exec -T platform \
+                python -m scripts.check_postgres_mcp_health || \
+                ! verify_presented_public_certificate "$tls_dir/tls.crt"; then
+            fail "$EX_UNAVAILABLE" 'renewed release failed and prior certificate release did not recover'
+        fi
+        trap - HUP INT TERM
+        rm -rf -- "$rollback"
+        fail "$EX_UNAVAILABLE" 'renewed certificate health failed; prior material restored and release recovered'
+    fi
+    trap - HUP INT TERM
+    rm -rf -- "$rollback"
+    printf '%s\n' 'certificate_renewal=complete' \
+        "minimum_validity_seconds=$(certificate_validity_seconds)" \
+        'rollback_material=removed' 'release_health=verified'
+}
+
+not_integrated() {
+    fail "$EX_UNAVAILABLE" "$1 is not integrated with a signed release protocol"
+}
+
+[ "$#" -ge 1 ] || { usage >&2; exit "$EX_USAGE"; }
+command_name=$1
+shift
+
+case "$command_name" in
+    doctor) [ "$#" -eq 0 ] || fail "$EX_USAGE" 'doctor takes no arguments'; doctor ;;
+    up) [ "$#" -eq 0 ] || fail "$EX_USAGE" 'up takes no arguments'; start_current_release ;;
+    status) [ "$#" -eq 0 ] || fail "$EX_USAGE" 'status takes no arguments'; require_launcher_active; compose ps ;;
+    logs) compose logs "$@" ;;
+    stop) [ "$#" -eq 0 ] || fail "$EX_USAGE" 'stop takes no arguments'; compose stop ;;
+    install) [ "$#" -eq 0 ] || fail "$EX_USAGE" 'install takes no arguments'; install_release ;;
+    uninstall) [ "$#" -eq 0 ] || fail "$EX_USAGE" 'uninstall takes no arguments'; uninstall_release ;;
+    backup) [ "$#" -eq 0 ] || fail "$EX_USAGE" 'backup takes no arguments'; backup_release ;;
+    restore) restore_release "$@" ;;
+    activate-restored) activate_restored_release "$@" ;;
+    renew-certificates) renew_certificates "$@" ;;
+    upgrade) [ "$#" -eq 0 ] || fail "$EX_USAGE" 'upgrade takes no arguments'; upgrade_release ;;
+    -h|--help|help) usage ;;
+    *) usage >&2; fail "$EX_USAGE" "unknown command: $command_name" ;;
+esac

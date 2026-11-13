@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- local-only --><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'self'; font-src 'none'; object-src 'none'"><!-- /local-only -->
+<title>Open EPM · Implementation explorer</title>
+<style>
+:root{color-scheme:dark;--bg:#0b111d;--panel:#101a29;--line:#26364b;--ink:#ecf2fb;--muted:#9eafc6;--mint:#74e2bd;--purple:#b7a3ff;--orange:#f6ba74}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}button,select{background:#18273b;border:1px solid #354a65;color:var(--ink);border-radius:7px;padding:7px 10px;cursor:pointer}button:hover{background:#243c57;border-color:#6a8db1}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--mint);outline-offset:2px}input[type=search]{width:100%;background:#0b1422;border:1px solid #3c526b;border-radius:7px;color:var(--ink);padding:10px}header{height:86px;display:flex;align-items:center;justify-content:space-between;padding:12px 22px;border-bottom:1px solid var(--line);gap:15px}h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.4px}.eyebrow{color:var(--mint);font-size:10px;letter-spacing:2px;font-weight:650}.sub{color:var(--muted);font-size:12px}.header-tools{display:flex;align-items:center;gap:10px}.pill{border:1px solid #355148;border-radius:20px;color:var(--mint);padding:3px 9px;font-size:11px}.layout{display:grid;grid-template-columns:280px minmax(300px,1fr) 340px;height:calc(100vh - 86px)}aside{min-height:0;background:var(--panel);padding:16px;overflow:auto}#left{border-right:1px solid var(--line)}#right{border-left:1px solid var(--line)}h2{font-size:14px;margin:0 0 8px}h3{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin:19px 0 8px}p{margin:6px 0 12px}small{color:var(--muted)}.function{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid #243247;border-radius:0;background:none;padding:11px 6px;font-size:12px}.function.active{border-left:3px solid var(--mint);background:#1a3337}.function span{display:block;font-size:10px;color:var(--muted);margin-top:2px}.function strong{font-weight:500}#catalog{margin-top:10px}.count{color:var(--mint);font-variant-numeric:tabular-nums}.toggle{display:flex;gap:7px;align-items:center;margin:6px 0;font-size:12px}.toggle input{accent-color:var(--mint)}.layer-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px}main{position:relative;min-width:0;min-height:0;display:flex;flex-direction:column}#toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:7px;padding:10px 13px;border-bottom:1px solid var(--line);background:#101a29;z-index:3}#toolbar select{max-width:145px;font-size:12px}#stage{flex:1;position:relative;min-height:250px;overflow:hidden}#graph{position:absolute;inset:0}#labels{position:absolute;inset:0;pointer-events:none;z-index:1}.node-label{position:absolute;background:#0b1422e8;border:1px solid #344b61;padding:3px 6px;border-radius:5px;max-width:208px;color:#eaf4ff;font-size:11px;line-height:1.3;transform:translate(9px,-50%);pointer-events:auto;cursor:pointer;white-space:normal;box-shadow:0 2px 10px #0005}.node-label.functionality{border-left:2px solid var(--mint)}.node-label.selected{border-color:#fff;color:#fff}#scene-heading{position:absolute;left:18px;top:14px;z-index:2;pointer-events:none;max-width:65%}#scene-title{font-size:16px;max-width:600px}#scene-help{font-size:11px;color:var(--muted);margin-top:4px}#scene-footer{position:absolute;bottom:12px;left:16px;right:16px;display:flex;justify-content:space-between;gap:15px;z-index:2;pointer-events:none;font-size:10px;color:#b5c5d8}#summary{padding:9px 14px;border-top:1px solid var(--line);background:#101a29;color:var(--muted);font-size:11px;min-height:40px}#selection-name{font-size:18px;line-height:1.25;overflow-wrap:anywhere;margin:8px 0 12px}.tag{display:inline-block;border:1px solid #435670;border-radius:4px;padding:2px 6px;color:#bbd2eb;font-size:10px;margin:2px 4px 2px 0}.status{border-left:2px solid var(--orange);padding:8px 10px;background:#2a241e;color:#f5d1a3;font-size:12px;margin:12px 0}.source{display:block;background:#0c1624;color:#a9ccff;text-align:left;width:100%;overflow-wrap:anywhere;white-space:normal;font:11px/1.5 ui-monospace,monospace;margin:6px 0}pre{white-space:pre-wrap;word-break:break-word;font:11px/1.55 ui-monospace,monospace;color:#bdd0e7}.connection{display:block;width:100%;text-align:left;padding:9px 7px;margin:5px 0;border-color:#293d55;font-size:11px;overflow-wrap:anywhere}.connection b{font-weight:550;color:#e0ecfa}.connection small{display:block}.certainty{font-size:10px;color:var(--orange)}.certainty.syntax{color:var(--mint)}.certainty.recorded{color:#9fc4ff}#neighbors-filter{padding:7px;margin:5px 0;font-size:12px}#search-results{margin-top:8px;max-height:260px;overflow:auto}.search-result{display:block;width:100%;text-align:left;margin:4px 0;font-size:11px;overflow-wrap:anywhere}.search-result small{display:block}#empty-search{font-size:11px}.inline-actions{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}.hint{font-size:11px;color:var(--muted)}a{color:#a9ccff}dialog{background:#101b2b;color:var(--ink);border:1px solid #526c8e;border-radius:10px;max-width:min(1000px,94vw);width:1000px;max-height:88vh;padding:20px}dialog::backdrop{background:#000b}.dialog-header{display:flex;justify-content:space-between;gap:15px;align-items:center;position:sticky;top:-20px;background:#101b2b;padding:8px 0}.dialog-body{max-height:69vh;overflow:auto;margin-top:10px}#source-lines{font:12px/1.7 ui-monospace,monospace}.code-line{display:flex;white-space:pre}.code-line mark{background:transparent;color:#718ca7;min-width:54px;text-align:right;padding-right:14px;user-select:none;flex-shrink:0}.code-line code{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}.code-line.highlight{background:#234948;color:#e4fff3}table{width:100%;border-collapse:collapse;font-size:12px}td,th{border-bottom:1px solid #304056;text-align:left;padding:7px;vertical-align:top}.warning{color:var(--orange)}#webgl-error{display:none;position:absolute;inset:100px 25px auto;padding:15px;background:#392820;z-index:5}details{border:1px solid #304056;border-radius:6px;margin-top:12px;padding:8px}summary{cursor:pointer;color:#b4cde5}#legend{font-size:10px;color:#a2b9d1;line-height:1.9;margin-top:16px}.muted{color:var(--muted)}@media(max-width:1100px){.layout{grid-template-columns:235px minmax(280px,1fr) 290px}aside{padding:12px}.header-tools .pill{display:none}}@media(max-width:800px){header{height:100px;padding:10px}.layout{height:auto;min-height:calc(100vh - 100px);grid-template-columns:1fr}#left{max-height:300px}#right{max-height:600px}main{height:70vh}.sub{font-size:10px}.header-tools{flex-direction:column;gap:4px}h1{font-size:17px}}
+</style></head><body>
+<style>
+#hover-card{position:fixed;z-index:8;top:120px;left:300px;width:min(760px,calc(100vw - 340px));max-height:calc(100vh - 150px);overflow:auto;padding:16px;background:#132235f7;border:1px solid #7598b5;border-radius:10px;box-shadow:0 15px 80px #000a;display:none}#hover-card h2{font-size:16px;overflow-wrap:anywhere;max-width:570px}.editor-head{display:flex;justify-content:space-between;gap:10px;align-items:start}.editor-head button{font-size:11px}textarea{font:12px/1.5 inherit;background:#0b1422;border:1px solid #3d546d;border-radius:5px;color:var(--ink);padding:7px;resize:vertical;max-width:100%}#edit-description{width:100%;min-height:90px}.test-grid{overflow:auto;margin:8px 0;max-height:310px}.test-grid table{min-width:850px}.test-grid textarea{width:145px;min-height:65px}.test-grid select{font-size:11px;width:120px}.test-grid .inactive{opacity:.65;background:#272731}.save-state{font-size:11px;max-width:175px;color:var(--orange)}.save-state.saved{color:var(--mint)}#perspective{width:100%;margin:8px 0;font-size:12px}.interface-grid{font-size:11px;margin:10px 0}.interface-grid td{padding:6px 3px;overflow-wrap:anywhere}.test-status{font-size:10px;color:var(--orange)}@media(max-width:1100px){#hover-card{left:250px;width:calc(100vw - 280px)}header{height:110px}.layout{height:calc(100vh - 110px)}.header-tools{gap:5px;flex-wrap:wrap;justify-content:flex-end;max-width:540px}.header-tools button{font-size:11px}}@media(max-width:800px){#hover-card{left:10px;top:80px;width:calc(100vw - 20px);max-height:calc(100vh - 100px)}header{height:auto;min-height:140px}.header-tools{max-width:240px}.layout{height:auto}}
+</style>
+<header><div><div class="eyebrow">OPEN EPM / REPOSITORY ATLAS</div><h1>Implementation explorer <span class="muted">/ 3D</span></h1><div class="sub" id="snapshot-label"></div></div><div class="header-tools"><!-- local-only --><span id="save-state" class="save-state">Loading saved edits…</span><button id="save-edits" disabled>Save edits</button><button id="export-edits">Export edits</button><button id="import-edits">Import edits</button><input id="import-file" type="file" accept="application/json,.json" hidden><!-- /local-only --><button id="coverage-button">Evidence & coverage</button><!-- local-only --><button id="export-button">Export graph</button><!-- /local-only --></div></header>
+<div class="layout">
+<aside id="left"><h2>What can the tool do?</h2><p class="hint">Start with a functionality, then follow its real names into the implementation.</p><label for="search" class="hint">Search every node, symbol or path</label><input id="search" type="search" placeholder="Try: dimension, upload, access…" autocomplete="off"><div id="search-results"></div><label class="hint" for="perspective">Connected perspectives</label><select id="perspective"><option value="all">User + supporting platform</option><option value="user">User functionality</option><option value="platform">Supporting platform</option></select><h3>Functionalities <span id="function-count" class="count"></span></h3><div id="catalog"></div></aside>
+<main><div id="toolbar"><button id="overview">Overview</button><label class="hint" for="detail">Detail</label><select id="detail"><option value="modules">Modules & operations</option><option value="symbols">Functions & methods</option><!-- local-only --><option value="evidence">Acceptance evidence</option><!-- /local-only --></select><button id="fit">Fit view</button><button id="labels-button" aria-pressed="true">Names on</button><button id="layers-button">Layers</button></div>
+<div id="stage"><div id="graph"></div><div id="labels"></div><div id="scene-heading"><div class="eyebrow">FUNCTIONALITY → IMPLEMENTATION</div><div id="scene-title">The built system, through its capabilities</div><div id="scene-help">Drag to rotate · scroll to zoom · right-drag to pan · click to inspect</div></div><div id="scene-footer"><span>Mint = functionality · blue = boundary · purple = core · amber = database</span><span id="visible-count"></span></div><div id="webgl-error">3D rendering could not start. Use the searchable catalogue and connection inspector, or reopen in a browser with WebGL enabled.</div></div>
+<div id="summary"></div></main>
+<aside id="right"><div id="inspector"></div><div id="legend"><b>Read the links</b><br><span style="color:var(--mint)">Green</span> · source syntax / static resolution<br><span style="color:var(--orange)">Amber</span> · authored business association<br><span style="color:#929dab">Gray</span> · heuristic candidate<br><span style="color:#a9ccff">Blue</span> · recorded acceptance evidence<br>Arrows point from source to target. Layout distance has no semantic meaning.</div></aside>
+</div>
+<dialog id="layers-dialog"><div class="dialog-header"><h2>Visible layers</h2><button data-close="layers-dialog">Close</button></div><p class="hint">External databases and libraries are terminal nodes. Select a node to see its available relationships.</p><div id="layer-options"></div><h3>Relationship confidence</h3><label class="toggle"><input id="show-heuristic" type="checkbox" checked>Show heuristic static links</label><label class="toggle"><input id="show-association" type="checkbox" checked>Show authored functionality associations</label></dialog>
+<dialog id="coverage-dialog"><div class="dialog-header"><h2>Snapshot, evidence & limits</h2><button data-close="coverage-dialog">Close</button></div><div class="dialog-body" id="coverage-content"></div></dialog>
+<!-- local-only --><dialog id="source-dialog"><div class="dialog-header"><div><h2 id="source-title"></h2><small id="source-hash"></small></div><button data-close="source-dialog">Close</button></div><div class="dialog-body" id="source-lines"></div></dialog>
+<style>
+#hover-summary,#preview-tests,#preview-entire{display:none}#hover-card.preview{width:min(410px,calc(100vw - 24px));max-height:min(430px,calc(100vh - 110px));background:#132235;box-shadow:0 8px 30px #0008;padding:13px}#hover-card.preview h2{font-size:14px;margin-bottom:5px}#hover-card.preview h3{margin:10px 0 4px}#hover-card.preview #hover-summary,#hover-card.preview #preview-tests,#hover-card.preview #preview-entire{display:block;font-size:12px;line-height:1.45;margin:7px 0}#hover-card.preview #hover-summary{max-height:112px;overflow:auto}#hover-card.preview #edit-description,#hover-card.preview #description-origin,#hover-card.preview #test-editor,#hover-card.preview #candidates,#hover-card.preview #annotation-reconciliation,#hover-card.preview #hover-entire,#hover-card.preview .inline-actions,#hover-card.preview .editing-hint{display:none}#preview-tests ul{margin:4px 0;padding-left:17px}#preview-tests li{margin:3px 0}#preview-entire{color:var(--muted);font-size:11px!important}.preview .editor-head{gap:6px}.preview .editor-head>div{white-space:nowrap}
+</style>
+<section id="hover-card" aria-label="Node description and test editor"><div class="editor-head"><h2 id="hover-title"></h2><div><button id="pin-card">Pin & edit</button> <button id="close-card">Close</button></div></div><div id="hover-meta" class="hint"></div><h3>Quick summary / your description</h3><p id="hover-summary"></p><textarea id="edit-description" maxlength="12000" aria-label="Node description"></textarea><div class="hint" id="description-origin"></div><h3>Attached test records</h3><div id="preview-tests"></div><p class="hint editing-hint">Active means eligible for a future selection design. No tests run here. Inactive records and their comments remain saved.</p><div id="test-editor"></div><div class="inline-actions"><button id="add-test">Add test specification</button><button id="save-card">Save to project file</button></div><div id="preview-entire"></div><details id="candidates"><summary>Source-derived test associations / coverage gaps</summary><div id="candidate-tests"></div></details><p class="hint" id="annotation-reconciliation"></p></section>
+<!-- /local-only --><script>/*__VENDOR__*/</script>
+<script id="graph-data" type="application/json">/*__DATA__*/</script>
+<script>
+'use strict';
+const DATA=JSON.parse(document.getElementById('graph-data').textContent);
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const COLORS={'Functionality':'#74e2bd','MCP / client boundary':'#73b8ff','Core application':'#b7a3ff','Database':'#f6ba74','Concurrency coordination':'#f18baa','Continuity / recovery':'#7bd3db','Deployment':'#a4bd80','Evidence':'#9aabc0','External dependency':'#d7c394'};
+const N=new Map(DATA.nodes.map(n=>[n.id,n])), ADJ=new Map(DATA.nodes.map(n=>[n.id,[]]));
+DATA.links.forEach((e,i)=>{e.index=i;ADJ.get(e.source).push(e);ADJ.get(e.target).push(e)});
+const F=DATA.nodes.filter(n=>n.kind==='functionality').sort((a,b)=>a.name.localeCompare(b.name));
+let selected=null, focus=null, graph=null, currentNodes=[], currentLinks=[], labelsOn=true, extras=new Set(), renderLimit=850;
+/* local-only */let annotations=structuredClone(DATA.annotations),savedRevision=0,dirty=false,serverReady=false,cardId=null,cardPinned=false;
+let hoverCloseTimer=null,cardPointer=false,lastPointer={x:innerWidth/2,y:innerHeight/2};/* /local-only */
+const activeLayers=new Set(Object.keys(COLORS)),edgeAllowed=e=>(e.certainty!=='heuristic'||$('show-heuristic').checked)&&(e.certainty!=='association'||$('show-association').checked);
+const isSymbol=n=>['function','method','class','resource','stage'].includes(n.kind),isFile=n=>['file','module','folder'].includes(n.kind);
+const isTerminal=n=>n.kind==='database terminal'||n.kind==='external package'||n.kind==='standard library'||n.kind==='external import';
+const nodeAllowed=n=>activeLayers.has(n.layer);
+const other=(e,id)=>e.source===id?e.target:e.source;
+/* local-only */function sourceButton(path,line=1,label){return path?`<button class="source" data-source="${esc(path)}" data-line="${line}">${esc(label||path+':'+line)} ↗</button>`:''}/* /local-only */
+function nodeButton(id,label){return `<button class="connection" data-node="${esc(id)}">${esc(label||N.get(id)?.name||id)}</button>`}
+function catalog(q=''){
+ const list=F.filter(n=>(!q||n.name.toLowerCase().includes(q.toLowerCase()))&&($('perspective').value==='all'||n.perspective===$('perspective').value));
+ $('function-count').textContent=F.length;
+ $('catalog').innerHTML=list.map(n=>`<button class="function ${focus===n.id?'active':''}" data-function="${esc(n.id)}"><strong>${esc(n.name)}</strong><span>${esc(n.package ? n.package+' · ' : '')}${ADJ.get(n.id).filter(e=>e.kind==='GROUPS_OPERATION').length||'source'} operations / links</span></button>`).join('');
+}
+function search(){
+ const q=$('search').value.trim().toLowerCase();
+ if(!q){$('search-results').innerHTML='';catalog();return}
+ const found=DATA.nodes.filter(n=>(n.name+' '+n.path+' '+(n.signature||'')).toLowerCase().includes(q));
+ found.sort((a,b)=>(a.kind==='functionality'?-1:0)-(b.kind==='functionality'?-1:0)||a.name.length-b.name.length);
+ $('search-results').innerHTML=`<p class="hint">${found.length.toLocaleString()} matches · first 60 shown</p>`+found.slice(0,60).map(n=>`<button class="search-result" data-node="${esc(n.id)}">${esc(n.name)}<small>${esc(n.kind)} · ${esc(n.path?n.path+':'+n.line:n.layer)}</small></button>`).join('');
+ catalog($('search').value);
+}
+function addNeighbors(ids,id,predicate=()=>true){for(const e of ADJ.get(id)||[]){if(!edgeAllowed(e))continue;const n=N.get(other(e,id));if(predicate(n,e))ids.add(n.id)}}
+function computeView(){
+ const ids=new Set(),mode=$('detail').value;
+ if(!focus){
+  F.filter(n=>$('perspective').value==='all'||n.perspective===$('perspective').value).forEach(n=>ids.add(n.id));
+  const shared=new Map();
+  for(const f of F)for(const e of ADJ.get(f.id)){const n=N.get(other(e,f.id));if(['module','file'].includes(n.kind)&&n.layer!=='Evidence'&&edgeAllowed(e))shared.set(n.id,(shared.get(n.id)||0)+1)}
+  [...shared].filter(([id,num])=>num>1).sort((a,b)=>b[1]-a[1]).slice(0,24).forEach(([id])=>ids.add(id));
+ }else{
+  ids.add(focus);
+  addNeighbors(ids,focus,(n,e)=> mode==='evidence'?n.layer==='Evidence':n.kind==='operation'||isFile(n)||isTerminal(n)||n.kind==='calculation mechanism'||n.kind==='functionality');
+  const seeds=[...ids];
+  for(const id of seeds){
+   const n=N.get(id);
+   if(n.kind==='operation'){
+    addNeighbors(ids,id,(v,e)=>['OPERATION_LITERAL','REGISTRY_KEY','DISPATCH_CHECK','UI_OPERATION_REFERENCE','UI_TEMPLATE_REFERENCE'].includes(e.kind));
+   }else if(n.kind==='calculation mechanism'){
+    addNeighbors(ids,id,(v,e)=>mode==='symbols'?isSymbol(v)||isFile(v):isFile(v));
+   }else if(isFile(n)&&n.kind!=='folder'){
+    addNeighbors(ids,id,(v,e)=> mode==='symbols'?isSymbol(v)||isTerminal(v)||e.kind==='MODULE_IMPORT':mode==='evidence'?v.layer==='Evidence':isTerminal(v)||e.kind==='MODULE_IMPORT');
+   }else if(mode==='evidence'&&n.kind==='acceptance package')addNeighbors(ids,id,(v)=>v.kind==='recorded outcome');
+  }
+  // Lift operation owners to modules at the coarse level. All function nodes
+  // remain available by selecting "Functions & methods" or through inspector.
+  if(mode==='modules')for(const id of [...ids])if(isSymbol(N.get(id))){ids.delete(id);if(N.get(id).path&&N.has('file:'+N.get(id).path))ids.add('file:'+N.get(id).path)}
+  const refs=[...ids];
+  for(const id of refs)if(N.get(id).kind==='module')addNeighbors(ids,id,(n,e)=>isTerminal(n));
+  // Include other functionality consumers of visible modules: true shared nodes.
+  for(const id of [...ids])if(isFile(N.get(id)))addNeighbors(ids,id,n=>n.kind==='functionality');
+ }
+ for(const id of extras){ids.add(id);addNeighbors(ids,id,(n)=>n.layer!=='Evidence'||mode==='evidence')}
+ if(selected)ids.add(selected);
+ let all=[...ids].map(id=>N.get(id)).filter(nodeAllowed);
+ all.sort((a,b)=>(a.id===focus?-5:a.id===selected?-4:a.kind==='functionality'?-3:isTerminal(a)?-2:0)-(b.id===focus?-5:b.id===selected?-4:b.kind==='functionality'?-3:isTerminal(b)?-2:0)||a.id.localeCompare(b.id));
+ const omitted=Math.max(0,all.length-renderLimit);all=all.slice(0,renderLimit);
+ const visible=new Set(all.map(n=>n.id));
+ const links=DATA.links.filter(e=>visible.has(e.source)&&visible.has(e.target)&&edgeAllowed(e));
+ return {all,links,omitted};
+}
+function seeded(s){let h=2166136261;for(const c of s)h=Math.imul(h^c.charCodeAt(0),16777619);return (h>>>0)/4294967296}
+function updateView(fit=true){
+ const {all,links,omitted}=computeView();
+ const groups=Object.keys(COLORS),fi=F.findIndex(n=>n.id===focus);
+ currentNodes=all.map(n=>{
+  let x,y,z; const r=seeded(n.id),a=r*Math.PI*2;
+  if(n.kind==='functionality'){
+   const i=F.findIndex(f=>f.id===n.id),phi=Math.acos(1-2*(i+.5)/F.length),theta=Math.PI*(3-Math.sqrt(5))*i;
+   x=310*Math.sin(phi)*Math.cos(theta);y=260*Math.cos(phi);z=250*Math.sin(phi)*Math.sin(theta);
+  }else{const i=groups.indexOf(n.layer);x=(i%3-1)*180+90*Math.cos(a);y=(Math.floor(i/3)-1)*190+90*Math.sin(a);z=(r-.5)*360;}
+  if(n.id===focus){x=0;y=0;z=0}
+  return {...n,x,y,z,fx:x,fy:y,fz:z};
+ });
+ currentLinks=links.map(e=>({...e}));
+ if(graph){
+  graph.graphData({nodes:currentNodes,links:currentLinks});
+  if(fit)setTimeout(()=>graph.zoomToFit(450,65),100);
+ }
+ $('visible-count').textContent=`${all.length} nodes · ${links.length.toLocaleString()} links`;
+ $('summary').textContent=(omitted?`${omitted} nodes omitted by the ${renderLimit}-node view limit. Narrow the scope; full data and search remain available. `:'')+(focus?'Shared modules keep one identity across functionalities. Click any node or connection to inspect frozen source.':'Overview shows functionalities and up to 24 shared implementation files. Select a functionality to reveal operations and code.');
+ $('scene-title').textContent=focus?N.get(focus).name:'The built system, through its capabilities';
+ $('labels').innerHTML='';lastLabelHTML='';
+ catalog($('search').value);
+ if(selected)inspect(selected);
+}
+function choose(id,asFocus=false){
+ const n=N.get(id);if(!n)return;
+ selected=id;
+ if(n.kind==='functionality'||asFocus){focus=id;extras.clear();updateView()}
+ else {if(!currentNodes.some(v=>v.id===id)){extras.add(id);updateView()}inspect(id)}
+}
+function inspect(id){
+ const n=N.get(id);selected=id;
+ const refs=ADJ.get(id)||[],outgoing=refs.filter(e=>e.source===id).length;
+ let html=`<div class="eyebrow">SELECTED NODE</div><div id="selection-name">${esc(n.name)}</div><span class="tag">${esc(n.kind)}</span><span class="tag">${esc(n.layer)}</span>`;
+ if(n.status)html+=`<div class="status">${esc(n.status)}</div>`;
+ if(n.qualification)html+=`<p class="hint">${esc(n.qualification)}</p>`;
+/* local-only */ if(n.package){const p=N.get('package:'+n.package);html+=`<p class="hint">Related package: <b>${esc(p.name)}</b>. This status applies to its stated scope; individual operations are not independently certified here.</p>`}/* /local-only */
+ if(n.basis)html+=`<p class="hint">${esc(n.basis)}</p>`;
+ if(n.notes)html+=`<p class="hint">${esc(n.notes)}</p>`;
+ if(n.signature)html+=`<pre>${esc(n.signature)}</pre>`;
+ if(n.summary)html+=`<p class="hint">${esc(n.summary)}</p>`;
+/* local-only */ const authored=annotations.nodes[id];if(authored?.description)html+=`<h3>Your description</h3><p>${esc(authored.description)}</p>`;
+ html+=`<button id="edit-selected">Edit description & tests</button>`;
+ if(['function','method','class','file','module'].includes(n.kind))html+=entireBoard(n);/* /local-only */
+ if(n.interfaces)html+=`<h3>Interface availability / proof</h3><table class="interface-grid"><tr><th></th><th>Current wiring</th><th>Verification</th></tr>${Object.entries(n.interfaces).map(([name,v])=>`<tr><td>${esc(name)}</td><td>${esc(v.availability)}</td><td>${esc(v.verification)}${v.recordedAssertions?'<pre>'+esc(JSON.stringify(v.recordedAssertions,null,2))+'</pre>':''}</td></tr>`).join('')}</table>`;
+/* local-only */ if(n.kind==='functionality'){
+  const ops=ADJ.get(id).filter(e=>e.kind==='GROUPS_OPERATION').map(e=>N.get(e.target));
+  if(ops.length)html+=`<h3>UI / MCP coverage at a glance</h3><p class="hint">${ops.length} registered MCP operations; ${ops.filter(o=>o.interfaces?.UI.references?.length).length} with literal inspector references; ${ops.filter(o=>o.interfaces?.UI.recordedAssertions).length} with specifically mapped historical UI assertions. Others remain individually unmapped. Select an operation for exact availability/proof.</p>`;
+ }
+ if(n.scaleEvidence)html+=`<details><summary>Scale targets vs recorded evidence</summary><pre>${esc(JSON.stringify(n.scaleEvidence,null,2))}</pre></details>`;
+ if(n.testCoverage)html+=`<h3>Test mapping</h3><p class="hint">${esc(n.testCoverage)} ${n.tests?.length||0} recorded/candidate links. ${authored?.tests?.filter(t=>t.status==='Active').length||0} active authored records; ${authored?.tests?.filter(t=>t.status==='Inactive').length||0} inactive. No passing run is inferred.</p>`;
+ html+=sourceButton(n.path,n.line);
+ if(n.pointer)html+=`<small>Record pointer: ${esc(n.pointer)}</small>`;/* /local-only */
+ html+=`<div class="inline-actions"><button id="expand-selected">Show neighbors</button><button id="fly-selected">Center node</button></div>`;
+ if(isTerminal(n))html+=`<p class="hint">Opaque terminal dependency. External internals are outside this graph.</p>`;
+/* local-only */ if(n.databaseEntities)html+=`<details><summary>Database entity evidence (${n.databaseEntities.length})</summary>${n.databaseEntities.map(e=>sourceButton(e.path,e.line,e.name)).join('')}</details>`;
+ if(n.record)html+=`<details><summary>Exact recorded scope & gaps</summary><pre>${esc(JSON.stringify(n.record,null,2))}</pre></details>`;/* /local-only */
+ html+=`<h3>Connections <span class="count">${refs.length}</span></h3><small>${outgoing} outgoing · ${refs.length-outgoing} incoming · all graph links</small><input id="neighbors-filter" type="search" placeholder="Filter connections…"><div id="connections"></div>`;
+ $('inspector').innerHTML=html;
+/* local-only */ $('edit-selected').onclick=()=>openCard(id,true);/* /local-only */
+ const show=()=>{
+  const q=$('neighbors-filter').value.toLowerCase();
+  const list=refs.filter(e=>(N.get(other(e,id)).name+' '+e.kind+' '+e.detail).toLowerCase().includes(q));
+  $('connections').innerHTML=`<p class="hint">${list.length} matching · first 100 shown</p>`+list.slice(0,100).map(e=>{
+   const n=N.get(other(e,id));return `<button class="connection" data-edge="${e.index}"><span class="certainty ${esc(e.certainty)}">${esc(e.certainty)} · ${e.source===id?'→':'←'} ${esc(e.kind)}</span><br><b>${esc(n.name)}</b><small>${esc(e.path?e.path+':'+e.line:'')}</small></button>`;
+  }).join('');
+ };$('neighbors-filter').addEventListener('input',show);show();
+ $('expand-selected').onclick=()=>{extras.add(id);updateView()};
+ $('fly-selected').onclick=()=>{const t=currentNodes.find(n=>n.id===id);if(t&&graph){const p=graph.cameraPosition();graph.cameraPosition({x:t.x+(p.x-t.x)*.35,y:t.y+(p.y-t.y)*.35,z:t.z+(p.z-t.z)*.35},t,700)}};
+}
+function inspectEdge(index){
+ const e=DATA.links[index],a=N.get(e.source),b=N.get(e.target);
+ $('inspector').innerHTML=`<div class="eyebrow">RELATIONSHIP EVIDENCE</div><div id="selection-name">${esc(e.kind)}</div><span class="certainty ${esc(e.certainty)}">${esc(e.certainty)}</span>${nodeButton(a.id,'From · '+a.name)}${nodeButton(b.id,'To · '+b.name)}<p>${esc(e.detail)}</p>/* local-only */${sourceButton(e.path,e.line)}<pre>${esc(JSON.stringify({confidence:e.confidence,resolution:e.resolution,provenance:e.provenance,warnings:e.warnings,evidence:e.evidence,witnesses:e.witnesses},null,2))}</pre>/* /local-only */<p class="hint">This evidence supports only the named relationship. It does not certify the business outcome or every runtime path.</p>`;
+}
+/* local-only */function showSource(path,line){
+ const text=DATA.sources[path];if(text===undefined)return;
+ $('source-title').textContent=path+':'+line;
+ $('source-hash').textContent='Frozen '+DATA.meta.commit.slice(0,12)+' · SHA-256 '+DATA.sourceHashes[path];
+ $('source-lines').innerHTML=text.split('\n').map((s,i)=>`<div class="code-line ${i+1===line?'highlight':''}" id="code-${i+1}"><mark>${i+1}</mark><code>${esc(s)}</code></div>`).join('');
+ if(!$('source-dialog').open)$('source-dialog').showModal();
+ const target=$('code-'+line);if(target)$('source-lines').scrollTop=target.offsetTop-$('source-lines').offsetTop-130;
+}
+function coverage(){
+ const m=DATA.meta;
+ $('coverage-content').innerHTML=`<p><b>Commit</b> <code>${esc(m.commit)}</code><br><b>Tree</b> <code>${esc(m.tree)}</code><br>${m.snapshotKind==='working-tree'?'Frozen development source based on '+esc(m.baseCommit):'Frozen committed source'} · source schema ${esc(m.sourceSchemaVersion??'unlisted')} · Entire Graph ${esc(m.providerVersion)} · full profile<br>Refresh is ad hoc by request; this artifact never polls or uploads.</p><p>${m.nodes.toLocaleString()} nodes · ${m.edges.toLocaleString()} relationships · ${m.declaredPublicOperations} declared public operations · ${F.length} functionality groups · ${m.sourceFiles} frozen source/evidence files.</p><div class="status">Whole rebuild complete: ${m.wholeRebuildComplete}. Production release and accounting certification are not established by this graph.</div><h3>Limits and unknowns</h3><ul>${m.limitations.map(l=>'<li>'+esc(l)+'</li>').join('')}<li>“PER file” is ambiguous in the voice transcript and has no invented feature mapping.</li><li>${m.operationsWithoutDispatchComparison.length} registry operations have no resolved comparison check in this extractor; catalog composition and runtime dispatch may still exist.</li><li>${m.entireSummary.partial_failures.length} upstream parsing exclusions/failures, primarily documentation artifacts; inspect coverage.json for the full original report.</li></ul><h3>Recorded package scope</h3><table><thead><tr><th>Package</th><th>Status</th><th>Remaining scope / qualification limits</th></tr></thead><tbody>${DATA.nodes.filter(n=>n.kind==='acceptance package').map(n=>`<tr><td>${esc(n.name.split(' · ')[0])}</td><td>${esc(n.status)}</td><td>${esc(n.notes)}</td></tr>`).join('')}</tbody></table><h3>Relationship vocabulary</h3><table>${Object.entries(m.relations).map(([k,v])=>`<tr><td>${esc(k)}</td><td>${v.toLocaleString()}</td></tr>`).join('')}</table><p>Renderer: 3D Force Graph 1.80.1 (MIT), bundled locally. Structural extraction: Entire Graph v0.6.0. Authored grouping and EPM-specific literal extraction supplement its static graph.</p>`;
+ $('coverage-dialog').showModal();
+}/* /local-only */
+let lastLabelTime=0,lastLabelHTML='';
+function drawLabels(now=0){
+ if(graph&&labelsOn&&now-lastLabelTime>90){
+  lastLabelTime=now;const stage=$('stage'),width=stage.clientWidth,height=stage.clientHeight,occupied=[];
+  const candidates=[...currentNodes].sort((a,b)=>(a.id===selected?-3:a.id===focus?-2:a.kind==='functionality'?-1:0)-(b.id===selected?-3:b.id===focus?-2:b.kind==='functionality'?-1:0));
+  const html=[];
+  for(const n of candidates){
+   if(!Number.isFinite(n.x))continue;
+   const p=graph.graph2ScreenCoords(n.x,n.y,n.z);
+   if(p.x<0||p.y<70||p.x>width-90||p.y>height-55)continue;
+   const label=n.kind==='functionality'?n.name:n.name.split('/').pop(),w=Math.min(208,label.length*6+12,width-p.x-16),h=label.length>30?36:22;
+   if(n.id!==selected&&occupied.some(b=>p.x<b.x+b.w&&p.x+w>b.x&&p.y<b.y+b.h&&p.y+h>b.y))continue;
+   occupied.push({x:p.x,y:p.y,w,h});html.push(`<div class="node-label ${esc(n.kind)} ${n.id===selected?'selected':''}" style="left:${p.x}px;top:${p.y}px;max-width:${w}px" data-node="${esc(n.id)}">${esc(label)}</div>`);
+   if(html.length>38)break;
+  }const markup=html.join('');if(markup!==lastLabelHTML){$('labels').innerHTML=markup;lastLabelHTML=markup}
+ }else if(!labelsOn){$('labels').innerHTML='';lastLabelHTML=''}
+ requestAnimationFrame(drawLabels);
+}
+/* local-only */document.addEventListener('pointermove',e=>{lastPointer={x:e.clientX,y:e.clientY}});
+document.addEventListener('mouseover',e=>{const t=e.target.closest('.node-label[data-node]');if(t&&!cardPinned){lastPointer={x:e.clientX,y:e.clientY};openCard(t.dataset.node,false)}});
+document.addEventListener('mouseout',e=>{const t=e.target.closest('.node-label[data-node]');if(t&&!t.contains(e.relatedTarget))scheduleHoverClose()});/* /local-only */
+document.addEventListener('click',e=>{
+ const t=e.target.closest('[data-node],[data-function],[data-edge],[data-source],[data-close]');if(!t)return;
+ if(t.dataset.node){choose(t.dataset.node);/* local-only */if(t.classList.contains('node-label'))openCard(t.dataset.node,true)/* /local-only */}
+ else if(t.dataset.function)choose(t.dataset.function,true);
+ else if(t.dataset.edge)inspectEdge(Number(t.dataset.edge));
+/* local-only */ else if(t.dataset.source)showSource(t.dataset.source,Number(t.dataset.line)||1);/* /local-only */
+ else if(t.dataset.close)$(t.dataset.close).close();
+});
+$('snapshot-label').textContent='Snapshot '+DATA.meta.commit.slice(0,12)+' · source and acceptance evidence · refreshed on request';
+$('search').addEventListener('input',search);
+$('perspective').onchange=()=>{focus=null;selected=null;extras.clear();welcome();updateView()};
+$('overview').onclick=()=>{focus=null;selected=null;extras.clear();welcome();updateView()};
+$('detail').onchange=()=>updateView();
+$('fit').onclick=()=>graph?.zoomToFit(600,65);
+$('labels-button').onclick=()=>{labelsOn=!labelsOn;lastLabelHTML='';$('labels-button').textContent=labelsOn?'Names on':'Names off';$('labels-button').setAttribute('aria-pressed',String(labelsOn))};
+$('layers-button').onclick=()=>$('layers-dialog').showModal();
+/* local-only */$('coverage-button').onclick=coverage;/* /local-only */
+/* local-only */$('export-button').onclick=()=>downloadJSON({...DATA,annotations},'openepm-graph-'+DATA.meta.commit.slice(0,12)+'.json');/* /local-only */
+$('layer-options').innerHTML=Object.entries(COLORS).map(([name,color])=>`<label class="toggle"><input type="checkbox" checked data-layer="${esc(name)}"><span class="layer-dot" style="background:${color}"></span>${esc(name)}</label>`).join('');
+$('layers-dialog').onchange=e=>{if(e.target.dataset.layer){if(e.target.checked)activeLayers.add(e.target.dataset.layer);else activeLayers.delete(e.target.dataset.layer)}updateView(false)};
+/* local-only */function welcome(){$('inspector').innerHTML=`<div class="eyebrow">EXPLORE THE ACTUAL BUILD</div><div id="selection-name">Follow a capability into its code</div><p class="hint">Select a functionality on the left. Its operations connect to named modules, classes and functions. A shared component appears once, even when several capabilities use it.</p><h3>Where to start</h3>${F.filter(n=>/dimensions|source data|rolling forecast|authorize|leases|restore/.test(n.name)).slice(0,6).map(n=>nodeButton(n.id)).join('')}<div class="status">Source presence ≠ qualified behavior. Read the linked acceptance scope before drawing a completion conclusion.</div><p class="hint">EPM-owned functions are the deepest code level. Libraries and databases are opaque terminals. No live services or business data were accessed.</p>`}
+let editGeneration=0,saving=false;
+function nodeSummary(n){return n.summary||n.notes||n.basis||n.qualification||(n.kind==='operation'?'Registered application-language operation. Inspect its dispatch/registry source and scoped evidence.':`${n.kind} in ${n.path||n.layer}. Source-derived identity; behavior is not certified by graph presence.`)}
+function footprint(ids){
+ const refs=[...new Set(ids||[])],known=refs.filter(id=>DATA.entireConnectivity[id]),neighbors=new Set(),dependents=new Set(),edges=new Set();let truncated=false;
+ for(const id of known){const f=DATA.entireConnectivity[id];f.directDependencyNeighborIds.forEach(x=>neighbors.add(x));f.reachableDependentIdsDepth2.forEach(x=>dependents.add(x));f.directDependencyEdgeIds.forEach(x=>edges.add(x));truncated||=f.truncated}
+ return `${known.length}/${refs.length} attached references mapped · ${neighbors.size} distinct direct dependency neighbors / ${edges.size} dependency edges · ${dependents.size} distinct incoming dependents within 2 hops${truncated?' (bounded / truncated)':''}. Shared dependents deduplicated. Static potential reach; not business seriousness or complete blast radius.`;
+}
+function entireBoard(n){return `<details open><summary>Entire references · read only (${n.entireReferences?.length||0})</summary><p class="hint">Technical attachments for deeper investigation; these do not define the semantic main graph or its tests.</p>${n.entireReferences?.length?n.entireReferences.map(r=>{const f=DATA.entireConnectivity[r.id];return `<div class="connection"><b>${esc(r.name)}</b><small>${esc(r.kind)} · ${esc(r.path)}:${r.line}</small><small>${esc(r.match)}</small><small>${f?f.directRelationCount+' direct relation incidences (including structure); ':''}${esc(footprint([r.id]))}</small><details><summary>Exact reference / traversal scope</summary><pre>${esc(r.id)}</pre><small>Snapshot ${esc(r.commit)}</small><pre>${esc(JSON.stringify(DATA.meta.entireFootprintScope,null,2))}</pre></details>${sourceButton(r.path,r.line,'Frozen matching source')}</div>`}).join(''):'<p class="hint">No matching Entire reference attached.</p>'}</details>`}
+function recordFor(id){if(!annotations.nodes[id])annotations.nodes[id]={description:nodeSummary(N.get(id)),tests:[],hiddenGeneratedTests:[]};return annotations.nodes[id]}
+function setSaveState(text,saved=false){$('save-state').textContent=text;$('save-state').classList.toggle('saved',saved);$('save-edits').disabled=!dirty||!serverReady||saving;$('save-card').disabled=!dirty||!serverReady||saving}
+function markDirty(){dirty=true;editGeneration++;if(cardId){cardPinned=true;setCardMode()}setSaveState('Unsaved edits · project file unchanged')}
+function orphanIds(){return Object.keys(annotations.nodes).filter(id=>!N.has(id))}
+function cancelHoverClose(){clearTimeout(hoverCloseTimer);hoverCloseTimer=null}
+function closeHoverCard(){cancelHoverClose();$('hover-card').style.display='none';cardPinned=false;cardPointer=false;cardId=null}
+function scheduleHoverClose(){cancelHoverClose();if(!cardPinned)hoverCloseTimer=setTimeout(()=>{if(!cardPinned&&!cardPointer)closeHoverCard()},180)}
+function setCardMode(){
+ const card=$('hover-card');card.classList.toggle('preview',!cardPinned);$('pin-card').textContent=cardPinned?'Unpin':'Pin & edit';
+ if(cardPinned){card.style.left='';card.style.top='';cancelHoverClose()}
+ else{const w=card.offsetWidth||410,h=card.offsetHeight||300;let x=lastPointer.x+18;if(x+w>innerWidth-12)x=lastPointer.x-w-18;card.style.left=Math.max(12,Math.min(x,innerWidth-w-12))+'px';card.style.top=Math.max(90,Math.min(lastPointer.y+16,innerHeight-h-12))+'px'}
+}
+function openCard(id,pin=false){
+ if(cardPinned&&cardId!==id&&!pin)return;
+ cancelHoverClose();
+ cardId=id;cardPinned=pin||cardPinned;
+ const n=N.get(id);if(!n)return;
+ $('hover-title').textContent=n.name;$('hover-meta').textContent=n.kind+' · '+(n.path?n.path+':'+n.line:n.layer);
+ $('hover-card').style.display='block';
+ $('edit-description').value=annotations.nodes[id]?.description??nodeSummary(n);
+ $('description-origin').textContent=annotations.nodes[id]?'User-authored overlay; source identity and evidence stay separate.':'Generated quick summary. Edit to create a user-authored overlay.';
+ $('annotation-reconciliation').textContent=orphanIds().length?`${orphanIds().length} saved node identities are absent in this snapshot. They remain in the file for explicit reconciliation; no automatic rename matching.`:'Stable identities preserve edits across refresh. Removed/renamed identities are retained for reconciliation.';
+ renderTestEditor();
+ let board=$('hover-entire');if(!board){board=document.createElement('div');board.id='hover-entire';$('candidates').after(board)}board.innerHTML=entireBoard(n);
+ $('hover-summary').textContent=annotations.nodes[id]?.description??nodeSummary(n);
+ const tests=annotations.nodes[id]?.tests||[];
+ $('preview-tests').innerHTML=tests.length?`<ul>${tests.slice(0,4).map(t=>`<li>${esc(t.name)} <small>· ${esc(t.status)} · ${esc(t.kind)}</small></li>`).join('')}</ul>${tests.length>4?`<small>${tests.length-4} more · pin to inspect/edit all</small>`:''}`:`<small>No authored tests attached. ${n.tests?.length||0} source associations require review.</small>`;
+ $('preview-entire').textContent=n.entireReferences?.length?'Entire references (read only): '+n.entireReferences.map(r=>r.name).join(', '):'No matching Entire reference attached.';
+ setCardMode();
+}
+function renderTestEditor(){
+ if(!cardId)return;const row=annotations.nodes[cardId],tests=row?.tests||[],cols=Math.max(0,...tests.map(t=>(t.comments||[]).length));
+ $('test-editor').innerHTML=tests.length?`<div class="test-grid"><table><thead><tr><th>Test case / specification</th><th>Kind / status</th><th>Executable path / notes</th>${Array.from({length:cols},(_,i)=>'<th>Comment '+(i+1)+'</th>').join('')}<th>Entire refs / potential reach</th><th>Actions</th></tr></thead><tbody>${tests.map(t=>`<tr class="${t.status==='Inactive'?'inactive':''}" data-test-row="${esc(t.id)}"><td><textarea data-test="${esc(t.id)}" data-field="name" aria-label="Test name" maxlength="300">${esc(t.name)}</textarea><small>${esc(t.id)}</small></td><td><select data-test="${esc(t.id)}" data-field="kind" aria-label="Test kind"><option ${t.kind==='draft specification'?'selected':''}>draft specification</option><option ${t.kind==='existing executable association'?'selected':''}>existing executable association</option></select><select data-test="${esc(t.id)}" data-field="status" aria-label="Test active status"><option ${t.status==='Active'?'selected':''}>Active</option><option ${t.status==='Inactive'?'selected':''}>Inactive</option></select><span class="test-status">No execution asserted</span></td><td><textarea data-test="${esc(t.id)}" data-field="path" aria-label="Executable test path" placeholder="Optional tests/… path">${esc(t.path||'')}</textarea><textarea data-test="${esc(t.id)}" data-field="notes" aria-label="Test notes" placeholder="Specification / expected outcome">${esc(t.notes||'')}</textarea>${t.path&&!DATA.sources[t.path]?'<small class="warning">Path not found in frozen sources; reconcile before treating as executable.</small>':''}</td>${Array.from({length:cols},(_,i)=>t.comments?.[i]?`<td><textarea data-test="${esc(t.id)}" data-comment="${esc(t.comments[i].id)}" aria-label="Comment ${i+1}" maxlength="12000">${esc(t.comments[i].text)}</textarea><small>Separate comment record</small></td>`:'<td><small>—</small></td>').join('')}<td><textarea data-test="${esc(t.id)}" data-field="entireRefs" aria-label="Attached Entire reference IDs" placeholder="Exact reference IDs, one per line">${esc((t.entireRefs||[]).join('\n'))}</textarea><small>${esc(footprint(t.entireRefs||[]))}</small><button data-use-node-refs="${esc(t.id)}">Attach node references</button></td><td><button data-add-comment="${esc(t.id)}">Add comment</button><button data-remove-test="${esc(t.id)}">Remove association</button></td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">No authored test records attached. Add a draft or attach a source-derived candidate below. Zero attached tests does not mean this node is covered.</p>';
+ const generated=[...new Map((N.get(cardId).tests||[]).map(t=>[t.test,t])).values()].filter(t=>!row?.hiddenGeneratedTests?.includes(t.test));
+ $('candidate-tests').innerHTML=`<p class="hint">${esc(N.get(cardId).testCoverage||'Behavioral test mapping not established.')} Import candidates require review. Existing evidence is never erased by editing an overlay.</p>`+generated.map(t=>`<div class="connection"><b>${esc(N.get(t.test)?.name||t.test)}</b><small>${esc(t.confidence)}</small><button data-attach-test="${esc(t.test)}">Edit / attach</button> <button data-hide-test="${esc(t.test)}">Hide association</button>${sourceButton(t.path,t.line,'Association evidence')}</div>`).join('')+(row?.hiddenGeneratedTests?.length?'<button id="restore-hidden">Restore hidden source associations</button>':'');
+ const restore=$('restore-hidden');if(restore)restore.onclick=()=>{recordFor(cardId).hiddenGeneratedTests=[];markDirty();renderTestEditor()};
+}
+$('edit-description').oninput=e=>{recordFor(cardId).description=e.target.value;markDirty()};
+$('hover-card').addEventListener('mouseenter',()=>{cardPointer=true;cancelHoverClose()});
+$('hover-card').addEventListener('mouseleave',()=>{cardPointer=false;scheduleHoverClose()});
+$('stage').addEventListener('mouseleave',scheduleHoverClose);
+$('hover-card').addEventListener('focusin',e=>{if(e.target.matches('input,textarea,select')){cardPinned=true;setCardMode()}});
+$('hover-card').addEventListener('input',e=>{
+ const id=e.target.dataset.test;if(!id)return;const t=recordFor(cardId).tests.find(t=>t.id===id);if(!t)return;
+ if(e.target.dataset.comment){const c=t.comments.find(c=>c.id===e.target.dataset.comment);if(c)c.text=e.target.value}
+ else if(e.target.dataset.field==='entireRefs'){t.entireRefs=[...new Set(e.target.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean))];e.target.closest('td').querySelector('small').textContent=footprint(t.entireRefs)}
+ else if(e.target.dataset.field)t[e.target.dataset.field]=e.target.value;
+ if(e.target.dataset.field==='status')e.target.closest('tr').classList.toggle('inactive',t.status==='Inactive');markDirty();
+});
+$('hover-card').addEventListener('click',e=>{
+ const t=e.target.closest('[data-add-comment],[data-remove-test],[data-attach-test],[data-hide-test],[data-use-node-refs]');if(!t)return;const row=recordFor(cardId);
+ if(t.dataset.useNodeRefs){row.tests.find(v=>v.id===t.dataset.useNodeRefs).entireRefs=(N.get(cardId).entireReferences||[]).map(r=>r.id)}
+ else if(t.dataset.addComment){const test=row.tests.find(v=>v.id===t.dataset.addComment);test.comments??=[];test.comments.push({id:crypto.randomUUID(),text:''})}
+ else if(t.dataset.removeTest)row.tests=row.tests.filter(v=>v.id!==t.dataset.removeTest);
+ else if(t.dataset.hideTest){row.hiddenGeneratedTests??=[];row.hiddenGeneratedTests.push(t.dataset.hideTest)}
+ else if(t.dataset.attachTest){const n=N.get(t.dataset.attachTest);if(!row.tests.some(v=>v.path===n.path))row.tests.push({id:crypto.randomUUID(),name:n.name,kind:'existing executable association',status:'Active',path:n.path,notes:'Source-derived association attached for review. Behavioral coverage and passing execution remain unverified.',comments:[]})}
+ markDirty();renderTestEditor();
+});
+$('add-test').onclick=()=>{recordFor(cardId).tests.push({id:crypto.randomUUID(),name:'New test specification',kind:'draft specification',status:'Active',path:'',notes:'',comments:[]});markDirty();renderTestEditor()};
+$('pin-card').onclick=()=>{cardPinned=!cardPinned;setCardMode();if(!cardPinned&&!cardPointer)scheduleHoverClose()};
+$('close-card').onclick=closeHoverCard;
+async function saveEdits(){
+ if(!serverReady||saving||!dirty)return;saving=true;const generation=editGeneration;
+ setSaveState('Saving to project file…');
+ try{
+  const payload={...annotations,snapshotCommit:DATA.meta.commit};
+  const response=await fetch('/api/annotations',{method:'PUT',headers:{'Content-Type':'application/json','If-Match':String(savedRevision)},body:JSON.stringify(payload)}),result=await response.json();
+  if(!response.ok)throw Error(result.error||'Save failed');
+  savedRevision=result.revision;
+  if(generation===editGeneration){annotations=result.state;dirty=false}
+  setSaveState(dirty?'New unsaved edits after last save':`Saved to disk · revision ${savedRevision}`,!dirty);
+ }catch(e){setSaveState('Save failed: '+e.message)}finally{saving=false;$('save-edits').disabled=!dirty||!serverReady;$('save-card').disabled=!dirty||!serverReady}
+}
+$('save-edits').onclick=saveEdits;$('save-card').onclick=saveEdits;
+function downloadJSON(data,name){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),5000)}
+$('export-edits').onclick=()=>downloadJSON({...annotations,snapshotCommit:DATA.meta.commit},'openepm-graph-annotations.json');
+$('import-edits').onclick=()=>$('import-file').click();
+function validateImport(data){
+ if(!data||data.format!=='openepm-graph-annotations-v1'||!data.nodes||typeof data.nodes!=='object'||Array.isArray(data.nodes)||Object.keys(data.nodes).length>20000)throw Error('Invalid annotation format');
+ for(const [id,row]of Object.entries(data.nodes)){
+  if(['__proto__','constructor','prototype'].includes(id)||id.length>2000||!row||typeof row!=='object'||Array.isArray(row)||typeof(row.description??'')!=='string'||(row.description||'').length>12000||!Array.isArray(row.tests??[])||(row.tests??[]).length>200)throw Error('Invalid node record');
+  if(!Array.isArray(row.hiddenGeneratedTests??[])||!(row.hiddenGeneratedTests??[]).every(x=>typeof x==='string'))throw Error('Invalid hidden associations');
+  for(const test of row.tests??[]){if(!test||typeof test.id!=='string'||!test.id||typeof test.name!=='string'||!test.name||test.name.length>300||!['Active','Inactive'].includes(test.status)||!['draft specification','existing executable association'].includes(test.kind)||!Array.isArray(test.entireRefs??[])||!(test.entireRefs??[]).every(x=>typeof x==='string'&&x.length<=4000)||!Array.isArray(test.comments??[])||!(test.comments??[]).every(c=>c&&typeof c.id==='string'&&typeof c.text==='string'&&c.text.length<=12000))throw Error('Invalid test/comment record')}
+ }return data;
+}
+$('import-file').onchange=async e=>{try{const file=e.target.files[0];if(!file)return;if(file.size>4*1024*1024)throw Error('Metadata exceeds 4 MB');const data=validateImport(JSON.parse(await file.text()));annotations=data;markDirty();if(cardId)openCard(cardId,true);setSaveState(`Imported draft · ${orphanIds().length} orphan identities · save to disk`)}catch(err){setSaveState('Import rejected: '+err.message)}finally{e.target.value=''}};
+window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue='Unsaved graph metadata'}});
+async function loadEdits(){
+ if(location.protocol==='file:'){setSaveState('Offline file · export edits to retain them');return}
+ try{const r=await fetch('/api/annotations'),result=await r.json();if(!r.ok)throw Error('Metadata unavailable');annotations=validateImport(result.state);savedRevision=result.revision;serverReady=true;setSaveState(`Saved to disk · revision ${savedRevision}`,true)}catch(e){setSaveState('Metadata load failed · '+e.message)}
+}/* /local-only */
+try{
+ graph=new ForceGraph3D($('graph'),{controlType:'orbit',rendererConfig:{antialias:true,alpha:false}})
+ .backgroundColor('#0b111d').showNavInfo(false).nodeId('id').nodeColor(n=>n.id===selected?'#ffffff':COLORS[n.layer]||'#b7a3ff')
+ .nodeVal(n=>n.kind==='functionality'?8:isTerminal(n)?5:n.kind==='operation'?2:1.4).nodeRelSize(3)
+ .nodeLabel(n=>esc(n.name)+'<br>'+esc(n.kind)+' · '+esc(n.path?n.path+':'+n.line:n.layer))
+ .linkColor(e=>e.certainty==='syntax'?'#4b9c89':e.certainty==='association'?'#b88e53':e.certainty==='recorded'?'#759bc9':'#778292').linkOpacity(.55)
+ .linkWidth(e=>e.certainty==='association'?.7:.45)
+ .linkDirectionalArrowLength(3).linkDirectionalArrowRelPos(.92).linkLabel(e=>esc(e.kind)+' · '+esc(e.certainty))
+ /* local-only */.onNodeHover(n=>{if(n&&!cardPinned)openCard(n.id,false);else if(!n)scheduleHoverClose()})/* /local-only */.onNodeClick(n=>{choose(n.id);/* local-only */openCard(n.id,true)/* /local-only */}).onLinkClick(e=>inspectEdge(e.index)).enableNodeDrag(false).warmupTicks(0).cooldownTicks(1);
+ graph.d3Force('charge').strength(-55);graph.d3Force('link').distance(72);
+ let resizeTimer;const resize=()=>{graph.width($('stage').clientWidth).height($('stage').clientHeight);clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>graph.zoomToFit(300,65),100)};new ResizeObserver(resize).observe($('stage'));resize();
+}catch(e){$('webgl-error').style.display='block';console.error(e)}
+welcome();catalog();updateView();requestAnimationFrame(drawLabels);/* local-only */loadEdits();/* /local-only */
+/* local-only */// Read-only state access supports repeatable local browser verification.
+window.epmGraph={data:DATA,getState:()=>({focus,selected,visibleNodes:currentNodes.length,visibleLinks:currentLinks.length,layers:[...activeLayers],detail:$('detail').value,webgl:!!graph}),getAuthorState:()=>({dirty,serverReady,revision:savedRevision,orphans:orphanIds(),annotations:structuredClone(annotations)}),choose,showSource,openCard,saveEdits,graph};/* /local-only */
+</script></body></html>

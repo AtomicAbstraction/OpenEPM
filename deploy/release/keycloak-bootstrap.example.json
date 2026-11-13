@@ -1,0 +1,12 @@
+{
+  "format": "openepm-keycloak-bootstrap-v2",
+  "adminUrl": "https://identity:8443",
+  "webOrigin": "https://epm.example.invalid",
+  "mcpRedirectUris": [
+    "http://127.0.0.1:8765/callback"
+  ],
+  "initialAdministrator": {
+    "username": "openepm-owner",
+    "displayName": "Open EPM Owner"
+  }
+}
