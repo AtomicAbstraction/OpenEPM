@@ -2128,7 +2128,7 @@ it.each([
     const reason = await screen.findByLabelText("Return reason");
     fireEvent.change(reason, { target: { value: "Replace prior evidence" } });
     fireEvent.click(screen.getByRole("checkbox"));
-    const send = screen.getByRole("button", {
+    const send = await screen.findByRole("button", {
       name: "Return to Prior preparation",
     });
     fireEvent.click(send);

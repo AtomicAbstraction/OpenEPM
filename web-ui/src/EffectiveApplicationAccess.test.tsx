@@ -105,9 +105,11 @@ it("finds named people in this application and reads their scoped assignments fr
   expect(screen.getByText("Capacity Contributor")).toBeVisible();
   expect(screen.getByText("facts.write")).toBeVisible();
   expect(screen.getByText(/Shift: Night.*Machine: Press/)).toBeVisible();
-  expect(
-    screen.getByRole("heading", { name: "Person’s access" }),
-  ).toHaveFocus();
+  await waitFor(() =>
+    expect(
+      screen.getByRole("heading", { name: "Person’s access" }),
+    ).toHaveFocus(),
+  );
   const params = fetch.mock.calls.map(
     ([, init]) => JSON.parse(String(init.body)).program.arguments,
   );
