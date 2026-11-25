@@ -478,7 +478,7 @@ it("checks a lost acknowledgement in its original dimension and preserves anothe
   const confirmed = await screen.findByText(
     "The original Security Tag change was recorded.",
   );
-  expect(confirmed).toHaveFocus();
+  await waitFor(() => expect(confirmed).toHaveFocus());
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Read the current Security Tag catalogue before editing.",
   );
