@@ -104,7 +104,12 @@ async function installApi(page, audit) {
     }
     if (url.pathname === "/api/session-identity") {
       await route.fulfill(
-        json({ displayIdentity: "Rules tester", applicationMcpEndpoint: null }),
+        json({
+          subject: "rules-fixture-tester",
+          identityBinding: "f".repeat(64),
+          displayIdentity: "Rules tester",
+          applicationMcpEndpoint: null,
+        }),
       );
       return;
     }
