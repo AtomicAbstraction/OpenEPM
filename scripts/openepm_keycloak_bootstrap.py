@@ -143,13 +143,48 @@ def audience(name: str, value: str) -> dict:
 
 
 def group_membership() -> dict:
-    """Emit stable Keycloak group names, never mutable Open EPM display labels."""
+    """Enable the fixed immutable-ID claim mapper on both interactive clients."""
     return {"name": "openepm-stable-groups", "protocol": "openid-connect",
-        "protocolMapper": "oidc-group-membership-mapper",
+        "protocolMapper": "openepm-group-id-mapper",
         "consentRequired": False, "config": {
-            "claim.name": "groups", "full.path": "false",
-            "id.token.claim": "false", "access.token.claim": "true",
-            "userinfo.token.claim": "true", "introspection.token.claim": "true"}}
+            "access.token.claim": "true", "introspection.token.claim": "false"}}
+
+
+def reconcile_group_membership_mapper(api: KeycloakApi, token: str,
+                                      client_path: str) -> None:
+    """Migrate the managed mapper on an existing client and read it back."""
+    path = client_path + "/protocol-mappers/models"
+    expected = group_membership()
+    fields = ("name", "protocol", "protocolMapper", "config")
+
+    def observed():
+        status, mappers = api.request("GET", path, token=token)
+        expect(status, (200,))
+        if type(mappers) is not list or any(type(mapper) is not dict for mapper in mappers):
+            raise RuntimeError("KEYCLOAK_BOOTSTRAP_GROUP_ID_MAPPER_INVALID")
+        matches = [mapper for mapper in mappers if mapper.get("name") == expected["name"]]
+        if len(matches) > 1:
+            raise RuntimeError("KEYCLOAK_BOOTSTRAP_GROUP_ID_MAPPER_INVALID")
+        return matches[0] if matches else {}
+
+    current = observed()
+    if all(current.get(field) == expected[field] for field in fields):
+        return
+    if not current:
+        status, _ = api.request("POST", path, body=expected, token=token)
+        expect(status, (201,))
+    else:
+        identifier = current.get("id")
+        if (current.get("protocol") != expected["protocol"]
+                or not isinstance(identifier, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identifier)):
+            raise RuntimeError("KEYCLOAK_BOOTSTRAP_GROUP_ID_MAPPER_INVALID")
+        status, _ = api.request("PUT", path + "/" + identifier,
+                                body={**expected, "id": identifier}, token=token)
+        expect(status, (204,))
+    current = observed()
+    if any(current.get(field) != expected[field] for field in fields):
+        raise RuntimeError("KEYCLOAK_BOOTSTRAP_GROUP_ID_MAPPER_NOT_CURRENT")
 
 
 def client(client_id: str, audience_value: str, redirects: list[str],
@@ -531,9 +566,12 @@ def bootstrap(*, api: KeycloakApi | None = None, config: Path = CONFIG,
         if (type(matches) is not list or len(matches) != 1
                 or not isinstance(matches[0].get("id"), str)):
             raise RuntimeError("KEYCLOAK_BOOTSTRAP_CLIENT_LOOKUP_INVALID")
-        status, _ = api.request("PUT", "/admin/realms/openepm/clients/" +
-            matches[0]["id"], body={**representation, "id": matches[0]["id"]}, token=token)
+        client_path = "/admin/realms/openepm/clients/" + matches[0]["id"]
+        status, _ = api.request("PUT", client_path,
+            body={**representation, "id": matches[0]["id"]}, token=token)
         expect(status, (204,))
+        if identifier in ("openepm-mcp", "openepm-web"):
+            reconcile_group_membership_mapper(api, token, client_path)
         client_ids[identifier] = matches[0]["id"]
     reconcile_mcp_offline_access(api, token, client_ids["openepm-mcp"])
     grant_directory_roles(api, token, client_ids[DIRECTORY_CLIENT_ID])

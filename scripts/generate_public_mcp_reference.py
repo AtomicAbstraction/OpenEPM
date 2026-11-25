@@ -47,9 +47,10 @@ def route_link(slug, label):
     return f'<a href="/documentation/{slug}/">{escape(label)}</a>'
 
 
-def json_block(value, kind):
+def json_block(value, kind, *, example_use=None):
     content = escape(json.dumps(value, ensure_ascii=False, indent=2))
-    return f'<pre><code data-contract="{kind}">{content}</code></pre>'
+    usage = f' data-example-use="{example_use}"' if example_use else ''
+    return f'<pre><code data-contract="{kind}"{usage}>{content}</code></pre>'
 
 
 def provenance(paths):
@@ -101,22 +102,27 @@ async def discover(inventory):
 
 
 def public_catalogs():
-    from epm_core.postgres_capability_contract import KNOWN_CAPABILITIES, filter_catalog
+    from epm_core.postgres_capability_contract import KNOWN_CAPABILITIES
+    from epm_core.application_catalog_projection import application_functions
     from epm_core.postgres_identity_directory import catalog as directory_catalog
     from epm_core.postgres_language_v2 import PostgresLanguageV2
     from epm_core.postgres_platform_provision import PostgresPlatformProvisioner
     from epm_core.postgres_security_language import PostgresSecurityLanguage
     from epm_core.processing_operation_registry import external_function_catalog, operation_contracts
 
-    app = filter_catalog(PostgresLanguageV2.catalog(), KNOWN_CAPABILITIES)["functions"]
+    catalog = PostgresLanguageV2.catalog()
     security = PostgresSecurityLanguage.catalog()["functions"]
+    app = application_functions(catalog, security_functions=security,
+        enabled=KNOWN_CAPABILITIES,
+        allowed={spec['permission'] for spec in
+                 (*catalog['functions'].values(), *security.values())})
     workspace = external_function_catalog()
     reset = {"workspace.reset.apply": workspace.pop("workspace.reset.apply")}
     platform = {
         **PostgresPlatformProvisioner.catalog()["functions"],
         **directory_catalog()["functions"],
     }
-    application = with_mcp_tools({**app, **security}, scope='application')
+    application = with_mcp_tools(app, scope='application')
     workspace = with_mcp_tools(workspace, scope='workspace')
     reset = with_mcp_tools(reset, scope='workspace')
     platform = with_mcp_tools(platform, scope='platform')
@@ -128,11 +134,134 @@ def public_catalogs():
     return application, security, workspace, reset, platform, operations
 
 
-def tool_page(tool, content, discovery, dispatch):
-    from epm_core.postgres_execution_policy import CAPACITY_CODE, DEADLINE_CODE, FAILURE_CODE
+def validate_application_examples(application):
+    """Check published examples against the fixed preflight before emitting pages."""
+    from epm_core.postgres_capability_contract import assert_public_program_admitted
+    from epm_core.postgres_member_lists import compile_member_list_write
+    from epm_core.postgres_source_evidence import PostgresSourceEvidence
+    from epm_core import (application_authorization_config as config,
+        postgres_access_explanation, postgres_authorization_objects, postgres_authorization_tags,
+        postgres_effective_access, postgres_resource_access)
+    from epm_core.public_program_contracts import FUNCTIONS, MEMBER_LIST_EFFECTS, SOURCE_EVIDENCE_WRITES
 
-    name = tool["name"]
-    example = content["example"]
+    authorization_parsers = {
+        **dict.fromkeys((config.READ, config.PREVIEW, config.APPLY), config.compile_config),
+        postgres_access_explanation.FUNCTION: postgres_access_explanation.compile_explanation,
+        postgres_authorization_objects.FUNCTION: postgres_authorization_objects.compile_objects,
+        postgres_authorization_tags.FUNCTION: postgres_authorization_tags.compile_tags,
+        postgres_effective_access.FUNCTION: postgres_effective_access.compile_report,
+        postgres_resource_access.FUNCTION: postgres_resource_access.compile_resource_review,
+    }
+
+    def preflight(program):
+        assert_public_program_admitted(program)
+        if program['function'] in authorization_parsers:
+            authorization_parsers[program['function']](program)
+        if program['function'] in MEMBER_LIST_EFFECTS:
+            compile_member_list_write(program)
+        if program['function'] in SOURCE_EVIDENCE_WRITES:
+            PostgresSourceEvidence._write_payload(program['function'], program)
+
+    return validate_owner_examples(application, FUNCTIONS, preflight)
+
+
+def validate_control_plane_example(program):
+    from epm_core import application_authorization_migration, postgres_workspace_access_review
+    from epm_core.postgres_identity_directory import (
+        READ_FUNCTIONS, USER_PASSWORD, WRITE_FUNCTIONS, compile_directory_read, compile_directory_write)
+    from epm_core.postgres_platform_provision import (
+        FUNCTION as CREATE_WORKSPACE, OPERATION_RECEIPT_READ,
+        compile_create_workspace, compile_operation_receipt_read)
+    from epm_core.postgres_workspace_lifecycle import (
+        FUNCTION as CREATE_APPLICATION, compile_create_application)
+    from epm_core.postgres_security_language import (
+        WORKSPACE_FUNCTION, WORKSPACE_GROUP_FUNCTION, WORKSPACE_GROUP_LIST_FUNCTION,
+        compile_workspace_access_program, compile_workspace_group_access_program,
+        compile_workspace_group_access_list)
+    from epm_core.public_program_diagnostics import validate_program_envelope, validate_program_structure
+    from epm_core.public_program_contracts import public_program_contract_scope
+
+    compilers = {**dict.fromkeys(application_authorization_migration.FUNCTIONS,
+                                application_authorization_migration.compile_program),
+                 **dict.fromkeys(postgres_workspace_access_review.FUNCTIONS,
+                                postgres_workspace_access_review.compile_workspace_review),
+                 WORKSPACE_FUNCTION: compile_workspace_access_program,
+                 WORKSPACE_GROUP_FUNCTION: compile_workspace_group_access_program,
+                 WORKSPACE_GROUP_LIST_FUNCTION: compile_workspace_group_access_list,
+                 CREATE_WORKSPACE: compile_create_workspace,
+                 CREATE_APPLICATION: compile_create_application,
+                 OPERATION_RECEIPT_READ: compile_operation_receipt_read,
+                 **dict.fromkeys(READ_FUNCTIONS, compile_directory_read),
+                 **dict.fromkeys(WRITE_FUNCTIONS - {USER_PASSWORD}, compile_directory_write)}
+    function = program.get('function') if isinstance(program, dict) else None
+    scope = public_program_contract_scope(function) if isinstance(function, str) else 'workspace'
+    validate_program_envelope(program, scope=scope)
+    if function not in compilers:
+        raise ValueError('NO_CONTROL_PLANE_EXAMPLE_COMPILER')
+    validate_program_structure(program, scope=scope)
+    compilers[function](program)
+
+
+def validate_owner_examples(catalog, functions, validate):
+    from epm_core.public_program_contracts import project_program_contract, public_program_contract
+
+    count = 0
+    for function in sorted(functions):
+        if function not in catalog:
+            raise ValueError(f"Missing published owner contract for {function}")
+        owner = public_program_contract(function)
+        published = project_program_contract(catalog[function])
+        examples = published['programContract']['examples']
+        if (not examples or examples != owner['programContract']['examples']
+                or any(published[field] != owner[field] for field in (
+                    'programSchema', 'resultSchema', 'resultSchemaScope'))):
+            raise ValueError(f"Published contract differs from the qualified owner for {function}")
+        for number, example in enumerate(examples, start=1):
+            program = example['program']
+            try:
+                if program.get('function') != function:
+                    raise ValueError('Unexpected example function')
+                validate(program)
+            except (AttributeError, ValueError) as error:
+                raise ValueError(f"Invalid published example {number} for {function}") from error
+            count += 1
+    return count
+
+
+def validate_example_coverage(catalog, qualified_functions):
+    """Refuse to publish runnable examples without owner parser coverage."""
+    from epm_core.application_catalog_projection import with_example_use
+
+    for function, specification in sorted(catalog.items()):
+        if not specification.get('programContract', {}).get('examples'):
+            continue
+        if (function not in qualified_functions
+                and specification.get('availability', {}).get('status') != 'unsupported'):
+            raise ValueError(f"Published examples lack owner parser coverage for {function}")
+        if specification.get('exampleUse') != with_example_use(function, specification)['exampleUse']:
+            raise ValueError(f"Invalid or missing published example use for {function}")
+
+
+def tool_example(name, content, application, dispatch, *, control_plane=None):
+    from epm_core.postgres_capability_contract import assert_public_program_admitted
+    from epm_core.public_program_contracts import (
+        WORKSPACE_SECURITY_FUNCTIONS, WORKSPACE_PROVISIONING_FUNCTIONS,
+        PLATFORM_DIRECTORY_READ_FUNCTIONS, PLATFORM_DIRECTORY_WRITE_FUNCTIONS,
+        PLATFORM_PROVISIONING_FUNCTIONS, public_program_contract)
+
+    example = dict(content["example"])
+    owner_function = example.pop("programExampleFunction", None)
+    binding = None
+    if owner_function is not None:
+        if (type(owner_function) is not str or "program" in example
+                or (owner_function not in application and owner_function not in (control_plane or {}))):
+            raise ValueError(f"Invalid owner example reference for {name}")
+        contract = public_program_contract(owner_function)
+        if not contract or not contract['programContract']['examples']:
+            raise ValueError(f"Missing owner example for {name}")
+        owner_example = contract['programContract']['examples'][0]
+        example['program'] = owner_example['program']
+        binding = owner_example.get('binding')
     if "program" in example:
         program = example["program"]
         if (set(program) != {"languageVersion", "function", "arguments"}
@@ -140,6 +269,26 @@ def tool_page(tool, content, discovery, dispatch):
                 or name not in dispatch.get(program["function"], ())
                 or not isinstance(program["arguments"], dict)):
             raise ValueError(f"Invalid documented program for {name}")
+        if program['function'] in application:
+            try:
+                assert_public_program_admitted(program)
+            except ValueError as error:
+                raise ValueError(f"Invalid application program example for {name}") from error
+        if program['function'] in (WORKSPACE_SECURITY_FUNCTIONS | WORKSPACE_PROVISIONING_FUNCTIONS
+                                   | PLATFORM_PROVISIONING_FUNCTIONS | PLATFORM_DIRECTORY_READ_FUNCTIONS
+                                   | PLATFORM_DIRECTORY_WRITE_FUNCTIONS):
+            try:
+                validate_control_plane_example(program)
+            except ValueError as error:
+                raise ValueError(f"Invalid scoped program example for {name}") from error
+    return example, binding
+
+
+def tool_page(tool, content, discovery, application, dispatch, *, control_plane):
+    from epm_core.postgres_execution_policy import CAPACITY_CODE, DEADLINE_CODE, FAILURE_CODE
+
+    name = tool["name"]
+    example, binding = tool_example(name, content, application, dispatch, control_plane=control_plane)
     module = tool["functionalityModule"]
     origins = [ROOT / item["source"] for item in tool["variants"]]
     origins.append(ROOT / "epm_core/postgres_execution_policy.py")
@@ -150,9 +299,11 @@ def tool_page(tool, content, discovery, dispatch):
         'signature registered by your deployment and confirm your identity '
         'and permissions before calling the tool.</p>',
         '<h2>Endpoint signatures and example arguments</h2>',
-        '<p>Examples show the arguments to the tool. Replace placeholder IDs '
-        'and illustrative revisions with values from your authorized disposable scope.</p>',
+        '<p>Fixture only. Bind example arguments to an authorized disposable scope '
+        'and replace illustrative IDs and revisions before calling a tool.</p>',
     ]
+    if binding:
+        blocks.append(f'<p>{escape(binding)}</p>')
     for variant in tool["variants"]:
         endpoint = variant["endpoint"]
         description, schema = discovery[endpoint, name]
@@ -174,7 +325,7 @@ def tool_page(tool, content, discovery, dispatch):
             f'<p>{escape(description)}</p>',
             f'<dl><dt>Required arguments</dt><dd>{arg_list(required)}</dd>'
             f'<dt>Optional arguments</dt><dd>{arg_list(optional)}</dd></dl>',
-            json_block(arguments, "tool-example"),
+            json_block(arguments, "tool-example", example_use="fixture-only"),
             '<details><summary>Exact JSON input schema</summary>',
             json_block(schema, "tool-input-schema"),
             '</details></section>',
@@ -208,6 +359,7 @@ def tool_page(tool, content, discovery, dispatch):
 def catalog_page(scopes, operations, dispatch, security):
     origins = [
         ROOT / path for path in (
+            "epm_core/application_catalog_projection.py",
             "epm_core/postgres_platform_provision.py",
             "epm_core/postgres_identity_directory.py",
             "epm_core/postgres_language_v2.py",
@@ -229,6 +381,10 @@ def catalog_page(scopes, operations, dispatch, security):
         'Application discovery is filtered by current grants and capabilities. '
         'Security functions additionally require the configured security service. '
         'Some functions require other deployment services such as a Python build runtime.</p>',
+        '<p>The <code>exampleUse</code> field applies to all examples of a function. '
+        'Use <code>authorized-read</code> with the current application returned by authenticated discovery. '
+        'Bind <code>fixture-only</code> examples in an authorized disposable scope. '
+        'A <code>diagnostic-only</code> request demonstrates the stated error in a disposable scope.</p>',
     ]
     for scope_id, label, functions, discovery_tool in scopes:
         blocks.append(f'<h2 id="{scope_id}">{label}</h2>')
@@ -252,6 +408,12 @@ def catalog_page(scopes, operations, dispatch, security):
 
 
 async def generate(check):
+    from epm_core.postgres_identity_directory import USER_PASSWORD
+    from epm_core.public_program_contracts import (
+        FUNCTIONS, WORKSPACE_SECURITY_FUNCTIONS, WORKSPACE_PROVISIONING_FUNCTIONS,
+        PLATFORM_DIRECTORY_READ_FUNCTIONS, PLATFORM_DIRECTORY_WRITE_FUNCTIONS,
+        PLATFORM_PROVISIONING_FUNCTIONS, project_program_contract, public_program_contract)
+
     inventory = json.loads(INVENTORY.read_text())
     verify_inventory_sources(inventory)
     content = json.loads(CONTENT.read_text())
@@ -260,6 +422,21 @@ async def generate(check):
         raise ValueError("Tool reference content must cover every discovered name exactly once")
     discovery = await discover(inventory)
     application, security, workspace, reset, platform, operations = public_catalogs()
+    control_plane = {**workspace, **platform}
+    password_contract = project_program_contract(platform[USER_PASSWORD])
+    if (password_contract != public_program_contract(USER_PASSWORD)
+            or password_contract['programContract']['examples']
+            or password_contract['programSchema']['properties']['arguments']['properties']['temporaryPassword'].get('writeOnly') is not True):
+        raise ValueError("The credential contract must publish a write-only schema without credential examples")
+    for field in ('programSchema', 'resultSchema'):
+        Draft202012Validator.check_schema(password_contract[field])
+    control_functions = (WORKSPACE_SECURITY_FUNCTIONS | WORKSPACE_PROVISIONING_FUNCTIONS
+        | PLATFORM_PROVISIONING_FUNCTIONS | PLATFORM_DIRECTORY_READ_FUNCTIONS
+        | (PLATFORM_DIRECTORY_WRITE_FUNCTIONS - {USER_PASSWORD}))
+    validate_example_coverage(application, FUNCTIONS)
+    validate_example_coverage({**control_plane, **reset}, control_functions)
+    example_count = (validate_application_examples(application) + validate_owner_examples(
+        control_plane, control_functions, validate_control_plane_example))
     functions = {**application, **workspace, **reset, **platform}
     dispatch = public_dispatch(application, workspace, reset, platform)
     if not {tool for names in dispatch.values() for tool in names} <= tool_names:
@@ -272,7 +449,7 @@ async def generate(check):
     )
     generated = {
         PAGES / f'{tool_slug(tool["name"])}.html':
-            tool_page(tool, content[tool["name"]], discovery, dispatch)
+            tool_page(tool, content[tool["name"]], discovery, application, dispatch, control_plane=control_plane)
         for tool in inventory["tools"]
     }
     generated[PAGES / "mcp-function-catalog.html"] = catalog_page(
@@ -284,7 +461,7 @@ async def generate(check):
         else:
             path.write_text(body, encoding="utf-8")
     print(f"{len(tool_names)} tools, {len(discovery)} endpoint signatures and "
-          f"{len(functions)} scoped functions")
+          f"{len(functions)} scoped functions. {example_count} owner-qualified examples passed preflight.")
 
 
 if __name__ == "__main__":

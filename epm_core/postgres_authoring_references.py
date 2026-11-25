@@ -9,6 +9,7 @@ import json
 from collections.abc import Mapping
 
 from openepm.metadata_references import MARKER, MetadataReference
+from openepm.diagnostics import MetadataAuthoringError
 from .postgres_authoring_context import metadata_row_allowed
 from .postgres_dimensional_scope import resolve_effective_dimensional_scope
 
@@ -79,11 +80,11 @@ def _reference_slots(value, *, parameter_requests=None):
             elif key == "sample" and item.get("type") in ("Member", "MemberList"):
                 admitted = ("member", "id")
             elif key == "memberId" and (kind in _HIERARCHY_KINDS | {"member"}
-                    or container == "target"):
+                    or container in {"target", "navigation.anchor"}):
                 admitted = ("member", "id")
             elif key == "rootMemberId" and kind in _TRANSFORM_KINDS:
                 admitted = ("member", "id")
-            elif key == "hierarchyId" and kind in _HIERARCHY_KINDS | _TRANSFORM_KINDS:
+            elif key == "hierarchyId" and kind in _HIERARCHY_KINDS | _TRANSFORM_KINDS | {"navigation"}:
                 admitted = ("hierarchy", "id")
             elif key == "attributeId" and (kind == "attribute"
                     or (kind == "order" and item.get("by") == "attribute")):
@@ -96,7 +97,8 @@ def _reference_slots(value, *, parameter_requests=None):
                          "relationDigest": "definitionDigest"}.get(key)
                 if field is not None:
                     child_dimension, admitted = None, ("applicability_relation", field)
-            child_container = ("member_list.parameters" if key == "parameters" and kind == "member_list"
+            child_container = ("navigation.anchor" if key == "anchor" and kind == "navigation"
+                else "member_list.parameters" if key == "parameters" and kind == "member_list"
                 else "reduceMemberSets.selections"
                 if key == "selections" and container == "reduceMemberSets" else key)
             walk(child, depth=depth + 1, dimension=child_dimension,
@@ -117,10 +119,12 @@ def _reference_slots(value, *, parameter_requests=None):
 def _select(rows, lookup, id_key):
     exact = [row for row in rows if row[id_key] == lookup]
     candidates = exact or rows
+    kind = {"member_id": "member", "hierarchy_id": "hierarchy", "attribute_id": "attribute",
+            "list_id": "member_list", "relation_id": "applicability_relation"}[id_key]
     if not candidates:
-        raise ValueError("METADATA_NAME_UNAVAILABLE")
+        raise MetadataAuthoringError("METADATA_NAME_UNAVAILABLE", kind)
     if len(candidates) != 1:
-        raise ValueError("METADATA_NAME_AMBIGUOUS")
+        raise MetadataAuthoringError("METADATA_NAME_AMBIGUOUS", kind)
     return candidates[0]
 
 
@@ -153,7 +157,7 @@ def bind_authoring_references(db, scope, identity, arguments, *, metadata_revisi
                   AND status='Active' AND model_role IS DISTINCT FROM 'Currency'""",
                 (*expected[:2], dimension)).fetchone()
             if row is None or not metadata_row_allowed(authority, dimension, row):
-                raise ValueError("METADATA_NAME_UNAVAILABLE")
+                raise MetadataAuthoringError("METADATA_NAME_UNAVAILABLE", "dimension")
             dimensions[dimension] = row
         lookup = reference.lookup
         if reference.kind == "member":
@@ -167,7 +171,7 @@ def bind_authoring_references(db, scope, identity, arguments, *, metadata_revisi
             exact = [row for row in rows if row["member_id"] == lookup]
             candidates = exact or rows
             if any(not metadata_row_allowed(authority, dimension, row) for row in candidates):
-                raise ValueError("METADATA_NAME_UNAVAILABLE")
+                raise MetadataAuthoringError("METADATA_NAME_UNAVAILABLE", "member")
             row = _select(candidates, lookup, "member_id")
             result = {"id": row["member_id"]}
         elif reference.kind == "hierarchy":
@@ -181,7 +185,7 @@ def bind_authoring_references(db, scope, identity, arguments, *, metadata_revisi
                 (*expected[:2], dimension, lookup, lookup, lookup, lookup)).fetchall()
             row = _select(rows, lookup, "hierarchy_id")
             if row["metadata_revision"] != metadata_revision or row["state_token"] is None:
-                raise ValueError("METADATA_HIERARCHY_UNAVAILABLE")
+                raise MetadataAuthoringError("METADATA_HIERARCHY_UNAVAILABLE", "hierarchy")
             result = {"id": row["hierarchy_id"], "stateToken": row["state_token"]}
         elif reference.kind == "attribute":
             rows = db.execute("""SELECT attribute_id,display_name FROM epm.attribute_definition
@@ -226,7 +230,7 @@ def bind_authoring_references(db, scope, identity, arguments, *, metadata_revisi
             else MetadataReference(expected, "member_list", dimension, list_value))
         resolved_id = resolve(list_reference)
         if isinstance(list_value, str) and resolved_id != list_value:
-            raise ValueError("METADATA_NAME_UNAVAILABLE")
+            raise MetadataAuthoringError("METADATA_NAME_UNAVAILABLE", "member_list")
         definition = resolved_objects[("member_list", dimension, list_reference.lookup)]["definition"]
         declarations = {item["name"]: item for item in definition["parameters"]}
         if type(supplied) is not dict:

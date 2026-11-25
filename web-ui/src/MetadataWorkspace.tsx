@@ -1,14 +1,19 @@
 import { Breadcrumbs } from "./Breadcrumbs";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { readProgram } from "./api";
+import { ApiError, readProgram } from "./api";
 import { AttributeCatalog } from "./AttributeCatalog";
-import { MetadataCreate } from "./MetadataCreate";
+import { FunctionReference } from "./FunctionReference";
+import { useLayoutReplacementRequest } from "./LayoutReplacementRequest";
+import { ModelMeaning } from "./ModelMeaning";
+import { MetadataDimensionCreateRows } from "./MetadataDimensionCreateRows";
 import { MetadataMemberGrid } from "./MetadataMemberGrid";
 import { MetadataMaintenance } from "./MetadataMaintenance";
 import { MetadataRelationships } from "./MetadataRelationships";
-import { MetadataSecurityStringEditor } from "./MetadataSecurityStringEditor";
+import {
+  canReadSecurityString,
+  MetadataSecurityStringEditor,
+} from "./MetadataSecurityStringEditor";
 import { SecurityTagCatalog } from "./SecurityTagCatalog";
-import { SemanticAttributes } from "./SemanticAttributes";
 import {
   collectCapabilityDimensions,
   collectCapabilityMembers,
@@ -19,6 +24,7 @@ import type {
   MetadataNavigationDimension,
   MetadataSection,
 } from "./metadata-navigation";
+import { metadataSectionLabels } from "./metadata-navigation";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
 import "./metadata-workspace.css";
 
@@ -44,16 +50,16 @@ const sections: Record<
       "Organize parent–child placements. A member can have more than one parent, so each placement has its own identity.",
     requiresDimension: true,
   },
+  tree: {
+    title: "Tree",
+    description:
+      "Work with the selected hierarchy as a tree while keeping member identity and each parent-child placement distinct.",
+    requiresDimension: true,
+  },
   attributes: {
     title: "Attribute definitions",
     description:
       "Define the additional fields your model needs. Choose whether a field describes dimensions, members or relationships.",
-    requiresDimension: true,
-  },
-  semantics: {
-    title: "Semantic guidance",
-    description:
-      "Describe what the model means to people and agents. These bindings explain your metadata; they do not introduce hidden business behavior.",
     requiresDimension: true,
   },
   "security-tags": {
@@ -71,7 +77,7 @@ const sections: Record<
   reference: {
     title: "Function reference",
     description:
-      "Inspect the metadata functions available to your current application role. The browser and MCP use these same contracts.",
+      "Inspect the metadata functions available in the current application context. The browser and MCP use these same contracts.",
     requiresDimension: false,
   },
 };
@@ -79,9 +85,15 @@ const sections: Record<
 const memberSections = new Set<MetadataSection>([
   "members",
   "relationships",
-  "semantics",
+  "tree",
 ]);
+const primaryDimensionViews: MetadataSection[] = [
+  "members",
+  "relationships",
+  "tree",
+];
 type Snapshot = {
+  context: string;
   dimensions: MetadataDimension[];
   dimensionId: string;
   members: MetadataMember[];
@@ -96,10 +108,12 @@ export function MetadataWorkspace({
   dimensionId,
   memberId,
   hierarchyId,
+  relationshipId,
   onNavigate,
   hrefForDestination,
   onDimensionsChange,
   onRequestTransition,
+  onRefreshCatalog,
 }: {
   app?: ApplicationSummary;
   catalog: ApplicationCatalog | null;
@@ -107,19 +121,34 @@ export function MetadataWorkspace({
   dimensionId?: string;
   memberId?: string;
   hierarchyId?: string;
+  relationshipId?: string;
   onNavigate: (destination: MetadataDestination) => void;
   hrefForDestination: (destination: MetadataDestination) => string;
-  onDimensionsChange: (dimensions: MetadataNavigationDimension[]) => void;
+  onDimensionsChange: (
+    dimensions: MetadataNavigationDimension[],
+    metadataRevision: number | null,
+  ) => void;
   onRequestTransition: (action: () => void) => void;
+  onRefreshCatalog?: (signal?: AbortSignal) => Promise<ApplicationCatalog>;
 }) {
   const definition = sections[section];
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [storedSnapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const [errorRecord, setErrorRecord] = useState<{
+    context: string;
+    value: string;
+  } | null>(null);
   const [filter, setFilter] = useState("");
   const [status, setStatus] = useState("All");
   const [windowIndex, setWindowIndex] = useState(0);
-  const [drawer, setDrawer] = useState<"dimension" | "member" | null>(null);
+  const [dimensionCreateOpen, setDimensionCreateOpen] = useState(false);
+  const dimensionCreateButton = useRef<HTMLButtonElement>(null);
+  const replacement = useLayoutReplacementRequest(app, catalog);
+  const trackingReplacement = Boolean(
+    replacement.busy || replacement.pending || replacement.recorded,
+  );
+  const pendingDimensionCreate = useRef<string | null>(null);
+  const [attributeTrayOpen, setAttributeTrayOpen] = useState(false);
   const [memberAccessOpen, setMemberAccessOpen] = useState(false);
   const pendingMemberAccess = useRef<{
     workspaceId: string;
@@ -136,11 +165,38 @@ export function MetadataWorkspace({
   );
   const canReadMembers = Boolean(catalog?.functions["metadata.member.list"]);
   const needsMembers = memberSections.has(section);
+  const needsSnapshot = section !== "reference";
   const workspaceId = app?.workspaceId;
   const applicationId = app?.applicationId;
+  const catalogueContext = JSON.stringify([
+    workspaceId,
+    applicationId,
+    catalog?.accessContext,
+    catalog?.applicationAccess,
+    catalog?.revisions.metadata,
+    catalog?.revisions.policy,
+    catalog?.revisions.security,
+    catalog?.revisions.schemaEpoch,
+    Object.keys(catalog?.functions || {}).sort(),
+  ]);
+  const snapshotContext = JSON.stringify([
+    catalogueContext,
+    dimensionId,
+    needsMembers,
+    needsSnapshot,
+  ]);
+  const currentContext = useRef(snapshotContext);
+  currentContext.current = snapshotContext;
+  const error =
+    errorRecord?.context === snapshotContext ? errorRecord.value : "";
+  const setError = (value: string) =>
+    setErrorRecord({ context: snapshotContext, value });
+  const snapshot =
+    storedSnapshot?.context === snapshotContext ? storedSnapshot : null;
 
   const refresh = useCallback(async () => {
-    if (!workspaceId || !applicationId || !canReadDimensions) return;
+    if (!needsSnapshot || !workspaceId || !applicationId || !canReadDimensions)
+      return;
     const version = ++loadVersion.current;
     controller.current?.abort();
     const currentController = new AbortController();
@@ -181,43 +237,68 @@ export function MetadataWorkspace({
         );
         members = memberResult.rows;
       }
-      if (version !== loadVersion.current || currentController.signal.aborted)
+      if (
+        version !== loadVersion.current ||
+        currentController.signal.aborted ||
+        currentContext.current !== snapshotContext
+      )
         return;
       setSnapshot({
+        context: snapshotContext,
         dimensions,
         dimensionId: selected?.dimension_id || dimensionId || "",
         members,
         metadataRevision,
         membersLoaded,
       });
-      changedRef.current(dimensions);
+      changedRef.current(dimensions, metadataRevision);
     } catch (reason) {
-      if (version !== loadVersion.current || currentController.signal.aborted)
+      if (
+        version !== loadVersion.current ||
+        currentController.signal.aborted ||
+        currentContext.current !== snapshotContext
+      )
         return;
       setError(
         reason instanceof Error
           ? reason.message
           : "Unable to read the metadata workspace.",
       );
-      // A failed read is not a fresh editing snapshot. Keep the old grid visible
-      // for orientation, but do not expose its controls as ready to publish.
+      if (
+        reason instanceof ApiError &&
+        (reason.kind === "authorization" ||
+          [
+            "METADATA_DIRECTORY_READ_AUTHORIZATION_STALE",
+            "METADATA_DIRECTORY_CURSOR_REQUIRED",
+            "METADATA_DIRECTORY_CURSOR_STALE",
+          ].includes(reason.code))
+      ) {
+        setSnapshot(null);
+        changedRef.current([], null);
+      }
     } finally {
-      if (version === loadVersion.current) setBusy(false);
+      if (
+        version === loadVersion.current &&
+        currentContext.current === snapshotContext
+      )
+        setBusy(false);
     }
   }, [
     workspaceId,
     applicationId,
     dimensionId,
     needsMembers,
+    needsSnapshot,
     canReadDimensions,
     canReadMembers,
+    snapshotContext,
   ]);
 
   useEffect(() => {
     setSnapshot(null);
     setError("");
     setBusy(false);
-    setDrawer(null);
+    setDimensionCreateOpen(false);
     setMemberAccessOpen(false);
     void refresh();
     return () => {
@@ -226,7 +307,14 @@ export function MetadataWorkspace({
     };
   }, [refresh]);
   useEffect(() => {
-    setDrawer(null);
+    setDimensionCreateOpen(
+      section === "dimensions" &&
+        pendingDimensionCreate.current === catalogueContext,
+    );
+    pendingDimensionCreate.current = null;
+  }, [catalogueContext, section, dimensionId, memberId]);
+  useEffect(() => {
+    setAttributeTrayOpen(false);
     const pending = pendingMemberAccess.current;
     setMemberAccessOpen(
       Boolean(
@@ -245,6 +333,15 @@ export function MetadataWorkspace({
   }, [filter, status]);
   const dimension = snapshot?.dimensions.find(
     (item) => item.dimension_id === snapshot.dimensionId,
+  );
+  const unresolvedDimension = definition.requiresDimension && !dimension;
+  const awaitingSnapshot = Boolean(
+    app &&
+      catalog &&
+      canReadDimensions &&
+      needsSnapshot &&
+      !error &&
+      (!snapshot || (busy && unresolvedDimension)),
   );
   const selectedMember = snapshot?.members.find(
     (item) => item.member_id === memberId,
@@ -273,21 +370,47 @@ export function MetadataWorkspace({
     targetSection: MetadataSection,
     targetDimension = currentDimensionId,
     targetMember?: string,
+    targetRelationship?: string,
   ) =>
     onNavigate({
       section: targetSection,
       dimensionId: targetDimension,
       memberId: targetMember,
+      relationshipId:
+        (targetSection === "relationships" || targetSection === "tree") &&
+        targetMember
+          ? targetRelationship
+          : undefined,
       hierarchyId:
         targetDimension === currentDimensionId ? hierarchyId : undefined,
     });
-  const openDrawer = (kind: "dimension" | "member") =>
-    onRequestTransition(() => setDrawer(kind));
-  const closeDrawer = () => onRequestTransition(() => setDrawer(null));
+  const beginDimensionCreate = () =>
+    onRequestTransition(() => {
+      if (section === "dimensions") setDimensionCreateOpen(true);
+      else {
+        pendingDimensionCreate.current = catalogueContext;
+        onNavigate({ section: "dimensions" });
+      }
+    });
   const contentReady = Boolean(snapshot && !error);
+  const hideWorkarea = Boolean(error && (!snapshot || unresolvedDimension));
+  const linkedSecurityKind =
+    section === "members" && memberId ? "Member" : "Dimension";
+  const linkedSecurityTarget =
+    linkedSecurityKind === "Member" ? memberId : dimensionId;
+  const openLinkedSecurity =
+    dimensionId &&
+    linkedSecurityTarget &&
+    (section === "settings" || section === "members") &&
+    canReadSecurityString(catalog, linkedSecurityKind) &&
+    (!canReadDimensions ||
+      (contentReady &&
+        !busy &&
+        (unresolvedDimension ||
+          (linkedSecurityKind === "Member" && !selectedMember))));
 
   return (
-    <div className="page metadata-page" aria-busy={busy}>
+    <div className="page metadata-page" aria-busy={busy || awaitingSnapshot}>
       <Breadcrumbs
         label="Metadata breadcrumb"
         className="metadata-breadcrumb"
@@ -334,28 +457,6 @@ export function MetadataWorkspace({
               Function reference
             </button>
           )}
-          {section === "dimensions" &&
-            Boolean(catalog?.functions["metadata.dimension.create"]) && (
-              <button
-                className="primary"
-                disabled={!contentReady || busy}
-                onClick={() => openDrawer("dimension")}
-              >
-                + New dimension
-              </button>
-            )}
-          {section === "members" &&
-            Boolean(catalog?.functions["metadata.member.create"]) && (
-              <button
-                className="primary"
-                disabled={
-                  !contentReady || busy || dimension?.status !== "Active"
-                }
-                onClick={() => openDrawer("member")}
-              >
-                + New member
-              </button>
-            )}
         </div>
       </header>
       <div className="metadata-context-bar">
@@ -370,7 +471,19 @@ export function MetadataWorkspace({
             >
               {!dimension && (
                 <option value={dimensionId || ""}>
-                  {dimensionId ? "Dimension unavailable" : "Choose a dimension"}
+                  {!app
+                    ? "Choose an application"
+                    : !catalog
+                      ? "Checking metadata availability…"
+                      : !canReadDimensions
+                        ? "Dimension list unavailable"
+                        : busy || awaitingSnapshot
+                          ? "Loading dimensions…"
+                          : error
+                            ? "Unable to load dimensions"
+                            : dimensionId
+                              ? "Dimension unavailable"
+                              : "Choose a dimension"}
                 </option>
               )}
               {snapshot?.dimensions.map((item) => (
@@ -391,7 +504,7 @@ export function MetadataWorkspace({
               <span>
                 {section === "dimensions"
                   ? "Dimensions define the axes of your model"
-                  : "Current authorized metadata contract"}
+                  : "Current metadata contract"}
               </span>
             </div>
           </div>
@@ -404,22 +517,24 @@ export function MetadataWorkspace({
             </span>
           </span>
         )}
-        <label className="metadata-mobile-section">
-          <span>Workspace</span>
-          <select
-            aria-label="Metadata workspace"
-            value={section}
-            onChange={(event) =>
-              navigate(event.target.value as MetadataSection)
-            }
-          >
-            {Object.entries(sections).map(([key, item]) => (
-              <option key={key} value={key}>
-                {item.title}
-              </option>
-            ))}
-          </select>
-        </label>
+        <div className="metadata-mobile-section">
+          <label>
+            <span>Workspace</span>
+            <select
+              aria-label="Metadata workspace"
+              value={section}
+              onChange={(event) =>
+                navigate(event.target.value as MetadataSection)
+              }
+            >
+              {Object.entries(sections).map(([key, item]) => (
+                <option key={key} value={key}>
+                  {item.title}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
         <div className="metadata-refresh">
           <span>
             {busy
@@ -429,20 +544,104 @@ export function MetadataWorkspace({
                 : "No snapshot loaded"}
           </span>
           <button
-            disabled={busy || !canReadDimensions}
-            onClick={() => onRequestTransition(() => void refresh())}
+            disabled={!canReadDimensions}
+            aria-disabled={busy || undefined}
+            onClick={() => {
+              if (!busy) onRequestTransition(() => void refresh());
+            }}
           >
             {busy ? "Refreshing…" : "Refresh"}
           </button>
         </div>
       </div>
-      {error && (
+      {definition.requiresDimension && snapshot && (
+        <section
+          className="metadata-dimension-strip"
+          aria-label="Dimension workspace selector"
+        >
+          <div className="metadata-dimension-strip-heading">
+            <div>
+              <strong>Dimensions</strong>
+              <span>Select a model axis without leaving this workspace.</span>
+            </div>
+            {trackingReplacement ? (
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => navigate("dimensions", undefined)}
+              >
+                View layout replacement
+              </button>
+            ) : (
+              Boolean(catalog?.functions["metadata.dimension.create"]) && (
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={!contentReady || busy}
+                  onClick={beginDimensionCreate}
+                >
+                  + Add dimension
+                </button>
+              )
+            )}
+          </div>
+          <div className="metadata-dimension-strip-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Dimension</th>
+                  <th>Role</th>
+                  <th>Status</th>
+                  <th>Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {snapshot.dimensions.map((item) => (
+                  <tr
+                    key={item.dimension_id}
+                    className={
+                      item.dimension_id === currentDimensionId
+                        ? "selected-row"
+                        : undefined
+                    }
+                  >
+                    <th scope="row">
+                      <button
+                        type="button"
+                        aria-current={
+                          item.dimension_id === currentDimensionId
+                            ? "true"
+                            : undefined
+                        }
+                        onClick={() => navigate(section, item.dimension_id)}
+                      >
+                        {item.name}
+                      </button>
+                    </th>
+                    <td>{item.model_role}</td>
+                    <td>
+                      <span
+                        className={`status-chip ${item.status.toLowerCase()}`}
+                      >
+                        {item.status}
+                      </span>
+                    </td>
+                    <td>{item.short_description || "No description"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+      {needsSnapshot && error && (
         <div className="inline-error metadata-load-error" role="alert">
           <strong>The model could not be refreshed.</strong>
           <p>{error}</p>
           <p>
-            Your last view is retained for context. Refresh successfully before
-            editing.
+            {snapshot
+              ? "Your last view is retained for context. Refresh successfully before editing."
+              : "Refresh to check the current metadata again."}
           </p>
         </div>
       )}
@@ -456,21 +655,47 @@ export function MetadataWorkspace({
         </div>
       ) : !catalog ? (
         <div className="metadata-empty" role="status">
-          Checking your access…
+          Checking metadata availability…
+        </div>
+      ) : openLinkedSecurity ? (
+        <section
+          className="metadata-primary-pane"
+          aria-label="Linked metadata classification"
+        >
+          <h2>
+            {linkedSecurityKind === "Member"
+              ? `${dimensionId} / ${memberId}`
+              : dimensionId}
+          </h2>
+          <MetadataSecurityStringEditor
+            app={app}
+            catalog={catalog}
+            targetKind={linkedSecurityKind}
+            targetId={linkedSecurityTarget}
+            dimensionId={dimensionId}
+            onChanged={refresh}
+          />
+        </section>
+      ) : !canReadDimensions &&
+        section !== "reference" &&
+        (canReadSecurityString(catalog, "Dimension") ||
+          canReadSecurityString(catalog, "Member")) ? (
+        <div className="metadata-empty">
+          <h2>Review a Security String</h2>
+          <p>Open a link to the dimension or member you want to classify.</p>
         </div>
       ) : !canReadDimensions && section !== "reference" ? (
         <div className="metadata-empty">
-          <h2>Metadata is not available to your role</h2>
+          <h2>Metadata is not available in this application context</h2>
           <p>
-            Your current application permissions do not include reading
-            dimensions.
+            Dimension reads are not offered by the current application contract.
           </p>
         </div>
-      ) : busy && !snapshot ? (
+      ) : awaitingSnapshot ? (
         <div className="metadata-empty" role="status">
           Loading the current metadata snapshot…
         </div>
-      ) : definition.requiresDimension && !dimension && snapshot ? (
+      ) : hideWorkarea ? null : unresolvedDimension && snapshot ? (
         <div className="metadata-empty">
           <h2>
             {dimensionId
@@ -488,15 +713,67 @@ export function MetadataWorkspace({
         </div>
       ) : (
         <div
-          className={`metadata-workarea${drawer || (section === "members" && selectedMember) ? " has-inspector" : ""}`}
+          className={`metadata-workarea${section === "members" && (selectedMember || attributeTrayOpen) ? " has-inspector" : ""}`}
           inert={busy || Boolean(error) || undefined}
         >
           <section
             className="metadata-primary-pane"
             aria-label={`${definition.title} workspace`}
           >
+            {dimension && primaryDimensionViews.includes(section) && (
+              <nav
+                className="metadata-primary-tabs"
+                aria-label={`${dimension.name} metadata views`}
+              >
+                {primaryDimensionViews.map((view) => (
+                  <button
+                    type="button"
+                    key={view}
+                    className={section === view ? "active" : ""}
+                    aria-current={section === view ? "page" : undefined}
+                    onClick={() =>
+                      navigate(
+                        view,
+                        dimension.dimension_id,
+                        memberId,
+                        relationshipId,
+                      )
+                    }
+                  >
+                    {metadataSectionLabels[view]}
+                  </button>
+                ))}
+                <span className="metadata-primary-tab-spacer" />
+                {Boolean(
+                  catalog?.functions["metadata.attribute-definition.list"],
+                ) && (
+                  <button
+                    type="button"
+                    className="metadata-secondary-tab-action"
+                    onClick={() => {
+                      if (section === "members")
+                        onRequestTransition(() => setAttributeTrayOpen(true));
+                      else navigate("attributes", dimension.dimension_id);
+                    }}
+                  >
+                    {section === "members"
+                      ? "+ Add attribute"
+                      : "Manage attributes"}
+                  </button>
+                )}
+              </nav>
+            )}
             {section === "dimensions" && (
               <>
+                {snapshot && app && catalog && (
+                  <ModelMeaning
+                    app={app}
+                    catalog={catalog}
+                    dimensions={snapshot.dimensions}
+                    metadataRevision={snapshot.metadataRevision}
+                    onRefreshCatalog={onRefreshCatalog}
+                  />
+                )}
                 <div className="metadata-grid-toolbar metadata-directory-toolbar">
                   <label>
                     <span>Find a dimension</span>
@@ -521,12 +798,47 @@ export function MetadataWorkspace({
                   <span className="metadata-result-count">
                     {filteredDimensions.length} dimensions
                   </span>
+                  {Boolean(catalog?.functions["metadata.dimension.create"]) && (
+                    <button
+                      type="button"
+                      className="primary"
+                      ref={dimensionCreateButton}
+                      disabled={
+                        !contentReady ||
+                        busy ||
+                        dimensionCreateOpen ||
+                        trackingReplacement
+                      }
+                      onClick={beginDimensionCreate}
+                    >
+                      + New dimension row
+                    </button>
+                  )}
                 </div>
                 <div
                   className="metadata-directory-scroll"
                   role="region"
                   aria-label="Dimensions grid"
                   tabIndex={0}
+                  onFocus={({ target, currentTarget }) => {
+                    if (
+                      !(target instanceof HTMLButtonElement) ||
+                      !target.matches(":focus-visible")
+                    )
+                      return;
+                    // Native focus scrolling can leave most of a preceding
+                    // column clipped when the next row receives keyboard focus.
+                    const control = target.getBoundingClientRect();
+                    const { left } = currentTarget.getBoundingClientRect();
+                    const outlineRoom = 4;
+                    const visibleLeft = left + outlineRoom;
+                    const visibleRight =
+                      left + currentTarget.clientWidth - outlineRoom;
+                    if (control.left < visibleLeft)
+                      currentTarget.scrollLeft += control.left - visibleLeft;
+                    else if (control.right > visibleRight)
+                      currentTarget.scrollLeft += control.right - visibleRight;
+                  }}
                 >
                   <table className="metadata-directory-grid">
                     <thead>
@@ -541,6 +853,30 @@ export function MetadataWorkspace({
                       </tr>
                     </thead>
                     <tbody>
+                      {snapshot && (
+                        <MetadataDimensionCreateRows
+                          app={app}
+                          catalog={catalog}
+                          dimensions={snapshot.dimensions}
+                          metadataRevision={snapshot.metadataRevision}
+                          open={dimensionCreateOpen}
+                          replacement={replacement}
+                          disabled={!contentReady || busy}
+                          onClose={() => {
+                            const opener = dimensionCreateButton.current;
+                            setDimensionCreateOpen(false);
+                            requestAnimationFrame(() => {
+                              if (
+                                opener &&
+                                dimensionCreateButton.current === opener
+                              )
+                                opener.focus();
+                            });
+                          }}
+                          onCreated={refresh}
+                          onRefreshCatalog={onRefreshCatalog}
+                        />
+                      )}
                       {visibleDimensions.map((item) => (
                         <tr
                           key={item.dimension_id}
@@ -651,7 +987,10 @@ export function MetadataWorkspace({
                 </div>
               </>
             )}
-            {dimension?.status !== "Active" &&
+            {dimension &&
+              dimension.status !== "Active" &&
+              !busy &&
+              !error &&
               definition.requiresDimension &&
               section !== "settings" && (
                 <div className="metadata-empty">
@@ -667,14 +1006,15 @@ export function MetadataWorkspace({
               )}
             {dimension?.status === "Active" && snapshot && (
               <>
-                {(section === "members" || section === "relationships") &&
+                {(section === "members" ||
+                  section === "relationships" ||
+                  section === "tree") &&
                   (!canReadMembers ? (
                     <div className="metadata-empty">
-                      Your role cannot read members in this workspace.
+                      Member reads are not available in the current application
+                      context.
                     </div>
-                  ) : !snapshot.members.length &&
-                    (section === "members" ||
-                      !catalog?.functions["metadata.hierarchy.list"]) ? (
+                  ) : !snapshot.members.length && section !== "members" ? (
                     <div className="metadata-empty">
                       <span className="metadata-empty-icon" aria-hidden="true">
                         ◇
@@ -689,11 +1029,7 @@ export function MetadataWorkspace({
                       ) && (
                         <button
                           className="primary"
-                          onClick={() =>
-                            section === "members"
-                              ? openDrawer("member")
-                              : navigate("members")
-                          }
+                          onClick={() => navigate("members")}
                         >
                           Add members
                         </button>
@@ -717,11 +1053,20 @@ export function MetadataWorkspace({
                       metadataRevision={snapshot.metadataRevision}
                       onChanged={refresh}
                       mode={section}
+                      showViewToggle={false}
                       selectedMemberId={selectedMember?.member_id || ""}
-                      onSelectedMemberIdChange={(id) =>
-                        navigate(section, dimension.dimension_id, id)
+                      selectedRelationshipId={relationshipId}
+                      onSelectedMemberIdChange={(id, placementId) =>
+                        navigate(
+                          section,
+                          dimension.dimension_id,
+                          id,
+                          placementId,
+                        )
                       }
-                      onRequestTransition={onRequestTransition}
+                      onRequestTransition={
+                        section === "members" ? undefined : onRequestTransition
+                      }
                       onEditMemberSecurityString={
                         catalog.functions[
                           "security.application.member-tags.read"
@@ -751,6 +1096,9 @@ export function MetadataWorkspace({
                           : undefined
                       }
                       securityBusy={busy}
+                      creationDisabled={
+                        !contentReady || busy || dimension.status !== "Active"
+                      }
                     />
                   ) : section === "members" ? (
                     <MetadataMemberGrid
@@ -765,11 +1113,15 @@ export function MetadataWorkspace({
                         navigate("members", dimension.dimension_id, id)
                       }
                       onChanged={refresh}
+                      creationDisabled={
+                        !contentReady || busy || dimension.status !== "Active"
+                      }
                       mode="members"
                     />
                   ) : (
                     <div className="metadata-empty">
-                      Your role cannot read relationships.
+                      Relationship reads are not available in the current
+                      application context.
                     </div>
                   ))}
                 {section === "members" && memberId && !selectedMember && (
@@ -794,25 +1146,8 @@ export function MetadataWorkspace({
                     />
                   ) : (
                     <div className="metadata-empty">
-                      Attribute definitions are not available to your current
-                      role.
-                    </div>
-                  ))}
-                {section === "semantics" &&
-                  (catalog?.functions["metadata.semantic_column.list"] ? (
-                    <SemanticAttributes
-                      key={dimension.dimension_id}
-                      app={app}
-                      catalog={catalog}
-                      dimensionId={dimension.dimension_id}
-                      dimensions={snapshot.dimensions}
-                      members={snapshot.members}
-                      metadataRevision={snapshot.metadataRevision}
-                      onChanged={refresh}
-                    />
-                  ) : (
-                    <div className="metadata-empty">
-                      Semantic guidance is not available to your current role.
+                      Attribute definitions are not available in the current
+                      application context.
                     </div>
                   ))}
                 {section === "security-tags" &&
@@ -827,7 +1162,8 @@ export function MetadataWorkspace({
                     />
                   ) : (
                     <div className="metadata-empty">
-                      Security tags are not available to your current role.
+                      Security tags are not available in the current application
+                      context.
                     </div>
                   ))}
               </>
@@ -875,66 +1211,52 @@ export function MetadataWorkspace({
             )}
             {section === "reference" && (
               <div className="metadata-reference">
-                <p>
-                  {functionNames.length} metadata functions are available to
-                  your role. Select a function to inspect its published
-                  contract.
-                </p>
-                {functionNames.map((name) => (
-                  <details key={name}>
-                    <summary>{name}</summary>
-                    <pre>
-                      {JSON.stringify(catalog?.functions[name], null, 2)}
-                    </pre>
-                  </details>
-                ))}
-                {!functionNames.length && (
-                  <p>No metadata functions are currently authorized.</p>
-                )}
+                <FunctionReference catalog={catalog} names={functionNames} />
               </div>
             )}
           </section>
-          {drawer && snapshot && (
-            <aside
-              className="metadata-inspector"
-              aria-label={
-                drawer === "dimension"
-                  ? "New dimension editor"
-                  : "New member editor"
-              }
-            >
-              <div className="metadata-inspector-heading">
-                <div>
-                  <small>CREATE</small>
-                  <h2>
-                    {drawer === "dimension"
-                      ? "New dimension"
-                      : `New member in ${dimension?.name || "dimension"}`}
-                  </h2>
+          {section === "members" &&
+            attributeTrayOpen &&
+            dimension &&
+            snapshot && (
+              <aside
+                className="metadata-inspector metadata-attribute-tray"
+                aria-label="Add member attribute"
+              >
+                <div className="metadata-inspector-heading">
+                  <div>
+                    <small>MEMBER COLUMN</small>
+                    <h2>Add attribute to {dimension.name}</h2>
+                    <p>
+                      Create or maintain a governed column without leaving the
+                      member grid.
+                    </p>
+                  </div>
+                  <button
+                    aria-label="Close attribute tray"
+                    onClick={() =>
+                      onRequestTransition(() => setAttributeTrayOpen(false))
+                    }
+                  >
+                    ×
+                  </button>
                 </div>
-                <button
-                  aria-label="Close creation editor"
-                  onClick={closeDrawer}
-                >
-                  ×
-                </button>
-              </div>
-              <MetadataCreate
-                key={`${drawer}:${currentDimensionId}`}
-                app={app}
-                catalog={catalog}
-                dimensions={snapshot.dimensions}
-                dimensionId={
-                  drawer === "member" ? currentDimensionId : undefined
-                }
-                metadataRevision={snapshot.metadataRevision}
-                onCreated={refresh}
-                mode={drawer}
-              />
-            </aside>
-          )}
-          {!drawer &&
-            section === "members" &&
+                <AttributeCatalog
+                  contextLocked
+                  initialScope="Member"
+                  onRequestTransition={onRequestTransition}
+                  key={`member-attribute-tray:${dimension.dimension_id}`}
+                  app={app}
+                  catalog={catalog}
+                  dimensions={snapshot.dimensions}
+                  dimensionId={dimension.dimension_id}
+                  metadataRevision={snapshot.metadataRevision}
+                  onChanged={refresh}
+                />
+              </aside>
+            )}
+          {section === "members" &&
+            !attributeTrayOpen &&
             selectedMember &&
             dimension &&
             snapshot && (
@@ -969,10 +1291,10 @@ export function MetadataWorkspace({
                   onChanged={refresh}
                   mode="member"
                 />
-                {Boolean(
-                  catalog?.functions["security.application.member-tags.read"],
-                ) && (
-                  <div className="metadata-member-access">
+                <div className="metadata-member-access">
+                  {Boolean(
+                    catalog?.functions["security.application.member-tags.read"],
+                  ) && (
                     <button
                       aria-expanded={memberAccessOpen}
                       onClick={() =>
@@ -985,19 +1307,18 @@ export function MetadataWorkspace({
                         ? "Hide member access"
                         : "Member access"}
                     </button>
-                    {memberAccessOpen && (
-                      <MetadataSecurityStringEditor
-                        key={`member-security:${dimension.dimension_id}:${selectedMember.member_id}`}
-                        app={app}
-                        catalog={catalog}
-                        targetKind="Member"
-                        targetId={selectedMember.member_id}
-                        dimensionId={dimension.dimension_id}
-                        onChanged={refresh}
-                      />
-                    )}
-                  </div>
-                )}
+                  )}
+                  <MetadataSecurityStringEditor
+                    key={`member-security:${dimension.dimension_id}:${selectedMember.member_id}`}
+                    app={app}
+                    catalog={catalog}
+                    targetKind="Member"
+                    targetId={selectedMember.member_id}
+                    dimensionId={dimension.dimension_id}
+                    onChanged={refresh}
+                    showEditor={memberAccessOpen}
+                  />
+                </div>
               </aside>
             )}
         </div>

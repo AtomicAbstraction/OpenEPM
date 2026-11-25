@@ -15,6 +15,7 @@ from __future__ import annotations
 from hashlib import sha256
 import base64
 import binascii
+from contextlib import contextmanager
 import hmac
 import json
 import re
@@ -28,7 +29,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .persistence_contract import ApplicationScope,Coordinate
-from .postgres_access import PostgresAccessChecker, VerifiedIdentity
+from .postgres_access import AccessGroupsChanged, PostgresAccessChecker, VerifiedIdentity
 from .postgres_numeric_store import PostgresNumericFactStore
 
 
@@ -42,6 +43,13 @@ BULK = 'facts.generic.value.bulk'
 READ = 'facts.generic.value.read'
 SCAN = 'facts.generic.value.scan'
 SNAPSHOT_SCAN = 'facts.generic.value.snapshot.scan'
+READ_FUNCTIONS = frozenset((LIST, READ, SCAN, SNAPSHOT_SCAN))
+READ_AUTHORIZATION_STALE = 'GENERIC_FACT_READ_AUTHORIZATION_STALE'
+MAX_TABLE_PAGE = 100
+MAX_VALUE_PAGE = 200
+MAX_SERIES_KEY = 1000
+MAX_CURSOR = 8192
+_CURSOR_FORMAT = 'openepm-generic-snapshot-v2'
 _ID = re.compile(r'[0-9a-f]{32}\Z')
 
 # Generic facts intentionally do not have a validated cube coordinate.  Keep
@@ -55,6 +63,97 @@ GENERIC_FACT_DATA_CONTRACT = {
     'dimensionalSecurity': 'not_applicable_no_cube_coordinate',
     'planningControlModel': 'synthetic_guard_coordinate_only',
 }
+
+
+def generic_read_program_contract(function: str) -> dict:
+    from .metadata_read_contract import obj, read_contract, read_example
+
+    identifier = {'type': 'string', 'pattern': r'^[0-9a-f]{32}(?![\s\S])'}
+    key = {'type': 'string', 'minLength': 1, 'maxLength': MAX_SERIES_KEY}
+    cursor = {'type': 'string', 'minLength': 1, 'maxLength': MAX_CURSOR}
+    value = {'type': ['object', 'array', 'string', 'number', 'boolean']}
+    last_revision = {'type': 'integer', 'minimum': 1}
+    revision = {'type': 'integer', 'minimum': 0}
+    boolean = {'type': 'boolean'}
+    table = obj({
+        'table_id': identifier, 'name': {'type': 'string', 'minLength': 1, 'maxLength': 200},
+        'short_description': {'type': 'string', 'maxLength': 500},
+        'semantic_definition': {'type': 'string', 'minLength': 1, 'maxLength': 2000},
+        'status': {'enum': ['Active', 'Inactive']},
+    })
+    row = obj({'series_key': key, 'value': value, 'change_id': identifier,
+               'last_revision': last_revision})
+    table_binding = 'Use a table_id from facts.generic.table.list in the selected application.'
+    sample_id = '0123456789abcdef0123456789abcdef'
+    sample_key = 'item-a'
+    rules = [
+        'Generic facts are application-scoped JSON records with opaque series keys. Access is governed by the application grant.',
+        'The server checks current table availability and READ access for every request.',
+    ]
+
+    if function == READ:
+        arguments = obj({'tableId': identifier, 'seriesKey': key})
+        result = obj({'tableId': identifier, 'seriesKey': key, 'exists': boolean,
+                      'value': {}, 'changeId': {'type': 'string'},
+                      'lastRevision': {'type': ['integer', 'null']}})
+        result.update({
+            'if': {'properties': {'exists': {'const': True}}},
+            'then': {'properties': {'value': value, 'changeId': identifier,
+                                    'lastRevision': last_revision}},
+            'else': {'properties': {'value': {'type': 'null'}, 'changeId': {'const': ''},
+                                    'lastRevision': {'type': 'null'}}},
+        })
+        examples = [read_example(function, {'tableId': sample_id, 'seriesKey': sample_key},
+            name='Read one generic value', binding=table_binding + ' Supply the exact series key.')]
+        rules.append('exists distinguishes an absent record from a present JSON false, zero, empty string or empty collection.')
+    else:
+        page_limit = MAX_TABLE_PAGE if function == LIST else MAX_VALUE_PAGE
+        bounds = {'type': 'integer', 'minimum': 1, 'maximum': page_limit}
+        if function == LIST:
+            anchor_name, next_name, anchor, example = (
+                'afterTableId', 'nextAfterTableId', identifier, sample_id)
+            shared = {}
+            fields = {}
+            page_row = table
+            first_binding = 'Select the authorized application and start with afterTableId null.'
+            rules.append('Table discovery lists current Active and Inactive tables. Each page is a live directory read.')
+        elif function == SCAN:
+            anchor_name, next_name, anchor, example = (
+                'afterSeriesKey', 'nextAfterSeriesKey', key, sample_key)
+            shared = {'tableId': identifier}
+            fields = dict(shared)
+            page_row = row
+            first_binding = table_binding
+            rules.append('A current scan reads live values. Use facts.generic.value.snapshot.scan to retain one committed cut across pages.')
+        elif function == SNAPSHOT_SCAN:
+            anchor_name, next_name, anchor, example = ('cursor', 'nextCursor', cursor, 'example-cursor')
+            shared = {'tableId': identifier}
+            fields = {**shared, 'snapshotRevision': revision, 'metadataRevision': revision}
+            page_row = row
+            first_binding = table_binding + ' Start with cursor null.'
+            rules.append('The continuation pins one committed revision. Copy the signed cursor, retaining the original table, limit, application and verified identity. Metadata changes invalidate the page sequence.')
+        else:
+            raise ValueError('V2_GENERIC_FACT_FUNCTION_UNSUPPORTED')
+        optional_anchor = {'anyOf': [anchor, {'type': 'null'}]}
+        arguments = obj({**shared, 'limit': bounds, anchor_name: optional_anchor})
+        result = obj({**fields, 'rows': {'type': 'array', 'items': page_row, 'maxItems': page_limit},
+                      'hasMore': boolean, next_name: optional_anchor})
+        result.update({
+            'if': {'properties': {'hasMore': {'const': True}}},
+            'then': {'properties': {'rows': {'minItems': 1}, next_name: anchor}},
+            'else': {'properties': {next_name: {'type': 'null'}}},
+        })
+        first = {**({'tableId': sample_id} if shared else {}), 'limit': 1, anchor_name: None}
+        examples = [read_example(function, first, name='Read the first page', binding=first_binding),
+                    read_example(function, {**first, anchor_name: example}, name='Read the next page',
+                        binding=f'Use {next_name} from the previous page as {anchor_name}; keep the same scope and limit.')]
+
+    contract = read_contract(function, arguments, result, owner='PostgresGenericFacts.read',
+                             examples=examples, semantic_rules=rules)
+    contract['programContract']['recovery'] = (
+        'If access changes, rediscover the authorized application and retry the exact lookup or restart paging. '
+        'Use current table discovery after an unavailable table, and restart a snapshot with a null cursor after metadata changes or cursor expiry.')
+    return contract
 
 
 def _planning_coordinate(table_id: str,series_key: str) -> Coordinate:
@@ -188,7 +287,8 @@ class PostgresGenericFacts:
             'result': 'bounded page pinned to one committed revision',
             'previewRequired': False, 'idempotencyRequired': False,
             'workClass': 'short'}}
-        return {name: {**specification, **GENERIC_FACT_DATA_CONTRACT}
+        return {name: {**specification, **GENERIC_FACT_DATA_CONTRACT,
+                       **(generic_read_program_contract(name) if name in READ_FUNCTIONS else {})}
                 for name, specification in functions.items()}
 
     def execute(self, scope: ApplicationScope, program: dict, *,
@@ -524,6 +624,29 @@ class PostgresGenericFacts:
         db.execute('''SELECT pg_advisory_xact_lock(hashtextextended(key,0))
             FROM unnest(%s::text[]) key ORDER BY key''',(list(keys),))
 
+    @contextmanager
+    def _current_read(self, db, scope: ApplicationScope):
+        with db.transaction():
+            db.execute('SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY')
+            PostgresNumericFactStore._set_scope(db, scope)
+            check = PostgresAccessChecker.check_in_transaction
+            opening = check(db, self.identity, scope, 'read')
+            response_error = None
+            try:
+                yield
+            except ValueError as error:
+                # An unavailable table can disclose state too. Recheck access
+                # before releasing either a result or a bounded owner error.
+                response_error = error
+            try:
+                current = check(db, self.identity, scope, 'read', expected_groups=opening.groups)
+            except AccessGroupsChanged:
+                raise ValueError(READ_AUTHORIZATION_STALE) from None
+            if current != opening:
+                raise ValueError(READ_AUTHORIZATION_STALE)
+            if response_error is not None:
+                raise response_error
+
     def read(self, scope: ApplicationScope, program: dict) -> dict:
         if not isinstance(program, dict):
             raise ValueError('V2_GENERIC_FACT_ARGUMENTS_INVALID')
@@ -535,7 +658,7 @@ class PostgresGenericFacts:
                                       or not _ID.fullmatch(after)):
                 raise ValueError('FACT_TABLE_CURSOR_INVALID')
             limit = args['limit']
-            if type(limit) is not int or not 1 <= limit <= 100:
+            if type(limit) is not int or not 1 <= limit <= MAX_TABLE_PAGE:
                 raise ValueError('FACT_PAGE_LIMIT_INVALID')
         elif function == READ:
             args = _program(program, READ, {'tableId','seriesKey'})
@@ -544,14 +667,14 @@ class PostgresGenericFacts:
                             {'tableId','afterSeriesKey','limit'})
             after = args['afterSeriesKey']
             if after is not None:
-                _text(after,maximum=1000,label='FACT_SERIES_KEY')
+                _text(after,maximum=MAX_SERIES_KEY,label='FACT_SERIES_KEY')
             limit = args['limit']
-            if type(limit) is not int or not 1 <= limit <= 200:
+            if type(limit) is not int or not 1 <= limit <= MAX_VALUE_PAGE:
                 raise ValueError('FACT_PAGE_LIMIT_INVALID')
         elif function == SNAPSHOT_SCAN:
             args = _program(program,SNAPSHOT_SCAN,{'tableId','limit','cursor'})
             limit = args['limit']
-            if type(limit) is not int or not 1 <= limit <= 200:
+            if type(limit) is not int or not 1 <= limit <= MAX_VALUE_PAGE:
                 raise ValueError('FACT_PAGE_LIMIT_INVALID')
             if self.cursor_secret is None:
                 raise ValueError('GENERIC_CURSOR_SECRET_INVALID')
@@ -575,13 +698,9 @@ class PostgresGenericFacts:
             if not isinstance(table_id,str) or not _ID.fullmatch(table_id):
                 raise ValueError('FACT_TABLE_ID_INVALID')
         if function == READ:
-            _text(args['seriesKey'],maximum=1000,label='FACT_SERIES_KEY')
+            _text(args['seriesKey'],maximum=MAX_SERIES_KEY,label='FACT_SERIES_KEY')
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY")
-                PostgresNumericFactStore._set_scope(db,scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db,self.identity,scope,'read')
+            with self._current_read(db, scope):
                 if function == LIST:
                     rows=db.execute('''SELECT table_id,name,
                         short_description,semantic_definition,status
@@ -595,13 +714,6 @@ class PostgresGenericFacts:
                             'hasMore':len(rows)>limit,
                             'nextAfterTableId':rows[limit-1]['table_id']
                             if len(rows)>limit else None}
-                table=db.execute('''SELECT 1 FROM epm.generic_fact_table
-                    WHERE workspace_id=%s AND application_id=%s
-                    AND table_id=%s AND status<>'Deleted' ''',
-                    (scope.workspace_id,scope.application_id,
-                     table_id)).fetchone()
-                if table is None:
-                    raise ValueError('FACT_TABLE_UNAVAILABLE')
                 if function == SNAPSHOT_SCAN:
                     state=db.execute('''SELECT metadata_revision,
                         commit_revision FROM epm.application_state
@@ -616,6 +728,14 @@ class PostgresGenericFacts:
                     if snapshot_revision > state['commit_revision']:
                         raise ValueError('GENERIC_CURSOR_INVALID')
                     metadata_revision=state['metadata_revision']
+                table=db.execute('''SELECT 1 FROM epm.generic_fact_table
+                    WHERE workspace_id=%s AND application_id=%s
+                    AND table_id=%s AND status<>'Deleted' ''',
+                    (scope.workspace_id,scope.application_id,
+                     table_id)).fetchone()
+                if table is None:
+                    raise ValueError('FACT_TABLE_UNAVAILABLE')
+                if function == SNAPSHOT_SCAN:
                     rows=db.execute('''SELECT series_key,
                         after_value AS value,
                         resulting_change_id AS change_id,
@@ -639,10 +759,7 @@ class PostgresGenericFacts:
                     if final_metadata is None or final_metadata['metadata_revision']!=metadata_revision:
                         raise ValueError('STALE_METADATA_REVISION')
                     page=[dict(row) for row in rows[:limit]]
-                    next_cursor=(self._pack_cursor({
-                        'scope':[scope.workspace_id,scope.application_id],
-                        'identity':[self.identity.issuer,
-                                    self.identity.subject_id],
+                    next_cursor=(self._pack_cursor(scope, {
                         'tableId':table_id,'limit':limit,
                         'after':page[-1]['series_key'],
                         'snapshotRevision':snapshot_revision,
@@ -679,14 +796,24 @@ class PostgresGenericFacts:
                         'nextAfterSeriesKey':rows[limit-1]['series_key']
                         if len(rows)>limit else None}
 
-    def _pack_cursor(self,payload: dict) -> str:
-        raw=json.dumps(payload,sort_keys=True,separators=(',',':'),
-                       ensure_ascii=False).encode()
+    def _cursor_context_digest(self, scope: ApplicationScope) -> str:
+        context = [scope.workspace_id, scope.application_id,
+                   self.identity.issuer, self.identity.subject_id]
+        return sha256(json.dumps(context, separators=(',', ':'),
+                                ensure_ascii=False).encode()).hexdigest()
+
+    def _pack_cursor(self, scope: ApplicationScope, pins: dict) -> str:
+        # Encode the anchor's UTF-8 bytes so JSON escaping cannot inflate a
+        # valid series key past the size accepted on the next request.
+        payload = {**pins,
+            'format': _CURSOR_FORMAT, 'contextDigest': self._cursor_context_digest(scope),
+            'after': base64.urlsafe_b64encode(pins['after'].encode()).decode()}
+        raw=json.dumps(payload,sort_keys=True,separators=(',',':')).encode()
         signature=hmac.new(self.cursor_secret,raw,sha256).digest()
         return base64.urlsafe_b64encode(raw+signature).decode()
 
     def _unpack_cursor(self,token: object,scope: ApplicationScope) -> dict:
-        if not isinstance(token,str) or len(token)>8192:
+        if not isinstance(token,str) or not 1<=len(token)<=MAX_CURSOR:
             raise ValueError('GENERIC_CURSOR_INVALID')
         try:
             packed=base64.b64decode(token,altchars=b'-_',validate=True)
@@ -695,20 +822,27 @@ class PostgresGenericFacts:
                 hmac.new(self.cursor_secret,raw,sha256).digest(),signature):
                 raise ValueError('Signature mismatch')
             payload=json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError('Missing cursor fields')
+            pins = {'tableId', 'limit', 'after', 'snapshotRevision', 'metadataRevision', 'expiresAt'}
+            if payload.get('format') == _CURSOR_FORMAT:
+                if (set(payload) != pins | {'format', 'contextDigest'} or
+                        payload['contextDigest'] != self._cursor_context_digest(scope)):
+                    raise ValueError('Cursor binding mismatch')
+                payload['after'] = base64.b64decode(payload['after'], altchars=b'-_',
+                                                     validate=True).decode()
+            elif (set(payload) != pins | {'scope', 'identity'} or
+                    payload['scope'] != [scope.workspace_id, scope.application_id] or
+                    payload['identity'] != [self.identity.issuer, self.identity.subject_id]):
+                raise ValueError('Cursor binding mismatch')
         except (ValueError,TypeError,binascii.Error) as error:
             raise ValueError('GENERIC_CURSOR_INVALID') from error
-        if (not isinstance(payload,dict) or
-            set(payload)!={'scope','identity','tableId','limit','after',
-                          'snapshotRevision','metadataRevision','expiresAt'} or
-            payload['scope']!=[scope.workspace_id,scope.application_id] or
-            payload['identity']!=[self.identity.issuer,
-                                 self.identity.subject_id] or
-            not isinstance(payload['tableId'],str) or
+        if (not isinstance(payload['tableId'],str) or
             not _ID.fullmatch(payload['tableId']) or
             not isinstance(payload['after'],str) or
-            not 1<=len(payload['after'])<=1000 or
+            not 1<=len(payload['after'])<=MAX_SERIES_KEY or
             type(payload['limit']) is not int or
-            not 1<=payload['limit']<=200 or
+            not 1<=payload['limit']<=MAX_VALUE_PAGE or
             type(payload['snapshotRevision']) is not int or
             payload['snapshotRevision']<0 or
             type(payload['metadataRevision']) is not int or

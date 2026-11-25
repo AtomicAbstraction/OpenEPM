@@ -18,7 +18,7 @@ from .postgres_calculated_members import (
     expression_program_for_definition, load_current_dependency_template,
     verify_calculated_member_pin)
 from .persistence_contract import ApplicationScope, Coordinate
-from .postgres_access import PostgresAccessChecker, VerifiedIdentity
+from .postgres_access import AccessDenied, PostgresAccessChecker, VerifiedIdentity
 from .postgres_connection import connect_postgres
 from .postgres_cube_query import PostgresCubeQuery
 from .postgres_dimensional_security_enforcement import (
@@ -629,13 +629,15 @@ FUNCTION = "facts.cube.resolved.read"
 class PostgresResolvedCubeRead:
     """Bounded direct resolved read; large/reduced work uses technical query."""
 
-    def __init__(self, dsn: str, *, identity: VerifiedIdentity):
+    def __init__(self, dsn: str, *, identity: VerifiedIdentity,
+                 cursor_secret: bytes | None = None):
         if not isinstance(dsn, str) or not dsn:
             raise ValueError("A PostgreSQL runtime DSN is required")
         if not isinstance(identity, VerifiedIdentity):
             raise ValueError("A verified identity is required")
         self.dsn = dsn
         self.identity = identity
+        self.cursor_secret = cursor_secret
 
     def read(self, scope: ApplicationScope, program: object) -> dict[str, object]:
         return self._read(scope, program, technical=False)
@@ -657,23 +659,36 @@ class PostgresResolvedCubeRead:
             # The established calculated-member compiler uses a session-local
             # membership relation.  Create it before the immutable business
             # read cut; the subsequent transaction can remain READ ONLY.
+            from .postgres_calculated_members import create_selected_domain_read_relation
             with db.transaction():
-                db.execute('''CREATE TEMP TABLE IF NOT EXISTS
-                    epm_selected_domain_member(
-                    dimension_id text NOT NULL,member_id text NOT NULL,
-                    PRIMARY KEY(dimension_id,member_id))
-                    ON COMMIT PRESERVE ROWS''')
+                create_selected_domain_read_relation(db)
             with db.transaction():
                 # Authorization rechecks intentionally require READ COMMITTED.
                 # Source revision pins below therefore fail the whole read if a
                 # concurrent commit crosses this transaction.
                 db.execute("SET TRANSACTION READ ONLY")
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, "read")
-                dimensions = _dimensions_for_read(db, scope)
+                access = PostgresAccessChecker.check_in_transaction(
+                    db, self.identity, scope, "read", function=FUNCTION)
+                from .cube_view_read_contract import FORMAT as VIEW_READ_FORMAT
+                if (access.authorization_model == 'group_assignments'
+                        and (technical or program['arguments'].get('format') != VIEW_READ_FORMAT)):
+                    raise AccessDenied("CUBE_VIEW_READ_DIRECT_REQUIRED")
+                snapshot = load_resolved_read_snapshot(db, scope)
+                layout = load_resolved_read_layout(db, scope, snapshot=snapshot)
+                dimensions = layout["dimensions"]
+                if program["arguments"].get("format") == VIEW_READ_FORMAT:
+                    if technical:
+                        raise ValueError("CUBE_VIEW_READ_DIRECT_REQUIRED")
+                    from .postgres_cube_view_read import read_cube_view_in_transaction
+                    return read_cube_view_in_transaction(db, scope,
+                        identity=self.identity, dsn=self.dsn,
+                        cursor_secret=self.cursor_secret,
+                        arguments=program["arguments"], dimensions=dimensions,
+                        snapshot=snapshot)
                 requested_plan = compile_resolved_cube_read(program["arguments"],
-                    active_dimensions=dimensions)
+                    active_dimensions=dimensions,
+                    expected_metadata_revision=snapshot["metadataRevision"])
                 expected_delivery = "technical_query" if technical else "direct"
                 if requested_plan.normalized["delivery"] != expected_delivery:
                     raise ValueError("RESOLVED_READ_TECHNICAL_QUERY_REQUIRED")
@@ -687,15 +702,11 @@ class PostgresResolvedCubeRead:
                     if reduce_output else requested_plan)
                 configure_statement_timeout(
                     db, plan.normalized["limits"]["timeoutMs"])
-                snapshot = load_resolved_read_snapshot(db, scope)
-                if plan.normalized["selection"]["metadataRevision"] != \
-                        snapshot["metadataRevision"]:
-                    raise ValueError("STALE_METADATA_REVISION")
                 authority = resolve_effective_dimensional_scope(
                     db, self.identity, scope, function=FUNCTION)
                 resolved = resolve_selection_in_transaction(db, scope,
                     plan.normalized["selection"], snapshot["metadataRevision"],
-                    authority=authority)
+                    authority=authority, require_current_layout=True)
                 execution = compile_current_resolved_read(db, scope,
                     plan=plan, snapshot=snapshot,
                     resolved_members=resolved["members"])
@@ -735,23 +746,26 @@ class PostgresResolvedCubeRead:
                         result["rows"] = validate_resolved_rows(
                             reduced, plan=requested_plan, snapshot=snapshot)
                         result["requestDigest"]=requested_plan.digest
-                    state = db.execute("""SELECT schema_epoch,
-                        active_projection_generation FROM epm.application_state
-                        WHERE workspace_id=%s AND application_id=%s""", (
-                        scope.workspace_id, scope.application_id)).fetchone()
                     result["technicalPins"] = {
-                        "schemaEpoch": state["schema_epoch"],
+                        "schemaEpoch": layout["schema_epoch"],
                         "activeProjectionGeneration":
-                            state["active_projection_generation"]}
+                            layout["active_projection_generation"]}
                 return result
 
 
-def _dimensions_for_read(db, scope: ApplicationScope) -> list[str]:
-    row = db.execute("""SELECT l.dimensions FROM epm.application_state s
-        JOIN epm.coordinate_layout l
+def load_resolved_read_layout(db, scope: ApplicationScope, *,
+                              snapshot: dict[str, int]) -> dict:
+    # READ COMMITTED can see a newer layout than the opening revision cut.
+    # Match revisions in the same statement that fetches the axes and pins.
+    row = db.execute("""SELECT s.metadata_revision,s.commit_revision,
+        s.schema_epoch,s.active_projection_generation,l.dimensions
+        FROM epm.application_state s LEFT JOIN epm.coordinate_layout l
           USING(workspace_id,application_id,schema_epoch)
         WHERE s.workspace_id=%s AND s.application_id=%s""", (
         scope.workspace_id, scope.application_id)).fetchone()
-    if row is None:
+    if (row is None or row["metadata_revision"] != snapshot["metadataRevision"]
+            or row["commit_revision"] != snapshot["commitRevision"]):
+        raise ValueError("RESOLVED_READ_SNAPSHOT_CHANGED")
+    if row["dimensions"] is None:
         raise ValueError("COORDINATE_LAYOUT_UNAVAILABLE")
-    return list(row["dimensions"])
+    return row

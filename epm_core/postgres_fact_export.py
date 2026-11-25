@@ -4,18 +4,14 @@ from __future__ import annotations
 from decimal import Decimal
 import hmac
 
-import psycopg
-from epm_core.postgres_connection import connect_postgres
-from epm_core.postgres_processing_limits import configure_statement_timeout
-from psycopg.rows import dict_row
-
 from .persistence_contract import ApplicationScope
-from .postgres_access import PostgresAccessChecker, VerifiedIdentity
-from .postgres_cube_query import PostgresCubeQuery
+from .postgres_access import VerifiedIdentity
+from .postgres_cube_query import MAX_CURSOR_CHARACTERS, PostgresCubeQuery, cube_member_filter_schema
 from .postgres_jobs import _canonical_digest
-from .postgres_numeric_store import PostgresNumericFactStore
 
 
+FUNCTION = 'facts.export.page'
+MAX_EXPORT_PAGE_SIZE = 50
 _EXPORT_SCHEMA = {
     'id': 'openepm.fact-transfer-page',
     'version': 1,
@@ -23,6 +19,65 @@ _EXPORT_SCHEMA = {
     'literalTypes': ['AmountLiteral', 'TextLiteral', 'LineDetailLiteral'],
     'sourceReference': 'required-stable-origin',
 }
+
+
+def export_row_schema() -> dict:
+    from .postgres_numeric_catalog import obj
+
+    text = {'type': 'string'}
+    member = {'type': 'string', 'minLength': 1}
+    coordinate = {'type': 'object', 'minProperties': 1, 'propertyNames': member,
+                  'additionalProperties': member}
+    line = obj({'description': text, 'decimal': text})
+    value = {'oneOf': [obj({'type': {'const': 'AmountLiteral'}, 'decimal': text}),
+                       obj({'type': {'const': 'TextLiteral'}, 'text': text}),
+                       obj({'type': {'const': 'LineDetailLiteral'},
+                            'items': {'type': 'array', 'items': line}})]}
+    return obj({'members': coordinate, 'value': value,
+                'sourceRef': {'type': 'string', 'pattern': r'^export:[0-9a-f]{64}(?![\s\S])'}})
+
+
+def export_page_program_contract() -> dict:
+    from .metadata_read_contract import obj, read_contract, read_example
+
+    revision = {'type': 'integer', 'minimum': 0}
+    cursor = {'type': 'string', 'minLength': 1, 'maxLength': MAX_CURSOR_CHARACTERS}
+    nullable_cursor = {**cursor, 'type': ['string', 'null']}
+    arguments = obj({
+        'members': cube_member_filter_schema(),
+        'limit': {'type': 'integer', 'minimum': 1, 'maximum': MAX_EXPORT_PAGE_SIZE,
+                  'default': MAX_EXPORT_PAGE_SIZE},
+        'cursor': nullable_cursor, 'snapshotRevision': {**revision, 'type': ['integer', 'null']},
+    }, [])
+    arguments['if'] = {'required': ['cursor'], 'properties': {'cursor': {'type': 'string'}}}
+    arguments['then'] = {'properties': {'members': {'type': 'null'}, 'snapshotRevision': {'type': 'null'}}}
+    result = obj({
+        'schema': {'const': _EXPORT_SCHEMA},
+        'rows': {'type': 'array', 'maxItems': MAX_EXPORT_PAGE_SIZE, 'items': export_row_schema()},
+        'nextCursor': nullable_cursor, 'hasMore': {'type': 'boolean'},
+        'snapshotRevision': revision, 'metadataRevision': revision, 'securityRevision': revision,
+        'source': {'enum': ['postgres_current', 'postgres_event_history']},
+        'contentDigest': {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'},
+    })
+    result['if'] = {'properties': {'hasMore': {'const': True}}}
+    result['then'] = {'properties': {'nextCursor': cursor, 'rows': {'minItems': 1}}}
+    result['else'] = {'properties': {'nextCursor': {'type': 'null'}}}
+    contract = read_contract(FUNCTION, arguments, result, owner='PostgresFactExport.page', examples=[
+        read_example(FUNCTION, {'limit': 10}, name='Read the first typed export page',
+            binding='Select the authorized application. Omit members for a bounded page over visible facts.'),
+        read_example(FUNCTION, {'cursor': 'example-cursor', 'limit': 10}, name='Continue the same typed export',
+            binding='Copy nextCursor from the previous export page and retain its original limit. Use the same application and verified identity.'),
+    ], semantic_rules=[
+        'The page exports present facts as typed exact amounts, text or ordered supporting detail at one committed revision.',
+        'Present numeric zero, present empty text and a present empty supporting-detail set retain their original type and presence.',
+        'Current READ authority covers both raw facts and their detail until the response is assembled. Use the previous nextCursor and the same limit until hasMore is false.',
+        'In a group-assigned application the facts.export duty permits the transfer operation. Every exported row remains bounded by the requester’s current facts.read assignments.',
+        'contentDigest binds application scope, schema, snapshot, metadata and security revisions, rows and continuation presence. Cursor refresh and physical current or history read do not change the digest.',
+    ])
+    contract['programContract']['recovery'] = (
+        'Restart after stale metadata, security or access and use the chosen committed snapshot again only '
+        'under current authority. Keep the original page size when continuing an authorized page.')
+    return contract
 
 
 def _valid_export_row(row: object) -> bool:
@@ -80,65 +135,38 @@ class PostgresFactExport:
                  cursor_secret: bytes):
         self.cube = PostgresCubeQuery(
             dsn, identity=identity, cursor_secret=cursor_secret)
-        self.dsn = dsn
-        self.identity = identity
 
     def page(self, scope: ApplicationScope, *,
              members: dict[str, str] | None = None,
-             limit: int = 50, cursor: str | None = None,
+             limit: int = MAX_EXPORT_PAGE_SIZE, cursor: str | None = None,
              snapshot_revision: int | None = None) -> dict:
-        if type(limit) is not int or not 1 <= limit <= 50:
+        if type(limit) is not int or not 1 <= limit <= MAX_EXPORT_PAGE_SIZE:
             raise ValueError('EXPORT_PAGE_BOUNDS_INVALID')
-        page = self.cube.scan(scope, members=members, limit=limit,
-                              cursor=cursor,
-                              snapshot_revision=snapshot_revision)
-        keys = [row['seriesKey'] for row in page['rows']]
-        detail = {}
-        if keys:
-            # Immutable events are used even for the latest page. A writer may
-            # commit between cube.scan and this query, but the pinned revision
-            # still selects exactly the detail visible to the exported facts.
-            with connect_postgres(self.dsn, row_factory=dict_row) as db:
-                with db.transaction():
-                    db.execute('SET TRANSACTION READ ONLY')
-                    configure_statement_timeout(db, 5000)
-                    PostgresNumericFactStore._set_scope(db, scope)
-                    PostgresAccessChecker.check_in_transaction(
-                        db, self.identity, scope, 'read')
-                    state = db.execute('''SELECT metadata_revision,
-                        security_revision FROM
-                        epm.application_state WHERE workspace_id=%s
-                        AND application_id=%s''',
-                        (scope.workspace_id, scope.application_id)).fetchone()
-                    if (state is None or state['metadata_revision'] !=
-                            page['metadataRevision']):
-                        raise ValueError('STALE_METADATA_REVISION')
-                    if state['security_revision'] != page['securityRevision']:
-                        raise ValueError('STALE_SECURITY_REVISION')
-                    raw = db.execute('''SELECT DISTINCT ON (c.series_key)
-                        c.series_key,d.items,d.total,d.change_id,d.present
-                        FROM epm.coordinate c JOIN epm.line_detail_event d
-                        ON d.workspace_id=c.workspace_id
-                        AND d.application_id=c.application_id
-                        AND d.coordinate_id=c.coordinate_id
-                        WHERE c.workspace_id=%s AND c.application_id=%s
-                        AND c.series_key=ANY(%s)
-                        AND d.committed_revision<=%s
-                        ORDER BY c.series_key,d.committed_revision DESC,
-                        d.event_id DESC''',
-                        (scope.workspace_id, scope.application_id, keys,
-                         page['snapshotRevision'])).fetchall()
-                    detail = {row['series_key']: row for row in raw}
-                    after = db.execute('''SELECT metadata_revision,
-                        security_revision FROM
-                        epm.application_state WHERE workspace_id=%s
-                        AND application_id=%s''',
-                        (scope.workspace_id, scope.application_id)).fetchone()
-                    if (after is None or after['metadata_revision'] !=
-                            page['metadataRevision']):
-                        raise ValueError('STALE_METADATA_REVISION')
-                    if after['security_revision'] != page['securityRevision']:
-                        raise ValueError('STALE_SECURITY_REVISION')
+        with self.cube._scan_page(scope, members=members, limit=limit, cursor=cursor,
+                                  snapshot_revision=snapshot_revision, operation=FUNCTION) as (db, page):
+            keys = [row['seriesKey'] for row in page['rows']]
+            detail = self._read_detail(db, scope, keys, page['snapshotRevision']) if keys else {}
+            return self._export_page(scope, page, detail)
+
+    @staticmethod
+    def _read_detail(db, scope, keys, snapshot_revision):
+        # Read immutable detail at the raw page's committed revision, even if
+        # a writer advances the current detail while the export assembles.
+        rows = db.execute('''SELECT DISTINCT ON (c.series_key)
+            c.series_key,d.items,d.total,d.change_id,d.present
+            FROM epm.coordinate c JOIN epm.line_detail_event d
+            ON d.workspace_id=c.workspace_id
+            AND d.application_id=c.application_id
+            AND d.coordinate_id=c.coordinate_id
+            WHERE c.workspace_id=%s AND c.application_id=%s
+            AND c.series_key=ANY(%s)
+            AND d.committed_revision<=%s
+            ORDER BY c.series_key,d.committed_revision DESC,d.event_id DESC''',
+            (scope.workspace_id, scope.application_id, keys, snapshot_revision)).fetchall()
+        return {row['series_key']: row for row in rows}
+
+    @staticmethod
+    def _export_page(scope, page, detail):
         rows = []
         for row in page['rows']:
             source = detail.get(row['seriesKey'])

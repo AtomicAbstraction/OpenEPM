@@ -7,6 +7,7 @@ authoritative; this service never resumes, automatically reruns or undoes work.
 from __future__ import annotations
 
 import re
+from typing import TypedDict
 
 from psycopg.rows import dict_row
 
@@ -24,12 +25,65 @@ _TASK_ID = re.compile(
     r"d:[0-9a-f]{64}|"
     r"[hy]:[0-9a-f]{32}/[A-Za-z0-9][A-Za-z0-9._:@/-]{0,299})")
 _MAX_VISIBILITY_SCAN = 10_000
-_WORKFLOW_HIDDEN = frozenset((
-    "APPLICATION_WORKFLOW_ACTIVITY_NOT_ASSIGNED",
-    "APPLICATION_WORKFLOW_ASSIGNMENT_NOT_EFFECTIVE",
-    "APPLICATION_WORKFLOW_ASSIGNMENT_UNAVAILABLE",
-    "APPLICATION_WORKFLOW_SELECTION_NOT_ASSIGNED",
-))
+
+
+class TaskEventRecord(TypedDict):
+    event: int
+    status: str
+    claimGeneration: int | None
+    receiptRevision: int | None
+    errorCode: str | None
+    occurredAt: str
+
+
+# Same-statement latest observation, independent of the ascending event page.
+# The scoped task_event primary key supports this one-row backward index lookup.
+_LATEST_EVENT_COLUMNS = """latest.event_ordinal AS latest_event_ordinal,
+    latest.status AS latest_event_status,
+    latest.claim_generation AS latest_event_claim_generation,
+    latest.receipt_revision AS latest_event_receipt_revision,
+    latest.error_code AS latest_event_error_code,
+    latest.occurred_at AS latest_event_occurred_at"""
+_LATEST_EVENT_JOIN = """LEFT JOIN LATERAL (
+    SELECT event_ordinal,status,claim_generation,receipt_revision,error_code,occurred_at
+    FROM epm.task_event e WHERE e.workspace_id=t.workspace_id
+      AND e.application_id=t.application_id AND e.task_id=t.task_id
+    ORDER BY event_ordinal DESC LIMIT 1
+) latest ON true"""
+
+# Derive status and recovery guidance from the same latest durable observation.
+# An older event page must not keep a rearmed task in the attention filter.
+_TASK_STATE_JOIN = """CROSS JOIN LATERAL (
+    SELECT CASE
+        WHEN t.status='InterruptRequested'
+         AND t.source_family IN ('PythonWorkflow','ApplicationRuleWorkflow')
+         AND latest.error_code='WORKFLOW_CANCELLATION_RECOVERY_PARKED'
+            THEN 'workflowCancellationPaused'
+        WHEN t.status='InterruptRequested'
+         AND t.source_family='PythonScheduleOccurrence' AND latest.error_code IN (
+            'PYTHON_SCHEDULE_CANCELLATION_RECOVERY_PARKED',
+            'PYTHON_SCHEDULE_ADMISSION_UNRESOLVED',
+            'PYTHON_SCHEDULE_CONTROL_AUTHORITY_REQUIRED')
+            THEN 'scheduleCancellationUnresolved'
+    END AS recovery_state
+) recovery CROSS JOIN LATERAL (
+    SELECT CASE
+        WHEN recovery.recovery_state IS NOT NULL
+          OR t.status IN ('Failed','Interrupted','Rejected','Stale','NeedsInspection')
+            THEN 'attention'
+        WHEN t.status IN ('Accepted','Waiting','Queued','Claimed','Running','InterruptRequested','Cancelling')
+            THEN 'inProgress'
+        WHEN t.status='Succeeded' THEN 'succeeded'
+        ELSE 'other' END AS progress_state
+) progress"""
+
+
+class TaskInterruptionResult(TypedDict):
+    """Internal control outcome; None explicitly preserves unknown effects."""
+    taskId: str
+    status: str
+    nativeStatus: str
+    committedEffectsRemain: bool | None
 
 
 class PostgresTaskService:
@@ -66,35 +120,36 @@ class PostgresTaskService:
                 PostgresAccessChecker.check_in_transaction(
                     db, self.identity, scope, "read")
                 administrator = self._authorized(db, scope, "admin")
-                rows = db.execute("""SELECT task_id,sequence,task_class,
-                    source_family,source_id,function_name,resource_class,status,
-                    interruptible,rerun_supported,human_occurrence_id,
-                    human_activity_id,workflow_occurrence_id,
-                    workflow_activity_id,issuer,subject_id,created_at,updated_at
-                    FROM epm.task WHERE workspace_id=%s AND application_id=%s
-                    AND (%s=0 OR sequence<%s)
-                    AND (NOT %s OR status=ANY(%s::text[]))
-                    ORDER BY sequence DESC LIMIT %s""",
-                    (scope.workspace_id, scope.application_id, after_sequence,
-                     after_sequence, attention_only,
-                     ['Failed','Interrupted','Rejected','Stale'],
-                     _MAX_VISIBILITY_SCAN + 1)).fetchall()
-                candidates = rows[:_MAX_VISIBILITY_SCAN]
+                rows = db.execute(f"""SELECT t.task_id,t.sequence,t.task_class,
+                    t.source_family,t.source_id,t.function_name,t.resource_class,t.status,
+                    t.interruptible,t.rerun_supported,t.human_occurrence_id,
+                    t.human_activity_id,t.workflow_occurrence_id,
+                    t.workflow_activity_id,t.issuer,t.subject_id,t.created_at,t.updated_at,
+                    {_LATEST_EVENT_COLUMNS}, recovery.recovery_state, progress.progress_state
+                    FROM epm.task t {_LATEST_EVENT_JOIN} {_TASK_STATE_JOIN}
+                    WHERE t.workspace_id=%s AND t.application_id=%s
+                    AND (%s OR t.source_family='ApplicationWorkflowActivity'
+                        OR (t.issuer=%s AND t.subject_id=%s))
+                    AND (%s=0 OR t.sequence<%s)
+                    AND (NOT %s OR progress.progress_state='attention')
+                    ORDER BY t.sequence DESC LIMIT %s""",
+                    (scope.workspace_id, scope.application_id, administrator,
+                     self.identity.issuer, self.identity.subject_id, after_sequence,
+                     after_sequence, attention_only, _MAX_VISIBILITY_SCAN + 1)).fetchall()
                 visible = []
-                for row in candidates:
-                    if administrator or self._visible(db, scope, row):
+                # Workflow tasks still require the current assignment check.
+                # The SQL predicate only removes rows known to be invisible.
+                for row in rows[:_MAX_VISIBILITY_SCAN]:
+                    if administrator or self._visible(db, scope, row, skip_unresolved=True):
                         visible.append(row)
                         if len(visible) > limit:
                             break
                 page = visible[:limit]
-                scan_exhausted = len(rows) > _MAX_VISIBILITY_SCAN
-                has_more = len(visible) > limit or scan_exhausted
-                if len(visible) > limit:
-                    next_sequence = page[-1]["sequence"]
-                elif candidates:
-                    next_sequence = candidates[-1]["sequence"]
-                else:
-                    next_sequence = after_sequence
+                has_more = len(visible) > limit
+                if not has_more and len(rows) > _MAX_VISIBILITY_SCAN:
+                    raise ValueError("TASK_VISIBILITY_SEARCH_INCOMPLETE")
+                # Never use an invisible task as a public cursor boundary.
+                next_sequence = page[-1]["sequence"] if page else after_sequence
                 return {"tasks": [self._task_row(row) for row in page],
                         "nextSequence": next_sequence,
                         "hasMore": has_more}
@@ -114,14 +169,15 @@ class PostgresTaskService:
                 PostgresAccessChecker.check_in_transaction(
                     db, self.identity, scope, "read")
                 administrator = self._authorized(db, scope, "admin")
-                row = db.execute("""SELECT task_id,sequence,task_class,
-                    source_family,source_id,function_name,resource_class,status,
-                    interruptible,rerun_supported,issuer,subject_id,
-                    human_occurrence_id,human_activity_id,
-                    workflow_occurrence_id,workflow_activity_id,
-                    created_at,updated_at
-                    FROM epm.task
-                    WHERE workspace_id=%s AND application_id=%s AND task_id=%s""",
+                row = db.execute(f"""SELECT t.task_id,t.sequence,t.task_class,
+                    t.source_family,t.source_id,t.function_name,t.resource_class,t.status,
+                    t.interruptible,t.rerun_supported,t.issuer,t.subject_id,
+                    t.human_occurrence_id,t.human_activity_id,
+                    t.workflow_occurrence_id,t.workflow_activity_id,
+                    t.created_at,t.updated_at,{_LATEST_EVENT_COLUMNS},
+                    recovery.recovery_state, progress.progress_state
+                    FROM epm.task t {_LATEST_EVENT_JOIN} {_TASK_STATE_JOIN}
+                    WHERE t.workspace_id=%s AND t.application_id=%s AND t.task_id=%s""",
                     (scope.workspace_id, scope.application_id, task_id)).fetchone()
                 if (row is None or (not administrator
                         and not self._visible(db, scope, row))):
@@ -182,7 +238,7 @@ class PostgresTaskService:
                 "sourceLog": source_log}
 
     @lock_busy_boundary
-    def interrupt(self, scope: ApplicationScope, task_id: str) -> dict:
+    def interrupt(self, scope: ApplicationScope, task_id: str) -> TaskInterruptionResult:
         if not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id):
             raise ValueError("TASK_ID_INVALID")
         # Resolve visibility and source family first.  The native family method
@@ -212,10 +268,11 @@ class PostgresTaskService:
             committed = False
         elif task["sourceFamily"] == "PythonWorkflow":
             from .postgres_python_workflow import PostgresPythonWorkflowStore
-            workflow = PostgresPythonWorkflowStore(
+            control = PostgresPythonWorkflowStore(
                 self.dsn, identity=self.identity
-            ).request_cancel_as_task_controller(
+            ).cancel_with_result_as_task_controller(
                 scope, task["sourceId"], allow_application_admin=True)
+            workflow = control.workflow
             pending = next((item for item in reversed(workflow.checkpoints)
                             if not item.committed), None)
             if (workflow.status.value == "cancel_requested"
@@ -224,21 +281,22 @@ class PostgresTaskService:
                     self.dsn, identity=self.identity).request_cancel(
                         scope, pending.job_id, allow_application_admin=True)
             native = {"status": workflow.status.value}
-            committed = workflow.committed_units > 0
+            committed = control.committed_effects_remain
         elif task["sourceFamily"] == "ApplicationRuleWorkflow":
             from .postgres_application_rule_workflow import (
                 PostgresApplicationRuleWorkflowStore)
-            workflow=PostgresApplicationRuleWorkflowStore(
+            control=PostgresApplicationRuleWorkflowStore(
                 self.dsn,identity=self.identity
-            ).request_cancel_as_task_controller(
+            ).cancel_with_result_as_task_controller(
                 scope,task["sourceId"],allow_application_admin=True)
+            workflow=control.workflow
             pending=next((item for item in reversed(workflow.checkpoints)
                           if not item.committed),None)
             if workflow.status.value=="cancel_requested" and pending is not None:
                 PostgresJobQueue(self.dsn,identity=self.identity).request_cancel(
                     scope,pending.job_id,allow_application_admin=True)
             native={"status":workflow.status.value}
-            committed=workflow.committed_units>0
+            committed=control.committed_effects_remain
         elif task["sourceFamily"] == "ApplicationScheduleOccurrence":
             from .postgres_application_schedules import (
                 PostgresApplicationSchedules)
@@ -246,21 +304,23 @@ class PostgresTaskService:
                 self.dsn,identity=self.identity
             ).request_cancel_as_task_controller(
                 scope,task["sourceId"],allow_application_admin=True)
-            committed=native["status"] in (
-                "published","partially_published")
+            committed=native["committedEffectsRemain"]
         elif task["sourceFamily"] == "ImportExecution":
             from .postgres_import_execution import PostgresImportExecution
             native = PostgresImportExecution(
                 self.dsn, identity=self.identity
             ).request_cancel_as_task_controller(
                 scope, task["sourceId"], allow_application_admin=True)
-            committed = native["status"] == "Completed"
+            committed = (True if native["status"] == "Completed" else
+                False if native["status"] == "Cancelled"
+                    and type(native.get("claimGeneration")) is int
+                    and native["claimGeneration"] == 0 else None)
         elif task["sourceFamily"] == "PythonScheduleOccurrence":
             from .postgres_python_schedules import PostgresPythonSchedules
             native = PostgresPythonSchedules(
                 self.dsn, identity=self.identity
             ).request_cancel_as_task_controller(scope, task["sourceId"])
-            committed = native["status"] == "published"
+            committed = native["committedEffectsRemain"]
         elif task["sourceFamily"] == "ExportProducer":
             from .postgres_export_producer_checkpoint import (
                 PostgresExportProducerCheckpoint)
@@ -314,7 +374,7 @@ class PostgresTaskService:
                 self.dsn, identity=self.identity
             )._request_cancel_as_task_controller(
                 scope, task["sourceId"], allow_application_admin=True)
-            committed = False
+            committed = None
         else:
             raise ValueError("TASK_NOT_INTERRUPTIBLE")
         normalized_native = native["status"]
@@ -401,19 +461,13 @@ class PostgresTaskService:
                 "operationId": native["operationId"],
                 "committedRevision": native["committedRevision"]}
 
-    def _visible(self, db, scope: ApplicationScope, row) -> bool:
+    def _visible(self, db, scope: ApplicationScope, row, *, skip_unresolved: bool = False) -> bool:
         if row["source_family"] == "ApplicationWorkflowActivity":
             from .postgres_application_workflow_occurrences import (
-                authorize_workflow_activity_task_in_transaction)
-            try:
-                authorize_workflow_activity_task_in_transaction(
-                    db, scope, self.identity,
-                    row["workflow_occurrence_id"],row["workflow_activity_id"])
-                return True
-            except ValueError as error:
-                if str(error) in _WORKFLOW_HIDDEN:
-                    return False
-                raise
+                workflow_activity_task_visible_in_transaction)
+            return workflow_activity_task_visible_in_transaction(
+                db, scope, self.identity, row["workflow_occurrence_id"], row["workflow_activity_id"],
+                skip_unresolved=skip_unresolved)
         # Domain-era HumanActivity rows can survive only as non-actionable
         # audit history after schema 235. Their source relations no longer
         # exist, so visibility falls back to the verified originating subject.
@@ -453,13 +507,23 @@ class PostgresTaskService:
                 "function": row["function_name"],
                 "resourceClass": row["resource_class"],
                 "status": row["status"],
+                "progressState": row["progress_state"],
+                "recoveryState": row["recovery_state"],
                 "interruptible": row["interruptible"],
                 "rerunSupported": row["rerun_supported"],
                 "createdAt": row["created_at"].isoformat(),
-                "updatedAt": row["updated_at"].isoformat()}
+                "updatedAt": row["updated_at"].isoformat(),
+                "latestEvent": (None if row.get("latest_event_ordinal") is None else
+                    PostgresTaskService._event_row({
+                        "event_ordinal": row["latest_event_ordinal"],
+                        "status": row["latest_event_status"],
+                        "claim_generation": row["latest_event_claim_generation"],
+                        "receipt_revision": row["latest_event_receipt_revision"],
+                        "error_code": row["latest_event_error_code"],
+                        "occurred_at": row["latest_event_occurred_at"]}))}
 
     @staticmethod
-    def _event_row(row) -> dict:
+    def _event_row(row) -> TaskEventRecord:
         return {"event": row["event_ordinal"], "status": row["status"],
                 "claimGeneration": row["claim_generation"],
                 "receiptRevision": row["receipt_revision"],

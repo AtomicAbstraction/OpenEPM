@@ -94,7 +94,12 @@ def build(packet_path: Path, output: Path) -> dict:
             "Copy this file, remove templateOnly/instructions, change format to "
             "openepm-owner-decision-selections-v1, select every option, fill every "
             "required parameter, and replace legal template references with the "
-            "completed attestation filename and SHA-256. Templates are never approvals."),
+            "completed attestation filename and SHA-256. On each legal attestation, "
+            "remove templateOnly and enter the review date as YYYY-MM-DD or an "
+            "ISO timestamp with seconds and a UTC offset. Enter the reviewed license "
+            "expression as text. Describe file scopes and attribution/NOTICE obligations "
+            "in text, lists of text, or named groups of textual findings. If the review "
+            "finds no obligations, state that conclusion in text. Templates are never approvals."),
         "selections": selections
     }
     envelope_path = output / "openepm-owner-decision-selections.template.json"

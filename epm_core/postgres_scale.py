@@ -17,12 +17,15 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .persistence_contract import ApplicationScope, Coordinate, NumericCell
-from .current_object_contract import require_state_token
+from .current_calculation_result import RESULT_KEY_PATTERN as _RESULT_KEY
+from .current_calculation_result import calculation_output_kind
+from .current_object_contract import STATE_TOKEN_PATTERN, require_state_token
 from .postgres_capability_contract import producer_capability_status
 from .postgres_access import PostgresAccessChecker, VerifiedIdentity
 from .postgres_jobs import _canonical_digest, _require_python_job_authority
 from .postgres_numeric_store import PostgresNumericFactStore
 from .dimensional_security_policy import AccessKind
+from .postgres_dimensional_security import CUBE_READ_AUTHORIZATION_STALE
 from .postgres_dimensional_security_enforcement import (
     authorize_coordinates, filter_read_rows)
 from .postgres_calculation_visibility import (
@@ -31,8 +34,10 @@ from .postgres_calculation_visibility import (
 from .postgres_calculation_status import published_result_status
 
 
-_RESULT_KEY = re.compile(r'[A-Za-z0-9._-]{8,128}\Z')
-_FUNCTION = 'facts.numeric.scale'
+SCALE = 'facts.numeric.scale'
+_FUNCTION = SCALE
+PUBLICATION_LIST = 'facts.calculation.publication.list'
+_PUBLICATION_PAGE_LIMIT = 100
 _COMPILER = 'numeric-relational-v1'
 _PLAN_DIGEST = _canonical_digest({
     'function': _FUNCTION, 'loweringVersion': 1,
@@ -430,6 +435,104 @@ class PostgresScalePublisher:
                 return result
 
 
+def publication_list_program_contract() -> dict:
+    from .metadata_read_contract import obj, read_contract, read_example
+
+    key = {'type': 'string', 'pattern': '^' + _RESULT_KEY.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    token = {'type': 'string', 'pattern': '^' + STATE_TOKEN_PATTERN.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    arguments = obj({
+        'limit': {'type': 'integer', 'minimum': 1, 'maximum': _PUBLICATION_PAGE_LIMIT},
+        'afterResultKey': {**key, 'type': ['string', 'null']},
+    }, [])
+    item = obj({
+        'resultKey': key, 'resultStateToken': token,
+        'function': {'type': 'string', 'minLength': 1}, 'updatedAt': {'type': 'string', 'format': 'date-time'},
+    })
+    items = {'type': 'array', 'items': item, 'maxItems': _PUBLICATION_PAGE_LIMIT}
+    result = {'oneOf': [
+        obj({'items': items, 'hasMore': {'const': False}, 'nextAfterResultKey': {'type': 'null'}}),
+        obj({'items': {**items, 'minItems': 1}, 'hasMore': {'const': True}, 'nextAfterResultKey': key}),
+    ]}
+    contract = read_contract(PUBLICATION_LIST, arguments, result,
+        owner='PostgresScaleReader.list_published', examples=[
+            read_example(PUBLICATION_LIST, {'limit': 1}, name='List the first current calculation publications',
+                binding='Select the authorized application. An application with no publications returns an empty page.'),
+            read_example(PUBLICATION_LIST, {'limit': 1, 'afterResultKey': 'example.result'},
+                name='Continue from a reported publication key',
+                binding='Use the exact nextAfterResultKey from the previous page when hasMore is true. Stop at a null continuation.'),
+        ], semantic_rules=[
+            'The catalogue returns current publication identities and their producer. Read the intended result or calculation status separately to assess currentness.',
+            'Each page reads current catalogue state under current application authority. The keyset is not a snapshot token or a locator for historical results.',
+        ])
+    contract['programContract']['recovery'] = (
+        'For a changed catalogue or application selection, list again from the first page under current authority.')
+    return contract
+
+
+def scale_program_contract() -> dict:
+    from .metadata_read_contract import DIALECT, obj, read_example
+    from .postgres_jobs import job_submission_schema
+    from .postgres_numeric_catalog import program_schema
+    from .postgres_planning_write_guard import planning_write_evidence_schema
+
+    key = {'type': 'string', 'pattern': '^' + _RESULT_KEY.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    token = {'type': 'string', 'pattern': '^' + STATE_TOKEN_PATTERN.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    identifier = {'type': 'string', 'minLength': 1, 'maxLength': 200}
+    revision = {'type': 'integer', 'minimum': 0}
+    count = {**revision, 'maximum': 500}
+    engine = {'const': 'postgres_exact_sql'}
+    arguments = obj({
+        'sourceMembers': {'type': 'object', 'maxProperties': 32,
+                          'propertyNames': identifier, 'additionalProperties': identifier},
+        'factor': obj({'type': {'const': 'RatioLiteral'}, 'decimal': {
+            'type': 'string', 'minLength': 1,
+            'description': 'Finite exact decimal, up to 8 integer digits and 12 fractional places. Use a plain decimal string.'}}),
+        'resultKey': key,
+    })
+    preview = {'$schema': DIALECT, **obj({
+        'languageVersion': {'type': 'integer', 'const': 2}, 'function': {'const': SCALE},
+        'programDigest': token, 'previewToken': {'type': 'string', 'minLength': 1},
+        'revisionVector': obj(dict.fromkeys(('metadata_revision', 'data_revision', 'policy_revision'), revision)),
+        'expectedTargetStateToken': {**token, 'type': ['string', 'null']},
+        'engine': engine, 'rounding': {'const': 'half-even-8'}, 'estimatedRows': count,
+    })}
+    fields = {'resultKey': key, 'resultStateToken': token, 'resultContentDigest': token,
+              'rowCount': count, 'sourceCommitRevision': revision, 'engine': engine, 'impactDigest': token}
+    published = {'$schema': DIALECT,
+                 **obj({**fields, 'planningPolicy': planning_write_evidence_schema()}, list(fields))}
+    submission = job_submission_schema()
+    example = read_example(SCALE, {'sourceMembers': {'Metric': 'A'},
+        'factor': {'type': 'RatioLiteral', 'decimal': '2'}, 'resultKey': 'example.scale'},
+        name='Publish an exact named scale result',
+        binding='In a disposable application, select a current authorized Metric member A with value 7.25000000. Review the signed preview, admit the unchanged program, and submit with one idempotency key. A published amount is 14.50000000.')
+    return {
+        'schemaCoverage': 'program-and-result', 'schemaDialect': DIALECT,
+        'programSchema': program_schema(SCALE, arguments),
+        'resultSchema': submission, 'resultSchemaScope': 'envelope',
+        'programContract': {
+            'owner': 'compile_scale_program and PostgresScalePublisher',
+            'examples': [example],
+            'outputSchemas': {
+                'preview': {'schema': preview, 'scope': 'envelope',
+                    'surface': 'preview_v2_program or browser /api/preview'},
+                'submission': {'schema': submission, 'scope': 'envelope',
+                    'surface': 'submit_v2_program or browser /api/submit'},
+                'publishedResult': {'schema': published, 'scope': 'result',
+                    'surface': 'published read_v2_job result or durable operation receipt result'},
+            },
+            'semanticRules': [
+                'sourceMembers filters present raw facts at their full coordinates. An empty filter selects all present numeric coordinates within the fixed 500-row limit.',
+                'The compiler accepts a finite exact RatioLiteral and the core rounds the product half-even to eight places. The named publication replaces its prior generation atomically and preserves source facts.',
+                'A signed preview binds the submitted program and target state. Approval, current write authority and revision or planning checks still apply at submission and publication.',
+                'Check the published job receipt before reading the named output. Use facts.calculation.scan and validate the result state and currentness.',
+            ],
+            'recovery': ('For an uncertain submit, read the existing job and receipt under current authority '
+                         'and preserve the original program and idempotency key. Refresh the preview when the '
+                         'source or target changes before authorizing new work.'),
+        },
+    }
+
+
 class PostgresScaleReader:
     def __init__(self, dsn: str, *, identity: VerifiedIdentity):
         if not isinstance(dsn, str) or not dsn:
@@ -439,9 +542,9 @@ class PostgresScaleReader:
         self.dsn = dsn
         self.identity = identity
 
-    def list_published(self, scope: ApplicationScope, *, limit: int = 100,
+    def list_published(self, scope: ApplicationScope, *, limit: int = _PUBLICATION_PAGE_LIMIT,
                        after_result_key: str | None = None) -> dict:
-        if (type(limit) is not int or not 1 <= limit <= 100
+        if (type(limit) is not int or not 1 <= limit <= _PUBLICATION_PAGE_LIMIT
                 or after_result_key is not None
                 and (not isinstance(after_result_key,str)
                      or not _RESULT_KEY.fullmatch(after_result_key))):
@@ -478,7 +581,7 @@ class PostgresScaleReader:
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
+                access = PostgresAccessChecker.check_in_transaction(
                     db, self.identity, scope, 'read')
                 pointer = db.execute('''SELECT
                     current_result.state_token,
@@ -513,37 +616,10 @@ class PostgresScaleReader:
                     raise ValueError('PUBLICATION_UNAVAILABLE')
                 currentness = published_result_status(db, scope, result_key, pointer['state_token'])
                 profiles = currentness['profileStatuses']
-                normalized=pointer['normalized_program']
-                typed_unit=(isinstance(normalized,dict) and (
-                    (pointer['function_name']=='currency.amount.translate.publish'
-                     and normalized.get('version')==3)
-                    or pointer['function_name']==
-                        'consolidation.equity.contribution.publish'
-                    or pointer['function_name']==
-                        'consolidation.proportional.contribution.publish'
-                    or pointer['function_name']==
-                        'consolidation.full.typed.contribute'
-                    or pointer['function_name']==
-                        'consolidation.method.total.publish'
-                    or pointer['function_name']==
-                        'consolidation.inventory.unrealized_profit.request'
-                    or (pointer['function_name']==
-                        'consolidation.nci.period.publish' and
-                        pointer.get('compiler_version') in (
-                        'period-nci-attribution-v7-typed-unit',
-                        'period-nci-attribution-v8-ic-adjusted-typed-unit'))
-                    or (pointer['function_name']=='facts.expression.calculate'
-                        and ((isinstance(normalized.get('expression'),dict)
-                          and normalized['expression'].get('op')=='CurrencyConvert')
-                         or pointer['compiler_version'] in (
-                            'typed-numeric-expression-v19',
-                            'typed-numeric-expression-v22',
-                            'typed-numeric-expression-v23',
-                            'typed-numeric-expression-v29',
-                            'typed-numeric-expression-v32')))))
-                typed_ratio=(pointer['function_name']=='facts.expression.calculate'
-                    and pointer.get('compiler_version')==
-                        'typed-numeric-expression-v24')
+                kind = calculation_output_kind(pointer['function_name'],
+                    pointer['compiler_version'], pointer['normalized_program'])
+                typed_unit = kind == 'currency'
+                typed_ratio = kind == 'ratio'
                 if typed_ratio:
                     rows=db.execute('''SELECT c.series_key,c.members,
                         r.source_amount,r.source_change_id,r.source_present,
@@ -617,7 +693,7 @@ class PostgresScaleReader:
                     AND r.result_key=%s ORDER BY c.series_key LIMIT 501''',
                     (scope.workspace_id,scope.application_id,result_key)).fetchall()
                 rows = filter_read_rows(
-                    db, self.identity, scope, rows)
+                    db, self.identity, scope, rows, expected_access=access)
                 result={'resultStateToken': pointer['state_token'],
                         'resultKey': result_key,
                         'function': pointer['function_name'],
@@ -759,8 +835,7 @@ class PostgresScaleReader:
                         result['inputRevisionStatus']['matchesAtRead'] &= (
                             context_dependency_status['matchesAtRead'])
                     redact_expression_lineage(
-                        db,self.identity,scope,program,result['rows'])
-                    redact_expression_result_metadata(result)
+                        db,self.identity,scope,program,result['rows'],expected_access=access)
                 if pointer['function_name'] in (
                         'consolidation.full.contribute',
                         'consolidation.full.typed.contribute'):
@@ -856,9 +931,12 @@ class PostgresScaleReader:
                                     'sourceLayer', 'sources', 'sourceChangeId',
                                     'accountingStage',
                                     'accountingPolicyStatus')}
-                redact_calculation_lineage(
-                    db,self.identity,scope,result['rows'])
-                redact_expression_result_metadata(result)
+                source_restricted=redact_calculation_lineage(
+                    db,self.identity,scope,result['rows'],producer=pointer,expected_access=access)
+                redact_expression_result_metadata(
+                    result,source_restricted=source_restricted,
+                    db=db,identity=self.identity,scope=scope,producer=pointer,
+                    expected_access=access)
                 final_security=db.execute('''SELECT security_revision FROM
                     epm.application_state WHERE workspace_id=%s
                     AND application_id=%s''',(scope.workspace_id,
@@ -876,6 +954,8 @@ class PostgresScaleReader:
                         pointer['state_token']):
                     raise ValueError(
                         'CALCULATION_RESULT_STATE_CHANGED_RESTART')
+                if PostgresAccessChecker.current_groups_in_transaction(db, self.identity) != access.groups:
+                    raise ValueError(CUBE_READ_AUTHORIZATION_STALE)
                 return result
 
     @staticmethod

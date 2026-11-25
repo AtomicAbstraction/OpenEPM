@@ -17,6 +17,7 @@ export function usePythonBuildObserver(
   observation: PythonBuildObservation | null,
   purpose: "Validation" | "ImpactTest",
   onChange: Dispatch<SetStateAction<PythonBuildObservation | null>>,
+  sourceProgramId?: string | null,
 ) {
   const [error, setError] = useState("");
   const [refresh, setRefresh] = useState(0);
@@ -28,6 +29,7 @@ export function usePythonBuildObserver(
     setError("");
     if (
       !scope ||
+      sourceProgramId === null ||
       !observation ||
       !current ||
       !buildIsPending(observation.build)
@@ -38,29 +40,50 @@ export function usePythonBuildObserver(
     let reads = 0;
     const poll = async () => {
       try {
-        const response = await request<{ result: PythonBuildStatus }>(
-          "/api/python-build",
-          {
-            workspaceId: scope.workspaceId,
-            applicationId: scope.applicationId,
-            action: "read",
-            buildId: observation.build.buildId,
-          },
-          controller.signal,
-        );
+        const build = sourceProgramId
+          ? (
+              await request<{
+                result: { validation?: PythonBuildStatus | null };
+              }>(
+                "/api/python-program",
+                {
+                  workspaceId: scope.workspaceId,
+                  applicationId: scope.applicationId,
+                  program: {
+                    languageVersion: 2,
+                    function: "python.program.read",
+                    arguments: { programId: sourceProgramId },
+                  },
+                },
+                controller.signal,
+              )
+            ).result.validation
+          : (
+              await request<{ result: PythonBuildStatus }>(
+                "/api/python-build",
+                {
+                  workspaceId: scope.workspaceId,
+                  applicationId: scope.applicationId,
+                  action: "read",
+                  buildId: observation.build.buildId,
+                },
+                controller.signal,
+              )
+            ).result;
         if (controller.signal.aborted) return;
         if (
-          response.result.buildId !== observation.build.buildId ||
-          response.result.purpose !== purpose
+          !build ||
+          build.buildId !== observation.build.buildId ||
+          build.purpose !== purpose
         )
           throw new Error(
             "The worker returned a different build identity or purpose.",
           );
         onChange({
-          build: response.result,
+          build,
           contextKey: observation.contextKey,
         });
-        if (buildIsPending(response.result)) {
+        if (buildIsPending(build)) {
           if (++reads < 60) timer = setTimeout(() => void poll(), 2000);
           else
             setError(
@@ -81,6 +104,13 @@ export function usePythonBuildObserver(
       controller.abort();
       if (timer) clearTimeout(timer);
     };
-  }, [contextKey, observation?.build.buildId, current, purpose, refresh]);
+  }, [
+    contextKey,
+    observation?.build.buildId,
+    current,
+    purpose,
+    refresh,
+    sourceProgramId,
+  ]);
   return { current, error, refresh: () => setRefresh((value) => value + 1) };
 }

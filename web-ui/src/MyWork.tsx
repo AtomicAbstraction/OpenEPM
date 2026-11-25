@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { readProgram, request } from "./api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ApiError, readProgram, request } from "./api";
+import { parameterObject } from "./ParameterFields";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
 
 export type WorkFocus = {
@@ -18,7 +19,7 @@ type Item = {
   source: string;
   page: WorkPage;
   focus: WorkFocus;
-  waiting?: boolean;
+  state: "ready" | "waiting" | "blocked";
 };
 
 export type WorkflowWorkItem = {
@@ -28,8 +29,36 @@ export type WorkflowWorkItem = {
   flowId: string;
 };
 
+const blockedWorkDetails = {
+  SelectionMetadataChanged:
+    "The model changed after this workflow was published. Ask an application administrator to review it.",
+  WorkflowDefinitionUnavailable:
+    "The workflow definition is no longer active for this occurrence. Ask an application administrator to review it.",
+  WorkflowDependencyUnavailable:
+    "A required workflow dependency is unavailable. Ask an application administrator to review it.",
+};
+
+export type BlockedWorkflowWork = WorkflowWorkItem & {
+  reason: keyof typeof blockedWorkDetails;
+};
+
+const waitingWorkDetails = {
+  DependencyPending: "Waiting on an earlier workflow dependency",
+  ReturnedForRework: "Waiting for the returned work to be completed",
+};
+
+type WaitingWorkflowWork = WorkflowWorkItem & {
+  reason: keyof typeof waitingWorkDetails;
+};
+
+export function blockedWorkflowDetail(item: BlockedWorkflowWork) {
+  return blockedWorkDetails[item.reason];
+}
+
 type WorkflowWorkPage<T extends WorkflowWorkItem> = {
   items: T[];
+  blockedItems?: BlockedWorkflowWork[];
+  waitingItems?: WaitingWorkflowWork[];
   nextCursor?: {
     afterOccurrenceId: string;
     afterActivityId: string;
@@ -52,8 +81,21 @@ export async function readCompleteWorkflowWorklist<
 >(
   scope: { workspaceId: string; applicationId: string },
   signal?: AbortSignal,
-): Promise<T[]> {
+  {
+    occurrenceId,
+    includeWaiting = false,
+  }: {
+    occurrenceId?: string;
+    includeWaiting?: boolean;
+  } = {},
+): Promise<{
+  items: T[];
+  blockedItems: BlockedWorkflowWork[];
+  waitingItems: WaitingWorkflowWork[];
+}> {
   const items: T[] = [];
+  const blockedItems: BlockedWorkflowWork[] = [];
+  const waitingItems: WaitingWorkflowWork[] = [];
   let cursor: WorkflowWorkPage<T>["nextCursor"] = null;
   const seen = new Set<string>();
   const seenItems = new Set<string>();
@@ -61,16 +103,32 @@ export async function readCompleteWorkflowWorklist<
     const page: WorkflowWorkPage<T> = await readProgram<WorkflowWorkPage<T>>(
       scope,
       "application.workflow.worklist",
-      { limit: 100, ...(cursor || {}) },
+      {
+        limit: 100,
+        includeBlocked: true,
+        ...(includeWaiting ? { includeWaiting: true } : {}),
+        ...(occurrenceId ? { occurrenceId } : {}),
+        ...(cursor || {}),
+      },
       signal,
     );
-    if (!Array.isArray(page.items))
+    const blocked =
+      !includeWaiting && page.blockedItems === undefined
+        ? []
+        : page.blockedItems;
+    const waiting = includeWaiting ? page.waitingItems : [];
+    if (
+      !Array.isArray(page.items) ||
+      !Array.isArray(blocked) ||
+      !Array.isArray(waiting)
+    )
       throw new Error("Workflow worklist rows are invalid.");
-    for (const item of page.items) {
+    for (const item of [...page.items, ...blocked, ...waiting]) {
       if (
         !item ||
         typeof item.occurrenceId !== "string" ||
         !item.occurrenceId ||
+        (occurrenceId && item.occurrenceId !== occurrenceId) ||
         typeof item.activityId !== "string" ||
         !item.activityId
       )
@@ -79,13 +137,31 @@ export async function readCompleteWorkflowWorklist<
       if (seenItems.has(identity))
         throw new Error("Workflow worklist continuation repeated a row.");
       seenItems.add(identity);
-      items.push(item);
     }
+    for (const item of blocked) {
+      if (
+        !Object.prototype.hasOwnProperty.call(blockedWorkDetails, item.reason)
+      )
+        throw new Error(
+          "Workflow worklist returned an invalid blocked reason.",
+        );
+    }
+    for (const item of waiting) {
+      if (
+        typeof item.name !== "string" ||
+        !Object.prototype.hasOwnProperty.call(waitingWorkDetails, item.reason)
+      )
+        throw new Error("Workflow worklist returned an invalid Waiting row.");
+    }
+    items.push(...page.items);
+    blockedItems.push(...blocked);
+    waitingItems.push(...waiting);
     cursor = page.nextCursor || null;
     if (cursor) {
       if (
         typeof cursor.afterOccurrenceId !== "string" ||
         !cursor.afterOccurrenceId ||
+        (occurrenceId && cursor.afterOccurrenceId !== occurrenceId) ||
         typeof cursor.afterActivityId !== "string" ||
         !cursor.afterActivityId
       )
@@ -95,7 +171,7 @@ export async function readCompleteWorkflowWorklist<
       seen.add(key);
     }
   } while (cursor);
-  return items;
+  return { items, blockedItems, waitingItems };
 }
 
 export async function readCompleteWaitingTasks(
@@ -104,141 +180,240 @@ export async function readCompleteWaitingTasks(
 ) {
   const tasks: WaitingTaskPage["tasks"] = [];
   let afterSequence = 0;
-  const seen = new Set<number>();
+  const seen = new Set<string>();
   while (true) {
     const page = await request<WaitingTaskPage>(
       "/api/tasks",
       { ...scope, afterSequence, limit: 100 },
       signal,
     );
-    tasks.push(...page.tasks);
+    if (!Array.isArray(page.tasks) || typeof page.hasMore !== "boolean")
+      throw new Error("Task worklist response is invalid.");
+    for (const task of page.tasks) {
+      if (
+        !task ||
+        typeof task.taskId !== "string" ||
+        !task.taskId ||
+        typeof task.sourceFamily !== "string" ||
+        typeof task.sourceId !== "string" ||
+        typeof task.status !== "string" ||
+        seen.has(task.taskId)
+      )
+        throw new Error("Task worklist contains an invalid or repeated task.");
+      seen.add(task.taskId);
+      tasks.push(task);
+    }
     if (!page.hasMore) return tasks;
     const next = page.nextSequence;
-    if (typeof next !== "number" || next <= 0 || seen.has(next))
+    if (
+      typeof next !== "number" ||
+      !Number.isSafeInteger(next) ||
+      next <= 0 ||
+      (afterSequence !== 0 && next >= afterSequence)
+    )
       throw new Error("Task worklist continuation is invalid.");
-    seen.add(next);
     afterSequence = next;
   }
 }
 
+type WorklistContext = {
+  workspaceId: string;
+  applicationId: string;
+  catalog: ApplicationCatalog;
+  refresh: number;
+  nativeWaiting: boolean;
+};
+type WorkRead<Context, Rows> =
+  | {
+      context: Context;
+      rows: Rows;
+      error?: undefined;
+      accessDenied?: undefined;
+    }
+  | {
+      context: Context;
+      rows?: undefined;
+      error: string;
+      accessDenied?: boolean;
+    };
+
 export function MyWork({
   app,
   catalog,
+  catalogueUnavailable = false,
   open,
 }: {
   app?: ApplicationSummary;
   catalog: ApplicationCatalog | null;
+  catalogueUnavailable?: boolean;
   open: (page: WorkPage, focus?: WorkFocus) => void;
 }) {
-  const [items, setItems] = useState<Item[]>([]);
-  const [workError, setWorkError] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [query, setQuery] = useState("");
-  const [workState, setWorkState] = useState<"all" | "ready" | "waiting">(
-    "all",
+  const [read, setRead] = useState<WorkRead<WorklistContext, Item[]> | null>(
+    null,
   );
+  const [refresh, setRefresh] = useState(0);
+  const [waitingRetry, setWaitingRetry] = useState(0);
+  const [query, setQuery] = useState("");
+  const [workState, setWorkState] = useState<"all" | Item["state"]>("all");
+  const workHeading = useRef<HTMLHeadingElement>(null);
+  const workspaceId = app?.workspaceId;
+  const applicationId = app?.applicationId;
+  const worklistSpec = parameterObject(
+    catalog?.functions["application.workflow.worklist"],
+  );
+  const schema = parameterObject(worklistSpec?.programSchema);
+  const args = parameterObject(parameterObject(schema?.properties)?.arguments);
+  const waitingSchema = parameterObject(
+    parameterObject(args?.properties)?.includeWaiting,
+  );
+  const nativeWaiting = waitingSchema?.type === "boolean";
+  const context = useMemo(
+    () =>
+      workspaceId && applicationId && catalog
+        ? { workspaceId, applicationId, catalog, refresh, nativeWaiting }
+        : null,
+    [workspaceId, applicationId, catalog, refresh, nativeWaiting],
+  );
+  const waitingContext = useMemo(
+    () =>
+      context && !context.nativeWaiting
+        ? { worklist: context, retry: waitingRetry }
+        : null,
+    [context, waitingRetry],
+  );
+  const [waitingRead, setWaitingRead] = useState<WorkRead<
+    NonNullable<typeof waitingContext>,
+    WaitingTaskPage["tasks"]
+  > | null>(null);
+  const canRead = Boolean(catalog?.functions["application.workflow.worklist"]);
+  const current = canRead && read?.context === context ? read : null;
+  const currentWaiting =
+    canRead && waitingRead?.context === waitingContext ? waitingRead : null;
+  const accessFailure = currentWaiting?.accessDenied
+    ? currentWaiting.error
+    : undefined;
+  const loadError = accessFailure ?? current?.error;
+  const loading = Boolean(context && canRead && !current && !accessFailure);
+  const assignmentRead = Boolean(current?.rows && accessFailure === undefined);
+  const waitingConfirmed = nativeWaiting
+    ? assignmentRead
+    : Boolean(currentWaiting?.rows);
+
   useEffect(() => {
-    setItems([]);
-    setWorkError("");
-    setLoading(false);
-    if (!app || !catalog) return;
-    setLoading(true);
+    if (!context || !canRead) return;
     const controller = new AbortController();
+    const { signal } = controller;
     const scope = {
-      workspaceId: app.workspaceId,
-      applicationId: app.applicationId,
+      workspaceId: context.workspaceId,
+      applicationId: context.applicationId,
     };
-    const reads: Promise<Item[]>[] = [];
-    const workflowFunction = "application.workflow.worklist";
-    if (Object.hasOwn(catalog.functions, workflowFunction))
-      reads.push(
-        readCompleteWorkflowWorklist(scope, controller.signal).then((items) =>
-          items.map((item) => ({
-            key: `flow-${item.occurrenceId}-${item.activityId}`,
-            title: item.name,
-            detail: "Ready for your action",
-            source: "Workflow",
-            page: "flows",
-            focus: {
-              workspaceId: app.workspaceId,
-              applicationId: app.applicationId,
-              occurrenceId: item.occurrenceId,
-              activityId: item.activityId,
-            },
-          })),
-        ),
-      );
-    if (Object.hasOwn(catalog.functions, workflowFunction))
-      reads.push(
-        readCompleteWaitingTasks(scope, controller.signal).then((tasks) =>
-          tasks.flatMap((task) => {
-            if (
-              task.sourceFamily !== "ApplicationWorkflowActivity" ||
-              task.status !== "Waiting"
-            )
-              return [];
-            const separator = task.sourceId.indexOf("/");
-            if (separator <= 0 || separator === task.sourceId.length - 1)
-              return [];
-            const occurrenceId = task.sourceId.slice(0, separator);
-            const activityId = task.sourceId.slice(separator + 1);
-            return [
-              {
-                key: `waiting-${task.taskId}`,
-                title: "Workflow activity",
-                detail: "Waiting on an earlier workflow dependency",
-                source: "Workflow",
-                page: "flows" as const,
-                focus: {
-                  workspaceId: app.workspaceId,
-                  applicationId: app.applicationId,
-                  occurrenceId,
-                  activityId,
-                },
-                waiting: true,
-              },
-            ];
-          }),
-        ),
-      );
-    Promise.all(reads)
-      .then((groups) => {
-        if (controller.signal.aborted) return;
-        const discovered = groups.flat();
-        const readyWorkflow = new Set(
-          discovered
-            .filter((item) => item.page === "flows" && !item.waiting)
-            .map(
-              (item) =>
-                `${item.focus.occurrenceId || ""}/${item.focus.activityId || ""}`,
-            ),
+    void readCompleteWorkflowWorklist(scope, signal, {
+      includeWaiting: context.nativeWaiting,
+    })
+      .then((worklist) => {
+        if (signal.aborted) return;
+        const assignment = (
+          item: WorkflowWorkItem,
+          detail: string,
+          state: Item["state"],
+        ): Item => ({
+          key: `flow-${item.occurrenceId}-${item.activityId}`,
+          title: item.name,
+          detail,
+          source: "Workflow",
+          page: "flows",
+          focus: {
+            ...scope,
+            occurrenceId: item.occurrenceId,
+            activityId: item.activityId,
+          },
+          state,
+        });
+        const ready = worklist.items.map((item) =>
+          assignment(item, "Ready for your action", "ready"),
         );
-        setItems(
-          discovered.filter(
-            (item) =>
-              !item.waiting ||
-              !readyWorkflow.has(
-                `${item.focus.occurrenceId || ""}/${item.focus.activityId || ""}`,
-              ),
-          ),
+        const blocked = worklist.blockedItems.map((item) =>
+          assignment(item, blockedWorkflowDetail(item), "blocked"),
         );
+        const waiting = worklist.waitingItems.map((item) =>
+          assignment(item, waitingWorkDetails[item.reason], "waiting"),
+        );
+        setRead({ context, rows: [...ready, ...blocked, ...waiting] });
       })
       .catch((reason: Error) => {
-        if (!controller.signal.aborted) setWorkError(reason.message);
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        if (!signal.aborted) setRead({ context, error: reason.message });
       });
     return () => controller.abort();
-  }, [app?.workspaceId, app?.applicationId, catalog]);
+  }, [context, canRead]);
 
-  const matching = items.filter((item) =>
+  useEffect(() => {
+    if (!waitingContext || !canRead) return;
+    const controller = new AbortController();
+    const { signal } = controller;
+    const { workspaceId, applicationId } = waitingContext.worklist;
+    void readCompleteWaitingTasks({ workspaceId, applicationId }, signal)
+      .then((rows) => {
+        if (!signal.aborted) setWaitingRead({ context: waitingContext, rows });
+      })
+      .catch((reason: Error) => {
+        if (!signal.aborted)
+          setWaitingRead({
+            context: waitingContext,
+            error: reason.message,
+            accessDenied:
+              reason instanceof ApiError && [401, 403].includes(reason.status),
+          });
+      });
+    return () => controller.abort();
+  }, [waitingContext, canRead]);
+
+  const rows = useMemo(() => {
+    const assigned = current?.rows;
+    if (!assigned || !context) return [];
+    const tasks = currentWaiting?.rows;
+    if (!tasks) return assigned;
+    const assignedKeys = new Set(
+      assigned.map(({ focus }) => `${focus.occurrenceId}/${focus.activityId}`),
+    );
+    const waiting = tasks.flatMap((task): Item[] => {
+      if (
+        task.sourceFamily !== "ApplicationWorkflowActivity" ||
+        task.status !== "Waiting" ||
+        assignedKeys.has(task.sourceId)
+      )
+        return [];
+      const separator = task.sourceId.indexOf("/");
+      if (separator <= 0 || separator === task.sourceId.length - 1) return [];
+      return [
+        {
+          key: `waiting-${task.taskId}`,
+          title: "Workflow activity",
+          detail: "Waiting on an earlier workflow dependency",
+          source: "Workflow",
+          page: "flows",
+          focus: {
+            workspaceId: context.workspaceId,
+            applicationId: context.applicationId,
+            occurrenceId: task.sourceId.slice(0, separator),
+            activityId: task.sourceId.slice(separator + 1),
+          },
+          state: "waiting",
+        },
+      ];
+    });
+    return [...assigned, ...waiting];
+  }, [context, current, currentWaiting]);
+
+  const matching = rows.filter((item) =>
     `${item.title} ${item.detail}`
       .toLocaleLowerCase()
       .includes(query.trim().toLocaleLowerCase()),
   );
-  const ready = matching.filter((item) => !item.waiting);
-  const waiting = matching.filter((item) => item.waiting);
+  const ready = matching.filter((item) => item.state === "ready");
+  const waiting = matching.filter((item) => item.state === "waiting");
+  const blocked = matching.filter((item) => item.state === "blocked");
+  const showBlocked =
+    rows.some((item) => item.state === "blocked") || workState === "blocked";
   const columns = [
     {
       key: "ready",
@@ -251,9 +426,20 @@ export function MyWork({
       key: "waiting",
       label: "Waiting",
       dot: "muted-dot",
-      items: waiting,
+      items: waitingConfirmed ? waiting : undefined,
       empty: "No work waiting on dependencies",
     },
+    ...(showBlocked
+      ? [
+          {
+            key: "blocked",
+            label: "Blocked",
+            dot: "muted-dot",
+            items: blocked,
+            empty: "No blocked activities",
+          },
+        ]
+      : []),
   ];
   const visibleColumns =
     workState === "all"
@@ -264,9 +450,11 @@ export function MyWork({
       <div className="page-heading">
         <div>
           <small>{app?.name || "Workspace"}</small>
-          <h1>My Work</h1>
+          <h1 ref={workHeading} tabIndex={-1}>
+            My Work
+          </h1>
           <p>
-            Your ready and waiting activities in{" "}
+            Your assigned activities in{" "}
             {app?.name || "the selected application"}. Open an activity to see
             its context and next step.
           </p>
@@ -278,23 +466,38 @@ export function MyWork({
         aria-label="Filter work by state"
       >
         {[
-          ["all", "All", matching.length],
+          ["all", "All", waitingConfirmed ? matching.length : "—"],
           ["ready", "Ready", ready.length],
-          ["waiting", "Waiting", waiting.length],
+          ["waiting", "Waiting", waitingConfirmed ? waiting.length : "—"],
+          ...(showBlocked ? [["blocked", "Blocked", blocked.length]] : []),
         ].map(([value, label, count]) => (
           <button
             key={String(value)}
             className={workState === value ? "selected" : ""}
             aria-pressed={workState === value}
+            disabled={!assignmentRead}
             onClick={() => setWorkState(value as typeof workState)}
           >
-            {label} <span>{count}</span>
+            {label} <span>{assignmentRead ? count : "—"}</span>
           </button>
         ))}
       </div>
-      {workError && (
+      {loadError !== undefined && (
         <div className="alert" role="alert">
-          {workError}
+          {loadError}
+          <p>
+            Your work could not be loaded. Empty columns are not a confirmed
+            result.
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              workHeading.current?.focus();
+              setRefresh((value) => value + 1);
+            }}
+          >
+            Retry worklist
+          </button>
         </div>
       )}
       <label className="work-search">
@@ -307,7 +510,7 @@ export function MyWork({
         />
       </label>
       {loading && <p role="status">Loading your work…</p>}
-      {!loading && (
+      {assignmentRead && (
         <section className="work-board" aria-label="Authoritative work board">
           {visibleColumns.map((column) => (
             <WorkColumn
@@ -316,6 +519,14 @@ export function MyWork({
               dot={column.dot}
               items={column.items}
               empty={column.empty}
+              error={
+                column.key === "waiting" ? currentWaiting?.error : undefined
+              }
+              retry={
+                column.key === "waiting"
+                  ? () => setWaitingRetry((value) => value + 1)
+                  : undefined
+              }
               open={open}
             />
           ))}
@@ -323,6 +534,18 @@ export function MyWork({
       )}
       {!app && (
         <p className="context-note">Choose an application to see your work.</p>
+      )}
+      {app && !catalog && (
+        <p role="status">
+          {catalogueUnavailable
+            ? "Access to assigned work could not be confirmed."
+            : "Checking access to assigned work…"}
+        </p>
+      )}
+      {app && catalog && !canRead && (
+        <p role="status">
+          The current application catalogue does not include assigned work.
+        </p>
       )}
     </div>
   );
@@ -337,63 +560,134 @@ function EmptyWork({ text }: { text: string }) {
   );
 }
 
+const activityPageSize = 50;
+
+export function activityPageBounds(page: number, count: number) {
+  const start = Math.min(
+    page * activityPageSize,
+    Math.max(0, Math.ceil(count / activityPageSize) - 1) * activityPageSize,
+  );
+  return { start, end: Math.min(start + activityPageSize, count), count };
+}
+
+export function ActivityPagination({
+  label,
+  bounds: { start, end, count },
+  empty,
+  onPage,
+}: {
+  label: string;
+  bounds: ReturnType<typeof activityPageBounds>;
+  empty?: string;
+  onPage: (page: number) => void;
+}) {
+  const canGoBack = start > 0;
+  const canGoForward = end < count;
+  const activities = `${label.toLowerCase()} activities`;
+  return (
+    <div className="directory-pagination work-pagination">
+      <span role="status">
+        {count ? `${start + 1}–${end} of ${count} ${activities}` : empty}
+      </span>
+      <div>
+        <button
+          type="button"
+          aria-label={`Previous ${activities}`}
+          aria-disabled={!canGoBack || undefined}
+          tabIndex={canGoBack ? undefined : -1}
+          onClick={() => {
+            if (canGoBack) onPage(start / activityPageSize - 1);
+          }}
+        >
+          Previous
+        </button>
+        <button
+          type="button"
+          aria-label={`Next ${activities}`}
+          aria-disabled={!canGoForward || undefined}
+          tabIndex={canGoForward ? undefined : -1}
+          onClick={() => {
+            if (canGoForward) onPage(start / activityPageSize + 1);
+          }}
+        >
+          Next
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function WorkColumn({
   label,
   dot,
   items,
   empty,
+  error,
+  retry,
   open,
 }: {
   label: string;
   dot: string;
-  items: Item[];
+  items?: Item[];
   empty: string;
+  error?: string;
+  retry?: () => void;
   open: (page: WorkPage, focus?: WorkFocus) => void;
 }) {
   const [page, setPage] = useState(0);
-  const start = Math.min(
-    page * 50,
-    Math.max(0, Math.ceil(items.length / 50) - 1) * 50,
-  );
+  const header = useRef<HTMLElement>(null);
+  const count = items?.length ?? 0;
+  const bounds = activityPageBounds(page, count);
   return (
     <div className="work-column">
-      <header>
+      <header ref={header} tabIndex={-1}>
         <span className={dot} />
-        {label} <b>{items.length}</b>
+        {label} <b>{items ? count : "—"}</b>
       </header>
-      {items.length ? (
-        <div className="work-items">
-          {items.slice(start, start + 50).map((item) => (
-            <article key={item.key}>
-              <span>{item.source}</span>
-              <strong>{item.title}</strong>
-              <p>{item.detail}</p>
-              <button
-                className="secondary-link"
-                onClick={() => open(item.page, item.focus)}
-              >
-                Open activity →
-              </button>
-            </article>
-          ))}
-          {items.length > 50 && (
-            <div className="directory-pagination">
-              <span>
-                {start + 1}–{Math.min(start + 50, items.length)} of{" "}
-                {items.length}
-              </span>
-              <button disabled={start === 0} onClick={() => setPage(page - 1)}>
-                Previous activities
-              </button>
-              <button
-                disabled={start + 50 >= items.length}
-                onClick={() => setPage(page + 1)}
-              >
-                Next activities
-              </button>
-            </div>
+      {!items ? (
+        error !== undefined ? (
+          <div className="alert">
+            <p role="alert">Waiting work could not be loaded. {error}</p>
+            <button
+              type="button"
+              onClick={() => {
+                header.current?.focus();
+                retry?.();
+              }}
+            >
+              Retry Waiting
+            </button>
+          </div>
+        ) : (
+          <p role="status">Loading waiting work…</p>
+        )
+      ) : items.length ? (
+        <>
+          {count > activityPageSize && (
+            <ActivityPagination
+              label={label}
+              bounds={bounds}
+              onPage={setPage}
+            />
           )}
-        </div>
+          <div className="work-items">
+            {items.slice(bounds.start, bounds.end).map((item) => (
+              <article key={item.key}>
+                <span>{item.source}</span>
+                <strong>{item.title}</strong>
+                <p>{item.detail}</p>
+                <button
+                  type="button"
+                  className="secondary-link"
+                  aria-label={`Open activity ${item.title}`}
+                  onClick={() => open(item.page, item.focus)}
+                >
+                  Open activity →
+                </button>
+              </article>
+            ))}
+          </div>
+        </>
       ) : (
         <EmptyWork text={empty} />
       )}

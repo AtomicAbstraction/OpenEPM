@@ -18,7 +18,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .persistence_contract import ApplicationScope, Coordinate, NumericCell
-from .postgres_access import PostgresAccessChecker, VerifiedIdentity
+from .postgres_access import AccessDecision, PostgresAccessChecker, VerifiedIdentity
 from .postgres_jobs import _canonical_digest
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_calculation_status import published_input_status
@@ -4034,7 +4034,9 @@ def expression_target_coordinates(db,scope:ApplicationScope,
 
 
 def enforce_expression_dimensional_security(db,identity:VerifiedIdentity,
-        scope:ApplicationScope,plan:ExpressionPlan,count:int,*,heartbeat=None)->None:
+        scope:ApplicationScope,plan:ExpressionPlan,count:int,*,heartbeat=None,
+        expected_access: AccessDecision | None = None)->None:
+    access_options = {'expected_access': expected_access} if expected_access is not None else {}
     if getattr(plan,'applicability_domain',None):
         observed=0
         for row_ids in _applicability_row_windows(
@@ -4043,21 +4045,25 @@ def enforce_expression_dimensional_security(db,identity:VerifiedIdentity,
                 db,scope,plan,row_ids)
             targets=_applicability_target_coordinates_for_rows(
                 db,scope,plan,row_ids)
-            authorize_coordinates(db,identity,scope,sources,kind=AccessKind.READ)
-            authorize_coordinates(db,identity,scope,targets,kind=AccessKind.WRITE)
+            authorize_coordinates(db,identity,scope,sources,kind=AccessKind.READ,**access_options)
+            authorize_coordinates(db,identity,scope,targets,kind=AccessKind.WRITE,**access_options)
             observed+=len(targets)
         if observed!=count:
             raise ValueError('CALCULATION_SOURCE_CHANGED')
         return
     sources=expression_source_coordinates(db,scope,plan)
     targets=expression_target_coordinates(db,scope,plan,count)
-    authorize_coordinates(db,identity,scope,sources,kind=AccessKind.READ)
-    authorize_coordinates(db,identity,scope,targets,kind=AccessKind.WRITE)
+    authorize_coordinates(db,identity,scope,sources,kind=AccessKind.READ,**access_options)
+    authorize_coordinates(db,identity,scope,targets,kind=AccessKind.WRITE,**access_options)
+
+
+MAX_DYNAMIC_MEMBER_ROWS = 500
 
 
 def evaluate_dynamic_expression(db,scope:ApplicationScope,
         identity:VerifiedIdentity,plan:ExpressionPlan,*,authorization_db=None,
-        definition_test=False,max_rows=500)->list[dict]:
+        expected_access: AccessDecision | None = None, definition_test=False,
+        max_rows=MAX_DYNAMIC_MEMBER_ROWS)->list[dict]:
     """Evaluate one bounded calculated member without persisting results."""
     if type(max_rows) is not int or not 1 <= max_rows <= 100_000:
         raise ValueError('CALCULATED_MEMBER_DYNAMIC_LIMIT_INVALID')
@@ -4075,8 +4081,10 @@ def evaluate_dynamic_expression(db,scope:ApplicationScope,
     sources=expression_source_coordinates(db,scope,plan)
     targets=expression_target_coordinates(db,scope,plan,count)
     authority = db if authorization_db is None else authorization_db
-    authorize_coordinates(authority,identity,scope,sources,kind=AccessKind.READ)
-    authorize_coordinates(authority,identity,scope,targets,kind=AccessKind.READ)
+    authorize_coordinates(authority,identity,scope,sources,kind=AccessKind.READ,
+                          expected_access=expected_access)
+    authorize_coordinates(authority,identity,scope,targets,kind=AccessKind.READ,
+                          expected_access=expected_access)
     joins,join_params,aliases,_,_=_published_joins(plan)
     expression_sql,expression_params=_sql(plan.expression,aliases)
     lineage_sql,lineage_params=_source_lineage_sql(plan)

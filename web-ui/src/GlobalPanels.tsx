@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { request } from "./api";
-import type { ApplicationCatalog, ApplicationSummary } from "./types";
+import { mergeTaskListPage, taskListBody } from "./task-list";
+import type { TaskListPage, TaskListRow } from "./task-list";
+import type { ApplicationCatalog, ApplicationSummary, Scope } from "./types";
 
 export type NavigationTarget = {
   id: string;
@@ -57,7 +59,7 @@ function usePanelKeyboard(
     window.addEventListener("keydown", keyboard);
     return () => {
       window.removeEventListener("keydown", keyboard);
-      trigger.current?.focus();
+      if (document.activeElement === document.body) trigger.current?.focus();
       trigger.current = null;
     };
   }, [open, panel, trapFocus]);
@@ -103,6 +105,11 @@ export function GlobalSearch({
   const functionResults = Object.keys(catalog?.functions || {})
     .filter((name) => name.toLocaleLowerCase().includes(normalized))
     .slice(0, 12);
+  const noMatches =
+    normalized.length > 0 &&
+    !applicationResults.length &&
+    !navigationResults.length &&
+    !functionResults.length;
 
   if (!open) return null;
   return (
@@ -135,12 +142,15 @@ export function GlobalSearch({
             placeholder="Search applications, pages or authorized functions"
           />
         </label>
+        <div role="status" className={noMatches ? "empty-state" : undefined}>
+          {noMatches ? "No accessible result matches your search." : ""}
+        </div>
         {!normalized ? (
           <p className="panel-hint">
             Type to search within your accessible applications and current
             authorized catalogue.
           </p>
-        ) : (
+        ) : !noMatches ? (
           <div className="search-results">
             {applicationResults.length > 0 && (
               <ResultGroup title="Applications">
@@ -190,15 +200,8 @@ export function GlobalSearch({
                 ))}
               </ResultGroup>
             )}
-            {!applicationResults.length &&
-              !navigationResults.length &&
-              !functionResults.length && (
-                <div className="empty-state">
-                  No accessible result matches “{query}”.
-                </div>
-              )}
           </div>
-        )}
+        ) : null}
       </section>
     </div>
   );
@@ -216,13 +219,10 @@ function ResultGroup({
   );
 }
 
-type TaskNotice = {
-  taskId: string;
-  function: string;
-  sourceFamily: string;
-  status: string;
-  updatedAt?: string;
-};
+type TaskNotice = TaskListRow & { sourceFamily: string };
+type NotificationResult =
+  | { scope: Scope; state: "ready"; notices: TaskNotice[] }
+  | { scope: Scope; state: "error" };
 
 export function Notifications({
   open,
@@ -235,33 +235,40 @@ export function Notifications({
   app?: ApplicationSummary;
   goMonitor: () => void;
 }) {
-  const [tasks, setTasks] = useState<TaskNotice[]>([]);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
+  const workspaceId = app?.workspaceId;
+  const applicationId = app?.applicationId;
+  const scope = useMemo(
+    () =>
+      open && workspaceId && applicationId
+        ? { workspaceId, applicationId }
+        : null,
+    [open, workspaceId, applicationId],
+  );
+  const [result, setResult] = useState<NotificationResult | null>(null);
   const panel = useRef<HTMLElement>(null);
   usePanelKeyboard(open, close, panel, false);
   useEffect(() => {
-    if (!open || !app) return;
+    if (!scope) return;
     const controller = new AbortController();
-    setLoading(true);
-    setError("");
-    request<{ tasks: TaskNotice[] }>(
+    const { signal } = controller;
+    request<TaskListPage<TaskNotice>>(
       "/api/tasks",
-      {
-        workspaceId: app.workspaceId,
-        applicationId: app.applicationId,
-        afterSequence: 0,
-        limit: 100,
-        attentionOnly: true,
-      },
-      controller.signal,
+      taskListBody(scope, 0, true),
+      signal,
     )
-      .then((value) => setTasks(value.tasks))
-      .catch((reason: Error) => setError(reason.message))
-      .finally(() => setLoading(false));
+      .then((value) => {
+        if (signal.aborted) return;
+        const { tasks } = mergeTaskListPage([], value, 0, false);
+        if (tasks.some((task) => task.progressState !== "attention"))
+          throw new Error("Task attention response is invalid.");
+        setResult({ scope, state: "ready", notices: tasks.slice(0, 12) });
+      })
+      .catch(() => {
+        if (!signal.aborted) setResult({ scope, state: "error" });
+      });
     return () => controller.abort();
-  }, [open, app?.workspaceId, app?.applicationId]);
-  const notices = useMemo(() => tasks, [tasks]);
+  }, [scope]);
+  const current = result?.scope === scope ? result : null;
   if (!open) return null;
   return (
     <section
@@ -281,42 +288,48 @@ export function Notifications({
           ×
         </button>
       </header>
-      {loading && (
-        <p className="panel-hint">Reading authoritative task state…</p>
+      {!scope && (
+        <p className="panel-hint">
+          Choose an application to see its notifications.
+        </p>
       )}
-      {error && (
+      {scope && !current && (
+        <p className="panel-hint" role="status">
+          Reading task status…
+        </p>
+      )}
+      {current?.state === "error" && (
         <div className="inline-error" role="alert">
-          {error}
+          Notifications could not be loaded. Reopen this panel to try again.
         </div>
       )}
-      {!loading && !error && !notices.length && (
+      {current?.state === "ready" && !current.notices.length && (
         <div className="empty-state">
-          <span>✓</span>
           <strong>No task currently needs attention</strong>
         </div>
       )}
-      <div className="notice-list">
-        {notices.slice(0, 12).map((task) => (
-          <article key={task.taskId}>
-            <span
-              className={`task-state ${["Failed", "Interrupted", "Cancelled", "Rejected", "Stale"].includes(task.status) ? "attention" : "running"}`}
-            >
-              {task.status}
-            </span>
-            <strong>{task.function}</strong>
-            <small>{task.sourceFamily}</small>
-          </article>
-        ))}
-      </div>
-      <button
-        className="primary-link panel-action"
-        onClick={() => {
-          goMonitor();
-          close();
-        }}
-      >
-        Open Monitor →
-      </button>
+      {current?.state === "ready" && current.notices.length > 0 && (
+        <div className="notice-list">
+          {current.notices.map((task) => (
+            <article key={task.taskId}>
+              <span className="task-state attention">{task.status}</span>
+              <strong>{task.function}</strong>
+              <small>{task.sourceFamily}</small>
+            </article>
+          ))}
+        </div>
+      )}
+      {scope && (
+        <button
+          className="primary-link panel-action"
+          onClick={() => {
+            goMonitor();
+            close();
+          }}
+        >
+          Open Monitor →
+        </button>
+      )}
     </section>
   );
 }

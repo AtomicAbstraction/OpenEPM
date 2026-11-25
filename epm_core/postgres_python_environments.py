@@ -19,6 +19,91 @@ REGISTER='python.environment.register'
 READ='python.environment.read'
 LIST='python.environment.list'
 PROFILE_LIST='python.environment.profile.list'
+FUNCTIONS = frozenset((REGISTER, READ, LIST, PROFILE_LIST))
+
+
+def environment_program_contract(function: str) -> dict:
+    """Describe the environment owner's existing public request and result shapes."""
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    def text(pattern):
+        return {'type': 'string', 'pattern': '^' + pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+
+    def nullable(schema):
+        return {'anyOf': [schema, {'type': 'null'}]}
+
+    identifier = text(_ID.pattern)
+    digest = text('[0-9a-f]{64}')
+    image_digest = text(_IMAGE.pattern)
+    revision = {'type': 'integer', 'minimum': 0}
+    status = {'const': 'Active'}
+    environment = obj({'environment_id': identifier, 'state_token': digest, 'status': status,
+        'manifest': {'type': 'object', 'description': 'Deployment-owned profile manifest.'},
+        'manifest_digest': digest, 'image_digest': image_digest,
+        'updated_at': {'type': 'string', 'format': 'date-time'}})
+    example_id = 'example-builder'
+    rules = (['In group-assigned applications, a rule designer can list active builder IDs and state tokens.']
+             if function == LIST else ['This operation requires current application administrator authority.'])
+
+    def example(arguments, name, binding):
+        return read_example(function, arguments, name=name, binding=binding)
+
+    if function == PROFILE_LIST:
+        arguments = obj({})
+        profile = obj({'profileId': identifier, 'environmentId': identifier, 'imageDigest': image_digest,
+            'network': {'type': ['string', 'null']},
+            'compilerVersions': {'type': 'array', 'items': {'type': 'string'}}})
+        result = obj({'profiles': {'type': 'array', 'items': profile}})
+        examples = [example({}, 'Discover deployment-approved builder profiles',
+            'Select the intended returned profileId and its matching environmentId for registration.')]
+        rules.append('An empty profiles array means this service has no approved profiles configured.')
+    elif function == READ:
+        arguments = obj({'environmentId': identifier})
+        result = {'oneOf': [
+            obj({'defined': {'const': True}, 'environment': environment}),
+            obj({'defined': {'const': False}, 'environment': {'type': 'null'}}),
+        ]}
+        examples = [example({'environmentId': example_id}, 'Inspect one current environment',
+            'Use the exact environmentId from an approved profile or environment_id from a registered page.')]
+        rules.append('Use a defined environment’s state_token when binding Python source or reviewing a replacement.')
+    elif function == LIST:
+        arguments = obj({'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100, 'default': 100},
+                         'afterEnvironmentId': nullable(identifier)}, [])
+        binding = obj({'environment_id': identifier, 'state_token': digest, 'status': status})
+        result = obj({'environments': {'type': 'array', 'items': {'oneOf':[environment,binding]}, 'maxItems': 100},
+                      'nextAfterEnvironmentId': nullable(identifier)})
+        result['allOf'] = [{'if': {'properties': {'environments': {'maxItems': 0}}},
+                            'then': {'properties': {'nextAfterEnvironmentId': {'type': 'null'}}}}]
+        examples = [example({'limit': 25}, 'List the first registered environment page',
+                        'Use the current application scope.'),
+                    example({'limit': 25, 'afterEnvironmentId': example_id}, 'Continue the registered environment list',
+                        'Copy the preceding non-null nextAfterEnvironmentId. Stop at a null continuation.')]
+        rules.append('Pages use the current environment IDs in keyset order. Read the selected environment again before a change.')
+    elif function == REGISTER:
+        pins = dict.fromkeys(('expectedMetadataRevision', 'expectedPolicyRevision', 'expectedSchemaEpoch'), revision)
+        required = {'environmentId': identifier, 'profileId': identifier, **pins}
+        arguments = obj({**required, 'expectedStateToken': nullable(digest)}, list(required))
+        result = obj({'operationId': text(_KEY.pattern), 'environmentId': identifier, 'stateToken': digest,
+                      'status': status, 'profileId': identifier, 'manifestDigest': digest, 'imageDigest': image_digest,
+                      'metadataRevision': revision, 'policyRevision': revision, 'schemaEpoch': revision})
+        first = {'environmentId': example_id, 'profileId': example_id, **dict.fromkeys(pins, 1)}
+        examples = [example(first, 'Register a deployment-approved profile',
+                        'Bind both IDs from the same profile, confirm the environment is undefined, copy current application revisions and obtain admission for the reviewed program.'),
+                    example({**first, 'expectedStateToken': 'a' * 64}, 'Replace a current environment',
+                        'Use its exact current state_token in addition to a matching approved profile and current application revisions.')]
+        rules.extend([
+            'The deployment owns the runtime image and manifest. Supply only an approved profileId and its matching environmentId.',
+            'Omit expectedStateToken or supply null for first registration. Supply the exact current token when replacing an environment.',
+            'Retain and replay the exact admitted request when its outcome is unknown. After a stale-context or state-conflict refusal, reread application state and the environment before reviewing a fresh registration.',
+        ])
+    else:
+        raise ValueError('PYTHON_ENVIRONMENT_PROGRAM_INVALID')
+
+    return read_contract(function, arguments, result, owner='PostgresPythonEnvironments',
+                         examples=examples, semantic_rules=rules)
+
+
 def _canonical(value,code):
  try:return json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False,allow_nan=False)
  except (TypeError,ValueError) as error:raise ValueError(code) from error
@@ -48,7 +133,7 @@ class PostgresPythonEnvironments:
  def catalog():
   read={'mode':'read_only','permission':'admin','previewRequired':False,
    'idempotencyRequired':False,'workClass':'short'}
-  return {REGISTER:{'mode':'atomic_write','permission':'admin',
+  operations = {REGISTER:{'mode':'atomic_write','permission':'admin',
    'previewRequired':False,'idempotencyRequired':True,'workClass':'short',
    'arguments':{'environmentId':'1-200 safe characters',
     'profileId':'deployment-approved profile identity; never an image supplied by the caller',
@@ -63,6 +148,8 @@ class PostgresPythonEnvironments:
     'result':'bounded registered environment page'},
    PROFILE_LIST:{**read,'arguments':{},
     'result':'deployment-approved registration profiles; no caller image input'}}
+  return {function: {**specification, **environment_program_contract(function)}
+          for function, specification in operations.items()}
  def execute(self,scope,program,*,idempotency_key):
   if (type(program) is not dict or set(program)!={'languageVersion','function','arguments'}
       or program.get('languageVersion')!=2 or program.get('function')!=REGISTER
@@ -102,7 +189,7 @@ class PostgresPythonEnvironments:
    with db.transaction():
     db.execute('SET TRANSACTION READ ONLY');configure_statement_timeout(db,5000)
     PostgresNumericFactStore._set_scope(db,scope)
-    PostgresAccessChecker.check_in_transaction(db,self.identity,scope,'admin',function=function)
+    access = PostgresAccessChecker.check_in_transaction(db,self.identity,scope,'admin',function=function)
     if function==PROFILE_LIST:
      return {'profiles':[{'profileId':profile.profile_id,
        'environmentId':profile.manifest['environmentId'],
@@ -110,15 +197,18 @@ class PostgresPythonEnvironments:
        'network':profile.manifest.get('network'),
        'compilerVersions':profile.manifest.get('compilerVersions',[])}
        for profile in sorted(self._profiles.values(),key=lambda value:value.profile_id)]}
-    rows=db.execute('''SELECT environment_id,state_token,status,
-      manifest,manifest_digest,image_digest,updated_at
-      FROM epm.python_environment_definition
+    bindings_only = function==LIST and access.authorization_model=='group_assignments'
+    columns = 'environment_id,state_token,status'
+    if not bindings_only:
+     columns += ',manifest,manifest_digest,image_digest,updated_at'
+    rows=db.execute('SELECT ' + columns + ''' FROM epm.python_environment_definition
       WHERE workspace_id=%s AND application_id=%s
       AND (%s::text IS NULL OR environment_id>%s)
       AND (%s::text IS NULL OR environment_id=%s)
       ORDER BY environment_id LIMIT %s''',(scope.workspace_id,scope.application_id,
       after,after,args.get('environmentId'),args.get('environmentId'),limit+1)).fetchall()
-    values=[dict(row) for row in rows[:limit]]
+    values = rows[:limit] if bindings_only else [
+        {**row, 'updated_at':row['updated_at'].isoformat()} for row in rows[:limit]]
     return ({'defined':bool(values),'environment':values[0] if values else None}
       if function==READ else {'environments':values,
        'nextAfterEnvironmentId':rows[limit-1]['environment_id'] if len(rows)>limit else None})

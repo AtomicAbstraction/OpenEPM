@@ -18,10 +18,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 try:
-    from scripts.openepm_release_inventory import (
-        InventoryError, resolve as resolve_release_inventory)
-except ModuleNotFoundError:  # bundled tools are copied into one directory
     from openepm_release_inventory import (  # type: ignore[no-redef]
+        InventoryError, resolve as resolve_release_inventory)
+except ModuleNotFoundError:  # Repository imports can resolve through the package.
+    from scripts.openepm_release_inventory import (
         InventoryError, resolve as resolve_release_inventory)
 
 try:
@@ -38,6 +38,13 @@ COMPONENTS = {"application", "database", "operations", "builder",
               "identity", "proxy", "browser_gateway",
               "browser_session_store", "telemetry_collector"}
 ARCHES = {"linux/amd64", "linux/arm64"}
+SHA256 = re.compile(r"[a-f0-9]{64}")
+MCP_IDENTITY_TOOL = "read_v2_session_identity"
+PHASES = ("host-attestation", "bundle-integrity", "epmctl-doctor",
+          "epmctl-install", "authenticated-mcp", "authenticated-browser",
+          "runsc-headless-python", "runsc-python-build-publication",
+          "database-version-read", "service-restart", "populated-backup",
+          "independent-host-restore", "storage-retirement", "native-architecture-proof")
 
 
 def canonical(value: object) -> bytes:
@@ -115,38 +122,201 @@ def plan(manifest_path: Path, *, architecture: str) -> dict:
                  "architecture": architecture, "requiredRuntime": "runsc",
                  "mustBeCleanHost": True},
         "nativeImageDigests": {key: image_digests[key] for key in sorted(image_digests)},
-        "phases": ["host-attestation", "bundle-integrity", "epmctl-doctor",
-            "epmctl-install", "authenticated-mcp", "authenticated-browser",
-            "runsc-headless-python",
-            "runsc-python-build-publication", "database-version-read",
-            "service-restart", "populated-backup", "independent-host-restore",
-            "storage-retirement", "native-architecture-proof"]}
+        "phases": list(PHASES)}
+
+
+def verify_mcp_identity_request(request: object) -> None:
+    if (not isinstance(request, dict)
+            or set(request) != {"jsonrpc", "id", "method", "params"}
+            or request.get("jsonrpc") != "2.0"
+            or type(request.get("id")) not in (int, str)
+            or request.get("method") != "tools/call"
+            or request.get("params") != {"name": MCP_IDENTITY_TOOL, "arguments": {}}):
+        raise QualificationError("MCP request must call read_v2_session_identity without arguments")
+
+
+def verify_mcp_identity_evidence(observation: object, *, before: dict | None = None) -> None:
+    fields = ("requestSha256", "responseSha256")
+    if (not isinstance(observation, dict)
+            or observation.get("verified") is not True
+            or observation.get("unsignedDenied") is not True
+            or observation.get("tool") != MCP_IDENTITY_TOOL
+            or any(not isinstance(observation.get(field), str)
+                   or not SHA256.fullmatch(observation[field]) for field in fields)):
+        label = "authenticated post-restart MCP" if before is not None else "authenticated MCP runtime"
+        raise QualificationError(f"{label} identity proof is incomplete")
+    if before is not None and (observation.get("authenticatedWorkflowClaimed") is not True
+            or any(observation[field] != before[field] for field in fields)):
+        raise QualificationError("authenticated post-restart MCP request or identity changed")
+
+
+def verify_restart_transition(before: dict[str, str], started: dict[str, str]) -> None:
+    if before["continuitySha256"] != started["continuitySha256"]:
+        raise QualificationError("release configuration, service identities or database volumes changed on restart")
+    if before["runningSha256"] == started["runningSha256"]:
+        raise QualificationError("release restart did not change the observed running generation")
+
+
+def verify_restart_continuity(evidence: object) -> None:
+    steps = ("beforeStop", "afterStart", "afterReadback")
+    fields = ("continuitySha256", "runningSha256")
+    if (not isinstance(evidence, dict) or set(evidence) != set(steps)
+            or any(not isinstance(row, dict) or set(row) != set(fields)
+                   or any(not isinstance(row[field], str) or not SHA256.fullmatch(row[field])
+                          for field in fields) for row in evidence.values())):
+        raise QualificationError("restart continuity evidence is incomplete")
+    before, started, readback = (evidence[step] for step in steps)
+    verify_restart_transition(before, started)
+    if started != readback:
+        raise QualificationError("release changed during authenticated post-restart readback")
+
+
+def verify_database_versions(versions: object) -> None:
+    if (not isinstance(versions, dict) or versions.get("readFromRunningDatabase") is not True
+            or not isinstance(versions.get("postgresql"), str)
+            or not re.fullmatch(r"PostgreSQL [1-9][0-9]*(?:\.[0-9]+)+(?: [^\r\n]+)?", versions["postgresql"])
+            or not isinstance(versions.get("pgDuckdb"), str)
+            or not re.fullmatch(r"pg_duckdb [0-9]+(?:\.[0-9]+)+(?:[-+._a-zA-Z0-9]*)", versions["pgDuckdb"])):
+        raise QualificationError("actual PostgreSQL server and pg_duckdb versions are required")
+
+
+def verify_restored_public_readback(readback: object, *, target: str,
+                                    runtime: str, expected: object) -> None:
+    """Require both public clients to read the attested source projection on the restored target."""
+    if (not isinstance(expected, str) or SHA256.fullmatch(expected) is None
+            or not isinstance(readback, dict)
+            or set(readback) != {"targetProject", "activatedRuntimeSha256", "browser", "mcp"}
+            or readback.get("targetProject") != target
+            or readback.get("activatedRuntimeSha256") != runtime):
+        raise QualificationError("restored public readback does not bind the source and activated target")
+    for surface in ("browser", "mcp"):
+        result = readback[surface]
+        if (not isinstance(result, dict)
+                or set(result) != {"authenticated", "unsignedDenied", "signature", "responseSha256"}
+                or result.get("authenticated") is not True
+                or result.get("unsignedDenied") is not True
+                or result.get("signature") != expected
+                or not isinstance(result.get("responseSha256"), str)
+                or SHA256.fullmatch(result["responseSha256"]) is None):
+            raise QualificationError(f"restored {surface} public readback differs from the attested source or lacks authority proof")
+
+
+def verify_restored_evidence(restore: object, backup: dict, host_identity: str) -> None:
+    """Bind the encrypted source, imported population and verified serving cutover."""
+    if not isinstance(restore, dict):
+        raise QualificationError("independent populated restore proof is incomplete")
+    population = backup["preBackupPopulatedSignature"]
+    runtime = restore.get("activatedRuntimeSha256")
+    projects = (restore.get("priorProject"), restore.get("targetProject"))
+    if (restore.get("populated") is not True
+            or restore.get("independentHost") is not True
+            or restore.get("encryptedTransfer") is not True
+            or restore.get("activationVerified") is not True
+            or restore.get("sourceHostIdentity") != backup["sourceHostIdentity"]
+            or restore.get("sourceHostIdentity") == host_identity
+            or restore.get("targetHostIdentity") != host_identity
+            or any(restore.get(field) != backup[field]
+                   for field in ("bundle", "manifestSha256", "encryptedArtifactSha256"))
+            or any(restore.get(field) != backup["manifestSha256"]
+                   for field in ("restoredManifestSha256", "activatedManifestSha256"))
+            or any(restore.get(field) != population for field in (
+                "beforeSignature", "restoredSignatureBeforeActivation", "afterSignature"))
+            or any(not isinstance(project, str) or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", project) is None
+                   for project in projects)
+            or projects[0] == projects[1]
+            or not isinstance(runtime, str) or re.fullmatch(r"[a-f0-9]{64}", runtime) is None):
+        raise QualificationError("independent populated restore proof is incomplete")
+    verify_restored_public_readback(restore.get("publicReadback"), target=projects[1],
+                                    runtime=runtime, expected=backup.get("preBackupPublicReadSignature"))
+
+
+def verify_serving_release(observation: object, release_binding: dict) -> str:
+    """Check the base installation against the live, signed operator projection."""
+    if not isinstance(observation, dict):
+        raise QualificationError("serving release observation is missing")
+    for observed, expected in (("releaseManifestSha256", "releaseManifestSha256"),
+                               ("inventorySha256", "releaseInventorySha256")):
+        digest = release_binding.get(expected)
+        if (not isinstance(digest, str) or not SHA256.fullmatch(digest)
+                or observation.get(observed) != digest):
+            raise QualificationError("serving release differs from the bound manifest or inventory")
+    project = observation.get("project")
+    launcher = observation.get("launcher")
+    compose = observation.get("composeObservation")
+    if (observation.get("format") != "openepm-operator-status-v1"
+            or not isinstance(project, str) or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", project) is None
+            or observation.get("releaseImageCheck") != "matched"
+            or observation.get("componentChecksPassed") is not True
+            or not isinstance(launcher, dict) or launcher.get("status") != "active"
+            or not isinstance(compose, dict) or compose.get("status") != "observed"
+            or observation.get("observedOptionalProfiles") != []
+            or type(observation.get("unclassifiedContainerCount")) is not int
+            or observation["unclassifiedContainerCount"] != 0):
+        raise QualificationError("serving release did not match the ready base installation")
+    inventory = release_binding.get("releaseInventory")
+    services = inventory.get("services") if isinstance(inventory, dict) else None
+    components = observation.get("components")
+    if (not isinstance(services, list) or not services
+            or any(not isinstance(service, str) or not service for service in services)
+            or not isinstance(components, list) or len(components) != len(services)):
+        raise QualificationError("serving release has incomplete component coverage")
+    remaining = set(services)
+    for component in components:
+        service = component.get("service") if isinstance(component, dict) else None
+        if (not isinstance(service, str) or service not in remaining
+                or component.get("readiness") != "checks-passed"
+                or component.get("releaseImageCheck") != "matched"):
+            raise QualificationError("serving release contains an unexpected or unverified component")
+        remaining.remove(service)
+        instances = component.get("instances")
+        if not isinstance(instances, list) or len(instances) != 1:
+            raise QualificationError("serving release must have one instance per component")
+        instance = instances[0]
+        if (not isinstance(instance, dict)
+                or instance.get("state") != "running"
+                or instance.get("instanceObservation") != "container-inspect"
+                or instance.get("releaseImageCheck") != "matched"
+                or instance.get("oneOff") is not False):
+            raise QualificationError("serving release lacks one inspected matching instance per component")
+    return project
+
+
+def verify_host_attestation(host: object, expected_host: object) -> None:
+    """Require an eligible Ubuntu/runsc target and an authenticated distinct source."""
+    if (not isinstance(host, dict) or not isinstance(expected_host, dict)
+            or not isinstance(expected_host.get("architecture"), str)
+            or expected_host["architecture"] not in ARCHES
+            or host.get("osId") != "ubuntu" or host.get("osVersion") != "24.04"
+            or host.get("architecture") != expected_host["architecture"]
+            or host.get("cleanHost") is not True
+            or not isinstance(host.get("runscVersion"), str) or not host["runscVersion"].strip()
+            or host.get("dockerRunscRegistered") is not True
+            or host.get("developmentMacPathsPresent") is not False):
+        raise QualificationError("clean Ubuntu/runsc host proof is incomplete")
+    host_identity = host.get("hostIdentity")
+    if not isinstance(host_identity, str) or not SHA256.fullmatch(host_identity):
+        raise QualificationError("clean-host identity proof is incomplete")
+    source = host.get("sourceHostIdentity")
+    if not isinstance(source, str) or not SHA256.fullmatch(source):
+        raise QualificationError("source backup host identity was not authenticated before installation")
+    if source == host_identity:
+        raise QualificationError("qualification target is not independent from source host")
 
 
 def verify(plan_value: dict, evidence: dict) -> dict:
     if (plan_value.get("format") != "openepm-clean-linux-qualification-plan-v2"
             or plan_value.get("status") != "execution-required"
-            or plan_value.get("qualificationClaimed") is not False):
+            or plan_value.get("qualificationClaimed") is not False
+            or plan_value.get("phases") != list(PHASES)):
         raise QualificationError("invalid qualification plan")
     if (evidence.get("format") != "openepm-clean-linux-qualification-evidence-v2"
             or evidence.get("status") != "passed"
             or evidence.get("planSha256") != hashlib.sha256(
                 canonical(plan_value)).hexdigest()):
         raise QualificationError("evidence does not bind the exact plan")
-    host = evidence.get("host", {})
-    expected_host = plan_value["host"]
-    if (host.get("osId") != "ubuntu" or host.get("osVersion") != "24.04"
-            or host.get("architecture") != expected_host["architecture"]
-            or host.get("cleanHost") is not True
-            or host.get("runscVersion") in (None, "")
-            or host.get("dockerRunscRegistered") is not True
-            or host.get("developmentMacPathsPresent") is not False):
-        raise QualificationError("clean Ubuntu/runsc host proof is incomplete")
-    host_identity = host.get("hostIdentity")
-    if (not isinstance(host_identity, str) or len(host_identity) != 64
-            or any(character not in "0123456789abcdef"
-                   for character in host_identity)):
-        raise QualificationError("clean-host identity proof is incomplete")
+    host = evidence.get("host")
+    expected_host = plan_value.get("host")
+    verify_host_attestation(host, expected_host)
     if (evidence.get("releaseManifestSha256") !=
             plan_value["releaseManifestSha256"]
             or evidence.get("resolvedReleasePolicySha256") !=
@@ -171,24 +341,16 @@ def verify(plan_value: dict, evidence: dict) -> dict:
     if any(workflows.get(key) is not True for key in required_workflows):
         raise QualificationError("required authenticated/runtime workflow is incomplete")
     attestations = evidence.get("runtimeAttestations", {})
+    if not isinstance(attestations, dict):
+        raise QualificationError("serving release attestations are invalid")
+    install_project = verify_serving_release(attestations.get("installedRelease"), plan_value)
     authenticated_mcp = attestations.get("authenticatedMcp", {})
-    if (authenticated_mcp.get("verified") is not True
-            or authenticated_mcp.get("unsignedDenied") is not True
-            or not isinstance(authenticated_mcp.get("responseSha256"), str)
-            or len(authenticated_mcp["responseSha256"]) != 64
-            or any(character not in "0123456789abcdef"
-                   for character in authenticated_mcp["responseSha256"])):
-        raise QualificationError("authenticated MCP runtime proof is incomplete")
+    verify_mcp_identity_evidence(authenticated_mcp)
     restart = attestations.get("restart", {})
-    if (restart.get("verified") is not True
-            or restart.get("authenticatedWorkflowClaimed") is not True
-            or restart.get("unsignedDenied") is not True
-            or not isinstance(restart.get("responseSha256"), str)
-            or len(restart["responseSha256"]) != 64
-            or any(character not in "0123456789abcdef"
-                   for character in restart["responseSha256"])
-            or restart["responseSha256"] != authenticated_mcp["responseSha256"]):
-        raise QualificationError("authenticated post-restart MCP proof is incomplete")
+    verify_mcp_identity_evidence(restart, before=authenticated_mcp)
+    verify_restart_continuity(restart.get("restartContinuity"))
+    if verify_serving_release(restart.get("servingRelease"), plan_value) != install_project:
+        raise QualificationError("serving release project changed on restart")
     headless = attestations.get("runscHeadlessPython", {})
     if (headless.get("verified") is not True
             or headless.get("runtime") != "runsc"
@@ -284,13 +446,7 @@ def verify(plan_value: dict, evidence: dict) -> dict:
             or any(character not in "0123456789abcdef"
                    for character in browser["outputSha256"])):
         raise QualificationError("authenticated browser runtime proof is incomplete")
-    versions = evidence.get("databaseVersions", {})
-    if (not isinstance(versions.get("postgresql"), str)
-            or not versions["postgresql"].strip()
-            or not isinstance(versions.get("pgDuckdb"), str)
-            or not versions["pgDuckdb"].strip()
-            or versions.get("readFromRunningDatabase") is not True):
-        raise QualificationError("actual PostgreSQL/pg_duckdb versions are absent")
+    verify_database_versions(evidence.get("databaseVersions"))
     backup = evidence.get("backup", {})
     backup_signature = backup.get("preBackupPopulatedSignature")
     if (not isinstance(backup.get("bundle"), str)
@@ -314,23 +470,9 @@ def verify(plan_value: dict, evidence: dict) -> dict:
             or backup["totalBytes"] < 1):
         raise QualificationError("populated encrypted backup proof is incomplete")
     restore = evidence.get("restore", {})
-    if (restore.get("populated") is not True
-            or restore.get("independentHost") is not True
-            or restore.get("encryptedTransfer") is not True
-            or restore.get("sourceHostIdentity") == restore.get("targetHostIdentity")
-            or not restore.get("sourceHostIdentity")
-            or restore.get("sourceHostIdentity") != backup["sourceHostIdentity"]
-            or restore.get("targetHostIdentity") != host_identity
-            or restore.get("beforeSignature") != backup_signature
-            or restore.get("afterSignature") != backup_signature
-            or restore.get("activationVerified") is not True
-            or restore.get("bundle") != backup.get("bundle")
-            or not isinstance(restore.get("targetProject"), str)
-            or not restore["targetProject"]
-            or not isinstance(restore.get("priorProject"), str)
-            or not restore["priorProject"]
-            or restore["targetProject"] == restore["priorProject"]):
-        raise QualificationError("independent populated restore proof is incomplete")
+    if backup.get("sourceHostIdentity") != host["sourceHostIdentity"]:
+        raise QualificationError("backup source differs from the pre-install host attestation")
+    verify_restored_evidence(restore, backup, host["hostIdentity"])
     retirement = evidence.get("storageRetirement", {})
     if (set(retirement.get("scannedImages", [])) != COMPONENTS
             or retirement.get("prohibitedMatches") != 0
@@ -351,6 +493,10 @@ def verify(plan_value: dict, evidence: dict) -> dict:
         "architecture": expected_host["architecture"],
         "releaseManifestSha256": plan_value["releaseManifestSha256"],
         "resolvedReleasePolicySha256": plan_value["resolvedReleasePolicySha256"],
+        "releaseInventorySha256": evidence["releaseInventorySha256"],
+        "activatedRestoreRuntimeSha256": restore["activatedRuntimeSha256"],
+        "restoredBackupManifestSha256": restore["activatedManifestSha256"],
+        "restoredPublicReadSignature": backup["preBackupPublicReadSignature"],
         "evidenceSha256": hashlib.sha256(canonical(evidence)).hexdigest(),
         "externalHostExecutionRequired": True}
 

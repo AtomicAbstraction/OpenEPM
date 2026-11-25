@@ -8,6 +8,7 @@ RUN npm ci
 COPY web-ui/index.html web-ui/tsconfig.json web-ui/tsconfig.app.json web-ui/tsconfig.node.json web-ui/vite.config.ts ./
 COPY web-ui/src/ ./src/
 COPY web-ui/build/ ./build/
+COPY docs/skills/multidimensional-cube-harness/SKILL.md /build/docs/skills/multidimensional-cube-harness/SKILL.md
 RUN npm run format:check && npm run check && npm test && npm run build
 
 FROM python:3.14-slim@sha256:35caba83af2fe6da9a5d922f9b0156f21d1246a48278c58a08bd253303ba42e8 AS app-build

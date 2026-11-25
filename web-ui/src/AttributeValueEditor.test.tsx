@@ -39,18 +39,24 @@ const definition = {
 
 it("reads complete member and relationship object catalogues", async () => {
   let memberPage = 0;
+  const tokenFor = (page: number) =>
+    "2000000000." + page.toString(16).padStart(64, "0");
   const members = await collectAttributeMemberObjects(
     "Entity",
     7,
     async (arguments_) => {
       const current = memberPage++;
-      if (current) expect(arguments_.expectedMetadataRevision).toBe(7);
+      if (current) {
+        expect(arguments_.expectedMetadataRevision).toBe(7);
+        expect(arguments_.expectedPageToken).toBe(tokenFor(current - 1));
+      }
       return {
         rows: Array.from({ length: 100 }, (_unused, row) => ({
           member_id: `m-${current}-${row}`,
           name: "Member",
         })),
         nextAfterMemberId: current === 100 ? null : `m-cursor-${current + 1}`,
+        nextPageToken: current === 100 ? null : tokenFor(current),
         metadataRevision: 7,
       };
     },

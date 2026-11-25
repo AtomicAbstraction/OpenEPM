@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import os
+from epm_core.mcp_diagnostics import DiagnosticToolError
+from epm_core.public_program_diagnostics import ProgramValidationError
 from mcp.server import MCPServer
 from epm_core.postgres_mcp_execution import bounded_tool
 from mcp.server.mcpserver import Context
@@ -46,6 +48,8 @@ def _assertion(ctx: Context) -> str:
 def _call(operation):
     try:
         return operation()
+    except ProgramValidationError as error:
+        raise DiagnosticToolError(error.diagnostics) from None
     except (AuthError,KeycloakDirectoryError,ValueError) as error:
         raise ToolError(str(error)) from error
     except psycopg.errors.LockNotAvailable as error:
@@ -71,12 +75,12 @@ def list_v2_platform_functions(ctx: Context) -> dict:
 @bounded_tool(server)
 def execute_v2_platform_program(program: dict,idempotency_key: str,
                                 ctx: Context) -> dict:
-    """Create a blank workspace and first Administrator atomically."""
+    """Execute a platform operation using its exact idempotency key."""
     return _call(lambda:application().create(
         _assertion(ctx),program,idempotency_key=idempotency_key))
 
 
 @bounded_tool(server)
 def read_v2_platform_program(program: dict,ctx: Context) -> dict:
-    """Read bounded native-user or stable-group directory metadata."""
+    """Read bounded directory metadata or the operator's original operation status."""
     return _call(lambda:application().read(_assertion(ctx),program))

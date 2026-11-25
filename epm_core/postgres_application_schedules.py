@@ -8,8 +8,10 @@ import json,re
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .application_schedule import canonical_digest,execution_bindings,validate_definition
-from .current_object_contract import new_state_token,require_state_token
+from .application_schedule import (
+    CANCELLATION_POLICY, FORMAT, SCHEDULE_ID_PATTERN as _ID, canonical_digest,
+    execution_bindings, schedule_definition_schema, schedule_identifier_schema, validate_definition)
+from .current_object_contract import STATE_TOKEN_PATTERN,new_state_token,require_state_token
 from .recurrence import CatchUpPolicy,due_from_interval
 from .persistence_contract import ApplicationScope
 from .postgres_access import (AccessDenied,PostgresAccessChecker,
@@ -25,13 +27,105 @@ SAVE="schedule.save";ACTIVATE="schedule.activate";DEACTIVATE="schedule.deactivat
 READ="schedule.read";LIST="schedule.list"
 FUNCTIONS=frozenset((SAVE,ACTIVATE,DEACTIVATE,READ,LIST))
 _KEY=re.compile(r"[A-Za-z0-9._-]{8,128}\Z")
-_ID=re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
 _HEX32=re.compile(r"[0-9a-f]{32}\Z")
 
 
 def _digest(value):
     return sha256(json.dumps(value,sort_keys=True,separators=(",",":"),
         ensure_ascii=True,allow_nan=False).encode("ascii")).hexdigest()
+
+
+def schedule_program_contract(function: str) -> dict:
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    identifier = schedule_identifier_schema()
+    token = {"type": "string", "pattern": "^" + STATE_TOKEN_PATTERN.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}
+    revision = {"type": "integer", "minimum": 0}
+    expected = dict.fromkeys(("expectedMetadataRevision", "expectedPolicyRevision", "expectedSchemaEpoch"), revision)
+    page_size = {"type": "integer", "minimum": 1, "maximum": 100}
+    definition = schedule_definition_schema()
+    example_id = "example-schedule"
+    example_token = "a" * 64
+    current = {"scheduleId": example_id}
+    if function in (READ, LIST):
+        record = obj({"scheduleId": identifier, "stateToken": token, "definition": definition,
+            "definitionDigest": token, "status": {"enum": ["Saved", "Active"]},
+            "targetStatus": {"enum": ["Current", "Stale"]},
+            "effectiveStatus": {"enum": ["Saved", "Active", "Blocked"]},
+            "reasonCode": {"enum": [None, "APPLICATION_SCHEDULE_TARGET_STALE"]},
+            "updatedAt": {"type": "string"}})
+    if function == LIST:
+        cursor = {"anyOf": [identifier, {"type": "null"}]}
+        arguments = obj({"limit": {**page_size, "default": 100}, "afterScheduleId": cursor}, [])
+        result = obj({"schedules": {"type": "array", "maxItems": 100, "items": record}, "nextAfterScheduleId": cursor})
+        examples = [read_example(function, {"limit": 20}, name="Read the first schedule page",
+            binding="Choose a currently readable application in discovery."),
+            read_example(function, {"limit": 20, "afterScheduleId": example_id}, name="Continue a schedule list",
+            binding="Copy nextAfterScheduleId from the prior response. A null cursor ends the list. Each page reads current state.")]
+    elif function == READ:
+        sequence = {"type": "integer", "minimum": 1, "maximum": 2**63 - 1}
+        occurrence = {"type": "string", "pattern": r"^[0-9a-f]{32}(?![\s\S])"}
+        page_request = obj({"expectedStateToken": token, "limit": page_size, "afterSequence": sequence},
+                           ["expectedStateToken", "limit"])
+        row = obj({"occurrenceId": occurrence, "taskId": {"type": "string", "pattern": r"^v:[0-9a-f]{32}(?![\s\S])"},
+            "sequence": sequence, "dueAt": {"type": "string"}, "nativeStatus": {"type": "string"},
+            "status": {"type": "string"}, "scheduleStateToken": token, "currentPin": {"type": "boolean"},
+            "workflowId": {"anyOf": [occurrence, {"type": "null"}]}})
+        page = obj({"scheduleStateToken": token, "items": {"type": "array", "maxItems": 100, "items": row},
+            "hasMore": {"type": "boolean"}, "nextAfterSequence": {"type": ["integer", "null"], "minimum": 1, "maximum": 2**63 - 1}})
+        arguments = obj({"scheduleId": identifier, "occurrences": page_request}, ["scheduleId"])
+        result = {"oneOf": [obj({"defined": {"const": False}, "schedule": {"type": "null"}}),
+            obj({"defined": {"const": True}, "schedule": record, "occurrences": page}, ["defined", "schedule"])]}
+        first = {"expectedStateToken": example_token, "limit": 20}
+        binding = "Use scheduleId and schedule.stateToken from a definition read in the same application."
+        examples = [read_example(function, current, name="Inspect the current schedule definition",
+            binding="Replace example-schedule with a scheduleId from an authorized list."),
+            read_example(function, {**current, "occurrences": first}, name="Read the first visible occurrence page", binding=binding),
+            read_example(function, {**current, "occurrences": {**first, "afterSequence": 10}},
+                name="Continue the visible occurrence history", binding=binding +
+                " Use nextAfterSequence only from the previous visible page with the same current schedule token.")]
+    else:
+        pins = dict.fromkeys(expected, 1)
+        receipt = {"operationId": {"type": "string", "pattern": "^" + _KEY.pattern.removesuffix(r"\Z") + r"(?![\s\S])"},
+            "scheduleId": identifier, "stateToken": token, "policyRevision": revision,
+            "status": {"const": "Active" if function == ACTIVATE else "Saved"}}
+        if function == SAVE:
+            arguments = obj({"definition": definition, **expected, "expectedStateToken": {"type": ["string", "null"], "pattern": token["pattern"]}},
+                            ["definition", *expected])
+            result = obj({**receipt, "definitionDigest": token})
+            create = {"definition": {"format": FORMAT, **current, "target": {"kind": "ApplicationRule",
+                "ruleId": "example-rule", "stateToken": example_token, "programDigest": "b" * 64},
+                "bindings": {}, "pov": [], "recurrence": {"kind": "FixedInterval", "intervalSeconds": 3600,
+                    "firstDueAt": "2035-01-01T00:00:00Z", "catchUpPolicy": "latest", "maxCatchUp": 1},
+                "retryPolicy": {"maxAttempts": 3, "backoffSeconds": 60, "needsInspectionAfter": True},
+                "cancellationPolicy": CANCELLATION_POLICY, "delegation": {"delegationId": "example-delegation",
+                    "stateToken": "c" * 64}}, **pins}
+            binding = ("Use ruleId, stateToken and programDigest from application.rule.read, current execution delegation "
+                "scoped to the schedule and application.rule.run, exact rule bindings and a chosen UTC due time. "
+                "Use revision pins from application.state.read and obtain admission for the exact effect.")
+            examples = [read_example(function, create, name="Save a new schedule", binding=binding),
+                read_example(function, {**create, "expectedStateToken": example_token}, name="Replace the exact current schedule",
+                    binding=binding + " Start with the definition and stateToken from schedule.read.")]
+        else:
+            arguments = obj({"scheduleId": identifier, "expectedStateToken": token, **expected})
+            result = obj(receipt)
+            examples = [read_example(function, {**current, "expectedStateToken": example_token, **pins},
+                name="Activate the exact saved schedule" if function == ACTIVATE else "Deactivate the exact active schedule",
+                binding="Use schedule.read for the current schedule token, application.state.read for revision pins, and obtain admission for the exact effect.")]
+    contract = read_contract(function, arguments, result, owner="PostgresApplicationSchedules", examples=examples,
+        semantic_rules=[
+            "Save leaves the schedule Saved. Lifecycle changes rotate its token and advance the policy revision.",
+            "The fixed owner checks current authority, schedule semantics, pinned rule and delegation, revision fences and exact receipts.",
+            "Each occurrence page uses the current schedule token and current task visibility. Each item retains its original schedule token.",
+            "Definition listing is a bounded live keyset walk. Reads do not materialize or control worker occurrences.",
+        ])
+    contract["programContract"]["recovery"] = (
+        "On APPLICATION_SCHEDULE_STALE_CONTEXT or APPLICATION_SCHEDULE_OCCURRENCE_CURSOR_INVALID, read the current "
+        "schedule without a cursor and restart the visible history from its first page. For a stale effect, refresh "
+        "the current schedule, rule, delegation and application pins before proposing a new intent. Resolve unknown "
+        "outcomes through the exact original operation receipt or authorized replay of the original admission.")
+    return contract
 
 
 def catalog():
@@ -42,7 +136,7 @@ def catalog():
     revisions={"expectedMetadataRevision":"current metadata revision",
         "expectedPolicyRevision":"current policy revision",
         "expectedSchemaEpoch":"current schema epoch"}
-    return {
+    functions = {
       SAVE:{**mutation,"arguments":{"definition":"current schedule definition",**revisions},
         "optionalArguments":{"expectedStateToken":"required to replace current schedule"},
         "result":"current Saved schedule and state token"},
@@ -53,10 +147,13 @@ def catalog():
         "expectedStateToken":"current schedule state token",**revisions},
         "result":"current Saved schedule and rotated state token"},
       READ:{**read,"arguments":{"scheduleId":"stable schedule ID"},
-        "result":"current schedule definition, lifecycle state and target currentness"},
+        "optionalArguments":{"occurrences":
+            "{expectedStateToken: current schedule token, limit: integer 1-100, afterSequence?: positive integer from this schedule's visible page}"},
+        "result":"current schedule definition, lifecycle state and target currentness; optional bounded owner/admin-visible occurrence task page, with original pins distinct from current schedule"},
       LIST:{**read,"arguments":{},"optionalArguments":{"limit":"1-100",
         "afterScheduleId":"stable keyset cursor"},
         "result":"current schedule page with effective target state"}}
+    return {function: {**entry, **schedule_program_contract(function)} for function, entry in functions.items()}
 
 
 def _occurrence_id(scope,schedule_id,state_token,due_at,*,schema_epoch):
@@ -157,14 +254,47 @@ class PostgresApplicationSchedules:
 
     @staticmethod
     def _cancel_stale_occurrences(db,scope,schedule_id,current_token):
+        """Stop fresh work without claiming that an admitted effect vanished.
+
+        The caller holds application_state. Linked work remains claimable for
+        control/receipt reconciliation after rotation. Preserve parked intent;
+        no parent/job locks or per-occurrence scans are added to definition save.
+        """
         db.execute('''UPDATE epm.application_schedule_occurrence SET
-            status='cancelled',claim_generation=claim_generation+1,claimant=NULL,
-            lease_until=NULL,next_attempt_at=NULL,
-            error_code='APPLICATION_SCHEDULE_TARGET_STALE',updated_at=transaction_timestamp()
+            status=CASE
+              WHEN status='needs_inspection' THEN 'needs_inspection'
+              WHEN application_rule_workflow_id IS NOT NULL THEN 'cancel_requested'
+              WHEN status='ready' AND claim_generation=0 AND attempt_count=0
+                THEN 'cancelled'
+              ELSE 'needs_inspection' END,
+            inspection_origin_status=CASE
+              WHEN status='needs_inspection' OR
+                (application_rule_workflow_id IS NULL AND NOT
+                  (status='ready' AND claim_generation=0 AND attempt_count=0))
+                THEN 'cancel_requested' ELSE NULL END,
+            claim_generation=claim_generation+1,claimant=NULL,lease_until=NULL,
+            next_attempt_at=NULL,error_code='APPLICATION_SCHEDULE_TARGET_STALE',
+            updated_at=transaction_timestamp()
             WHERE workspace_id=%s AND application_id=%s AND schedule_id=%s
               AND schedule_state_token<>%s AND status IN
-              ('ready','running','submitted','cancel_requested')''',(
-            scope.workspace_id,scope.application_id,schedule_id,current_token))
+              ('ready','running','submitted','cancel_requested','needs_inspection')''',
+            (scope.workspace_id,scope.application_id,schedule_id,current_token))
+
+    @staticmethod
+    def _cancellation_disposition(row,parent):
+        if parent is not None and parent['status'] in (
+                'published','partially_published','failed','cancelled'):
+            return parent['status']
+        # A parked cancellation is not automatically rearmed by replacement.
+        if row['status']=='needs_inspection':
+            return 'needs_inspection'
+        if parent is not None:
+            return ('needs_inspection' if parent['status']=='needs_inspection'
+                    else 'cancel_requested')
+        if (row['application_rule_workflow_id'] is None and row['status']=='ready'
+                and row['claim_generation']==0 and row['attempt_count']==0):
+            return 'cancelled'
+        return 'needs_inspection'
 
     @staticmethod
     def _lock_schedule(db,scope,schedule_id):
@@ -174,20 +304,23 @@ class PostgresApplicationSchedules:
             scope.workspace_id,scope.application_id,schedule_id))
 
     def execute(self,scope,program,*,idempotency_key=None,registry=None,
-                compiler_version="application-rule-v1"):
+                compiler_version="application-rule-v1",replay_only=False):
         function=program.get("function") if type(program) is dict else None
         if function not in FUNCTIONS:raise ValueError("APPLICATION_SCHEDULE_FUNCTION_INVALID")
         args=self._arguments(program,function)
+        if replay_only and function not in (SAVE,ACTIVATE,DEACTIVATE):
+            raise ValueError("OPERATION_ADMISSION_EXPIRED")
+        replay={"replay_only":True} if replay_only else {}
         rev={"expectedMetadataRevision","expectedPolicyRevision","expectedSchemaEpoch"}
         if function==SAVE:
             if set(args) not in ({"definition",*rev},{"definition","expectedStateToken",*rev}):
                 raise ValueError("APPLICATION_SCHEDULE_ARGUMENTS_INVALID")
-            if registry is None:raise ValueError("APPLICATION_SCHEDULE_REGISTRY_REQUIRED")
+            if registry is None and not replay_only:raise ValueError("APPLICATION_SCHEDULE_REGISTRY_REQUIRED")
             return self.save(scope,args["definition"],expected_state_token=args.get("expectedStateToken"),
                 expected_metadata_revision=args["expectedMetadataRevision"],
                 expected_policy_revision=args["expectedPolicyRevision"],
                 expected_schema_epoch=args["expectedSchemaEpoch"],idempotency_key=idempotency_key,
-                registry=registry,compiler_version=compiler_version)
+                registry=registry,compiler_version=compiler_version,**replay)
         if function in (ACTIVATE,DEACTIVATE):
             if set(args)!={"scheduleId","expectedStateToken",*rev}:
                 raise ValueError("APPLICATION_SCHEDULE_ARGUMENTS_INVALID")
@@ -195,9 +328,12 @@ class PostgresApplicationSchedules:
                 expected_state_token=args["expectedStateToken"],
                 expected_metadata_revision=args["expectedMetadataRevision"],
                 expected_policy_revision=args["expectedPolicyRevision"],
-                expected_schema_epoch=args["expectedSchemaEpoch"],idempotency_key=idempotency_key)
+                expected_schema_epoch=args["expectedSchemaEpoch"],idempotency_key=idempotency_key,**replay)
         if idempotency_key is not None:raise ValueError("APPLICATION_SCHEDULE_IDEMPOTENCY_UNEXPECTED")
         if function==READ:
+            if set(args)=={"scheduleId","occurrences"}:
+                self._occurrence_arguments(args["occurrences"])
+                return self.read(scope,args["scheduleId"],occurrences=args["occurrences"])
             if set(args)!={"scheduleId"}:raise ValueError("APPLICATION_SCHEDULE_ARGUMENTS_INVALID")
             return self.read(scope,args["scheduleId"])
         if set(args)-{"limit","afterScheduleId"}:raise ValueError("APPLICATION_SCHEDULE_ARGUMENTS_INVALID")
@@ -205,14 +341,14 @@ class PostgresApplicationSchedules:
 
     def save(self,scope,definition,*,expected_state_token,
              expected_metadata_revision,expected_policy_revision,expected_schema_epoch,
-             idempotency_key,registry,compiler_version):
+             idempotency_key,registry,compiler_version,replay_only=False):
         canonical=validate_definition(definition)
         if expected_state_token is not None:
             require_state_token(expected_state_token,error="APPLICATION_SCHEDULE_ARGUMENTS_INVALID")
         if (any(type(v) is not int or v<0 for v in (expected_metadata_revision,
                 expected_policy_revision,expected_schema_epoch))
                 or type(idempotency_key) is not str or _KEY.fullmatch(idempotency_key) is None
-                or not callable(getattr(registry,"validate_operation",None))
+                or not replay_only and not callable(getattr(registry,"validate_operation",None))
                 or type(compiler_version) is not str or not compiler_version):
             raise ValueError("APPLICATION_SCHEDULE_ARGUMENTS_INVALID")
         target=canonical["target"]
@@ -237,6 +373,7 @@ class PostgresApplicationSchedules:
                 if prior["command_digest"]!=command_digest or prior["actor_id"]!=self.identity.subject_id:
                     raise ValueError("APPLICATION_SCHEDULE_IDEMPOTENCY_CONFLICT")
                 return prior["result"]
+            if replay_only:return None
         sealed=PostgresApplicationRules(self.dsn,identity=self.identity).seal_published(
             scope,target["ruleId"],registry=registry,bindings=execution_bindings(canonical),
             compiler_version=compiler_version,expected_state_token=target["stateToken"],
@@ -342,7 +479,7 @@ class PostgresApplicationSchedules:
 
     def set_active(self,scope,schedule_id,*,active,expected_state_token,
                    expected_metadata_revision,expected_policy_revision,expected_schema_epoch,
-                   idempotency_key):
+                   idempotency_key,replay_only=False):
         if (type(schedule_id) is not str or _ID.fullmatch(schedule_id) is None
                 or type(active) is not bool or type(idempotency_key) is not str
                 or _KEY.fullmatch(idempotency_key) is None
@@ -359,6 +496,7 @@ class PostgresApplicationSchedules:
         digest=_digest(command)
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
           with db.transaction():
+            if replay_only:db.execute("SET TRANSACTION READ ONLY")
             self._scope(db,scope);PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
             PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"admin",function=function)
             prior=db.execute('''SELECT command_digest,actor_id,result FROM epm.operation_receipt
@@ -368,6 +506,7 @@ class PostgresApplicationSchedules:
                 if prior["command_digest"]!=digest or prior["actor_id"]!=self.identity.subject_id:
                     raise ValueError("APPLICATION_SCHEDULE_IDEMPOTENCY_CONFLICT")
                 return prior["result"]
+            if replay_only:return None
             state=db.execute('''SELECT metadata_revision,policy_revision,schema_epoch,commit_revision
                 FROM epm.application_state WHERE workspace_id=%s AND application_id=%s FOR UPDATE''',(
                 scope.workspace_id,scope.application_id)).fetchone()
@@ -506,210 +645,279 @@ class PostgresApplicationSchedules:
             return {"scheduleId":schedule_id,"stateToken":row["state_token"],
                 "status":"Materialized","occurrences":occurrences}
 
+    @staticmethod
+    def _control_row(db,scope,occurrence_id):
+        # The task preserves the original actor across schedule replacement.
+        # Its visibility does not grant execution authority for a new effect.
+        return db.execute('''SELECT o.*,t.issuer AS execution_issuer,
+            t.subject_id AS execution_subject
+            FROM epm.application_schedule_occurrence o JOIN epm.task t
+              ON (t.workspace_id,t.application_id,t.source_id)=
+                 (o.workspace_id,o.application_id,o.occurrence_id)
+             AND t.source_family='ApplicationScheduleOccurrence'
+             AND t.task_id='v:'||o.occurrence_id
+            WHERE o.workspace_id=%s AND o.application_id=%s
+              AND o.occurrence_id=%s FOR UPDATE OF o''',
+            (scope.workspace_id,scope.application_id,occurrence_id)).fetchone()
+
+    def _authorize_control(self,db,scope,row,*,allow_application_admin,error_code):
+        if row is None:raise ValueError(error_code)
+        owner=(row['execution_issuer'],row['execution_subject'])==(
+            self.identity.issuer,self.identity.subject_id)
+        try:
+            if owner:
+                PostgresAccessChecker.check_in_transaction(db,self.identity,scope,
+                    'rule_run',function='application.rule.run')
+            elif allow_application_admin:
+                PostgresAccessChecker.check_in_transaction(db,self.identity,scope,'admin')
+            else:
+                raise AccessDenied('owner required')
+        except AccessDenied as error:
+            raise ValueError(error_code) from error
+
+    def _cancel_parent_after_occurrence(self,scope,parent,*,allow_application_admin):
+        """The occurrence transaction is closed before parent/job controls."""
+        from .postgres_application_rule_workflow import PostgresApplicationRuleWorkflowStore
+        from .postgres_jobs import PostgresJobQueue
+        if parent['status'] not in ('accepted','running','cancel_requested'):
+            return
+        current=PostgresApplicationRuleWorkflowStore(self.dsn,identity=self.identity
+            ).request_cancel_as_task_controller(scope,parent['workflow_id'],
+                allow_application_admin=allow_application_admin)
+        pending=next((item for item in reversed(current.checkpoints)
+                      if not item.committed),None)
+        if current.status.value=='cancel_requested' and pending is not None:
+            PostgresJobQueue(self.dsn,identity=self.identity).request_cancel(
+                scope,pending.job_id,allow_application_admin=allow_application_admin)
+
     def request_cancel_as_task_controller(self,scope,occurrence_id,*,allow_application_admin=False):
         if (not isinstance(scope,ApplicationScope) or type(occurrence_id) is not str
                 or _HEX32.fullmatch(occurrence_id) is None or type(allow_application_admin) is not bool):
-            raise ValueError("APPLICATION_SCHEDULE_OCCURRENCE_UNAVAILABLE")
+            raise ValueError('APPLICATION_SCHEDULE_OCCURRENCE_UNAVAILABLE')
+        from .postgres_job_origin import schedule_control_parent
+        parent=None
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
           with db.transaction():
             self._scope(db,scope);PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-            row=db.execute('''SELECT o.*,s.execution_issuer,s.execution_subject,
-                s.rule_id,s.rule_state_token FROM
-                epm.application_schedule_occurrence o JOIN epm.application_schedule_definition s
-                  ON (s.workspace_id,s.application_id,s.schedule_id,s.state_token)=
-                     (o.workspace_id,o.application_id,o.schedule_id,o.schedule_state_token)
-                WHERE o.workspace_id=%s AND o.application_id=%s AND o.occurrence_id=%s FOR UPDATE OF o''',(
-                scope.workspace_id,scope.application_id,occurrence_id)).fetchone()
-            if row is None:raise ValueError("APPLICATION_SCHEDULE_OCCURRENCE_UNAVAILABLE")
-            owner=(row["execution_issuer"],row["execution_subject"])==(
-                self.identity.issuer,self.identity.subject_id)
+            row=self._control_row(db,scope,occurrence_id)
+            self._authorize_control(db,scope,row,allow_application_admin=allow_application_admin,
+                error_code='APPLICATION_SCHEDULE_OCCURRENCE_UNAVAILABLE')
+            initial_status=row['status']
+            status=initial_status
+            if status not in ('published','partially_published','failed','cancelled','needs_inspection'):
+                parent=schedule_control_parent(db,scope,row)
+                status=self._cancellation_disposition(row,parent)
+                if status!=row['status']:
+                    db.execute('''UPDATE epm.application_schedule_occurrence SET status=%s,
+                        inspection_origin_status=%s,claim_generation=claim_generation+1,
+                        claimant=NULL,lease_until=NULL,next_attempt_at=NULL,error_code=%s,
+                        updated_at=transaction_timestamp() WHERE workspace_id=%s
+                          AND application_id=%s AND occurrence_id=%s''',
+                        (status,'cancel_requested' if status=='needs_inspection' else None,
+                         'APPLICATION_RULE_EXECUTION_ORIGIN_UNRESOLVED'
+                         if status=='needs_inspection' else None,
+                         scope.workspace_id,scope.application_id,occurrence_id))
+            committed=(True if status in ('published','partially_published') else
+                False if initial_status=='ready' and status=='cancelled' and parent is None else None)
+            result={'occurrenceId':occurrence_id,'status':status,
+                    'workflowId':row['application_rule_workflow_id'],
+                    'committedEffectsRemain':committed}
+        if parent is not None and status=='cancel_requested':
             try:
-                if owner:PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"rule_run")
-                elif allow_application_admin:PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"admin")
-                else:raise AccessDenied("owner required")
-            except AccessDenied as error:
-                raise ValueError("APPLICATION_SCHEDULE_OCCURRENCE_UNAVAILABLE") from error
-            terminal=("published","partially_published","failed","cancelled","needs_inspection")
-            status=row["status"]
-            if status not in terminal and status!="cancel_requested":
-                status="cancelled" if status=="ready" else "cancel_requested"
-                db.execute('''UPDATE epm.application_schedule_occurrence SET status=%s,
-                    claim_generation=claim_generation+1,claimant=NULL,lease_until=NULL,next_attempt_at=NULL,
-                    updated_at=transaction_timestamp() WHERE workspace_id=%s AND application_id=%s
-                      AND occurrence_id=%s''',(status,scope.workspace_id,scope.application_id,occurrence_id))
-            child_id=row["application_rule_workflow_id"]
-            if status=="cancel_requested":
-                child=db.execute('''SELECT * FROM epm.application_rule_workflow
-                    WHERE workspace_id=%s AND application_id=%s AND idempotency_key=%s
-                      AND issuer=%s AND subject_id=%s FOR UPDATE''',(scope.workspace_id,
-                    scope.application_id,"schedule-rule-"+occurrence_id,
-                    row["execution_issuer"],row["execution_subject"])).fetchone()
-                if (child is not None and (child["rule_id"]!=row["rule_id"]
-                        or child["rule_state_token"]!=row["rule_state_token"]
-                        or child_id not in (None,child["workflow_id"]))):
-                    raise ValueError("APPLICATION_SCHEDULE_WORKFLOW_CONFLICT")
-                if child_id is not None and child is None:
-                    raise ValueError("APPLICATION_SCHEDULE_WORKFLOW_CONFLICT")
-                if child is not None:
-                    child_id=child["workflow_id"]
-                    if row["application_rule_workflow_id"] is None:
-                        db.execute('''UPDATE epm.application_schedule_occurrence SET
-                            application_rule_workflow_id=%s WHERE workspace_id=%s
-                              AND application_id=%s AND occurrence_id=%s''',(child_id,
-                            scope.workspace_id,scope.application_id,occurrence_id))
-                    child_status=("cancelled" if child["status"]=="accepted"
-                        else "cancel_requested" if child["status"]=="running"
-                        else child["status"])
-                    if child_status!=child["status"]:
-                        db.execute('''UPDATE epm.application_rule_workflow SET status=%s,
-                            updated_at=transaction_timestamp() WHERE workspace_id=%s
-                              AND application_id=%s AND workflow_id=%s''',(child_status,
-                            scope.workspace_id,scope.application_id,child_id))
-                    checkpoints=child["result"].get("checkpoints",[])
-                    pending=next((item for item in reversed(checkpoints)
-                        if isinstance(item,dict) and item.get("committed") is False),None)
-                    if child_status=="cancel_requested" and pending is not None:
-                        job=db.execute('''SELECT status FROM epm.job WHERE workspace_id=%s
-                            AND application_id=%s AND job_id=%s AND issuer=%s
-                              AND subject_id=%s FOR UPDATE''',(scope.workspace_id,
-                            scope.application_id,pending.get("jobId"),row["execution_issuer"],
-                            row["execution_subject"])).fetchone()
-                        if job is None:raise ValueError("APPLICATION_SCHEDULE_WORKFLOW_CONFLICT")
-                        job_status=("cancelled" if job["status"] in ("accepted","ready")
-                            else "cancel_requested" if job["status"] in ("running","staged")
-                            else job["status"])
-                        if job_status!=job["status"]:
-                            db.execute('''UPDATE epm.job SET status=%s,
-                                claim_generation=claim_generation+1,claimant=NULL,lease_until=NULL,
-                                updated_at=transaction_timestamp() WHERE workspace_id=%s
-                                  AND application_id=%s AND job_id=%s''',(job_status,
-                                scope.workspace_id,scope.application_id,pending["jobId"]))
-            return {"occurrenceId":occurrence_id,"status":status,"workflowId":child_id}
+                self._cancel_parent_after_occurrence(scope,parent,
+                    allow_application_admin=allow_application_admin)
+            except ValueError as error:
+                if str(error)!='PYTHON_WORKFLOW_CANCEL_NOT_AVAILABLE':raise
+                # Publication can win after our observation. Only a newly
+                # observed terminal parent explains this precise race.
+                observed=self.reconcile_cancel_requested(scope,occurrence_id,
+                    allow_application_admin=allow_application_admin)
+                if observed['status'] not in ('published','partially_published','failed','cancelled'):
+                    raise
+                result.update(status=observed['status'], committedEffectsRemain=(
+                    True if observed['status'] in ('published','partially_published') else None))
+        return result
 
-    def reconcile_cancel_requested(self,scope,occurrence_id):
+    def reconcile_cancel_requested(self,scope,occurrence_id,*,allow_application_admin=False):
+        if (not isinstance(scope,ApplicationScope) or type(occurrence_id) is not str
+                or _HEX32.fullmatch(occurrence_id) is None or type(allow_application_admin) is not bool):
+            raise ValueError('APPLICATION_SCHEDULE_OCCURRENCE_UNAVAILABLE')
+        from .postgres_job_origin import schedule_control_parent
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
           with db.transaction():
-            self._scope(db,scope)
-            row=db.execute('''SELECT o.*,s.execution_issuer,s.execution_subject,
-                s.rule_id,s.rule_state_token,s.delegation_id,s.delegation_state_token,
-                s.definition,s.definition_digest FROM
-                epm.application_schedule_occurrence o JOIN epm.application_schedule_definition s
-                  ON (s.workspace_id,s.application_id,s.schedule_id,s.state_token)=
-                     (o.workspace_id,o.application_id,o.schedule_id,o.schedule_state_token)
-                WHERE o.workspace_id=%s AND o.application_id=%s AND o.occurrence_id=%s FOR UPDATE OF o''',(
-                scope.workspace_id,scope.application_id,occurrence_id)).fetchone()
-            if row is None or row["status"]!="cancel_requested":
-                raise ValueError("APPLICATION_SCHEDULE_CANCEL_NOT_REQUESTED")
-            child=None
-            if row["application_rule_workflow_id"] is not None:
-                child=db.execute('''SELECT workflow_id,status FROM epm.application_rule_workflow
-                    WHERE workspace_id=%s AND application_id=%s AND workflow_id=%s''',(
-                    scope.workspace_id,scope.application_id,row["application_rule_workflow_id"])).fetchone()
-                if child is None:raise ValueError("APPLICATION_SCHEDULE_WORKFLOW_CONFLICT")
-            if child is None or child["status"] in ("cancelled","failed"):
-                status="cancelled" if child is None else child["status"]
-            elif child["status"] in ("published","partially_published"):status=child["status"]
-            else:status="cancel_requested"
-            return {"occurrenceId":occurrence_id,"status":status,
-                "workflowId":None if child is None else child["workflow_id"],"workflowStatus":status}
+            self._scope(db,scope);PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
+            row=self._control_row(db,scope,occurrence_id)
+            self._authorize_control(db,scope,row,allow_application_admin=allow_application_admin,
+                error_code='APPLICATION_SCHEDULE_OCCURRENCE_UNAVAILABLE')
+            if row['status']!='cancel_requested':
+                raise ValueError('APPLICATION_SCHEDULE_CANCEL_NOT_REQUESTED')
+            child=schedule_control_parent(db,scope,row)
+            if child is None:
+                raise ValueError('APPLICATION_RULE_EXECUTION_ORIGIN_UNRESOLVED')
+            status=(child['status'] if child['status'] in (
+                'cancelled','failed','published','partially_published') else 'cancel_requested')
+            return {'occurrenceId':occurrence_id,'status':status,
+                'workflowId':child['workflow_id'],'workflowStatus':status}
 
     def reconcile_needs_inspection(self,scope,occurrence_id,*,idempotency_key,
                                    allow_application_admin=False):
         if (not isinstance(scope,ApplicationScope) or type(occurrence_id) is not str
                 or _HEX32.fullmatch(occurrence_id) is None or type(idempotency_key) is not str
                 or _KEY.fullmatch(idempotency_key) is None or type(allow_application_admin) is not bool):
-            raise ValueError("APPLICATION_SCHEDULE_RECONCILE_UNAVAILABLE")
+            raise ValueError('APPLICATION_SCHEDULE_RECONCILE_UNAVAILABLE')
+        from .postgres_job_origin import schedule_control_parent,require_rule_execution_authority
+        from .postgres_application_rule_workflow import PostgresApplicationRuleWorkflowStore
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
           with db.transaction():
             self._scope(db,scope);PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-            row=db.execute('''SELECT o.*,s.execution_issuer,s.execution_subject,
-                s.rule_id,s.rule_state_token,s.delegation_id,s.delegation_state_token,
-                s.definition,s.definition_digest FROM
-                epm.application_schedule_occurrence o LEFT JOIN epm.application_schedule_definition s
-                  ON (s.workspace_id,s.application_id,s.schedule_id,s.state_token)=
-                     (o.workspace_id,o.application_id,o.schedule_id,o.schedule_state_token)
-                WHERE o.workspace_id=%s AND o.application_id=%s AND o.occurrence_id=%s FOR UPDATE OF o''',(
-                scope.workspace_id,scope.application_id,occurrence_id)).fetchone()
-            if row is None:
-                raise ValueError("APPLICATION_SCHEDULE_RECONCILE_UNAVAILABLE")
-            prior=row["result"].get("reconciliation")
-            if isinstance(prior,dict) and prior.get("operationId")==idempotency_key:
-                if prior.get("actor")!=[self.identity.issuer,self.identity.subject_id]:
-                    raise ValueError("APPLICATION_SCHEDULE_RECONCILE_IDEMPOTENCY_CONFLICT")
-                return {"occurrenceId":occurrence_id,"status":prior["resultStatus"],
-                    "originStatus":prior["originStatus"],"workflowId":prior.get("workflowId")}
-            if (row["status"]!="needs_inspection" or row["claimant"] is not None
-                    or row["lease_until"] is not None or row["inspection_origin_status"] not in
-                    ("running","submitted","cancel_requested")):
-                raise ValueError("APPLICATION_SCHEDULE_RECONCILE_NOT_AVAILABLE")
-            origin=row["inspection_origin_status"]
-            child=None
-            if row["execution_issuer"] is None:
-                status="failed";error="APPLICATION_SCHEDULE_TARGET_STALE"
-            else:
-                definition=validate_definition(row["definition"])
-                if (definition["scheduleId"]!=row["schedule_id"]
-                        or canonical_digest(definition)!=row["definition_digest"]):
-                    raise ValueError("APPLICATION_SCHEDULE_DEFINITION_CORRUPT")
-                owner=(row["execution_issuer"],row["execution_subject"])==(
-                    self.identity.issuer,self.identity.subject_id)
-                try:
-                    if owner:PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"rule_run")
-                    elif allow_application_admin:PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"admin")
-                    else:raise AccessDenied("owner required")
-                except AccessDenied as denied:
-                    raise ValueError("APPLICATION_SCHEDULE_RECONCILE_UNAVAILABLE") from denied
-                child=db.execute('''SELECT workflow_id,status,rule_id,rule_state_token
-                    FROM epm.application_rule_workflow WHERE workspace_id=%s
-                      AND application_id=%s AND idempotency_key=%s AND issuer=%s
-                      AND subject_id=%s''',(scope.workspace_id,scope.application_id,
-                    "schedule-rule-"+occurrence_id,row["execution_issuer"],
-                    row["execution_subject"])).fetchone()
-                if child is not None and (child["rule_id"]!=row["rule_id"]
-                        or child["rule_state_token"]!=row["rule_state_token"]
-                        or row["application_rule_workflow_id"] not in
-                           (None,child["workflow_id"])):
-                    raise ValueError("APPLICATION_SCHEDULE_WORKFLOW_CONFLICT")
-                if row["application_rule_workflow_id"] is not None and child is None:
-                    raise ValueError("APPLICATION_SCHEDULE_WORKFLOW_CONFLICT")
-                status=(child["status"] if child and child["status"] in
-                    ("published","partially_published","failed","cancelled") else origin or "running")
-                if status not in ("published","partially_published","failed","cancelled") and origin!="cancel_requested":
-                    allowed=db.execute('''SELECT epm.execution_delegation_is_current(
-                        %s,%s,%s,%s,%s,%s,%s,%s) AS allowed''',(scope.workspace_id,
-                        scope.application_id,row["delegation_id"],row["delegation_state_token"],
-                        row["execution_issuer"],row["execution_subject"],"application.rule.run",
-                        row["schedule_id"])).fetchone()["allowed"]
-                    if not allowed:status="failed"
-                error=("APPLICATION_SCHEDULE_AUTHORIZATION_REVOKED"
-                       if status=="failed" and (child is None or child["status"]!="failed") else None)
-            result=dict(row["result"]);result["reconciliation"]={
-                "operationId":idempotency_key,
-                "actor":[self.identity.issuer,self.identity.subject_id],
-                "originStatus":origin,"resultStatus":status,
-                "workflowId":None if child is None else child["workflow_id"]}
+            # A requested execution resume shares the delegation/definition
+            # fence, acquired before the occurrence, never after its parent.
+            db.execute('''SELECT schema_epoch FROM epm.application_state
+                WHERE workspace_id=%s AND application_id=%s FOR UPDATE''',
+                (scope.workspace_id,scope.application_id)).fetchone()
+            row=self._control_row(db,scope,occurrence_id)
+            self._authorize_control(db,scope,row,allow_application_admin=allow_application_admin,
+                error_code='APPLICATION_SCHEDULE_RECONCILE_UNAVAILABLE')
+            prior=row['result'].get('reconciliation')
+            if isinstance(prior,dict) and prior.get('operationId')==idempotency_key:
+                if prior.get('actor')!=[self.identity.issuer,self.identity.subject_id]:
+                    raise ValueError('APPLICATION_SCHEDULE_RECONCILE_IDEMPOTENCY_CONFLICT')
+                return {'occurrenceId':occurrence_id,'status':prior['resultStatus'],
+                    'originStatus':prior['originStatus'],'workflowId':prior.get('workflowId')}
+            if (row['status']!='needs_inspection' or row['claimant'] is not None
+                    or row['lease_until'] is not None or row['inspection_origin_status'] not in
+                    ('running','submitted','cancel_requested')):
+                raise ValueError('APPLICATION_SCHEDULE_RECONCILE_NOT_AVAILABLE')
+            origin=row['inspection_origin_status']
+            child=schedule_control_parent(db,scope,row)
+            status='needs_inspection';error='APPLICATION_RULE_EXECUTION_ORIGIN_UNRESOLVED'
+            if child is not None:
+                if child['status'] in ('published','partially_published','failed','cancelled'):
+                    status=child['status'];error=None
+                elif origin=='cancel_requested':
+                    status='cancel_requested';error=None
+                else:
+                    try:
+                        require_rule_execution_authority(db,scope,child)
+                        PostgresApplicationRuleWorkflowStore._verify_current(db,scope,child)
+                    except AccessDenied:
+                        error='APPLICATION_SCHEDULE_AUTHORIZATION_REVOKED'
+                    except ValueError as failure:
+                        if str(failure) not in (
+                                'APPLICATION_RULE_EXECUTION_ORIGIN_UNRESOLVED',
+                                'APPLICATION_RULE_EXECUTION_ORIGIN_INVALID',
+                                'APPLICATION_RULE_WORKFLOW_PUBLICATION_STALE',
+                                'APPLICATION_RULE_WORKFLOW_OWNER_CERTIFICATE_STALE',
+                                'APPLICATION_RULE_WORKFLOW_CONTEXT_STALE'):
+                            raise
+                        error=str(failure)
+                    else:
+                        status=origin;error=None
+            result=dict(row['result']);result['reconciliation']={
+                'operationId':idempotency_key,
+                'actor':[self.identity.issuer,self.identity.subject_id],
+                'originStatus':origin,'resultStatus':status,
+                'workflowId':None if child is None else child['workflow_id']}
             db.execute('''UPDATE epm.application_schedule_occurrence SET status=%s,error_code=%s,
-                inspection_origin_status=NULL,claimant=NULL,lease_until=NULL,
-                application_rule_workflow_id=COALESCE(application_rule_workflow_id,%s),
+                inspection_origin_status=%s,claimant=NULL,lease_until=NULL,next_attempt_at=NULL,
                 result=%s,updated_at=transaction_timestamp()
-                WHERE workspace_id=%s AND application_id=%s AND occurrence_id=%s''',(
-                status,error,None if child is None else child["workflow_id"],Jsonb(result),
-                scope.workspace_id,scope.application_id,occurrence_id))
-            return {"occurrenceId":occurrence_id,"status":status,"originStatus":origin,
-                "workflowId":None if child is None else child["workflow_id"]}
+                WHERE workspace_id=%s AND application_id=%s AND occurrence_id=%s''',
+                (status,error,origin if status=='needs_inspection' else None,Jsonb(result),
+                 scope.workspace_id,scope.application_id,occurrence_id))
+            return {'occurrenceId':occurrence_id,'status':status,'originStatus':origin,
+                'workflowId':None if child is None else child['workflow_id']}
 
-    def read(self,scope,schedule_id):
+    @staticmethod
+    def _occurrence_arguments(value):
+        if (type(value) is not dict
+                or set(value) not in ({"expectedStateToken","limit"},
+                    {"expectedStateToken","limit","afterSequence"})
+                or type(value.get("limit")) is not int or not 1<=value["limit"]<=100
+                or "afterSequence" in value and (
+                    type(value["afterSequence"]) is not int
+                    or not 1<=value["afterSequence"]<=9223372036854775807)):
+            raise ValueError("APPLICATION_SCHEDULE_ARGUMENTS_INVALID")
+        require_state_token(value["expectedStateToken"],
+            error="APPLICATION_SCHEDULE_ARGUMENTS_INVALID")
+
+    def _occurrence_page(self,db,scope,schedule_id,state_token,request,access):
+        from .postgres_tasks import PostgresTaskService
+        tasks=PostgresTaskService(self.dsn,identity=self.identity)
+        administrator=access.role == "Administrator" and tasks._authorized(db,scope,"admin")
+        # This fixed source family uses originating-subject visibility. The SQL
+        # prefilter bounds work without exposing hidden counts or cursors; the
+        # existing task service remains the final visibility decision.
+        source='''FROM epm.application_schedule_occurrence occurrence
+            JOIN epm.task task ON task.workspace_id=occurrence.workspace_id
+             AND task.application_id=occurrence.application_id
+             AND task.source_family='ApplicationScheduleOccurrence'
+             AND task.source_id=occurrence.occurrence_id
+            WHERE occurrence.workspace_id=%s AND occurrence.application_id=%s
+             AND occurrence.schedule_id=%s
+             AND (%s OR (task.issuer=%s AND task.subject_id=%s))'''
+        parameters=(scope.workspace_id,scope.application_id,schedule_id,
+            administrator,self.identity.issuer,self.identity.subject_id)
+        after=request.get("afterSequence")
+        if after is not None:
+            cursor=db.execute('''SELECT task.source_family,task.issuer,
+                task.subject_id '''+source+''' AND task.sequence=%s''',
+                (*parameters,after)).fetchone()
+            if cursor is None or not (administrator or tasks._visible(db,scope,cursor)):
+                raise ValueError("APPLICATION_SCHEDULE_OCCURRENCE_CURSOR_INVALID")
+        rows=db.execute('''SELECT occurrence.occurrence_id,occurrence.due_at,
+            occurrence.status AS native_status,occurrence.schedule_state_token,
+            occurrence.application_rule_workflow_id,task.task_id,task.sequence,
+            task.status,task.source_family,task.issuer,task.subject_id '''+source+'''
+            AND (%s::bigint IS NULL OR task.sequence<%s)
+            ORDER BY task.sequence DESC LIMIT %s''',
+            (*parameters,after,after,request["limit"]+1)).fetchall()
+        visible=[row for row in rows if administrator or tasks._visible(db,scope,row)]
+        items=[{"occurrenceId":row["occurrence_id"],"taskId":row["task_id"],
+            "sequence":row["sequence"],"dueAt":row["due_at"].isoformat(),
+            "nativeStatus":row["native_status"],"status":row["status"],
+            "scheduleStateToken":row["schedule_state_token"],
+            "currentPin":row["schedule_state_token"]==state_token,
+            "workflowId":row["application_rule_workflow_id"]}
+            for row in visible[:request["limit"]]]
+        has_more=len(visible)>request["limit"]
+        return {"scheduleStateToken":state_token,"items":items,"hasMore":has_more,
+            "nextAfterSequence":items[-1]["sequence"] if has_more else None}
+
+    def read(self,scope,schedule_id,*,occurrences=None):
         if type(schedule_id) is not str or _ID.fullmatch(schedule_id) is None:
             raise ValueError("APPLICATION_SCHEDULE_ARGUMENTS_INVALID")
+        if occurrences is not None:self._occurrence_arguments(occurrences)
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
           with db.transaction():
             db.execute("SET TRANSACTION READ ONLY");self._scope(db,scope)
-            PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"read",function=READ)
+            access=PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"read",function=READ)
             row=db.execute('''SELECT '''+self._read_columns()+''' WHERE
                 schedule.workspace_id=%s AND schedule.application_id=%s
                 AND schedule.schedule_id=%s''',(scope.workspace_id,
                 scope.application_id,schedule_id)).fetchone()
-            return {"defined":row is not None,"schedule":None if row is None else self._result(row)}
+            result={"defined":row is not None,"schedule":None if row is None else self._result(row)}
+            if row is not None and occurrences is not None:
+                if row["state_token"]!=occurrences["expectedStateToken"]:
+                    PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"read",function=READ)
+                    raise ValueError("APPLICATION_SCHEDULE_STALE_CONTEXT")
+                page=self._occurrence_page(db,scope,schedule_id,row["state_token"],occurrences,access)
+                # READ COMMITTED may observe a definition change between page
+                # statements. Never attach that page to a different current pin.
+                current=db.execute('''SELECT '''+self._read_columns()+''' WHERE
+                    schedule.workspace_id=%s AND schedule.application_id=%s
+                    AND schedule.schedule_id=%s''',(scope.workspace_id,
+                    scope.application_id,schedule_id)).fetchone()
+                if current is None or current["state_token"]!=row["state_token"]:
+                    PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"read",function=READ)
+                    raise ValueError("APPLICATION_SCHEDULE_STALE_CONTEXT")
+                result["schedule"]=self._result(current)
+                result["occurrences"]=page
+            # Directory changes can commit independently of the workspace
+            # fence. Never return history built with an earlier visibility role.
+            final_access=PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"read",function=READ)
+            if "occurrences" in result and final_access.role != access.role:
+                raise ValueError("APPLICATION_SCHEDULE_STALE_CONTEXT")
+            return result
 
     def list(self,scope,*,limit=100,after_schedule_id=None):
         if (type(limit) is not int or not 1<=limit<=100 or after_schedule_id is not None
@@ -725,5 +933,6 @@ class PostgresApplicationSchedules:
                 ORDER BY schedule.schedule_id LIMIT %s''',(scope.workspace_id,scope.application_id,
                 after_schedule_id,after_schedule_id,limit+1)).fetchall()
             values=[self._result(row) for row in rows[:limit]]
+            PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"read",function=LIST)
             return {"schedules":values,"nextAfterScheduleId":
                 values[-1]["scheduleId"] if len(rows)>limit else None}

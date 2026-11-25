@@ -95,6 +95,21 @@ class PostgresCubeAggregateDispatch:
                 return {'status':row['outcome'],
                         'errorCode':row['error_code']}
 
+    def settle_denied(self, claim: dict) -> dict:
+        required = ('workspace_id', 'application_id', 'query_id', 'claim_generation',
+                    'claimant', 'authorization_scope_digest')
+        if type(claim) is not dict or not set(required) <= set(claim):
+            raise ValueError('CUBE_AGGREGATE_WORKER_SETTLEMENT_INVALID')
+        with connect_postgres(self.dsn, row_factory=dict_row) as db:
+            with db.transaction():
+                configure_statement_timeout(db, 5000)
+                configure_lock_wait(db)
+                row = db.execute('''SELECT * FROM epm.cube_aggregate_worker_settle_denied(
+                    %s,%s,%s,%s,%s,%s)''', tuple(claim[key] for key in required)).fetchone()
+                if row is None or row['outcome'] not in {'sealed', 'cancelled', 'failed', 'expired', 'stale'}:
+                    raise ValueError('CUBE_AGGREGATE_WORKER_SETTLEMENT_INVALID')
+                return {'status': row['outcome'], 'errorCode': row['error_code']}
+
     def expire(self, *, limit: int = 100,
                payload_retention_seconds: int = 900) -> dict:
         if (type(limit) is not int or not 1 <= limit <= 1000

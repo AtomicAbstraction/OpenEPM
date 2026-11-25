@@ -1,3 +1,4 @@
+import { browserIdentityFixture } from "./test-setup";
 import { MetadataWorkspace } from "./MetadataWorkspace";
 import { render, screen, waitFor } from "@testing-library/react";
 import axe from "axe-core";
@@ -36,7 +37,7 @@ function stubShellReads() {
       if (url === "/api/session-identity")
         return new Response(
           JSON.stringify({
-            subject: "owner",
+            ...browserIdentityFixture("owner"),
             displayIdentity: "owner@example.com",
             applicationMcpEndpoint: "https://mcp.example/epu_personal",
           }),

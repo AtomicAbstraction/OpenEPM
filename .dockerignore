@@ -1,18 +1,11 @@
 *
+# A directory exception admits its descendants. Allow release inputs directly.
 !requirements-postgres.txt
 !requirements-postgres.lock
-!epm_core/
-!epm_core/auth.py
-!epm_core/persistence_contract.py
-!epm_core/postgres*.py
-!openepm/
+!epm_core/*.py
 !openepm/*.py
 !platform_postgres*.py
-!docs/
-!docs/skills/
-!docs/skills/multidimensional-cube-harness/
 !docs/skills/multidimensional-cube-harness/SKILL.md
-!web-ui/
 !web-ui/package.json
 !web-ui/package-lock.json
 !web-ui/index.html
@@ -20,26 +13,42 @@
 !web-ui/tsconfig.app.json
 !web-ui/tsconfig.node.json
 !web-ui/vite.config.ts
-!web-ui/src/
+!web-ui/build/*.mjs
+!web-ui/build/*.d.mts
 !web-ui/src/**
-!scripts/
+!scripts/operator_import_path.py
 !scripts/apply_postgres_migrations.py
 !scripts/initialize_postgres_release.py
 !scripts/initialize_schema163_public_parity.py
 !scripts/bootstrap_postgres_operator.py
 !scripts/bootstrap_postgres_service_roles.py
+!scripts/bootstrap_postgres_python_coordinator.py
 !scripts/check_postgres_mcp_health.py
 !scripts/serve_openepm_postgres_worker.py
-!schema/
-!schema/postgres/
+!scripts/serve_openepm_python_build_broker.py
+!scripts/serve_openepm_sandbox_launcher.py
+!scripts/openepm_release_operations.py
+!scripts/validate_release_manifest.py
+!scripts/openepm_signing_trust_policy.py
+!scripts/openepm_release_policy_contract.py
+!scripts/openepm_release_inventory.py
+!scripts/build_openepm_sdk_release.py
+!scripts/openepm_control_bootstrap.py
+!scripts/openepm_keycloak_bootstrap.py
+!scripts/backup_postgres_physical.sh
+!scripts/retire_proxy_binary.py
 !schema/postgres/*.sql
-!tests/
-!tests/evidence/
 !tests/evidence/schema163-fresh-baseline-artifact-2026-10-29.json
-!deploy/
-!deploy/postgres/
 !deploy/postgres/Dockerfile
-!deploy/notebook/
+!deploy/identity/openepm-keycloak-entrypoint.sh
+!deploy/identity/group-claim-provider/src/OpenEpmGroupIdsMapper.java
+!deploy/identity/group-claim-provider/resources/META-INF/services/org.keycloak.protocol.ProtocolMapper
+!deploy/operations/openepm-release-backup
+!deploy/operations/openepm-release-restore
+!deploy/operations/openepm-release-restore-verify
+!deploy/operations/openepm-release-upgrade-preflight
+!deploy/operations/openepm-control-bootstrap
+!deploy/operations/openepm-keycloak-bootstrap
 !deploy/notebook/**
 
 !deploy/postgres/Dockerfile.db
@@ -52,7 +61,17 @@
 !scripts/check_postgres_worker_health.py
 !scripts/check_notebook_runtime_retirement.py
 
-# Never package interpreter caches from a developer worktree.  The broad
-# reviewed source-directory includes above would otherwise re-include them.
+# Exclude local artifacts from the recursively included source directories.
 **/__pycache__/
 **/*.py[cod]
+**/node_modules/
+**/.git/
+**/.DS_Store
+**/.env
+**/.env.*
+**/id_rsa
+**/id_ed25519
+**/*.pem
+**/*.key
+**/*.secret
+**/*.credentials

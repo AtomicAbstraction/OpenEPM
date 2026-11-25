@@ -14,15 +14,46 @@ import json,re
 
 FORMAT="openepm-application-schedule-v1"
 MAX_BYTES=1_048_576
-_ID=re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
+SCHEDULE_ID_PATTERN=re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
 _KEY=re.compile(r"[A-Za-z0-9._-]{8,128}\Z")
 _DIGEST=re.compile(r"[0-9a-f]{64}\Z")
 _CATCH_UP=frozenset(("skip","latest","all"))
 CANCELLATION_POLICY="PreserveCommittedStopFuture"
 
 
+def schedule_identifier_schema() -> dict:
+    return {"type": "string", "pattern": "^" + SCHEDULE_ID_PATTERN.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}
+
+
+def schedule_definition_schema() -> dict:
+    """Structural definition shared by current schedule reads and saves."""
+    from .postgres_numeric_catalog import obj
+
+    identifier = schedule_identifier_schema()
+    token = {"type": "string", "pattern": "^" + _DIGEST.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}
+    return obj({
+        "format": {"const": FORMAT}, "scheduleId": identifier,
+        "target": obj({"kind": {"const": "ApplicationRule"}, "ruleId": identifier,
+                       "stateToken": token, "programDigest": token}),
+        "bindings": {"type": "object", "maxProperties": 100, "propertyNames": identifier,
+                     "description": "Use exact typed rule parameters. The native owner checks nested JSON bounds and refuses floats."},
+        "pov": {"type": "array", "maxItems": 64, "items": obj({
+            "dimensionId": identifier, "parameter": identifier, "memberId": identifier})},
+        "recurrence": obj({"kind": {"const": "FixedInterval"},
+            "intervalSeconds": {"type": "integer", "minimum": 60, "maximum": 2_678_400},
+            "firstDueAt": {"type": "string", "description": "A UTC timestamp aligned to a whole minute."},
+            "catchUpPolicy": {"enum": sorted(_CATCH_UP)},
+            "maxCatchUp": {"type": "integer", "minimum": 1, "maximum": 36}}),
+        "retryPolicy": obj({"maxAttempts": {"type": "integer", "minimum": 1, "maximum": 10},
+            "backoffSeconds": {"type": "integer", "minimum": 0, "maximum": 86_400},
+            "needsInspectionAfter": {"const": True}}),
+        "cancellationPolicy": {"const": CANCELLATION_POLICY},
+        "delegation": obj({"delegationId": identifier, "stateToken": token}),
+    })
+
+
 def _identifier(value,code="APPLICATION_SCHEDULE_DEFINITION_INVALID"):
-    if type(value) is not str or _ID.fullmatch(value) is None:raise ValueError(code)
+    if type(value) is not str or SCHEDULE_ID_PATTERN.fullmatch(value) is None:raise ValueError(code)
     return value
 
 
@@ -108,6 +139,7 @@ def validate_definition(value: object) -> dict:
             or recurrence.get("kind")!="FixedInterval"
             or type(recurrence.get("intervalSeconds")) is not int
             or not 60<=recurrence["intervalSeconds"]<=2_678_400
+            or type(recurrence.get("catchUpPolicy")) is not str
             or recurrence.get("catchUpPolicy") not in _CATCH_UP
             or type(recurrence.get("maxCatchUp")) is not int
             or not 1<=recurrence["maxCatchUp"]<=36):
@@ -131,7 +163,7 @@ def validate_definition(value: object) -> dict:
     if (type(delegation) is not dict
             or set(delegation)!={"delegationId","stateToken"}
             or type(delegation.get("delegationId")) is not str
-            or _ID.fullmatch(delegation["delegationId"]) is None
+            or SCHEDULE_ID_PATTERN.fullmatch(delegation["delegationId"]) is None
             or type(delegation.get("stateToken")) is not str
             or _DIGEST.fullmatch(delegation["stateToken"]) is None):
         raise ValueError("APPLICATION_SCHEDULE_DELEGATION_INVALID")

@@ -19,12 +19,15 @@ import sys
 from scenarios import SCENARIOS
 
 REGISTER = 'docs/enterprise-obligation-disposition.json'
+READINESS_REGISTER = 'docs/enterprise-readiness-acceptance-register.json'
+IMPROVEMENT_PLAN = 'docs/product-improvement-strategy/improvement-plan.json'
 REGISTRY = 'epm_core/postgres_capability_contract.py'
 VENDOR_SHA = '13088340aad408156064fd120c3bc3a47c93a3cc45b8f132d6284b20e2223be9'
 ROOTS = {'epm_core', 'openepm', 'schema', 'scripts', 'web', 'web-ui', 'deploy'}
 # Longest matching prefix wins. These are authored navigation associations,
 # never asserted business correctness or runtime reachability.
 GROUPS = [
+ ('facts.slice.copy.', 'Copy authorized multidimensional slices', 'P12'),
  ('facts.planning.driver', 'Build driver-based plans', 'P13'),
  ('facts.planning.seed', 'Seed plans from scenarios', 'P13'),
  ('facts.planning.scenario', 'Copy planning scenarios', 'P13'),
@@ -38,10 +41,12 @@ GROUPS = [
  ('planning.slice', 'Submit, review and reopen planning slices', 'P14'),
  ('planning.', 'Govern planning policies and locks', 'P14'),
  ('facts.source', 'Import and validate source data', 'P12'),
+ ('source.evidence.', 'Manage source evidence and reviewed cutover', 'P12'),
  ('facts.transfer', 'Manage durable data transfers', 'P12'),
  ('facts.export', 'Export fact pages', 'P12'),
  ('facts.cube.aggregate', 'Run durable analytical queries', 'P11'),
  ('facts.cube', 'Explore multidimensional cube data', 'P11'),
+ ('facts.cell.', 'Inspect authorized cell editability', 'P14'),
  ('facts.projection', 'Reconstruct and clean fact projections', 'P07'),
  ('facts.numeric', 'Write and transform exact numeric facts', 'P07'),
  ('facts.text', 'Write text facts', 'P07'),
@@ -147,6 +152,222 @@ def operation_entries(tree):
                 yield operation, literal.lineno, status
 
 
+def operation_group(operation):
+    """Return the explicit authored grouping, never invent coverage for a new API."""
+    name = next((new + operation[len(old):]
+                 for old, new in GROUP_PREFIX_ALIASES.items()
+                 if operation.startswith(old)), operation)
+    return max((group for group in GROUPS if name.startswith(group[0])),
+               key=lambda group: len(group[0]), default=None)
+
+
+def recorded_readiness(document):
+    """Project the current register without evaluating or certifying its claims."""
+    if document.get('format') != 'openepm-enterprise-readiness-v1':
+        raise ValueError('Unsupported graph readiness record')
+    laptop = document['laptopFunctionalAcceptance']
+    if laptop.get('format') != 'openepm-laptop-functional-acceptance-v1':
+        raise ValueError('Unsupported graph laptop acceptance record')
+
+    def statuses(group):
+        result = []
+        for row in group['workPackages']:
+            if row['status'] not in group['statusValues']:
+                raise ValueError('Unknown recorded work-package status')
+            result.append({key: row[key] for key in ('id', 'title', 'status')})
+        return result
+
+    return {
+        'evidencePath': READINESS_REGISTER,
+        'asOf': document['asOf'],
+        'qualification': 'Recorded register statements only; graph generation does not validate acceptance evidence or certify completion.',
+        'enterpriseWorkPackages': statuses(document),
+        'releaseGates': dict(document['releaseGates']),
+        'laptopWorkPackages': statuses(laptop),
+        'laptopPopulation': dict(laptop['population']),
+        'laptopAcceptanceClaims': dict(laptop['acceptanceClaims']),
+        'laptopDeferredCampaigns': [dict(row) for row in laptop['deferredCampaigns']],
+        'enterpriseDeferredRequirements': [dict(row) for row in document['deferred']],
+        'sourceSchemaMigrationCount': document['sourceSchemaMigrationCount'],
+        'sourceSchemaCountMeaning': document['sourceSchemaCountMeaning'],
+    }
+
+
+def graph_document(root, name):
+    path = root / name
+    if path.resolve() != path or not path.is_file():
+        raise ValueError('Missing or noncanonical review document: ' + name)
+    return path.read_bytes()
+
+
+def improvement_documents(root, readiness):
+    """Read only the plan and exact component documents linked by the register."""
+    group = readiness.get('productImprovementAcceptance')
+    if group is None:
+        return None, {}
+    if (not isinstance(group, dict)
+            or group.get('format') != 'openepm-product-improvement-acceptance-v1'
+            or group.get('authority') != IMPROVEMENT_PLAN):
+        raise ValueError('Unsupported graph improvement acceptance record')
+    plan = graph_document(root, IMPROVEMENT_PLAN)
+    if digest(plan) != group.get('authoritySha256'):
+        raise ValueError('Graph improvement plan differs from its registered digest')
+    expected = json.loads(plan)['packages']
+    rows = group['workPackages']
+    if [p['id'] for p in rows] != [p['id'] for p in expected]:
+        raise ValueError('Graph improvement package inventory differs from the plan')
+    documents = {}
+
+    def include(reference):
+        name = reference['artifactPath']
+        wanted = reference['artifactSha256']
+        path = Path(name)
+        if (path.is_absolute() or path.as_posix() != name or '..' in path.parts
+                or not name.startswith('docs/qualifications/') or path.suffix != '.json'):
+            raise ValueError('Invalid graph review document path: ' + name)
+        if name not in documents:
+            raw = graph_document(root, name)
+            documents[name] = (digest(raw), json.loads(raw))
+        checksum, data = documents[name]
+        if checksum != wanted or not isinstance(data, dict) or data.get('format') != reference['evidenceFormat']:
+            raise ValueError('Graph review document differs from its registered binding: ' + name)
+        return data
+
+    for package, planned in zip(rows, expected, strict=True):
+        status = package['status']
+        criteria = package['acceptanceCriteria']
+        if (package['title'] != planned['title'] or status not in {'pending', 'in_progress', 'verified'}
+                or [(c['id'], c['requirement']) for c in criteria] != [
+                    (f"{package['id']}-AC-{index:02d}", text)
+                    for index, text in enumerate(planned['acceptance_criteria'], 1)]
+                or (status == 'verified') != all(c['status'] == 'verified' for c in criteria)):
+            raise ValueError('Graph improvement package differs from the plan: ' + package['id'])
+        for criterion in criteria:
+            if criterion['status'] not in {'pending', 'in_progress', 'verified'}:
+                raise ValueError('Unknown improvement criterion status: ' + criterion['id'])
+            for reference in criterion['evidence']:
+                data = include(reference)
+                if data.get('format') == 'openepm-improvement-acceptance-evidence-v1':
+                    for retained in data.get('independentReview', {}).get('reviewedPackets', []):
+                        include(retained)
+    return group, {name: data for name, (_, data) in documents.items()}
+
+
+def evidence_source_bindings(data):
+    """Normalize the explicit file digests used by current and retained records."""
+    values = data.get('sourceBindings', {})
+    if isinstance(values, dict):
+        pairs = values.items()
+    elif isinstance(values, list):
+        pairs = [(row.get('path', row.get('artifactPath')), row.get('sha256', row.get('artifactSha256')))
+                 for row in values]
+    else:
+        raise ValueError('Invalid graph evidence source bindings')
+    result = {}
+    for path, expected in pairs:
+        if (not isinstance(path, str) or not path or not isinstance(expected, str)
+                or re.fullmatch(r'[0-9a-f]{64}', expected) is None
+                or path in result and result[path] != expected):
+            raise ValueError('Invalid graph evidence source binding')
+        result[path] = expected
+    return result
+
+
+def add_improvement_graph(group, documents, source_hashes, node, edge, file_node):
+    """Draw exact register and source links with their recorded scope."""
+    def evidence_node(path):
+        return 'qualification:' + path
+
+    for path, data in documents.items():
+        eid = evidence_node(path)
+        binding = data.get('qualificationBinding', {})
+        cases = binding.get('executedScenarios', [])
+        scope = data.get('scope')
+        status = ('accepted criterion evidence' if data['format'] == 'openepm-improvement-acceptance-evidence-v1'
+                  else 'scoped qualification evidence')
+        counts = {'matches': 0, 'changed': 0, 'missing': 0}
+        node(eid, Path(path).stem, 'qualification evidence', path, layer='Evidence',
+             status=status, notes=scope if isinstance(scope, str) else '',
+             evidenceSha256=source_hashes[path], sourceBindingCounts=counts,
+             executedScenarios=cases, qualification=(
+                 'Recorded scenario names and explicit source bindings only. '
+                 'This graph does not rerun the qualification.'))
+        for file, expected in evidence_source_bindings(data).items():
+            actual = source_hashes.get(file)
+            state = 'missing' if actual is None else 'matches' if actual == expected else 'changed'
+            counts[state] += 1
+            if actual and (implementation_path(file) or file.startswith('tests/')):
+                edge(eid, file_node(file), 'EVIDENCE_BINDS_SOURCE', path, certainty='recorded',
+                     detail='Explicit file digest in the recorded evidence. Frozen source ' + state + '.',
+                     expectedSourceSha256=expected, sourceBindingState=state)
+
+    counts = Counter()
+    pointer = '/productImprovementAcceptance/workPackages/'
+    for index, package in enumerate(group['workPackages']):
+        pid = node('package:' + package['id'], package['id'] + ' · ' + package['title'],
+                   'acceptance package', READINESS_REGISTER, status=package['status'],
+                   pointer=pointer + str(index), layer='Evidence')
+        for number, criterion in enumerate(package['acceptanceCriteria']):
+            counts[criterion['status']] += 1
+            cid = node('criterion:' + criterion['id'], criterion['id'] + ' · ' + criterion['requirement'],
+                       'acceptance criterion', READINESS_REGISTER, status=criterion['status'],
+                       pointer=f'{pointer}{index}/acceptanceCriteria/{number}', layer='Evidence',
+                       notes=criterion['requirement'])
+            edge(pid, cid, 'HAS_ACCEPTANCE_CRITERION', READINESS_REGISTER, certainty='recorded',
+                 detail='Criterion and status recorded in the readiness register.')
+            for reference in criterion['evidence']:
+                path = reference['artifactPath']
+                eid = evidence_node(path)
+                edge(cid, eid, 'HAS_RECORDED_EVIDENCE', READINESS_REGISTER, certainty='recorded',
+                     detail='Exact evidence document registered for this criterion.')
+                if documents[path]['format'] == 'openepm-improvement-acceptance-evidence-v1':
+                    for retained in documents[path]['independentReview'].get('reviewedPackets', []):
+                        edge(eid, evidence_node(retained['artifactPath']), 'REVIEWED_PACKET', path,
+                             certainty='recorded', detail='Exact component packet retained by this decision.')
+    return {'authority': group['authority'], 'authoritySha256': group['authoritySha256'],
+            'workPackages': len(group['workPackages']), 'criterionStatuses': dict(counts),
+            'evidenceDocuments': len(documents)}
+
+
+def semantic_identity_map(nodes, source, source_hashes):
+    """Keep unique names stable; bind indistinguishable declarations to source bytes."""
+    identities = {id: 'code:' + n['path'] + '::' + n['kind'] + ':'
+                  + n.get('sourceQualifiedName', n['name'])
+                  for id, n in nodes.items() if id.startswith('local/')}
+    groups = defaultdict(list)
+    for id, identity in identities.items():
+        groups[identity].append(id)
+    for base, ids in groups.items():
+        if len(ids) == 1:
+            continue
+        declarations = defaultdict(list)
+        for id in ids:
+            n = nodes[id]
+            declaration = '\n'.join(source(n['path']).splitlines()[n['line'] - 1:n['end']])
+            declarations[base + '@' + digest(declaration.encode())[:20]].append(id)
+        for declaration_id, matches in declarations.items():
+            if len(matches) == 1:
+                identities[matches[0]] = declaration_id
+                continue
+            # Identical callbacks/conditional definitions cannot inherit a
+            # durable name/body identity. A content-bound location is explicitly
+            # snapshot-local: edits orphan old reviews rather than guess intent.
+            for id in matches:
+                n = nodes[id]
+                witness = {'path': n['path'], 'sourceSha256': source_hashes[n['path']],
+                           'kind': n['kind'], 'name': n.get('sourceQualifiedName', n['name']),
+                           'startLine': n['line'], 'endLine': n['end']}
+                encoded = json.dumps(witness, sort_keys=True, separators=(',', ':')).encode()
+                identities[id] = base + '@snapshot-' + digest(encoded)
+                n['semanticIdentity'] = {
+                    'scope': 'source-snapshot', 'witness': witness,
+                    'reason': 'Repeated name and identical declaration; source edits invalidate this identity. Existing annotations require explicit reconciliation.',
+                }
+    if len(set(identities.values())) != len(identities):
+        raise ValueError('Indistinguishable graph declarations share the same exact source witness')
+    return identities
+
+
 def render_local_viewer(data_bytes, vendor):
     if digest(vendor) != VENDOR_SHA:
         raise ValueError('Unexpected renderer bytes')
@@ -197,6 +418,7 @@ def validate_annotations(data):
 
 
 def build(snapshot, raw_path, out, assets, annotations=None, base_commit=None):
+    snapshot = snapshot.resolve()
     out.mkdir(parents=True, exist_ok=True)
     records = [json.loads(line) for line in (gzip.open(raw_path, 'rt') if raw_path.suffix == '.gz' else raw_path.open())]
     header, summary = records[0], records[-1]
@@ -513,18 +735,40 @@ def build(snapshot, raw_path, out, assets, annotations=None, base_commit=None):
                      detail='DuckDB setting in EPM SQL literal. Qualification/gated integration only; production acceleration is disabled.')
     nodes[postgres]['databaseEntities'] = database_entities
 
-    packages = json.loads(source(REGISTER))
+    dispositions = json.loads(source(REGISTER))
+    readiness_document = json.loads(source(READINESS_REGISTER))
+    readiness = recorded_readiness(readiness_document)
+    improvement, improvement_evidence = improvement_documents(snapshot, readiness_document)
+    if improvement is not None:
+        source(IMPROVEMENT_PLAN)
+        readiness['improvementPlan'] = add_improvement_graph(
+            improvement, improvement_evidence, source_hashes, node, edge, file_node)
     package_ids = {}
-    former_packages = [row for row in packages['obligations']
-                       if row['source'] == 'P']
-    for index, p in enumerate(former_packages):
+    for index, p in enumerate(dispositions['obligations']):
+        if p['source'] != 'P':
+            continue
         package_id = p['obligationId']
         status = p['disposition']
         pid = node('package:' + package_id,
                    package_id + ' · ' + status, 'acceptance package', REGISTER,
                    status=status, notes=p['rationale'],
+                   qualification='Historical obligation disposition, not current package completion.',
+                   replacementWorkPackages=p['replacementWorkPackages'],
                    pointer='/obligations/' + str(index), layer='Evidence')
         package_ids[package_id] = pid
+    for key, pointer in (('enterpriseWorkPackages', '/workPackages/'),
+                         ('laptopWorkPackages', '/laptopFunctionalAcceptance/workPackages/')):
+        for index, package in enumerate(readiness[key]):
+            node('package:' + package['id'], package['id'] + ' · ' + package['title'],
+                 'acceptance package', READINESS_REGISTER, status=package['status'],
+                 notes='Recorded ' + package['status'] + ' status. ' + readiness['qualification'],
+                 pointer=pointer + str(index), layer='Evidence')
+    for p in dispositions['obligations']:
+        if p['source'] == 'P':
+            for replacement in p['replacementWorkPackages']:
+                edge(package_ids[p['obligationId']], 'package:' + replacement,
+                     'REPLACED_BY_WORK_PACKAGE', REGISTER, certainty='recorded',
+                     detail='Explicit replacement mapping; disposition does not confer verification on either package.')
 
     functionalities, unknown_operations = {}, []
     def functionality(id, title, package, basis):
@@ -540,11 +784,9 @@ def build(snapshot, raw_path, out, assets, annotations=None, base_commit=None):
     for op, oid in operations.items():
         if nodes[oid]['status'] == 'internal lowering only':
             continue
-        group_name=next((new+op[len(old):] for old,new in GROUP_PREFIX_ALIASES.items()
-                         if op.startswith(old)),op)
-        matches = [g for g in GROUPS if group_name.startswith(g[0])]
-        if matches:
-            prefix, title, package = max(matches, key=lambda g: len(g[0]))
+        group = operation_group(op)
+        if group:
+            prefix, title, package = group
         else:
             prefix, title, package = op.rsplit('.', 1)[0], op.rsplit('.', 1)[0], 'P09'
             unknown_operations.append(op)
@@ -607,11 +849,11 @@ def build(snapshot, raw_path, out, assets, annotations=None, base_commit=None):
             edge(f,optimization,'RELATED_CALCULATION_PLATFORM',certainty='association',
                  detail='Authored related-platform navigation. Follow individual source paths to determine which mechanisms this operation actually uses.')
     nodes['functionality:concurrency']['scaleEvidence'] = {
-        'target': '300 concurrent users; 500 GB per application is owner-deferred and not qualified.',
-        'recordedScope': packages['packages'][8]['next'],
-        'remainingGate': next(p['next'] for p in packages['packages'] if p['id']=='P21'),
-        'evidencePath': REGISTER,
-        'qualification': 'Historical register statements, not new measurements. Concurrent correctness does not certify sustained capacity.'}
+        'recordedFunctionalPopulation': readiness['laptopPopulation'],
+        'recordedDeferredCampaigns': readiness['laptopDeferredCampaigns'],
+        'recordedSustained300SessionsGate': readiness['releaseGates']['sustained300Sessions'],
+        'evidencePath': READINESS_REGISTER,
+        'qualification': 'Recorded functional scope and deferrals, not new measurements. Five-user functional proof does not certify concurrent capacity.'}
 
     # The retained workflow matrix is a record, not a fresh rerun. Superseded
     # metadata and transfer matrices were removed with their historical tests.
@@ -710,20 +952,11 @@ def build(snapshot, raw_path, out, assets, annotations=None, base_commit=None):
     # The main model owns semantic identities. Entire definitions are read-only
     # technical attachments, not main-node IDs or an expansion floor in the UI.
     # No fuzzy identity migration is performed for earlier authored records.
-    semantic_ids={id: 'code:'+n['path']+'::'+n['kind']+':'+n.get('sourceQualifiedName',n['name'])
-                  for id,n in nodes.items() if id.startswith('local/')}
-    identity_counts=Counter(semantic_ids.values())
+    semantic_ids = semantic_identity_map(nodes, source, source_hashes)
     for id,n in nodes.items():
         if id in semantic_ids:
-            base=semantic_ids[id]
-            if identity_counts[base]>1:
-                # Conditional definitions share a qualified name. Retire the
-                # ambiguous base identity so existing reviews never attach to
-                # an arbitrarily selected declaration.
-                declaration='\n'.join(source(n['path']).splitlines()[n['line']-1:n['end']])
-                semantic_ids[id]=base+'@'+digest(declaration.encode())[:20]
             n['entireReferences']=[dict(id=id,name=n['name'],path=n['path'],line=n['line'],end=n['end'],
-                kind=n['kind'],commit=header['commit'],match='same declaration path, kind and location; lexical scope checked in source',provider='Entire Graph '+header['provider_version'])]
+                kind=n['kind'],commit=header['commit'],match='same declaration path, kind and location; '+('lexical scope resolved in source' if 'sourceQualifiedName' in n else 'extractor-qualified name'),provider='Entire Graph '+header['provider_version'])]
             n['name']=n.get('sourceQualifiedName',n['name'])
     for r in records:
         if r.get('record_type')=='file' and 'file:'+r['path'] in nodes:
@@ -810,8 +1043,9 @@ def build(snapshot, raw_path, out, assets, annotations=None, base_commit=None):
         declaredControlPlaneOperations=sum(nodes[v]['status'] == 'declared control-plane registry' for v in operations.values()),
         operationsWithoutDispatchComparison=[op for op in operations if not dispatch_counts[op]],
         fallbackFunctionalityLabels=unknown_operations,
-        wholeRebuildComplete=packages['baseline']['wholeRebuildComplete'],
-        packageCompletion=packages['completion'], integratedSchemaMigrations=packages['currentIntegratedSchemaMigrations'],
+        wholeRebuildComplete=False,
+        wholeRebuildCompleteMeaning='Graph generation never certifies whole-product completion; consult recordedAcceptance and its evidence authority.',
+        recordedAcceptance=readiness,
         unresolvedSqlNames=dict(unresolved_sql), entireSummary=summary,
         deliberatelyExcludedRelationFamilies=dict(rejected),
         sourceFiles=len(sources), sourceHashManifest=digest(json.dumps(source_hashes, sort_keys=True).encode()),
@@ -821,7 +1055,8 @@ def build(snapshot, raw_path, out, assets, annotations=None, base_commit=None):
             confidence='Includes static heuristic/ambiguous relations. Not a certified blast radius, complete transitive closure or business criticality.'),
         limitations=[
             ('Frozen development source from the checkout, based on the stated committed revision. '
-             'Only the named source scopes were overlaid; release state and later edits are excluded.'
+             'The named source and registered improvement evidence scopes were overlaid. '
+             'Release state and later edits are excluded.'
              if base_commit else 'Frozen committed snapshot; uncommitted changes and later commits are excluded.'),
             'Graph nodes prove source presence, not correctness, usage, feature completeness or production release.',
             'Business groupings, infrastructure paths and package associations are authored, inferred navigation.',

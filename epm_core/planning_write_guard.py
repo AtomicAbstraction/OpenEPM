@@ -19,6 +19,7 @@ from .planning_workflow_policy import PlanningWorkflowPolicy
 
 
 MAX_GUARDED_WRITES=10_000
+WORKFLOW_ROLE_UNBOUND='PLANNING_WORKFLOW_ROLE_BINDING_UNAVAILABLE'
 _LOCK_STATES=frozenset(('Open','Locked','Submitted','Approved'))
 
 
@@ -55,7 +56,8 @@ def guard_planning_writes(*,scope: ApplicationScope,
                           writes: Sequence[PlanningWrite],
                           workflow_role: str,on_date: date,
                           expected_policy_digest: str|None=None,
-                          ordered_actions: bool=False
+                          ordered_actions: bool=False,
+                          coordinate_duties: Mapping[Coordinate, frozenset[str]]|None=None
                           ) -> PlanningWriteGuardEvidence:
     """Evaluate a bounded publication unit against one pinned active policy.
 
@@ -91,9 +93,15 @@ def guard_planning_writes(*,scope: ApplicationScope,
         raise ValueError('PLANNING_WRITE_POLICY_DIGEST_STALE')
     matched=set()
     for ordinal,item in enumerate(writes):
-        decision=policy.evaluate(
+        if coordinate_duties is None:
+            duties=frozenset((workflow_role,))
+        else:
+            duties=coordinate_duties.get(item.coordinate)
+            if not duties:
+                raise ValueError(WORKFLOW_ROLE_UNBOUND)
+        decision=policy.evaluate_for_roles(
             scope,item.coordinate,action=item.action,
-            workflow_role=workflow_role,on_date=on_date,
+            workflow_roles=duties,on_date=on_date,
             lock_state=item.lock_state,
             expected_digest=expected_policy_digest)
         matched.update(decision.matched_rule_ids)

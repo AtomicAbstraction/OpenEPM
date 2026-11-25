@@ -36,6 +36,8 @@ class WorkflowStore(Protocol):
     def recover_child(self, workflow: WorkflowRecord, *, ordinal: int,
                       operation: Mapping[str, object]) -> UnitCheckpoint | None: ...
     def authorize_publication(self, workflow: WorkflowRecord) -> Mapping[str, object]: ...
+    def recover_cancelled_child(self, workflow: WorkflowRecord, *, ordinal: int,
+                                operation: Mapping[str, object], admission: V2Admission) -> UnitCheckpoint | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,14 +163,49 @@ class SealedPlanRunner:
         if current.status not in (WorkflowStatus.RUNNING,
                                   WorkflowStatus.CANCEL_REQUESTED):
             return current
+        if (current.status == WorkflowStatus.CANCEL_REQUESTED
+                and len(current.checkpoints) < current.unit_count
+                and all(item.committed for item in current.checkpoints)):
+            # Acceptance may have committed before its parent checkpoint. A
+            # cancellation may only inspect that original admission; it must
+            # never preview/submit a replacement or advance an unadmitted unit.
+            ordinal = len(current.checkpoints) + 1
+            try:
+                recovered = self.store.recover_cancelled_child(current,
+                    ordinal=ordinal, operation=self._atomic_operation(units[ordinal - 1]),
+                    admission=self.admission)
+            except ValueError as error:
+                if str(error)!='PYTHON_WORKFLOW_CHILD_PROOF_UNAVAILABLE':raise
+                # Unknown provenance must not erase cancellation intent. The
+                # worker parks repeated unresolved recovery; it never retries
+                # admission, rebuilds source or claims a missing receipt.
+                raise ValueError('WORKFLOW_CANCELLATION_CHILD_PROOF_UNAVAILABLE') from error
+            if recovered is not None:
+                if recovered.ordinal != ordinal:
+                    raise ValueError('PYTHON_WORKFLOW_CHILD_CONFLICT')
+                updated = current.checkpoint(recovered)
+                if not self.store.compare_and_set(current, updated):
+                    raise ValueError('PYTHON_WORKFLOW_STALE_CONTROL_STATE')
+                current = updated
         # Reconcile an admitted child before admitting the next unit.  This
         # gives retries a durable, receipt-based boundary.
         if current.checkpoints and not current.checkpoints[-1].committed:
             last = current.checkpoints[-1]
+            if current.status == WorkflowStatus.CANCEL_REQUESTED:
+                # Also retry a lost child-control acknowledgement. The native
+                # job owner preserves a publication which already won the race.
+                self.inspector.request_cancel(current.scope, last.job_id)
             outcome = self.inspector.inspect(current.scope, last.job_id)
             if outcome.status in ('accepted', 'ready', 'queued', 'running',
                                   'staged', 'cancel_requested'):
                 return current
+            if (current.status == WorkflowStatus.CANCEL_REQUESTED
+                    and (outcome.status == 'needs_inspection'
+                         or (outcome.status == 'published' and not outcome.receipt_id))):
+                # Ordinary in-flight child control may keep waiting above.
+                # A child requiring inspection is different: repeated worker
+                # attempts must park without losing cancellation or receipts.
+                raise ValueError('WORKFLOW_CANCELLATION_CHILD_UNRESOLVED')
             if outcome.status == 'published' and outcome.receipt_id:
                 checkpoints = current.checkpoints[:-1] + (UnitCheckpoint(
                     last.ordinal, last.job_id, True, outcome.receipt_id),)
@@ -207,21 +244,27 @@ class SealedPlanRunner:
             if callable(replay_admitted):
                 admitted=replay_admitted(current,ordinal=ordinal,operation=operation)
             else:
-                self.store.authorize_publication(current)
-                preview=self.admission.preview(current.scope,operation)
-                token=preview.get('previewToken') if isinstance(preview,dict) else None
-                if type(token) is not str or not token:
-                    raise ValueError('PYTHON_RUN_PREVIEW_INVALID')
                 dependencies=(() if not current.checkpoints else
                               (current.checkpoints[-1].job_id,))
                 key_factory=getattr(self.store,'child_idempotency_key',None)
                 key=(key_factory(current,ordinal) if callable(key_factory)
                      else f'py-{current.workflow_id}-{ordinal}')
                 authority=self.store.authorize_publication(current)
-                submission=dict(preview_token=token,idempotency_key=key,
+                submission=dict(idempotency_key=key,
                                 depends_on_job_ids=dependencies)
                 if authority:submission['_execution_authority']=authority
-                admitted=self.admission.submit(current.scope,operation,**submission)
+                replay_ordered=getattr(self.admission,'replay_ordered',None)
+                admitted=(replay_ordered(current.scope,operation,**submission)
+                    if callable(replay_ordered) else NotImplemented)
+                if admitted is NotImplemented:
+                    preview=self.admission.preview(current.scope,operation)
+                    token=preview.get('previewToken') if isinstance(preview,dict) else None
+                    if type(token) is not str or not token:
+                        raise ValueError('PYTHON_RUN_PREVIEW_INVALID')
+                    authority=self.store.authorize_publication(current)
+                    if authority:submission['_execution_authority']=authority
+                    admitted=self.admission.submit(current.scope,operation,
+                        preview_token=token,**submission)
             if (not isinstance(admitted,dict)
                     or admitted.get('jobId')!=recovered.job_id):
                 raise ValueError('PYTHON_WORKFLOW_CHILD_CONFLICT')
@@ -231,8 +274,10 @@ class SealedPlanRunner:
             return updated
         # Recheck persisted authority immediately around child admission.  The
         # store derives it from the sealed build; callers cannot swap it.
-        self.store.authorize_publication(current)
-        preview = self.admission.preview(current.scope, operation)
+        authority = self.store.authorize_publication(current)
+        preview_child = getattr(self.store, 'preview_rule_child', None)
+        preview = (preview_child(self.admission,current,operation,authority) if callable(preview_child)
+                   else self.admission.preview(current.scope, operation))
         token = preview.get('previewToken') if isinstance(preview, dict) else None
         if type(token) is not str or not token:
             raise ValueError('PYTHON_RUN_PREVIEW_INVALID')

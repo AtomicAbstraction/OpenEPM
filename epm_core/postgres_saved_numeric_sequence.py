@@ -1,4 +1,10 @@
-"""Current authored ordered programs, runtime CAS binding and fenced jobs."""
+"""Legacy ordered-template interpretation and fenced job compatibility.
+
+Current source-owned application rules can contain ``facts.numeric.sequence``.
+The old saved-template family has no current definition-owner kind. Keep its
+compiler/receipt interpretation while reporting that unsupported boundary
+explicitly; never fabricate an empty list or revive direct template authoring.
+"""
 from copy import deepcopy
 import re
 
@@ -26,6 +32,33 @@ PLAN_DIGEST=_canonical_digest({'function':RUN,'compiler':COMPILER,
     'baseCompilers':[(sequence.COMPILER,sequence.PLAN_DIGEST),(EXPRESSION_COMPILER,EXPRESSION_PLAN)],
     'template':'typed_parameters_no_authored_cas','execution':'existing_exact_ordered_sql',
     'publication':'current_version_grants_source_and_lease_fenced','events':'one_atomic_commit'})
+
+CURRENT_OWNER_UNSUPPORTED = 'ORDERED_RULE_CURRENT_OWNER_UNSUPPORTED'
+
+
+def current_owner_availability():
+    """One owner boundary for execution, discovery and new workflow references.
+
+    Function registration is not evidence that this legacy owner exists. This
+    reports owner support only, never the caller's grants or runtime validity.
+    """
+    from .postgres_definition_lifecycle import STORED_KINDS
+    supported = TEMPLATE in STORED_KINDS
+    return {'version': 1, 'kind': 'current-definition-owner',
+            'ownerFunction': TEMPLATE,
+            'status': 'available' if supported else 'unsupported',
+            'code': None if supported else CURRENT_OWNER_UNSUPPORTED}
+
+
+def _require_current_owner():
+    """Fail before a legacy template reaches a current-owner query.
+
+    This is not a projection onto ApplicationRule: its source ownership,
+    parameters and checkpoint contract cannot be inferred from a legacy name.
+    Public-family retirement still requires closing its client consumers.
+    """
+    if current_owner_availability()['status'] != 'available':
+        raise ValueError(CURRENT_OWNER_UNSUPPORTED)
 
 
 def bind_template(stored,bindings=None,*,authoring=False):
@@ -147,8 +180,19 @@ def parse(raw,function):
 class PostgresSavedNumericSequences(PostgresExpressionRules):
     SAVE,PUBLISH,READ,LIST=SAVE,PUBLISH,READ,LIST
     STORED_FUNCTION=TEMPLATE
+    LIST_COLLECTION_FORMAT = None
     _parse=staticmethod(parse)
     _validate_definition=staticmethod(sequence.validate_coordinates)
+
+    def read(self, scope, raw):
+        self._parse(raw, self.READ)
+        _require_current_owner()
+        return super().read(scope, raw)
+
+    def list_published(self, scope, raw):
+        self._parse(raw, self.LIST)
+        _require_current_owner()
+        return super().list_published(scope, raw)
 
     @staticmethod
     def _summary(definition):
@@ -174,6 +218,7 @@ def intent(raw):
 
 
 def resolve(db,scope,run):
+    _require_current_owner()
     row=db.execute('''SELECT v.state_token,v.status,
         v.program,v.program_digest,v.metadata_revision,
         s.metadata_revision current_metadata FROM epm.expression_rule_definition v
@@ -181,6 +226,7 @@ def resolve(db,scope,run):
         WHERE v.workspace_id=%s AND v.application_id=%s AND v.rule_id=%s''',
         (scope.workspace_id,scope.application_id,run['ruleId'])).fetchone()
     if (row is None or row['status']!='Active'
+            or not isinstance(row['program'],dict)
             or row['program'].get('function')!=TEMPLATE):
         raise ValueError('ORDERED_RULE_NOT_PUBLISHED')
     if row['metadata_revision']!=row['current_metadata']:raise ValueError('ORDERED_RULE_METADATA_STALE')
@@ -278,6 +324,9 @@ def submit(language,scope,raw,token,key,dependencies):
                         or _canonical_digest(descriptor)!=prior['request_digest']):
                     raise ValueError('ORDERED_RULE_IDEMPOTENCY_CONFLICT')
                 return {'jobId':prior['job_id'],'status':prior['status'],'duplicate':True}
+            # Historical outcomes remain recoverable without a current owner.
+            # Fresh work cannot obtain a usable preview without that owner.
+            _require_current_owner()
             payload=language._unpack_preview(scope,RUN,token)
             normalized=normalize(db,scope,run)
             revisions={k:state[k] for k in ('metadata_revision','data_revision','policy_revision')}

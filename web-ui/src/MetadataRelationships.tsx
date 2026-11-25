@@ -1,19 +1,89 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { readProgram, requestAdmittedEffect } from "./api";
+import { ApiError, readProgram } from "./api";
 import { MetadataMemberGrid } from "./MetadataMemberGrid";
 import { validMetadataText } from "./MetadataCreate";
 import { MetadataSecurityStringEditor } from "./MetadataSecurityStringEditor";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
 import { usePreservedDraft } from "./unsaved-work";
 import { useStableMutationIntentKey } from "./mutation-intent";
-import { collectAllContinuations } from "./continuation";
+import {
+  collectMetadataRelationships,
+  type MetadataRelationship,
+} from "./metadata-relationships-data";
+export {
+  collectMetadataRelationships,
+  type MetadataRelationship,
+} from "./metadata-relationships-data";
 import {
   collectMetadataHierarchies,
   collectHierarchyMembers,
   type MetadataHierarchy,
   type HierarchyMember,
 } from "./metadata-hierarchies";
+import {
+  focusWhenInteractive,
+  MetadataReceiptRecovery,
+} from "./MetadataReceiptRecovery";
+import { useMetadataMutationRecovery } from "./metadata-mutation-recovery";
+import {
+  hierarchyBuild,
+  useHierarchyBuildRecovery,
+} from "./hierarchy-build-recovery";
 import { MetadataHierarchyEditor } from "./MetadataHierarchyEditor";
+import { MemberSelectionDialog } from "./member-selection/MemberSelectionDialog";
+import {
+  placementApply,
+  useHierarchyPlacementRecovery,
+  type HierarchyPatchPreview,
+  type PlacementDraftAction,
+} from "./hierarchy-placement-recovery";
+
+type HierarchyPatchChange =
+  | {
+      action: "Create";
+      relationshipId: string;
+      parentMemberId: string;
+      childMemberId: string;
+    }
+  | { action: "Deactivate"; relationshipId: string };
+
+type HierarchyPatchArguments = {
+  dimensionId: string;
+  hierarchyId?: string;
+  changes: HierarchyPatchChange[];
+  expectedMetadataRevision: number;
+  expectedHierarchyStateToken: string;
+};
+
+const newHiddenRelationshipId = () => `placement-${crypto.randomUUID()}`;
+
+export function placementPatchChanges({
+  action,
+  relationshipId,
+  sourceRelationshipId,
+  parentMemberId,
+  childMemberId,
+}: {
+  action: PlacementDraftAction;
+  relationshipId: string;
+  sourceRelationshipId?: string;
+  parentMemberId: string;
+  childMemberId: string;
+}): HierarchyPatchChange[] {
+  const create: HierarchyPatchChange = {
+    action: "Create",
+    relationshipId,
+    parentMemberId,
+    childMemberId,
+  };
+  if (action !== "move") return [create];
+  if (!sourceRelationshipId)
+    throw new Error("A move requires the exact current placement.");
+  return [
+    { action: "Deactivate", relationshipId: sourceRelationshipId },
+    create,
+  ];
+}
 
 type Member = {
   member_id: string;
@@ -25,66 +95,39 @@ type Member = {
   custom_values?: Record<string, unknown>;
 };
 
-type Relationship = {
-  relationship_id: string;
-  hierarchy_id?: string;
-  aggregation_operator_override?: string | null;
-  dimension_id: string;
-  name?: string;
-  short_description?: string;
-  detailed_description?: string;
-  semantic_description?: string;
-  parent_member_id: string;
-  child_member_id: string;
-  status: "Active" | "Inactive";
+const relationshipEditFields = {
+  "metadata.relationship.rename": ["name"],
+  "metadata.relationship.describe": ["shortDescription", "detailedDescription"],
+  "metadata.relationship.status.set": ["status"],
+  "metadata.relationship.aggregation-operator.set": [
+    "aggregationOperatorOverride",
+  ],
+} as const;
+type RelationshipEdit = keyof typeof relationshipEditFields;
+type RelationshipProperties = {
+  name: string;
+  shortDescription: string;
+  detailedDescription: string;
+  status: MetadataRelationship["status"];
+  aggregationOperatorOverride: string;
 };
-
-type RelationshipPage = {
-  rows: Relationship[];
-  metadataRevision: number;
-  nextCursor: string | null;
-  hierarchyId?: string | null;
+type RelationshipDraft = {
+  relationshipId: string;
+  fields: Partial<RelationshipProperties>;
 };
-
-export function collectMetadataRelationships(
-  dimensionId: string,
-  expectedMetadataRevision: number | null,
-  readPage: (arguments_: Record<string, unknown>) => Promise<RelationshipPage>,
-  hierarchyId?: string,
-) {
-  return collectAllContinuations<RelationshipPage, Relationship>({
-    label: "Relationship catalogue",
-    readPage: (cursor) =>
-      readPage(
-        cursor
-          ? { cursor }
-          : {
-              dimension: dimensionId,
-              limit: 100,
-              ...(hierarchyId ? { hierarchyId } : {}),
-            },
-      ),
-    rows: (page) => {
-      if (
-        hierarchyId &&
-        (page.hierarchyId !== hierarchyId ||
-          page.rows.some((row) => row.hierarchy_id !== hierarchyId))
-      )
-        throw new Error("Relationship response belongs to another hierarchy.");
-      return page.rows;
-    },
-    nextCursor: (page) => page.nextCursor,
-    rowIdentity: (row) => row.relationship_id,
-    consistencyIdentity: (page) => {
-      if (
-        expectedMetadataRevision !== null &&
-        page.metadataRevision !== expectedMetadataRevision
-      )
-        throw new Error("Metadata changed while reading relationships.");
-      return page.metadataRevision;
-    },
-  });
-}
+const relationshipRefusals = new Set([
+  "ACTIVE_MEMBERS_REQUIRED",
+  "ACTIVE_RELATIONSHIP_REQUIRED",
+  "METADATA_DESCRIPTION_UNCHANGED",
+  "METADATA_NAME_UNCHANGED",
+  "RELATIONSHIP_AGGREGATION_OPERATOR_INVALID",
+  "RELATIONSHIP_AGGREGATION_OPERATOR_UNCHANGED",
+  "RELATIONSHIP_HAS_ACTIVE_OWNERSHIP",
+  "RELATIONSHIP_STATUS_INVALID",
+  "RELATIONSHIP_STATUS_UNCHANGED",
+  "RELATIONSHIP_UNAVAILABLE",
+  "SEMANTIC_REFERENCE_MEMBER_UNAVAILABLE",
+]);
 
 export const metadataActionBody = (
   app: ApplicationSummary,
@@ -113,11 +156,14 @@ export function MetadataRelationships({
   metadataRevision,
   onChanged,
   selectedMemberId,
+  selectedRelationshipId: routedRelationshipId,
   onSelectedMemberIdChange,
   onRequestTransition,
   onEditMemberSecurityString,
   securityBusy,
+  creationDisabled,
   mode = "all",
+  showViewToggle = true,
 }: {
   app?: ApplicationSummary;
   catalog: ApplicationCatalog | null;
@@ -128,14 +174,22 @@ export function MetadataRelationships({
   metadataRevision: number | null;
   onChanged: () => Promise<void>;
   selectedMemberId?: string;
-  onSelectedMemberIdChange?: (memberId: string) => void;
+  selectedRelationshipId?: string;
+  onSelectedMemberIdChange?: (
+    memberId: string,
+    relationshipId?: string,
+  ) => void;
   onRequestTransition?: (action: () => void) => void;
   onEditMemberSecurityString?: (member: Member) => void;
   securityBusy?: boolean;
-  mode?: "members" | "relationships" | "all";
+  creationDisabled?: boolean;
+  mode?: "members" | "relationships" | "tree" | "all";
+  showViewToggle?: boolean;
 }) {
   const mutationIntentKey = useStableMutationIntentKey("relationship-ui");
-  const [storedRelationships, setRelationships] = useState<Relationship[]>([]);
+  const [storedRelationships, setRelationships] = useState<
+    MetadataRelationship[]
+  >([]);
   const [internalHierarchySelection, setHierarchySelection] = useState("");
   const hierarchySelection =
     hierarchyId ?? (onHierarchyIdChange ? "" : internalHierarchySelection);
@@ -152,6 +206,7 @@ export function MetadataRelationships({
     app?.workspaceId,
     app?.applicationId,
     dimensionId,
+    catalog?.accessContext,
     catalog?.applicationAccess.issuer,
     catalog?.applicationAccess.subjectId,
     catalog?.revisions.security,
@@ -188,39 +243,186 @@ export function MetadataRelationships({
   const [relationshipRevision, setRelationshipRevision] = useState<
     number | null
   >(null);
+  const [relationshipRefresh, setRelationshipRefresh] = useState(0);
   const [relationshipId, setRelationshipId] = useState("");
   const [parentMemberId, setParentMemberId] = useState("");
   const [childMemberId, setChildMemberId] = useState("");
-  const [createReviewed, setCreateReviewed] = useState(false);
-  const [selectedRelationshipId, setSelectedRelationshipId] = useState("");
-  const [selectedStatus, setSelectedStatus] = useState<"Active" | "Inactive">(
-    "Active",
-  );
+  const [placementAction, setPlacementAction] =
+    useState<PlacementDraftAction>("create");
+  const [sourceRelationshipId, setSourceRelationshipId] = useState("");
+  const [patchPreview, setPatchPreview] = useState<{
+    arguments: HierarchyPatchArguments;
+    result: HierarchyPatchPreview;
+  } | null>(null);
+  const [internalSelectedRelationshipId, setSelectedRelationshipId] =
+    useState("");
+  const selectedRelationshipId =
+    routedRelationshipId ?? internalSelectedRelationshipId;
   const [statusReviewed, setStatusReviewed] = useState(false);
-  const [relationshipName, setRelationshipName] = useState("");
-  const [relationshipShort, setRelationshipShort] = useState("");
-  const [relationshipSemantic, setRelationshipSemantic] = useState("");
-  const [relationshipOperator, setRelationshipOperator] = useState("");
+  const [propertyDraft, setPropertyDraft] = useState<RelationshipDraft | null>(
+    null,
+  );
   const [renameReviewed, setRenameReviewed] = useState(false);
   const [describeReviewed, setDescribeReviewed] = useState(false);
-  const [buildReviewed, setBuildReviewed] = useState(false);
+  const [reviewedBuild, setReviewedBuild] = useState<string | null>(null);
+  const buildPin = JSON.stringify([
+    relationshipContext,
+    metadataRevision,
+    selectedHierarchy?.hierarchyId,
+    selectedHierarchy?.stateToken,
+  ]);
+  const buildReviewed = reviewedBuild === buildPin;
   const [draftRevision, setDraftRevision] = useState(metadataRevision);
-  const [placementDraftTouched, setPlacementDraftTouched] = useState(false);
-  const placementDraftRef = useRef(placementDraftTouched);
-  placementDraftRef.current = placementDraftTouched;
+  const propertyDraftRef = useRef(propertyDraft);
+  propertyDraftRef.current = propertyDraft;
   const readGeneration = useRef(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState("");
-  const [editorMode, setEditorMode] = useState<"grid" | "board">("grid");
-  const [draggedMemberId, setDraggedMemberId] = useState("");
+  const resultStatus = useRef<HTMLParagraphElement>(null);
+  const focusReceiptResult = useRef(false);
+  const activeView = useRef(relationshipContext);
+  activeView.current = relationshipContext;
+  async function refreshRelationshipWorkspace() {
+    await onChanged();
+    if (activeView.current === relationshipContext)
+      setRelationshipRefresh((previous) => previous + 1);
+  }
+  function refreshAfterCommit(message: string) {
+    setRelationshipRevision(null);
+    const view = activeView.current;
+    void Promise.resolve()
+      .then(refreshRelationshipWorkspace)
+      .catch(() => {
+        if (activeView.current === view) setError(message);
+      });
+  }
+  const placementRecovery = useHierarchyPlacementRecovery(
+    app,
+    catalog,
+    JSON.stringify([
+      relationshipContext,
+      catalog?.applicationAccess.role,
+      catalog?.revisions.capability,
+    ]),
+    ({ action, preview }, source) => {
+      const label =
+        action === "move" ? "move" : action === "copy" ? "copy" : "creation";
+      setResult(
+        source === "receipt"
+          ? `The original placement ${label} was recorded.`
+          : `The reviewed placement ${label} was applied atomically.`,
+      );
+      if (patchPreview?.result.previewToken === preview.previewToken) {
+        setPlacementAction("create");
+        setSourceRelationshipId("");
+        setRelationshipId("");
+        setPatchPreview(null);
+      }
+      refreshAfterCommit(
+        "Placement recorded. Refresh the model to see the current hierarchy.",
+      );
+    },
+  );
+  const propertyRecovery = useMetadataMutationRecovery<
+    RelationshipDraft & {
+      actorId: string;
+      metadataRevision: number;
+    }
+  >(
+    app,
+    mode === "members" ? null : catalog,
+    JSON.stringify([
+      relationshipContext,
+      catalog?.applicationAccess.role,
+      catalog?.revisions.capability,
+    ]),
+    {
+      editor: `metadata-relationship-change:${dimensionId}`,
+      pendingLabel: "Relationship change with an unconfirmed outcome",
+      functions: Object.keys(relationshipEditFields),
+      subject: "relationship change",
+      closePrompt:
+        "Close this unconfirmed relationship change? Read the current model before reviewing another change.",
+      refuses: (code) => relationshipRefusals.has(code),
+    },
+    (attempt, source) => {
+      setPropertyDraft((current) => {
+        if (current?.relationshipId !== attempt.relationshipId) return current;
+        const fields = { ...current.fields };
+        for (const field of Object.keys(
+          attempt.fields,
+        ) as (keyof RelationshipProperties)[])
+          if (fields[field] === attempt.fields[field]) delete fields[field];
+        return Object.keys(fields).length ? { ...current, fields } : null;
+      });
+      setStatusReviewed(false);
+      setRenameReviewed(false);
+      setDescribeReviewed(false);
+      setReviewedBuild(null);
+      focusReceiptResult.current = source === "receipt";
+      setResult(
+        source === "receipt"
+          ? "The original relationship change was recorded."
+          : "The reviewed relationship change was applied.",
+      );
+      refreshAfterCommit(
+        "Relationship change recorded. Refresh the model to see the current placement.",
+      );
+    },
+  );
+  const buildRecovery = useHierarchyBuildRecovery(
+    app,
+    mode === "members" ? null : catalog,
+    JSON.stringify([
+      relationshipContext,
+      catalog?.applicationAccess.role,
+      catalog?.revisions.capability,
+    ]),
+    dimensionId,
+    (_attempt, source) => {
+      setStatusReviewed(false);
+      setReviewedBuild(null);
+      focusReceiptResult.current = source === "receipt";
+      setResult(
+        source === "receipt"
+          ? "The original hierarchy build was recorded."
+          : "The reviewed hierarchy was built.",
+      );
+      refreshAfterCommit(
+        "Hierarchy build recorded. Refresh the model to see the current closure.",
+      );
+    },
+  );
+  const changeBlocked =
+    placementRecovery.busy ||
+    placementRecovery.pending ||
+    propertyRecovery.busy ||
+    propertyRecovery.pending ||
+    buildRecovery.busy ||
+    buildRecovery.pending;
+  useEffect(() => {
+    if (result && focusReceiptResult.current) {
+      focusReceiptResult.current = false;
+      return focusWhenInteractive(resultStatus.current);
+    }
+  }, [result]);
+  const [editorMode, setEditorMode] = useState<"grid" | "board">(
+    mode === "tree" ? "board" : "grid",
+  );
+  const [draggedPlacement, setDraggedPlacement] = useState<{
+    memberId: string;
+    relationshipId?: string;
+  } | null>(null);
   const [internalSelectedMemberId, setInternalSelectedMemberId] = useState("");
   const [expandedMemberIds, setExpandedMemberIds] = useState<Set<string>>(
     new Set(),
   );
+  const [relationshipMemberChooser, setRelationshipMemberChooser] = useState<
+    "parent" | "child" | null
+  >(null);
 
   const canRead = Boolean(catalog?.functions["metadata.relationship.list"]);
-  const canCreate = Boolean(catalog?.functions["metadata.relationship.create"]);
   const canSetStatus = Boolean(
     catalog?.functions["metadata.relationship.status.set"],
   );
@@ -228,7 +430,11 @@ export function MetadataRelationships({
   const canDescribe = Boolean(
     catalog?.functions["metadata.relationship.describe"],
   );
-  const canBuild = Boolean(catalog?.functions["metadata.hierarchy.build"]);
+  const canBuild = Boolean(catalog?.functions[hierarchyBuild]);
+  const canPatchRelationships = Boolean(
+    catalog?.functions["metadata.hierarchy.relationships.preview"] &&
+      catalog?.functions["metadata.hierarchy.relationships.apply"],
+  );
   const canSetOperator = Boolean(
     catalog?.functions["metadata.relationship.aggregation-operator.set"],
   );
@@ -273,24 +479,92 @@ export function MetadataRelationships({
       parentMemberId !== childMemberId &&
       !relationships.some(
         (relationship) => relationship.relationship_id === relationshipId,
+      ) &&
+      !relationships.some(
+        (relationship) =>
+          relationship.status === "Active" &&
+          relationship.parent_member_id === parentMemberId &&
+          relationship.child_member_id === childMemberId,
       ),
   );
-  const selectedRelationship = relationships.find(
-    (relationship) => relationship.relationship_id === selectedRelationshipId,
+  const hierarchyPatchValid = Boolean(
+    createValid &&
+      canPatchRelationships &&
+      selectedHierarchy?.stateToken &&
+      metadataRevision !== null &&
+      (placementAction !== "move" ||
+        relationships.some(
+          (relationship) =>
+            relationship.relationship_id === sourceRelationshipId &&
+            relationship.status === "Active" &&
+            relationship.child_member_id === childMemberId &&
+            relationship.parent_member_id !== parentMemberId,
+        )),
+  );
+  const sourceRelationship = relationships.find(
+    (relationship) => relationship.relationship_id === sourceRelationshipId,
   );
   const effectiveSelectedMemberId =
     selectedMemberId === undefined
       ? internalSelectedMemberId
       : selectedMemberId;
+  const selectedRelationship = relationships.find(
+    (relationship) =>
+      relationship.relationship_id === selectedRelationshipId &&
+      relationship.child_member_id === effectiveSelectedMemberId,
+  );
+  const baseProperties: RelationshipProperties = {
+    name:
+      selectedRelationship?.name || selectedRelationship?.relationship_id || "",
+    shortDescription: selectedRelationship?.short_description || "",
+    detailedDescription:
+      selectedRelationship?.detailed_description ??
+      selectedRelationship?.semantic_description ??
+      "",
+    status: selectedRelationship?.status || "Active",
+    aggregationOperatorOverride:
+      selectedRelationship?.aggregation_operator_override || "",
+  };
+  const propertyValues = {
+    ...baseProperties,
+    ...(propertyDraft?.relationshipId === selectedRelationshipId
+      ? propertyDraft.fields
+      : {}),
+  };
+  const {
+    name: relationshipName,
+    shortDescription: relationshipShort,
+    detailedDescription: relationshipSemantic,
+    status: selectedStatus,
+    aggregationOperatorOverride: relationshipOperator,
+  } = propertyValues;
+  function editProperty<Field extends keyof RelationshipProperties>(
+    field: Field,
+    value: RelationshipProperties[Field],
+  ) {
+    setPropertyDraft((current) => {
+      const fields =
+        current?.relationshipId === selectedRelationshipId
+          ? { ...current.fields }
+          : {};
+      if (value === baseProperties[field]) delete fields[field];
+      else fields[field] = value;
+      return Object.keys(fields).length
+        ? { relationshipId: selectedRelationshipId, fields }
+        : null;
+    });
+  }
   const currentSelection = useRef({
     memberId: effectiveSelectedMemberId,
     relationshipId: selectedRelationshipId,
     members,
+    explicitPlacement: routedRelationshipId !== undefined,
   });
   currentSelection.current = {
     memberId: effectiveSelectedMemberId,
     relationshipId: selectedRelationshipId,
     members,
+    explicitPlacement: routedRelationshipId !== undefined,
   };
   const selectedMember = members.find(
     (member) => member.member_id === effectiveSelectedMemberId,
@@ -304,50 +578,34 @@ export function MetadataRelationships({
     snapshotCurrent &&
       selectedRelationship &&
       validMetadataText(relationshipName) &&
-      relationshipName !==
-        (selectedRelationship.name || selectedRelationship.relationship_id),
+      relationshipName !== baseProperties.name,
   );
   const describeValid = Boolean(
     snapshotCurrent &&
       selectedRelationship &&
       relationshipShort.length <= 500 &&
       relationshipSemantic.length <= 10000 &&
-      (relationshipShort !== (selectedRelationship.short_description || "") ||
-        relationshipSemantic !==
-          (selectedRelationship.semantic_description ||
-            selectedRelationship.detailed_description ||
-            "")),
+      (relationshipShort !== baseProperties.shortDescription ||
+        relationshipSemantic !== baseProperties.detailedDescription),
   );
   usePreservedDraft(
     app?.workspaceId || "none",
     app?.applicationId || "none",
     `metadata-relationships:${mode}:${dimensionId || "none"}:${selectedHierarchy?.hierarchyId || hierarchySelection || "default"}`,
     "Unsaved hierarchy relationship changes",
-    mode !== "members" &&
-      Boolean(
-        relationshipId ||
-          placementDraftTouched ||
-          statusValid ||
-          renameValid ||
-          describeValid,
-      ),
+    mode !== "members" && Boolean(relationshipId || propertyDraft),
     {
       draftRevision,
-      placementDraftTouched,
+      propertyDraft,
       relationshipId,
       parentMemberId,
       childMemberId,
-      createReviewed,
+      placementAction,
+      sourceRelationshipId,
       selectedRelationshipId,
-      selectedStatus,
       statusReviewed,
-      relationshipName,
-      relationshipShort,
-      relationshipSemantic,
-      relationshipOperator,
       renameReviewed,
       describeReviewed,
-      buildReviewed,
       editorMode,
       internalSelectedMemberId,
     },
@@ -355,20 +613,17 @@ export function MetadataRelationships({
       setRelationshipId(draft.relationshipId);
       setParentMemberId(draft.parentMemberId);
       setChildMemberId(draft.childMemberId);
-      setCreateReviewed(false);
+      setPlacementAction(draft.placementAction || "create");
+      setSourceRelationshipId(draft.sourceRelationshipId || "");
+      setPatchPreview(null);
       setDraftRevision(draft.draftRevision);
-      placementDraftRef.current = draft.placementDraftTouched;
-      setPlacementDraftTouched(draft.placementDraftTouched);
+      propertyDraftRef.current = draft.propertyDraft;
+      setPropertyDraft(draft.propertyDraft);
       setSelectedRelationshipId(draft.selectedRelationshipId);
-      setSelectedStatus(draft.selectedStatus);
       setStatusReviewed(false);
-      setRelationshipName(draft.relationshipName);
-      setRelationshipShort(draft.relationshipShort);
-      setRelationshipSemantic(draft.relationshipSemantic);
-      setRelationshipOperator(draft.relationshipOperator);
       setRenameReviewed(false);
       setDescribeReviewed(false);
-      setBuildReviewed(false);
+      setReviewedBuild(null);
       setEditorMode(draft.editorMode);
       setInternalSelectedMemberId(draft.internalSelectedMemberId);
     },
@@ -378,20 +633,18 @@ export function MetadataRelationships({
     setRelationships([]);
     setRelationshipRevision(null);
     setRelationshipId("");
-    setPlacementDraftTouched(false);
+    setPropertyDraft(null);
     setParentMemberId("");
     setChildMemberId("");
-    setRelationshipName("");
-    setRelationshipShort("");
-    setRelationshipSemantic("");
-    setRelationshipOperator("");
+    setPlacementAction("create");
+    setSourceRelationshipId("");
+    setPatchPreview(null);
     setDraftRevision(metadataRevision);
     setSelectedRelationshipId("");
-    setCreateReviewed(false);
     setStatusReviewed(false);
     setRenameReviewed(false);
     setDescribeReviewed(false);
-    setBuildReviewed(false);
+    setReviewedBuild(null);
     setError("");
     setResult("");
     setInternalSelectedMemberId("");
@@ -411,23 +664,28 @@ export function MetadataRelationships({
     const next = selectedHierarchy?.hierarchyId;
     priorCanonicalHierarchy.current = next;
     if (previous && next && previous !== next) {
-      setPlacementDraftTouched(false);
+      setPropertyDraft(null);
       setRelationshipId("");
       setParentMemberId("");
       setChildMemberId("");
-      setRelationshipName("");
-      setRelationshipShort("");
-      setRelationshipSemantic("");
-      setRelationshipOperator("");
-      setCreateReviewed(false);
+      setPlacementAction("create");
+      setSourceRelationshipId("");
+      setPatchPreview(null);
       setRenameReviewed(false);
       setDescribeReviewed(false);
-      setBuildReviewed(false);
+      setReviewedBuild(null);
       setDraftRevision(metadataRevision);
     }
   }, [selectedHierarchy?.hierarchyId]);
 
   useEffect(() => {
+    // A visible placement can be chosen before this render's passive effects
+    // run. Do not replace that newer member/placement intent with a fallback.
+    if (
+      currentSelection.current.memberId !== effectiveSelectedMemberId ||
+      currentSelection.current.relationshipId !== selectedRelationshipId
+    )
+      return;
     const nextMemberId = members.some(
       (member) => member.member_id === effectiveSelectedMemberId,
     )
@@ -435,10 +693,16 @@ export function MetadataRelationships({
       : members[0]?.member_id || "";
     if (nextMemberId !== effectiveSelectedMemberId)
       selectMember(nextMemberId, undefined, false);
-  }, [members, effectiveSelectedMemberId]);
+  }, [members, effectiveSelectedMemberId, selectedRelationshipId]);
 
   useEffect(() => {
-    if (!effectiveSelectedMemberId) return;
+    if (
+      currentSelection.current.memberId !== effectiveSelectedMemberId ||
+      currentSelection.current.relationshipId !== selectedRelationshipId
+    )
+      return;
+    if (!effectiveSelectedMemberId || routedRelationshipId !== undefined)
+      return;
     const currentPlacement = relationships.find(
       (relationship) => relationship.relationship_id === selectedRelationshipId,
     );
@@ -448,26 +712,15 @@ export function MetadataRelationships({
         relationship.child_member_id === effectiveSelectedMemberId,
     );
     setSelectedRelationshipId(nextPlacement?.relationship_id || "");
-    setSelectedStatus(nextPlacement?.status || "Active");
     setStatusReviewed(false);
-  }, [effectiveSelectedMemberId, relationships, selectedRelationshipId]);
+  }, [
+    effectiveSelectedMemberId,
+    relationships,
+    selectedRelationshipId,
+    routedRelationshipId,
+  ]);
 
   useEffect(() => {
-    setRenameReviewed(false);
-    setDescribeReviewed(false);
-    if (placementDraftRef.current) return;
-    setRelationshipName(
-      selectedRelationship?.name || selectedRelationship?.relationship_id || "",
-    );
-    setRelationshipShort(selectedRelationship?.short_description || "");
-    setRelationshipOperator(
-      selectedRelationship?.aggregation_operator_override || "",
-    );
-    setRelationshipSemantic(
-      selectedRelationship?.semantic_description ||
-        selectedRelationship?.detailed_description ||
-        "",
-    );
     setRenameReviewed(false);
     setDescribeReviewed(false);
   }, [selectedRelationship?.relationship_id, relationshipRevision]);
@@ -501,34 +754,60 @@ export function MetadataRelationships({
     canReadHierarchies,
     hierarchySelection,
     hierarchyContext,
+    relationshipRefresh,
   ]);
 
   useEffect(() => {
-    setCreateReviewed(false);
     setStatusReviewed(false);
     setRenameReviewed(false);
     setDescribeReviewed(false);
-    setBuildReviewed(false);
-    if (!relationshipId && !placementDraftTouched)
-      setDraftRevision(metadataRevision);
+    setReviewedBuild(null);
+    if (!relationshipId && !propertyDraft) setDraftRevision(metadataRevision);
   }, [metadataRevision]);
 
   function invalidateCreate() {
-    setCreateReviewed(false);
+    setPatchPreview(null);
     setResult("");
   }
 
-  function prepareRelationship(parent: string, child: string) {
+  function prepareRelationship(
+    parent: string,
+    child: string,
+    action: PlacementDraftAction = "create",
+    sourceId = "",
+  ) {
     if (!parent || !child || parent === child) return;
     setParentMemberId(parent);
     setChildMemberId(child);
-    if (!relationshipId) setRelationshipId(`${parent}-${child}`);
+    setPlacementAction(action);
+    setSourceRelationshipId(action === "create" ? "" : sourceId);
+    setRelationshipId(newHiddenRelationshipId());
     invalidateCreate();
+  }
+
+  function placementLabel(relationship: MetadataRelationship) {
+    const parent = members.find(
+      (member) => member.member_id === relationship.parent_member_id,
+    );
+    const child = members.find(
+      (member) => member.member_id === relationship.child_member_id,
+    );
+    return `${child?.name || relationship.child_member_id} under ${parent?.name || relationship.parent_member_id}`;
+  }
+
+  function patchChanges(): HierarchyPatchChange[] {
+    return placementPatchChanges({
+      action: placementAction,
+      relationshipId,
+      sourceRelationshipId,
+      parentMemberId,
+      childMemberId,
+    });
   }
 
   function selectMember(
     memberId: string,
-    relationship?: Relationship,
+    relationship?: MetadataRelationship,
     notify = true,
   ) {
     const placementId = relationship?.relationship_id || "";
@@ -538,12 +817,11 @@ export function MetadataRelationships({
         memberId,
         relationshipId: placementId,
       };
-      if (placementId !== selectedRelationshipId)
-        setPlacementDraftTouched(false);
+      if (placementId !== selectedRelationshipId) setPropertyDraft(null);
       if (selectedMemberId === undefined) setInternalSelectedMemberId(memberId);
-      if (notify) onSelectedMemberIdChange?.(memberId);
+      if (notify)
+        onSelectedMemberIdChange?.(memberId, placementId || undefined);
       setSelectedRelationshipId(placementId);
-      if (relationship) setSelectedStatus(relationship.status);
       setStatusReviewed(false);
       setRenameReviewed(false);
       setDescribeReviewed(false);
@@ -572,7 +850,7 @@ export function MetadataRelationships({
   function hierarchyNode(
     memberId: string,
     ancestry: Set<string>,
-    placement?: Relationship,
+    placement?: MetadataRelationship,
   ): ReactNode {
     const member = activeMembers.find((item) => item.member_id === memberId);
     if (!member || ancestry.has(memberId)) return null;
@@ -610,13 +888,32 @@ export function MetadataRelationships({
                 : ""
             }`}
             draggable
-            onDragStart={() => setDraggedMemberId(memberId)}
-            onDragEnd={() => setDraggedMemberId("")}
+            onDragStart={() =>
+              setDraggedPlacement({
+                memberId,
+                ...(placement
+                  ? { relationshipId: placement.relationship_id }
+                  : {}),
+              })
+            }
+            onDragEnd={() => setDraggedPlacement(null)}
             onDragOver={(event) => event.preventDefault()}
             onDrop={(event) => {
               event.preventDefault();
-              prepareRelationship(memberId, draggedMemberId);
-              setDraggedMemberId("");
+              if (!draggedPlacement) return;
+              const source = draggedPlacement.relationshipId
+                ? relationships.find(
+                    (item) =>
+                      item.relationship_id === draggedPlacement.relationshipId,
+                  )
+                : undefined;
+              prepareRelationship(
+                memberId,
+                draggedPlacement.memberId,
+                source ? "move" : "create",
+                source?.relationship_id,
+              );
+              setDraggedPlacement(null);
             }}
             onClick={() => selectMember(memberId, placement)}
             onKeyDown={(event) => {
@@ -635,7 +932,7 @@ export function MetadataRelationships({
                 });
               }
             }}
-            aria-label={`Select ${member.name} in hierarchy`}
+            aria-label={`Select ${member.name} in hierarchy${placement ? ` under ${members.find((item) => item.member_id === placement.parent_member_id)?.name || placement.parent_member_id}` : ""}`}
           >
             <strong>{member.name}</strong>
             <small>{member.member_id}</small>
@@ -755,19 +1052,37 @@ export function MetadataRelationships({
             relationship.relationship_id === latestSelection.relationshipId &&
             relationship.child_member_id === selectedMemberAfterRead,
         ) ||
-        found.find(
-          (relationship) =>
-            relationship.child_member_id === selectedMemberAfterRead,
-        );
-      if (!placementDraftRef.current)
+        (!latestSelection.explicitPlacement
+          ? found.find(
+              (relationship) =>
+                relationship.child_member_id === selectedMemberAfterRead,
+            )
+          : undefined);
+      if (!propertyDraftRef.current)
         selectMember(selectedMemberAfterRead, selectedPlacement, false);
-      setCreateReviewed(false);
       setStatusReviewed(false);
       setRenameReviewed(false);
       setDescribeReviewed(false);
-      setBuildReviewed(false);
+      setReviewedBuild(null);
     } catch (reason) {
       if (generation !== readGeneration.current) return;
+      if (
+        reason instanceof ApiError &&
+        (reason.kind === "authorization" ||
+          [
+            "METADATA_DIRECTORY_READ_AUTHORIZATION_STALE",
+            "METADATA_DIRECTORY_CURSOR_REQUIRED",
+            "METADATA_DIRECTORY_CURSOR_STALE",
+            "UNKNOWN_OR_AMBIGUOUS_DIMENSION",
+            "HIERARCHY_UNAVAILABLE",
+          ].includes(reason.code))
+      ) {
+        setLoadedContext("");
+        setHierarchyCatalogue(null);
+        setHierarchyMembers([]);
+        setRelationships([]);
+        setRelationshipRevision(null);
+      }
       setError(
         reason instanceof Error
           ? reason.message
@@ -778,53 +1093,202 @@ export function MetadataRelationships({
     }
   }
 
-  async function execute(
-    functionName: string,
-    args: Record<string, unknown>,
+  async function executePropertyChange(
+    functionName: RelationshipEdit,
     confirmation: string,
   ) {
-    if (!app || !snapshotCurrent || !window.confirm(confirmation)) return;
+    const actorId = catalog?.applicationAccess.subjectId;
+    if (
+      !app ||
+      !actorId ||
+      !selectedRelationship ||
+      metadataRevision === null ||
+      busy ||
+      changeBlocked ||
+      !snapshotCurrent ||
+      !window.confirm(confirmation)
+    )
+      return;
+    const fields = Object.fromEntries(
+      relationshipEditFields[functionName].map((field) => [
+        field,
+        propertyValues[field],
+      ]),
+    ) as Partial<RelationshipProperties>;
+    const args = {
+      ...fields,
+      relationshipId: selectedRelationship.relationship_id,
+      expectedMetadataRevision: metadataRevision,
+      ...(functionName === "metadata.relationship.aggregation-operator.set"
+        ? {
+            aggregationOperatorOverride:
+              fields.aggregationOperatorOverride || null,
+          }
+        : {}),
+    };
+    setError("");
+    setResult("");
+    setStatusReviewed(false);
+    setRenameReviewed(false);
+    setDescribeReviewed(false);
+    setReviewedBuild(null);
+    await propertyRecovery.submit(
+      metadataActionBody(
+        app,
+        functionName,
+        args,
+        mutationIntentKey({
+          workspaceId: app.workspaceId,
+          applicationId: app.applicationId,
+          functionName,
+          args,
+        }),
+      ),
+      {
+        actorId,
+        metadataRevision,
+        relationshipId: selectedRelationship.relationship_id,
+        fields,
+      },
+    );
+  }
+
+  async function buildHierarchy() {
+    const actorId = catalog?.applicationAccess.subjectId;
+    const stateToken = selectedHierarchy?.stateToken ?? null;
+    if (
+      !app ||
+      !actorId ||
+      metadataRevision === null ||
+      busy ||
+      changeBlocked ||
+      !snapshotCurrent ||
+      !buildReviewed ||
+      !window.confirm(`Build the reviewed ${dimensionId} hierarchy?`)
+    )
+      return;
+    const args = {
+      dimensionId,
+      ...(selectedHierarchy
+        ? { hierarchyId: selectedHierarchy.hierarchyId }
+        : {}),
+      expectedMetadataRevision: metadataRevision,
+      ...(stateToken !== null ? { expectedStateToken: stateToken } : {}),
+    };
+    setReviewedBuild(null);
+    setError("");
+    setResult("");
+    await buildRecovery.submit(
+      metadataActionBody(
+        app,
+        hierarchyBuild,
+        args,
+        mutationIntentKey({
+          workspaceId: app.workspaceId,
+          applicationId: app.applicationId,
+          functionName: hierarchyBuild,
+          args,
+        }),
+      ),
+      {
+        actorId,
+        metadataRevision,
+        hierarchyId: selectedHierarchy?.hierarchyId,
+        stateToken,
+      },
+    );
+  }
+
+  async function previewPlacementChangeset() {
+    if (
+      !app ||
+      busy ||
+      changeBlocked ||
+      !hierarchyPatchValid ||
+      metadataRevision === null ||
+      !selectedHierarchy?.stateToken
+    )
+      return;
+    const args: HierarchyPatchArguments = {
+      dimensionId,
+      hierarchyId: selectedHierarchy.hierarchyId,
+      changes: patchChanges(),
+      expectedMetadataRevision: metadataRevision,
+      expectedHierarchyStateToken: selectedHierarchy.stateToken,
+    };
     setBusy(true);
     setError("");
     setResult("");
     try {
-      await requestAdmittedEffect<{
-        receiptId?: string;
-        result?: { receiptId?: string; operationId?: string };
-      }>(
-        "/api/metadata-action",
-        metadataActionBody(
-          app,
-          functionName,
-          args,
-          mutationIntentKey({
-            workspaceId: app.workspaceId,
-            applicationId: app.applicationId,
-            functionName,
-            args,
-          }),
-        ),
+      const preview = await readProgram<HierarchyPatchPreview>(
+        {
+          workspaceId: app.workspaceId,
+          applicationId: app.applicationId,
+        },
+        "metadata.hierarchy.relationships.preview",
+        args,
       );
-      setResult("The reviewed relationship change was applied.");
-      setCreateReviewed(false);
-      setPlacementDraftTouched(false);
-      if (functionName === "metadata.relationship.create")
-        setRelationshipId("");
-      setStatusReviewed(false);
-      setBuildReviewed(false);
-      // Revoke the old snapshot before refreshing. A completed refresh must not
-      // be cleared by this operation returning after its replacement read.
-      setRelationshipRevision(null);
-      await onChanged();
+      setPatchPreview({ arguments: args, result: preview });
     } catch (reason) {
+      setPatchPreview(null);
       setError(
         reason instanceof Error
           ? reason.message
-          : "Unable to apply metadata change",
+          : "Unable to preview the hierarchy placement changeset.",
       );
     } finally {
       setBusy(false);
     }
+  }
+
+  async function applyPlacementChangeset() {
+    const actorId = catalog?.applicationAccess.subjectId;
+    if (
+      !app ||
+      !actorId ||
+      !patchPreview ||
+      !snapshotCurrent ||
+      busy ||
+      changeBlocked
+    )
+      return;
+    const args = {
+      ...patchPreview.arguments,
+      previewToken: patchPreview.result.previewToken,
+    };
+    const parentName =
+      members.find((member) => member.member_id === parentMemberId)?.name ||
+      parentMemberId;
+    const childName =
+      members.find((member) => member.member_id === childMemberId)?.name ||
+      childMemberId;
+    if (
+      !window.confirm(
+        `${placementAction === "move" ? "Move" : placementAction === "copy" ? "Copy" : "Create"} the reviewed placement ${childName} under ${parentName}?`,
+      )
+    )
+      return;
+    setError("");
+    setResult("");
+    await placementRecovery.submit(
+      metadataActionBody(
+        app,
+        placementApply,
+        args,
+        mutationIntentKey({
+          workspaceId: app.workspaceId,
+          applicationId: app.applicationId,
+          functionName: placementApply,
+          args,
+        }),
+      ),
+      {
+        action: placementAction,
+        actorId,
+        preview: patchPreview.result,
+        metadataRevision: args.expectedMetadataRevision,
+      },
+    );
   }
 
   if (!canRead) return null;
@@ -866,11 +1330,14 @@ export function MetadataRelationships({
           <h3 id="metadata-relationships-heading">
             {mode === "relationships"
               ? "Hierarchy placements"
-              : "Relationships"}
+              : mode === "tree"
+                ? "Hierarchy tree"
+                : "Relationships"}
           </h3>
           <p>
-            Read current parent-child placements before proposing a reviewed
-            relationship or rebuilding the server-owned closure.
+            Edit parent-child placements in the grid or tree. Both views share
+            one reviewed draft and the fixed core publishes the hierarchy
+            atomically.
           </p>
         </div>
         <span className="automatic-read-status">
@@ -882,6 +1349,40 @@ export function MetadataRelationships({
           {error}
         </div>
       )}
+      <MetadataReceiptRecovery
+        object="placement"
+        recovery={placementRecovery}
+        onClose={() => {
+          if (placementRecovery.closeRecovery()) {
+            setPatchPreview(null);
+            void readRelationships();
+          }
+        }}
+      />
+      <MetadataReceiptRecovery
+        object="relationship"
+        recovery={propertyRecovery}
+        onClose={() => {
+          if (propertyRecovery.closeRecovery()) {
+            setRelationshipRevision(null);
+            void refreshRelationshipWorkspace().catch(() =>
+              setError(
+                "Refresh the model before reviewing another relationship change.",
+              ),
+            );
+          }
+        }}
+      />
+      <MetadataReceiptRecovery
+        object="hierarchy build"
+        recovery={buildRecovery}
+        onClose={() => {
+          if (buildRecovery.closeRecovery())
+            refreshAfterCommit(
+              "Refresh the model before reviewing another hierarchy build.",
+            );
+        }}
+      />
       {relationshipRevision !== null && (
         <p role="status">
           {relationships.length} current relationships
@@ -898,11 +1399,10 @@ export function MetadataRelationships({
             type="button"
             onClick={() => {
               setDraftRevision(metadataRevision);
-              setCreateReviewed(false);
               setStatusReviewed(false);
               setRenameReviewed(false);
               setDescribeReviewed(false);
-              setBuildReviewed(false);
+              setReviewedBuild(null);
             }}
           >
             Review against current metadata
@@ -940,7 +1440,7 @@ export function MetadataRelationships({
               )}
               {hierarchies.map((row) => (
                 <option key={row.hierarchyId} value={row.hierarchyId}>
-                  {row.name} · {row.hierarchyId}
+                  {row.name}
                   {row.status === "Inactive" ? " (inactive)" : ""}
                 </option>
               ))}
@@ -968,31 +1468,33 @@ export function MetadataRelationships({
             hierarchies={hierarchies}
             members={members}
             memberships={visibleHierarchyMembers}
-            current={snapshotCurrent}
-            onChanged={onChanged}
+            current={snapshotCurrent && !changeBlocked}
+            onChanged={refreshRelationshipWorkspace}
           />
         </>
       )}
-      <div
-        className="metadata-editor-tabs"
-        role="group"
-        aria-label="Relationship editor mode"
-      >
-        <button
-          className={editorMode === "grid" ? "active" : ""}
-          aria-pressed={editorMode === "grid"}
-          onClick={() => setEditorMode("grid")}
+      {showViewToggle && (mode === "all" || mode === "relationships") && (
+        <div
+          className="metadata-editor-tabs"
+          role="group"
+          aria-label="Relationship editor mode"
         >
-          List View
-        </button>
-        <button
-          className={editorMode === "board" ? "active" : ""}
-          aria-pressed={editorMode === "board"}
-          onClick={() => setEditorMode("board")}
-        >
-          Tree View
-        </button>
-      </div>
+          <button
+            className={editorMode === "grid" ? "active" : ""}
+            aria-pressed={editorMode === "grid"}
+            onClick={() => setEditorMode("grid")}
+          >
+            List View
+          </button>
+          <button
+            className={editorMode === "board" ? "active" : ""}
+            aria-pressed={editorMode === "board"}
+            onClick={() => setEditorMode("board")}
+          >
+            Tree View
+          </button>
+        </div>
+      )}
       {editorMode === "grid" && members.length > 0 && (
         <MetadataMemberGrid
           app={app}
@@ -1006,14 +1508,16 @@ export function MetadataRelationships({
           onChanged={onChanged}
           onEditSecurityString={onEditMemberSecurityString}
           securityBusy={securityBusy}
-          mode={mode}
+          creationDisabled={creationDisabled}
+          mode={mode === "tree" ? "relationships" : mode}
         />
       )}
       {editorMode === "board" && (
         <div className="hierarchy-board" aria-label="Metadata Tree View">
           <p>
-            Drag a member onto a tree node to prepare it as that node’s child.
-            Nothing is saved until the exact relationship draft is reviewed.
+            Drag an unplaced member onto a parent to create a placement. Drag an
+            existing placement onto another parent to prepare an atomic move.
+            Nothing is saved until the exact changeset is previewed and applied.
           </p>
           <div className="metadata-tree-workspace">
             <div>
@@ -1034,8 +1538,10 @@ export function MetadataRelationships({
                     key={member.member_id}
                     className="hierarchy-member-card"
                     draggable
-                    onDragStart={() => setDraggedMemberId(member.member_id)}
-                    onDragEnd={() => setDraggedMemberId("")}
+                    onDragStart={() =>
+                      setDraggedPlacement({ memberId: member.member_id })
+                    }
+                    onDragEnd={() => setDraggedPlacement(null)}
                     onClick={() => selectMember(member.member_id)}
                   >
                     <strong>{member.name}</strong>
@@ -1046,10 +1552,34 @@ export function MetadataRelationships({
             </div>
           </div>
           <p className="hierarchy-draft" role="status">
-            Draft: {parentMemberId || "parent"} → {childMemberId || "child"}
+            Draft:{" "}
+            {placementAction === "move"
+              ? "Move"
+              : placementAction === "copy"
+                ? "Copy"
+                : "Create"}{" "}
+            {members.find((member) => member.member_id === childMemberId)
+              ?.name ||
+              childMemberId ||
+              "child"}{" "}
+            under{" "}
+            {members.find((member) => member.member_id === parentMemberId)
+              ?.name ||
+              parentMemberId ||
+              "parent"}
           </p>
         </div>
       )}
+      {routedRelationshipId !== undefined &&
+        !selectedRelationship &&
+        loadedContext === relationshipContext &&
+        relationshipRevision !== null &&
+        !busy && (
+          <p role="status">
+            The selected placement is unavailable for this member and hierarchy.
+            Choose a current placement.
+          </p>
+        )}
       {selectedMember && (
         <aside
           className="metadata-property-pane"
@@ -1077,17 +1607,29 @@ export function MetadataRelationships({
             <small>PLACEMENT PROPERTIES</small>
             {selectedRelationship ? (
               <>
-                <h4>{selectedRelationship.relationship_id}</h4>
+                <h4>{placementLabel(selectedRelationship)}</h4>
                 <dl>
                   <dt>Name</dt>
                   <dd>
                     {selectedRelationship.name ||
-                      selectedRelationship.relationship_id}
+                      placementLabel(selectedRelationship)}
                   </dd>
                   <dt>Parent</dt>
-                  <dd>{selectedRelationship.parent_member_id}</dd>
+                  <dd>
+                    {members.find(
+                      (member) =>
+                        member.member_id ===
+                        selectedRelationship.parent_member_id,
+                    )?.name || selectedRelationship.parent_member_id}
+                  </dd>
                   <dt>Child</dt>
-                  <dd>{selectedRelationship.child_member_id}</dd>
+                  <dd>
+                    {members.find(
+                      (member) =>
+                        member.member_id ===
+                        selectedRelationship.child_member_id,
+                    )?.name || selectedRelationship.child_member_id}
+                  </dd>
                   <dt>Status</dt>
                   <dd>{selectedRelationship.status}</dd>
                   <dt>Hierarchy</dt>
@@ -1100,12 +1642,57 @@ export function MetadataRelationships({
                   <dt>Short description</dt>
                   <dd>{selectedRelationship.short_description || "—"}</dd>
                   <dt>Semantic description</dt>
-                  <dd>
-                    {selectedRelationship.semantic_description ||
-                      selectedRelationship.detailed_description ||
-                      "—"}
-                  </dd>
+                  <dd>{baseProperties.detailedDescription || "—"}</dd>
+                  {selectedRelationship.semantic_description &&
+                    selectedRelationship.semantic_description !==
+                      baseProperties.detailedDescription && (
+                      <>
+                        <dt>Legacy semantic description</dt>
+                        <dd>{selectedRelationship.semantic_description}</dd>
+                      </>
+                    )}
                 </dl>
+                {canPatchRelationships &&
+                  selectedRelationship.status === "Active" && (
+                    <div className="reviewed-inline-action">
+                      <button
+                        type="button"
+                        disabled={busy || changeBlocked}
+                        onClick={() => {
+                          setPlacementAction("move");
+                          setSourceRelationshipId(
+                            selectedRelationship.relationship_id,
+                          );
+                          setChildMemberId(
+                            selectedRelationship.child_member_id,
+                          );
+                          setRelationshipId("");
+                          setPatchPreview(null);
+                          setRelationshipMemberChooser("parent");
+                        }}
+                      >
+                        Move placement…
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy || changeBlocked}
+                        onClick={() => {
+                          setPlacementAction("copy");
+                          setSourceRelationshipId(
+                            selectedRelationship.relationship_id,
+                          );
+                          setChildMemberId(
+                            selectedRelationship.child_member_id,
+                          );
+                          setRelationshipId("");
+                          setPatchPreview(null);
+                          setRelationshipMemberChooser("parent");
+                        }}
+                      >
+                        Copy placement…
+                      </button>
+                    </div>
+                  )}
               </>
             ) : (
               <p>This member has no selected parent-child placement.</p>
@@ -1114,7 +1701,10 @@ export function MetadataRelationships({
         </aside>
       )}
       {selectedRelationship && (canRename || canDescribe || canSetOperator) && (
-        <fieldset className="metadata-placement-editor">
+        <fieldset
+          className="metadata-placement-editor"
+          disabled={changeBlocked}
+        >
           <legend>Selected placement editor</legend>
           {canSetOperator && (
             <div className="maintenance-action">
@@ -1123,8 +1713,10 @@ export function MetadataRelationships({
                 <select
                   value={relationshipOperator}
                   onChange={(event) => {
-                    setPlacementDraftTouched(true);
-                    setRelationshipOperator(event.target.value);
+                    editProperty(
+                      "aggregationOperatorOverride",
+                      event.target.value,
+                    );
                   }}
                 >
                   <option value="">Inherit member operator</option>
@@ -1144,19 +1736,15 @@ export function MetadataRelationships({
               <button
                 disabled={
                   busy ||
+                  changeBlocked ||
                   !snapshotCurrent ||
                   relationshipOperator ===
                     (selectedRelationship.aggregation_operator_override || "")
                 }
                 onClick={() =>
-                  void execute(
+                  void executePropertyChange(
                     "metadata.relationship.aggregation-operator.set",
-                    {
-                      relationshipId: selectedRelationship.relationship_id,
-                      aggregationOperatorOverride: relationshipOperator || null,
-                      expectedMetadataRevision: metadataRevision,
-                    },
-                    `Save aggregation operator for placement ${selectedRelationship.relationship_id}?`,
+                    `Save the aggregation operator for ${placementLabel(selectedRelationship)}?`,
                   )
                 }
               >
@@ -1173,8 +1761,7 @@ export function MetadataRelationships({
                   value={relationshipName}
                   maxLength={200}
                   onChange={(event) => {
-                    setPlacementDraftTouched(true);
-                    setRelationshipName(event.target.value);
+                    editProperty("name", event.target.value);
                     setRenameReviewed(false);
                     setResult("");
                   }}
@@ -1194,16 +1781,13 @@ export function MetadataRelationships({
                   model.
                 </label>
                 <button
-                  disabled={busy || !renameReviewed || !renameValid}
+                  disabled={
+                    busy || changeBlocked || !renameReviewed || !renameValid
+                  }
                   onClick={() =>
-                    void execute(
+                    void executePropertyChange(
                       "metadata.relationship.rename",
-                      {
-                        relationshipId: selectedRelationship.relationship_id,
-                        name: relationshipName,
-                        expectedMetadataRevision: metadataRevision,
-                      },
-                      `Rename relationship ${selectedRelationship.relationship_id} to ${relationshipName}?`,
+                      `Rename ${placementLabel(selectedRelationship)} to ${relationshipName}?`,
                     )
                   }
                 >
@@ -1220,8 +1804,7 @@ export function MetadataRelationships({
                   value={relationshipShort}
                   maxLength={500}
                   onChange={(event) => {
-                    setPlacementDraftTouched(true);
-                    setRelationshipShort(event.target.value);
+                    editProperty("shortDescription", event.target.value);
                     setDescribeReviewed(false);
                     setResult("");
                   }}
@@ -1233,8 +1816,7 @@ export function MetadataRelationships({
                   value={relationshipSemantic}
                   maxLength={10000}
                   onChange={(event) => {
-                    setPlacementDraftTouched(true);
-                    setRelationshipSemantic(event.target.value);
+                    editProperty("detailedDescription", event.target.value);
                     setDescribeReviewed(false);
                     setResult("");
                   }}
@@ -1254,17 +1836,13 @@ export function MetadataRelationships({
                   current model.
                 </label>
                 <button
-                  disabled={busy || !describeReviewed || !describeValid}
+                  disabled={
+                    busy || changeBlocked || !describeReviewed || !describeValid
+                  }
                   onClick={() =>
-                    void execute(
+                    void executePropertyChange(
                       "metadata.relationship.describe",
-                      {
-                        relationshipId: selectedRelationship.relationship_id,
-                        shortDescription: relationshipShort,
-                        detailedDescription: relationshipSemantic,
-                        expectedMetadataRevision: metadataRevision,
-                      },
-                      `Save reviewed descriptions for ${selectedRelationship.relationship_id}?`,
+                      `Save reviewed descriptions for ${placementLabel(selectedRelationship)}?`,
                     )
                   }
                 >
@@ -1275,118 +1853,191 @@ export function MetadataRelationships({
           )}
         </fieldset>
       )}
-      {canCreate && hierarchyActive && (
-        <fieldset>
-          <legend>New relationship · inline editor</legend>
+      {canPatchRelationships && hierarchyActive && (
+        <fieldset
+          className="metadata-placement-changeset"
+          disabled={changeBlocked}
+        >
+          <legend>Placement changeset</legend>
           <div className="react-grid-scroll">
             <table className="react-cube-grid metadata-inline-grid">
               <thead>
                 <tr>
-                  <th>Stable ID</th>
+                  <th>Change</th>
                   <th>Parent member</th>
                   <th>Child member</th>
-                  <th>Reviewed</th>
-                  <th>Action</th>
+                  <th>Review</th>
                 </tr>
               </thead>
               <tbody>
                 <tr>
                   <td>
-                    <input
-                      aria-label="Stable ID"
-                      value={relationshipId}
-                      maxLength={200}
-                      onChange={(event) => {
-                        setRelationshipId(event.target.value);
-                        invalidateCreate();
-                      }}
-                    />
-                  </td>
-                  <td>
-                    <select
-                      aria-label="Parent member"
-                      value={parentMemberId}
-                      onChange={(event) => {
-                        setParentMemberId(event.target.value);
-                        invalidateCreate();
-                      }}
-                    >
-                      {activeMembers.map((member) => (
-                        <option key={member.member_id} value={member.member_id}>
-                          {member.name}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-                  <td>
-                    <select
-                      aria-label="Child member"
-                      value={childMemberId}
-                      onChange={(event) => {
-                        setChildMemberId(event.target.value);
-                        invalidateCreate();
-                      }}
-                    >
-                      {activeMembers.map((member) => (
-                        <option key={member.member_id} value={member.member_id}>
-                          {member.name}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-                  <td>
-                    <label className="review-check compact-review">
-                      <input
-                        type="checkbox"
-                        checked={createReviewed}
-                        disabled={!createValid}
-                        onChange={(event) =>
-                          setCreateReviewed(event.target.checked)
-                        }
-                      />
-                      <span>
-                        I reviewed this exact parent-child relationship against
-                        the current model.
-                      </span>
-                    </label>
+                    {placementAction === "move"
+                      ? "Move placement"
+                      : placementAction === "copy"
+                        ? "Copy placement"
+                        : "Create placement"}
                   </td>
                   <td>
                     <button
-                      disabled={busy || !createReviewed || !createValid}
-                      onClick={() =>
-                        void execute(
-                          "metadata.relationship.create",
-                          {
-                            dimensionId,
-                            ...(selectedHierarchy
-                              ? { hierarchyId: selectedHierarchy.hierarchyId }
-                              : {}),
-                            relationshipId,
-                            parentMemberId,
-                            childMemberId,
-                            expectedMetadataRevision: metadataRevision,
-                          },
-                          `Create reviewed relationship ${relationshipId}?`,
-                        )
-                      }
+                      type="button"
+                      className="metadata-member-picker"
+                      aria-label="Parent member"
+                      disabled={!app || !catalog || metadataRevision === null}
+                      onClick={() => setRelationshipMemberChooser("parent")}
                     >
-                      Create relationship
+                      {activeMembers.find(
+                        (member) => member.member_id === parentMemberId,
+                      )?.name || "Choose parent"}
+                      <span aria-hidden="true">▾</span>
+                    </button>
+                  </td>
+                  <td>
+                    <button
+                      type="button"
+                      className="metadata-member-picker"
+                      aria-label="Child member"
+                      disabled={
+                        !app ||
+                        !catalog ||
+                        metadataRevision === null ||
+                        placementAction !== "create"
+                      }
+                      onClick={() => setRelationshipMemberChooser("child")}
+                    >
+                      {activeMembers.find(
+                        (member) => member.member_id === childMemberId,
+                      )?.name || "Choose child"}
+                      <span aria-hidden="true">▾</span>
+                    </button>
+                  </td>
+                  <td>
+                    <button
+                      type="button"
+                      disabled={busy || !hierarchyPatchValid}
+                      onClick={() => void previewPlacementChangeset()}
+                    >
+                      Preview exact changes
                     </button>
                   </td>
                 </tr>
               </tbody>
             </table>
           </div>
+          {patchPreview && !placementRecovery.pending && (
+            <div className="metadata-changeset-review" role="status">
+              <h4>Exact server preview</h4>
+              <table className="react-cube-grid">
+                <thead>
+                  <tr>
+                    <th>Before</th>
+                    <th>After</th>
+                    <th>Effect</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>
+                      {sourceRelationship
+                        ? `${placementLabel(sourceRelationship)}${placementAction === "copy" ? " (retained)" : ""}`
+                        : "No placement"}
+                    </td>
+                    <td>
+                      {members.find(
+                        (member) => member.member_id === childMemberId,
+                      )?.name || childMemberId}{" "}
+                      under{" "}
+                      {members.find(
+                        (member) => member.member_id === parentMemberId,
+                      )?.name || parentMemberId}
+                    </td>
+                    <td>
+                      {patchPreview.result.edgeCount} active placements ·{" "}
+                      {patchPreview.result.affectedPathCount} affected hierarchy
+                      paths
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <button
+                type="button"
+                className="primary"
+                disabled={
+                  busy ||
+                  !snapshotCurrent ||
+                  !catalog?.applicationAccess.subjectId
+                }
+                onClick={() => void applyPlacementChangeset()}
+              >
+                Apply reviewed changeset
+              </button>
+            </div>
+          )}
         </fieldset>
       )}
+      {relationshipMemberChooser &&
+        app &&
+        catalog &&
+        metadataRevision !== null && (
+          <MemberSelectionDialog
+            app={app}
+            catalog={catalog}
+            request={{
+              dimensionId,
+              dimensionName: dimensionId,
+              metadataRevision,
+              hierarchyId: selectedHierarchy?.hierarchyId,
+              cardinality: { kind: "exactly-one" },
+              capability: {
+                allowExplicitMembers: true,
+                allowHierarchySelector: false,
+                allowNamedMemberList: false,
+                allowAttributeSelector: false,
+                allowInlineExpression: false,
+                allowExclusion: false,
+                orderMatters: false,
+              },
+              initial: (
+                relationshipMemberChooser === "parent"
+                  ? parentMemberId
+                  : childMemberId
+              )
+                ? {
+                    kind: "member",
+                    memberId:
+                      relationshipMemberChooser === "parent"
+                        ? parentMemberId
+                        : childMemberId,
+                  }
+                : null,
+            }}
+            members={activeMembers}
+            onCancel={() => {
+              if (!relationshipId) {
+                setPlacementAction("create");
+                setSourceRelationshipId("");
+              }
+              setRelationshipMemberChooser(null);
+            }}
+            onApply={(result) => {
+              if (result.include.kind !== "member") return;
+              if (!relationshipId) setRelationshipId(newHiddenRelationshipId());
+              if (relationshipMemberChooser === "parent")
+                setParentMemberId(result.include.memberId);
+              else setChildMemberId(result.include.memberId);
+              invalidateCreate();
+              setRelationshipMemberChooser(null);
+            }}
+          />
+        )}
       {canSetStatus && relationships.length > 0 && (
-        <fieldset>
+        <fieldset disabled={changeBlocked}>
           <legend>Relationship status</legend>
           <div className="metadata-create-fields">
             <label>
               Relationship
               <select
-                value={selectedRelationshipId}
+                value={selectedRelationship?.relationship_id || ""}
                 onChange={(event) => {
                   const selected = relationships.find(
                     (item) => item.relationship_id === event.target.value,
@@ -1395,12 +2046,19 @@ export function MetadataRelationships({
                     selectMember(selected.child_member_id, selected);
                 }}
               >
+                {!selectedRelationship && (
+                  <option value="">
+                    {routedRelationshipId !== undefined
+                      ? "Unavailable placement"
+                      : "Choose a placement"}
+                  </option>
+                )}
                 {relationships.map((relationship) => (
                   <option
                     key={relationship.relationship_id}
                     value={relationship.relationship_id}
                   >
-                    {relationship.relationship_id}
+                    {placementLabel(relationship)}
                   </option>
                 ))}
               </select>
@@ -1410,8 +2068,8 @@ export function MetadataRelationships({
               <select
                 value={selectedStatus}
                 onChange={(event) => {
-                  setPlacementDraftTouched(true);
-                  setSelectedStatus(
+                  editProperty(
+                    "status",
                     event.target.value as "Active" | "Inactive",
                   );
                   setStatusReviewed(false);
@@ -1434,16 +2092,13 @@ export function MetadataRelationships({
               model.
             </label>
             <button
-              disabled={busy || !statusReviewed || !statusValid}
+              disabled={
+                busy || changeBlocked || !statusReviewed || !statusValid
+              }
               onClick={() =>
-                void execute(
+                void executePropertyChange(
                   "metadata.relationship.status.set",
-                  {
-                    relationshipId: selectedRelationshipId,
-                    status: selectedStatus,
-                    expectedMetadataRevision: metadataRevision,
-                  },
-                  `Set ${selectedRelationshipId} to ${selectedStatus}?`,
+                  `Set ${selectedRelationship ? placementLabel(selectedRelationship) : "this placement"} to ${selectedStatus}?`,
                 )
               }
             >
@@ -1458,10 +2113,7 @@ export function MetadataRelationships({
         catalog={catalog}
         targetKind="Relationship"
         targetId={selectedRelationshipId}
-        onChanged={async () => {
-          await onChanged();
-          await readRelationships();
-        }}
+        onChanged={refreshRelationshipWorkspace}
       />
       {canBuild && hierarchyActive && relationshipRevision !== null && (
         <div className="reviewed-inline-action">
@@ -1469,33 +2121,29 @@ export function MetadataRelationships({
             <input
               type="checkbox"
               checked={buildReviewed}
-              disabled={!snapshotCurrent}
-              onChange={(event) => setBuildReviewed(event.target.checked)}
+              disabled={!snapshotCurrent || changeBlocked}
+              onChange={(event) =>
+                setReviewedBuild(event.target.checked ? buildPin : null)
+              }
             />
             I reviewed this dimension and relationship snapshot for hierarchy
             build.
           </label>
           <button
-            disabled={busy || !buildReviewed || !snapshotCurrent}
-            onClick={() =>
-              void execute(
-                "metadata.hierarchy.build",
-                {
-                  dimensionId,
-                  ...(selectedHierarchy
-                    ? { hierarchyId: selectedHierarchy.hierarchyId }
-                    : {}),
-                  expectedMetadataRevision: metadataRevision,
-                },
-                `Build the reviewed ${dimensionId} hierarchy?`,
-              )
+            disabled={
+              busy || changeBlocked || !buildReviewed || !snapshotCurrent
             }
+            onClick={() => void buildHierarchy()}
           >
             Build hierarchy
           </button>
         </div>
       )}
-      {result && <p role="status">{result}</p>}
+      {result && (
+        <p role="status" tabIndex={-1} ref={resultStatus}>
+          {result}
+        </p>
+      )}
       <p className="authority-note">
         Cycle checks, dependency guards, closure construction and publication
         remain fixed-core responsibilities.

@@ -28,6 +28,50 @@ MAX_REASSIGNMENTS=20
 _ID=re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,299}\Z")
 
 
+def assignment_identifier_schema() -> dict:
+    return {"type": "string", "pattern": "^" + _ID.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}
+
+
+def assignment_definition_schema() -> dict:
+    """Structural form for the definition consumed and stored by this compiler."""
+    from .postgres_numeric_catalog import obj
+
+    def identifiers(maximum, *, minimum=0):
+        return {"type": "array", "minItems": minimum, "maxItems": maximum,
+                "uniqueItems": True, "items": identifier}
+
+    identifier = assignment_identifier_schema()
+    name = {"type": "string", "minLength": 1, "maxLength": 200}
+    instant = {"type": "string", "minLength": 1, "description": "ISO 8601 date and time with a UTC offset."}
+    optional_instant = {"anyOf": [instant, {"type": "null"}]}
+    reassignments = {"type": "integer", "minimum": 0, "maximum": MAX_REASSIGNMENTS}
+    depth = {"type": "integer", "minimum": 0, "maximum": MAX_DELEGATION_DEPTH}
+    controls = obj({"reassignable": {"type": "boolean"}, "maxReassignments": reassignments,
+        "delegationAllowed": {"type": "boolean"}, "maxDelegationDepth": depth,
+        "delegationExpiresAt": optional_instant})
+    controls["allOf"] = [
+        {"if": {"properties": {"reassignable": {"const": True}}},
+         "then": {"properties": {"maxReassignments": {"minimum": 1}}},
+         "else": {"properties": {"maxReassignments": {"const": 0}}}},
+        {"if": {"properties": {"delegationAllowed": {"const": True}}},
+         "then": {"properties": {"maxDelegationDepth": {"minimum": 1}, "delegationExpiresAt": instant}},
+         "else": {"properties": {"maxDelegationDepth": {"const": 0},
+                                  "delegationExpiresAt": {"type": "null"}}}},
+    ]
+    reviewer = obj({"kind": {"enum": ["Subject", "Group"]}, "id": identifier})
+    assignment = obj({"assignmentId": identifier, "name": name,
+        "subjects": identifiers(MAX_PRINCIPALS), "groups": identifiers(MAX_PRINCIPALS),
+        "memberSelectors": {"type": "object", "maxProperties": MAX_SCOPE_DIMENSIONS,
+            "propertyNames": identifier, "additionalProperties": identifiers(MAX_MEMBERS_PER_SELECTOR, minimum=1)},
+        "reviewerChain": {"type": "array", "minItems": 1, "maxItems": MAX_REVIEWERS,
+                          "uniqueItems": True, "items": reviewer},
+        "dueAt": instant, "controls": controls})
+    assignment["anyOf"] = [{"properties": {kind: {"minItems": 1}}} for kind in ("subjects", "groups")]
+    return obj({"format": {"const": FORMAT}, "workspaceId": identifier, "applicationId": identifier,
+        "assignmentSetId": identifier, "name": name, "effectiveFrom": instant, "effectiveTo": optional_instant,
+        "assignments": {"type": "array", "minItems": 1, "maxItems": MAX_ASSIGNMENTS, "items": assignment}})
+
+
 def _identifier(value: object,field: str) -> str:
     if type(value) is not str or _ID.fullmatch(value) is None:
         raise ValueError(f"APPLICATION_ASSIGNMENT_{field}_INVALID")

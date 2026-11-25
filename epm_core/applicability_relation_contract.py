@@ -134,3 +134,23 @@ def applicability_relation_digest(value: object) -> str:
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"),
                          ensure_ascii=True, allow_nan=False).encode("ascii")
     return sha256(encoded).hexdigest()
+
+
+def structural_schema_definitions():
+    """Wire structure for the canonical current relation returned by its reader."""
+    from .postgres_numeric_catalog import obj
+    identifier = {'type': 'string', 'pattern': '^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$'}
+    column = obj({'columnId': identifier, 'type': {'enum': sorted(_TYPES)},
+        'dimensionId': {'anyOf': [identifier, {'type': 'null'}]}})
+    column['allOf'] = [{'if': {'properties': {'type': {'const': 'Member'}}},
+        'then': {'properties': {'dimensionId': identifier}},
+        'else': {'properties': {'dimensionId': {'type': 'null'}}}}]
+    columns = {'type': 'array', 'minItems': 1, 'maxItems': MAX_COLUMNS, 'items': column}
+    definition = obj({'format': {'const': FORMAT}, 'relationId': identifier,
+        'name': {'type': 'string', 'minLength': 1, 'maxLength': 200}, 'columns': columns,
+        'rows': {'type': 'array', 'minItems': 1, 'maxItems': MAX_ROWS,
+            'items': obj({'rowId': identifier, 'values': {'type': 'object',
+                'minProperties': 1, 'maxProperties': MAX_COLUMNS,
+                'propertyNames': identifier,
+                'additionalProperties': {'type': ['string', 'boolean']}}})}})
+    return {'applicabilityColumns': columns, 'applicabilityDefinition': definition}

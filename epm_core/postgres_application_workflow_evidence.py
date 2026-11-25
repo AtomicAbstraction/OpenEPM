@@ -15,9 +15,13 @@ import re
 from .application_workflow import Activity
 from .cube_view_contract import canonical_cube_view
 from .persistence_contract import ApplicationScope
-from .postgres_access import VerifiedIdentity
+from .dimensional_security_policy import AccessKind
+from .postgres_access import AccessDenied, VerifiedIdentity
+from .postgres_definition_lifecycle import current_state, read_owner, resolution_context
+from .postgres_dimensional_security_enforcement import authorize_coordinates
 from .postgres_jobs import (_NUMERIC_COMPILER,_NUMERIC_PLAN_DIGEST,
-                            _canonical_digest)
+                            _canonical_digest, _decode_numeric_program)
+from .postgres_selection_preview import resolve_selection_in_transaction
 from .python_plan_runner import SealedPlanRunner
 
 
@@ -27,7 +31,43 @@ _NUMERIC_VALIDATOR="workflow.numeric-job-receipt"
 _RULE_FUNCTION="application.rule.run"
 _RULE_VALIDATOR="workflow.application-rule-parent-receipt"
 _VIEW_VALIDATOR="workflow.cube-view-numeric-receipt"
+CALCULATION_FUNCTION="facts.expression.calculate"
+CALCULATION_IMPACT_PENDING="APPLICATION_WORKFLOW_EVIDENCE_IMPACT_PENDING"
+_CALCULATION_VALIDATOR="workflow.cube-view-calculation-receipt"
 _MANUAL_VALIDATOR="workflow.manual-attestation"
+_RECEIPT_FUNCTIONS=frozenset((_NUMERIC_FUNCTION,_RULE_FUNCTION))
+_VIEW_RECEIPT_FUNCTIONS={"raw":_NUMERIC_FUNCTION,"calculated":CALCULATION_FUNCTION}
+RECEIPT_CONTRACT_UNSUPPORTED="APPLICATION_WORKFLOW_RECEIPT_CONTRACT_UNSUPPORTED"
+VIEW_SCOPE_MISMATCH="APPLICATION_WORKFLOW_EVIDENCE_VIEW_SCOPE_MISMATCH"
+_RECEIPT_ASSESSMENT_BASIS={
+    _NUMERIC_VALIDATOR:"ExactNumericEffects",
+    _VIEW_VALIDATOR:"ExactNumericEffects",
+    _RULE_VALIDATOR:"RulePublication",
+    _CALCULATION_VALIDATOR:"CalculationPublication",
+}
+RECEIPT_ASSESSMENT_BASES=tuple(dict.fromkeys(_RECEIPT_ASSESSMENT_BASIS.values()))
+
+
+def validate_workflow_receipt_contract(destination: dict, allowed_functions, *, view_source_kind: str|None) -> None:
+    """Require every advertised choice to have a validator for this destination."""
+    expected = None
+    if destination["kind"] == "Function" and destination["function"] in _RECEIPT_FUNCTIONS:
+        expected = destination["function"]
+    if destination["kind"] == "CubeView":
+        expected = _VIEW_RECEIPT_FUNCTIONS.get(view_source_kind)
+    if expected is None or set(allowed_functions) != {expected}:
+        raise ValueError(RECEIPT_CONTRACT_UNSUPPORTED)
+
+
+def completion_evidence_schema() -> dict:
+    from .postgres_numeric_catalog import obj
+
+    receipt = {"type": "string", "pattern": "^" + _OPERATION.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}
+    return {"oneOf": [
+        obj({"kind": {"const": "ManualAttestation"},
+             "confirmed": {"type": "boolean", "const": True}}),
+        obj({"kind": {"const": "OperationReceipt"}, "operationId": receipt}),
+    ]}
 
 
 @dataclass(frozen=True,slots=True)
@@ -38,6 +78,7 @@ class WorkflowEvidence:
     validator_version: int
     evidence_operation_id: str|None=None
     evidence_committed_revision: int|None=None
+    current_assessment: bool|None=None
 
 
 def _mapping(value: tuple[tuple[str,object],...])->dict:
@@ -47,38 +88,58 @@ def _mapping(value: tuple[tuple[str,object],...])->dict:
 
 def _certificate(normalized: dict,validator_id: str,*,
                  operation_id: str|None=None,
-                 committed_revision: int|None=None)->WorkflowEvidence:
+                 committed_revision: int|None=None,
+                 current_assessment: bool|None=None)->WorkflowEvidence:
     return WorkflowEvidence(normalized,_canonical_digest(normalized),
-        validator_id,1,operation_id,committed_revision)
+        validator_id,1,operation_id,committed_revision,current_assessment)
 
 
-def _manual(db,identity: VerifiedIdentity,contract: dict,evidence: object
-            )->WorkflowEvidence:
-    if evidence!={"kind":"ManualAttestation","confirmed":True}:
-        raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_INVALID")
-    now=db.execute("SELECT transaction_timestamp() AS now").fetchone()["now"]
+def _manual_certificate(issuer: str,subject: str,contract: dict,
+                        now: datetime)->WorkflowEvidence:
     if not isinstance(now,datetime):
         raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_TIME_INVALID")
     normalized={"kind":"ManualAttestation",
         "statementDigest":sha256(
             contract["statement"].encode("utf-8")).hexdigest(),
-        "actor":{"issuer":identity.issuer,
-            "subjectId":identity.subject_id},
+        "actor":{"issuer":issuer,"subjectId":subject},
         "confirmedAt":now.isoformat(),"confirmed":True,
         "validator":{"id":_MANUAL_VALIDATOR,"version":1}}
     return _certificate(normalized,_MANUAL_VALIDATOR)
 
 
+def _manual(db,identity: VerifiedIdentity,contract: dict,evidence: object
+            )->WorkflowEvidence:
+    if (type(evidence) is not dict
+            or evidence!={"kind":"ManualAttestation","confirmed":True}
+            or evidence["confirmed"] is not True):
+        raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_INVALID")
+    now=db.execute("SELECT transaction_timestamp() AS now").fetchone()["now"]
+    return _manual_certificate(identity.issuer,identity.subject_id,contract,now)
+
+
+def matches_completed_attestation(activity: Activity,normalized: dict,*,
+                                  issuer: str,subject: str,completed_at: datetime)->bool:
+    contract=_mapping(activity.evidence_contract)
+    if contract.get("kind")!="ManualAttestation":
+        return False
+    return normalized==_manual_certificate(
+        issuer,subject,contract,completed_at).normalized
+
+
 def _numeric_effects(db,scope: ApplicationScope,row: dict,
-                     *,require_current: bool)->list[dict]:
-    program=row["normalized_program"]
-    if (type(program) is not dict
-            or set(program)!={"version","function","mutations"}
-            or program["version"]!=1
-            or program["function"]!=_NUMERIC_FUNCTION
-            or type(program["mutations"]) is not list
-            or not program["mutations"]):
-        raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_UNSUPPORTED")
+                     *,reader: VerifiedIdentity,require_current: bool,
+                     assessment: bool)->tuple[list[dict],bool]:
+    try:
+        mutations=_decode_numeric_program(row["normalized_program"])
+    except ValueError as error:
+        raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_UNSUPPORTED") from error
+    try:
+        # These coordinates come from the fixed, digest-bound job plan.
+        # Prove whole-collection access before reading facts or currentness.
+        authorize_coordinates(db,reader,scope,
+            (mutation.coordinate for mutation in mutations),kind=AccessKind.READ)
+    except AccessDenied:
+        raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_UNAVAILABLE") from None
     effects=db.execute("""SELECT e.line_ordinal,e.kind,e.present,
         e.resulting_amount,e.change_id,e.committed_revision,c.members,
         p.present AS current_present,p.amount AS current_amount,
@@ -92,51 +153,38 @@ def _numeric_effects(db,scope: ApplicationScope,row: dict,
          AND p.application_id=e.application_id
          AND p.coordinate_id=e.coordinate_id
         WHERE e.workspace_id=%s AND e.application_id=%s
-          AND e.operation_id=%s ORDER BY e.line_ordinal""",(
-        scope.workspace_id,scope.application_id,row["operation_id"])).fetchall()
-    mutations=program["mutations"]
+          AND e.operation_id=%s ORDER BY e.line_ordinal LIMIT %s""",(
+        scope.workspace_id,scope.application_id,row["operation_id"],
+        len(mutations)+1)).fetchall()
     if (len(effects)!=len(mutations)
             or row["result"].get("changedCount")!=len(effects)):
         raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_EFFECT_MISMATCH")
     for ordinal,(mutation,effect) in enumerate(zip(mutations,effects),1):
-        if (type(mutation) is not dict
-                or effect["line_ordinal"]!=ordinal
-                or effect["members"]!=mutation.get("members")
-                or effect["kind"]!=mutation.get("kind")
+        if (effect["line_ordinal"]!=ordinal
+                or effect["members"]!=dict(mutation.coordinate.members)
+                or effect["kind"]!=mutation.kind.value
                 or effect["committed_revision"]!=row["committed_revision"]
                 or effect["change_id"]!=
                     f'{row["committed_revision"]}:{ordinal}'):
             raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_EFFECT_MISMATCH")
-        if require_current and (effect["current_change_id"]!=effect["change_id"]
-                or effect["current_revision"]!=effect["committed_revision"]
-                or effect["current_present"] is not effect["present"]
-                or effect["current_amount"]!=effect["resulting_amount"]):
-            raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_NOT_CURRENT")
-    return effects
+    current=all(
+        effect["current_change_id"]==effect["change_id"]
+        and effect["current_revision"]==effect["committed_revision"]
+        and effect["current_present"] is effect["present"]
+        and effect["current_amount"]==effect["resulting_amount"]
+        for effect in effects)
+    if require_current and not current and not assessment:
+        raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_NOT_CURRENT")
+    return effects,current
 
 
-def _cube_view_numeric(db,scope: ApplicationScope,row: dict,
-        destination: dict,resolved_selection: dict|None,*,
-        require_current: bool)->WorkflowEvidence:
-    """Prove that one exact numeric receipt is bounded by a pinned cube view.
-
-    A saved view is presentation metadata, not evidence by itself. This
-    profile therefore verifies its immutable digest, the workflow's current
-    server-resolved complete-grain selection and every authoritative event
-    produced by the referenced receipt. The caller cannot supply members or
-    a view definition as evidence.
-    """
+def _bound_view_definition(view, destination, resolved_selection, *, source_kind):
     if (type(resolved_selection) is not dict
             or resolved_selection.get("format")!=
                "openepm-resolved-selection-v1"
             or type(resolved_selection.get("members")) is not dict
             or type(resolved_selection.get("resolutionDigest")) is not str):
         raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_SCOPE_REQUIRED")
-    view=db.execute("""SELECT definition,canonical_digest,metadata_revision
-        FROM epm.saved_grid_definition WHERE workspace_id=%s
-          AND application_id=%s AND grid_id=%s""",(
-        scope.workspace_id,scope.application_id,destination["viewId"],
-        )).fetchone()
     if (view is None or view["canonical_digest"]!=destination["digest"]):
         raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_VIEW_MISMATCH")
     members=resolved_selection["members"]
@@ -146,27 +194,64 @@ def _cube_view_numeric(db,scope: ApplicationScope,row: dict,
     except ValueError as error:
         raise ValueError(
             "APPLICATION_WORKFLOW_EVIDENCE_VIEW_UNSUPPORTED") from error
-    if (definition["dataSource"]["kind"]!="raw"
+    if (definition["dataSource"]["kind"]!=source_kind
             or definition["selection"]["metadataRevision"]!=
                view["metadata_revision"]):
         raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_VIEW_UNSUPPORTED")
-    fixed={item["dimensionId"]:item["include"]["memberId"]
-           for item in definition["selection"]["dimensions"]
-           if item["include"]["kind"]=="member"}
-    explicit={item["dimensionId"]:item["include"]["memberIds"]
-              for item in definition["selection"]["dimensions"]
-              if item["include"]["kind"]=="members"}
-    if (len(fixed)+len(explicit)!=len(
-            definition["selection"]["dimensions"])):
-        raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_VIEW_UNSUPPORTED")
-    if (any(type(selected) is not list or not selected
-            for selected in members.values())
-            or any(members.get(dimension)!=[member]
-                   for dimension,member in fixed.items())
-            or any(members.get(dimension)!=selected
-                   for dimension,selected in explicit.items())):
-        raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_VIEW_SCOPE_MISMATCH")
-    effects=_numeric_effects(db,scope,row,require_current=require_current)
+    return definition
+
+
+def _evidence_view(db, scope, destination, resolved_selection, *, source_kind):
+    view=db.execute("""SELECT definition,canonical_digest,metadata_revision
+        FROM epm.saved_grid_definition WHERE workspace_id=%s
+          AND application_id=%s AND grid_id=%s""",(
+        scope.workspace_id,scope.application_id,destination["viewId"],
+        )).fetchone()
+    return _bound_view_definition(view,destination,resolved_selection,source_kind=source_kind)
+
+
+def _raw_view_members(db,scope,definition,resolved_selection):
+    selection=definition["selection"]
+    try:
+        view_members=resolve_selection_in_transaction(db,scope,selection,
+            selection["metadataRevision"])["members"]
+    except ValueError:
+        raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_VIEW_UNSUPPORTED") from None
+    if view_members!=resolved_selection["members"] or any(not members for members in view_members.values()):
+        raise ValueError(VIEW_SCOPE_MISMATCH)
+    return view_members
+
+
+def validate_workflow_view_evidence_scope(db,scope,view,destination,resolved_selection,*,require_current):
+    """Check that the authored view and workflow resolve to an eligible receipt scope."""
+    kind=view["source_kind"]
+    try:
+        definition=_bound_view_definition(view,destination,resolved_selection,source_kind=kind)
+        revision=resolved_selection["metadataRevision"]
+        if (require_current or kind=="calculated") and definition["selection"]["metadataRevision"]!=revision:
+            raise ValueError(VIEW_SCOPE_MISMATCH)
+        if kind=="raw":
+            _raw_view_members(db,scope,definition,resolved_selection)
+            return
+        # Match the calculation publication owner's effective selection and pins.
+        view_scope=resolve_selection_in_transaction(db,scope,definition["selection"],revision,
+            require_current_layout=True)
+        if (view_scope["resolutionDigest"]!=resolved_selection["resolutionDigest"]
+                or any(not members for members in view_scope["members"].values())):
+            raise ValueError(VIEW_SCOPE_MISMATCH)
+    except ValueError:
+        raise ValueError(VIEW_SCOPE_MISMATCH) from None
+
+
+def _cube_view_numeric(db,scope: ApplicationScope,row: dict,
+        destination: dict,resolved_selection: dict|None,*,
+        reader: VerifiedIdentity,require_current: bool,
+        assessment: bool,include_currentness: bool)->WorkflowEvidence:
+    """Prove the original effects under the current view and READ policy."""
+    definition=_evidence_view(db,scope,destination,resolved_selection,source_kind="raw")
+    members=_raw_view_members(db,scope,definition,resolved_selection)
+    effects,current=_numeric_effects(db,scope,row,require_current=require_current,
+        reader=reader,assessment=assessment)
     allowed={dimension:frozenset(selected)
              for dimension,selected in members.items()}
     for effect in effects:
@@ -174,18 +259,18 @@ def _cube_view_numeric(db,scope: ApplicationScope,row: dict,
         if (type(coordinate) is not dict
                 or set(coordinate)!=set(allowed)
                 or any(member not in allowed[dimension]
-                       for dimension,member in coordinate.items())
-                or any(coordinate[dimension]!=member
-                       for dimension,member in fixed.items())):
-            raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_VIEW_SCOPE_MISMATCH")
-    if require_current:
+                       for dimension,member in coordinate.items())):
+            raise ValueError(VIEW_SCOPE_MISMATCH)
+    if require_current or assessment or include_currentness:
         state=db.execute("""SELECT metadata_revision
             FROM epm.application_state WHERE workspace_id=%s
               AND application_id=%s""",(
             scope.workspace_id,scope.application_id)).fetchone()
-        if (state is None or state["metadata_revision"]!=
-                view["metadata_revision"]):
+        metadata_current=(state is not None
+                          and state["metadata_revision"]==definition["selection"]["metadataRevision"])
+        if require_current and not metadata_current and not assessment:
             raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_NOT_CURRENT")
+        current=current and metadata_current
     normalized={"kind":"OperationReceipt",
         "operationId":row["operation_id"],
         "committedRevision":row["committed_revision"],
@@ -201,12 +286,47 @@ def _cube_view_numeric(db,scope: ApplicationScope,row: dict,
         "currentAtValidation":require_current,
         "validator":{"id":_VIEW_VALIDATOR,"version":1}}
     return _certificate(normalized,_VIEW_VALIDATOR,
-        operation_id=row["operation_id"],
-        committed_revision=row["committed_revision"])
+        operation_id=row["operation_id"],committed_revision=row["committed_revision"],
+        current_assessment=current if assessment or include_currentness else None)
+
+
+def _cube_view_calculation(db, scope, row, destination, resolved_selection, *,
+                           reader, require_current, assessment, include_currentness):
+    from .postgres_calculation_scan import PostgresCalculationScan
+
+    definition = _evidence_view(db,scope,destination,resolved_selection,source_kind="calculated")
+    receipt = row['result']
+    if (row['status'] != 'published' or row['receipt_revision'] != row['committed_revision']
+            or type(receipt) is not dict or row['job_result'] != receipt
+            or receipt.get('resultKey') != definition['dataSource']['resultKey']
+            or row['program_digest'] != row['command_digest'] or row['subject_id'] != row['actor_id']
+            or _canonical_digest(row['normalized_program']) != row['program_digest']):
+        raise ValueError('APPLICATION_WORKFLOW_EVIDENCE_RECEIPT_MISMATCH')
+    freshness = PostgresCalculationScan.expression_evidence_freshness(db, scope, reader,
+        receipt=receipt, operation_id=row['operation_id'], committed_revision=row['committed_revision'],
+        compiler=row['compiler_version'], program=row['normalized_program'],
+        selection=definition['selection'], resolved_selection=resolved_selection)
+    if freshness == 'unavailable':
+        raise ValueError('APPLICATION_WORKFLOW_EVIDENCE_UNAVAILABLE')
+    if freshness == 'impact_coverage_pending' and (require_current or assessment):
+        raise ValueError(CALCULATION_IMPACT_PENDING)
+    current = freshness == 'current'
+    if require_current and not current and not assessment:
+        raise ValueError('APPLICATION_WORKFLOW_EVIDENCE_NOT_CURRENT')
+    normalized = {'kind': 'OperationReceipt', 'operationId': row['operation_id'],
+        'committedRevision': row['committed_revision'], 'function': CALCULATION_FUNCTION,
+        'programDigest': row['program_digest'], 'resultDigest': _canonical_digest(receipt),
+        'view': {'viewId': destination['viewId'], 'digest': destination['digest']},
+        'selectionResolutionDigest': resolved_selection['resolutionDigest'],
+        'currentAtValidation': require_current, 'validator': {'id': _CALCULATION_VALIDATOR, 'version': 1}}
+    return _certificate(normalized, _CALCULATION_VALIDATOR,
+        operation_id=row['operation_id'], committed_revision=row['committed_revision'],
+        current_assessment=current if assessment or include_currentness else None)
 
 
 def _rule_parent(db,scope: ApplicationScope,row: dict,destination: dict,
-                 *,require_current: bool)->WorkflowEvidence:
+                 *,require_current: bool,include_currentness: bool,
+                 assessment: bool)->WorkflowEvidence:
     parent=db.execute("""SELECT * FROM epm.application_rule_workflow
         WHERE workspace_id=%s AND application_id=%s AND workflow_id=%s""",(
         scope.workspace_id,scope.application_id,row["operation_id"])).fetchone()
@@ -293,28 +413,26 @@ def _rule_parent(db,scope: ApplicationScope,row: dict,destination: dict,
     if receipt.get("childReceipts")!=[
             child["operationId"] for child in child_receipts]:
         raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_RECEIPT_MISMATCH")
-    current=require_current
-    if require_current:
+    current=None
+    if require_current or include_currentness or assessment:
         state=db.execute("""SELECT metadata_revision,policy_revision,
             schema_epoch FROM epm.application_state WHERE workspace_id=%s
               AND application_id=%s""",(
             scope.workspace_id,scope.application_id)).fetchone()
-        publication=db.execute("""SELECT state_token,status,program_digest
-            FROM epm.expression_rule_definition
-            WHERE workspace_id=%s AND application_id=%s AND rule_id=%s""",(
-            scope.workspace_id,scope.application_id,
-            parent["rule_id"])).fetchone()
+        publication=read_owner(db,scope,
+            {"kind":"ApplicationRule","definitionId":parent["rule_id"]})
         publication_current=(publication is not None
-            and publication["status"]=="Active"
             and publication["state_token"]==parent["rule_state_token"]
-            and publication["program_digest"]==parent["program_digest"])
+            and publication["program_digest"]==parent["program_digest"]
+            and current_state(publication,resolution_context(
+                db,scope,[publication]))["executable"])
         current=(state is not None and publication_current and
             (state["metadata_revision"],state["policy_revision"],
              state["schema_epoch"])==
             (parent["expected_metadata_revision"],
              parent["expected_policy_revision"],
              parent["expected_schema_epoch"]))
-        if not current:
+        if require_current and not current and not assessment:
             raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_NOT_CURRENT")
     normalized={"kind":"OperationReceipt",
         "operationId":parent["workflow_id"],
@@ -325,16 +443,18 @@ def _rule_parent(db,scope: ApplicationScope,row: dict,destination: dict,
         "stateToken":parent["rule_state_token"],
         "planDigest":parent["plan_digest"],
         "childReceipts":child_receipts,
-        "currentAtValidation":current,
+        "currentAtValidation":require_current,
         "validator":{"id":_RULE_VALIDATOR,"version":1}}
     return _certificate(normalized,_RULE_VALIDATOR,
         operation_id=parent["workflow_id"],
-        committed_revision=row["committed_revision"])
+        committed_revision=row["committed_revision"],
+        current_assessment=current if include_currentness or assessment else None)
 
 
 def _operation_receipt(db,scope: ApplicationScope,activity: Activity,
                        contract: dict,evidence: object,*,
-                       resolved_selection: dict|None)->WorkflowEvidence:
+                       resolved_selection: dict|None,reader: VerifiedIdentity,
+                       assessment: bool=False,include_currentness: bool=False)->WorkflowEvidence:
     if (type(evidence) is not dict
             or set(evidence)!={"kind","operationId"}
             or evidence.get("kind")!="OperationReceipt"
@@ -362,7 +482,11 @@ def _operation_receipt(db,scope: ApplicationScope,activity: Activity,
                 and destination.get("function")!=function)):
         raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_DESTINATION_MISMATCH")
     if destination.get("kind")=="CubeView":
-        if (function!=_NUMERIC_FUNCTION
+        if function == _VIEW_RECEIPT_FUNCTIONS["calculated"]:
+            return _cube_view_calculation(db,scope,row,destination,resolved_selection,
+                reader=reader,require_current=contract["requireCurrent"],assessment=assessment,
+                include_currentness=include_currentness)
+        if (function!=_VIEW_RECEIPT_FUNCTIONS["raw"]
                 or row["status"]!="published"
                 or row["receipt_revision"]!=row["committed_revision"]
                 or type(row["job_result"]) is not dict
@@ -380,12 +504,14 @@ def _operation_receipt(db,scope: ApplicationScope,activity: Activity,
                 or row["plan_digest"]!=_NUMERIC_PLAN_DIGEST):
             raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_RECEIPT_MISMATCH")
         return _cube_view_numeric(db,scope,row,destination,
-            resolved_selection,require_current=contract["requireCurrent"])
+            resolved_selection,require_current=contract["requireCurrent"],
+            reader=reader,assessment=assessment,include_currentness=include_currentness)
     if destination.get("kind")!="Function":
         raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_UNSUPPORTED")
     if function==_RULE_FUNCTION:
         return _rule_parent(db,scope,row,destination,
-                            require_current=contract["requireCurrent"])
+                            require_current=contract["requireCurrent"],
+                            include_currentness=include_currentness,assessment=assessment)
     if destination.get("argumentsDigest")!=row["program_digest"]:
         raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_DESTINATION_MISMATCH")
     if (row["status"]!="published"
@@ -402,12 +528,12 @@ def _operation_receipt(db,scope: ApplicationScope,activity: Activity,
             or _canonical_digest(row["normalized_program"])!=
                row["program_digest"]):
         raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_RECEIPT_MISMATCH")
-    if (function!=_NUMERIC_FUNCTION
+    if (function not in _RECEIPT_FUNCTIONS
             or row["compiler_version"]!=_NUMERIC_COMPILER
             or row["plan_digest"]!=_NUMERIC_PLAN_DIGEST):
         raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_UNSUPPORTED")
-    _numeric_effects(db,scope,row,
-                     require_current=contract["requireCurrent"])
+    _,current=_numeric_effects(db,scope,row,
+        require_current=contract["requireCurrent"],reader=reader,assessment=assessment)
     normalized={"kind":"OperationReceipt",
         "operationId":row["operation_id"],
         "committedRevision":row["committed_revision"],
@@ -418,13 +544,14 @@ def _operation_receipt(db,scope: ApplicationScope,activity: Activity,
         "currentAtValidation":contract["requireCurrent"],
         "validator":{"id":_NUMERIC_VALIDATOR,"version":1}}
     return _certificate(normalized,_NUMERIC_VALIDATOR,
-        operation_id=row["operation_id"],
-        committed_revision=row["committed_revision"])
+        operation_id=row["operation_id"],committed_revision=row["committed_revision"],
+        current_assessment=current if assessment or include_currentness else None)
 
 
 def validate_workflow_evidence(db,scope: ApplicationScope,
         identity: VerifiedIdentity,activity: Activity,
-        evidence: object,*,resolved_selection: dict|None=None
+        evidence: object,*,resolved_selection: dict|None=None,
+        include_currentness: bool=False,
         )->WorkflowEvidence:
     """Validate one caller reference using only fixed server-owned profiles."""
     if not isinstance(scope,ApplicationScope) or not isinstance(
@@ -435,5 +562,39 @@ def validate_workflow_evidence(db,scope: ApplicationScope,
         return _manual(db,identity,contract,evidence)
     if contract.get("kind")=="OperationReceipt":
         return _operation_receipt(db,scope,activity,contract,evidence,
-            resolved_selection=resolved_selection)
+            resolved_selection=resolved_selection,reader=identity,
+            include_currentness=include_currentness)
     raise ValueError("APPLICATION_WORKFLOW_EVIDENCE_UNSUPPORTED")
+
+
+def assess_completed_basis(db,scope: ApplicationScope,
+        identity: VerifiedIdentity,activity: Activity,completed: WorkflowEvidence,
+        *,resolved_selection: dict|None=None)->tuple[str,bool]|None:
+    """Check one stored completion under current READ authority.
+
+    The occurrence owner must supply the validated historical completion and
+    verify that its activity, original definition and application pins remain
+    stable across this read. None withholds an unavailable or hidden basis.
+    """
+    basis=_RECEIPT_ASSESSMENT_BASIS.get(completed.validator_id)
+    if basis is None:
+        return None
+    contract=_mapping(activity.evidence_contract)
+    if contract.get("kind")!="OperationReceipt" or completed.validator_version!=1:
+        return None
+    try:
+        current=_operation_receipt(db,scope,activity,contract,
+            {"kind":"OperationReceipt","operationId":completed.evidence_operation_id},
+            resolved_selection=resolved_selection,reader=identity,assessment=True)
+    except ValueError as error:
+        if str(error)==CALCULATION_IMPACT_PENDING:
+            raise
+        if str(error).startswith("APPLICATION_WORKFLOW_EVIDENCE_"):
+            return None
+        raise
+    if (current.digest!=completed.digest or current.normalized!=completed.normalized
+            or current.evidence_committed_revision!=completed.evidence_committed_revision
+            or current.validator_id!=completed.validator_id
+            or type(current.current_assessment) is not bool):
+        return None
+    return basis,current.current_assessment

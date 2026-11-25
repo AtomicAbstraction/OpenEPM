@@ -163,25 +163,23 @@ it("preserves numeric typing drafts and refuses unsafe integers without rounding
   expect(screen.getByLabelText("Input error")).not.toBeEmptyDOMElement();
 });
 
-it("retains malformed advanced input for correction instead of silently clearing it", () => {
+it("offers a governed reset when saved values cannot be matched to named fields", () => {
   render(
     <Form
       initial="{"
       schema={{ type: "object", properties: { factor: { type: "string" } } }}
     />,
   );
-  expect(screen.getByLabelText("Advanced bindings")).toHaveValue("{");
+  expect(screen.queryByLabelText("Advanced bindings")).not.toBeInTheDocument();
   expect(screen.getByLabelText("Input error")).toHaveTextContent(
     "valid object",
   );
-  fireEvent.change(screen.getByLabelText("Advanced bindings"), {
-    target: { value: '{"factor":"2"}' },
-  });
-  expect(screen.getByLabelText("factor")).toHaveValue("2");
+  fireEvent.click(screen.getByRole("button", { name: "Reset parameters" }));
+  expect(screen.getByLabelText("factor")).toHaveValue("");
   expect(screen.getByLabelText("Input error")).toBeEmptyDOMElement();
 });
 
-it("keeps near-integer and underflow drafts exact and blocks advanced JSON rounding", () => {
+it("keeps near-integer and underflow drafts exact without exposing the whole parameter object", () => {
   const schema = {
     type: "object",
     properties: { factor: { type: "number" }, note: { type: "string" } },
@@ -199,23 +197,8 @@ it("keeps near-integer and underflow drafts exact and blocks advanced JSON round
     );
     expect(screen.getByLabelText("Input error")).not.toBeEmptyDOMElement();
   }
-  const original = '{"factor":0.999999999999999999999,"note":"keep"}';
-  fireEvent.change(screen.getByLabelText("Advanced bindings"), {
-    target: { value: original },
-  });
-  expect(screen.getByLabelText("Submitted bindings")).toHaveTextContent(
-    original,
-  );
-  expect(screen.getByLabelText("Input error")).toHaveTextContent(
-    "exact safe integers",
-  );
-  expect(screen.queryByLabelText("note")).toBeNull();
-  fireEvent.change(screen.getByLabelText("Advanced bindings"), {
-    target: { value: '{"factor":1,"note":"keep"}' },
-  });
-  expect(screen.getByLabelText("factor")).toHaveValue("1");
-  expect(screen.getByLabelText("note")).toHaveValue("keep");
-  expect(screen.getByLabelText("Input error")).toBeEmptyDOMElement();
+  expect(screen.queryByLabelText("Advanced bindings")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("note")).toHaveValue("");
 });
 
 it("keeps invalid array drafts visible and blocks their submission as strings", () => {

@@ -7,7 +7,7 @@ remain fixed-core data and opaque state tokens fence every mutation.
 from __future__ import annotations
 
 import re
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import psycopg
 from epm_core.postgres_connection import connect_postgres
@@ -27,6 +27,7 @@ from .postgres_expression import (FUNCTION as EXPRESSION_FUNCTION,
                                   _decimal)
 from .postgres_jobs import _canonical_digest
 from .postgres_numeric_store import PostgresNumericFactStore
+from .postgres_processing_limits import ProcessingBusy, lock_busy_boundary
 from .current_object_contract import new_state_token, require_state_token
 from .postgres_definition_lifecycle import (
     STORED_KINDS, certificate, current_state, resolution_context, replace_references)
@@ -37,9 +38,13 @@ PUBLISH = 'rules.expression.activate'
 READ = 'rules.expression.read'
 LIST = 'rules.expression.list'
 RUN = 'rules.expression.run'
+READ_AUTHORIZATION_STALE = 'RULE_READ_AUTHORIZATION_STALE'
 _ID = re.compile(r'[A-Za-z0-9._-]{1,100}\Z')
 _KEY = re.compile(r'[A-Za-z0-9._-]{8,128}\Z')
 _PARAM = re.compile(r'[A-Za-z][A-Za-z0-9_]{0,63}\Z')
+_LIST_LIMIT = 100
+_LIST_TOKEN = re.compile(r'[0-9a-f]{64}\Z')
+_LIST_REVISIONS = ('expectedMetadataRevision', 'expectedPolicyRevision')
 
 
 def bind_rule_calculation(program: dict, bindings: object = None,
@@ -286,22 +291,20 @@ def _program(raw: object, function: str) -> dict:
         raise ValueError('V2_EXPRESSION_RULE_FUNCTION_INVALID')
     args = raw['arguments']
     if function == LIST:
-        if set(args) - {'limit', 'afterRuleId',
-                        'expectedMetadataRevision',
-                        'expectedPolicyRevision'}:
+        if set(args) - {'limit', 'afterRuleId', 'collectionToken', *_LIST_REVISIONS}:
             raise ValueError('V2_EXPRESSION_RULE_ARGUMENTS_INVALID')
-        limit = args.get('limit', 100)
+        limit = args.get('limit', _LIST_LIMIT)
         after = args.get('afterRuleId')
-        if (type(limit) is not int or not 1 <= limit <= 100
+        if (type(limit) is not int or not 1 <= limit <= _LIST_LIMIT
                 or (after is not None and
                     (not isinstance(after, str)
                      or not _ID.fullmatch(after)))
                 or any(type(args[key]) is not int or args[key] < 0
-                       for key in ('expectedMetadataRevision',
-                                   'expectedPolicyRevision') if key in args)
-                or (after is not None and
-                    not {'expectedMetadataRevision',
-                         'expectedPolicyRevision'} <= set(args))):
+                       for key in _LIST_REVISIONS if key in args)
+                or (after is not None and not set(_LIST_REVISIONS) <= set(args))
+                or ('collectionToken' in args and (
+                    after is None or type(args['collectionToken']) is not str
+                    or _LIST_TOKEN.fullmatch(args['collectionToken']) is None))):
             raise ValueError('V2_EXPRESSION_RULE_ARGUMENTS_INVALID')
         return args
     if (not isinstance(args.get('ruleId'), str)
@@ -338,6 +341,89 @@ def _program(raw: object, function: str) -> dict:
         return {**args, 'calculation': calculation,
                 'plan': plan}
     return args
+
+
+def read_program_contract(function: str) -> dict:
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    if function not in (READ, LIST):
+        raise ValueError('V2_EXPRESSION_RULE_FUNCTION_INVALID')
+    identifier = {'type': 'string', 'pattern': r'^[A-Za-z0-9._-]{1,100}(?![\s\S])'}
+    token = {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}
+    def nullable(schema):
+        return {'anyOf': [schema, {'type': 'null'}]}
+
+    revision = {'type': 'integer', 'minimum': 0}
+    text = {'type': 'string'}
+    boolean = {'type': 'boolean'}
+    state = {
+        **dict.fromkeys(('defined', 'valid', 'active', 'sourceCurrent', 'executable'), boolean),
+        'resultCurrent': {'type': 'null'}, 'reason': nullable(text),
+        'status': {'enum': ['Active', 'Inactive', 'Unavailable']},
+    }
+    rules = [
+        'Only current expression rule definitions are returned. Use executable to distinguish a current runnable definition from one that is inactive, stale or unavailable.',
+        f'After {READ_AUTHORIZATION_STALE}, refresh current application access before reading again.',
+    ]
+    if function == LIST:
+        arguments = obj({'limit': {**revision, 'minimum': 1, 'maximum': _LIST_LIMIT,
+                                  'default': _LIST_LIMIT},
+                         'afterRuleId': nullable(identifier), 'collectionToken': token,
+                         **dict.fromkeys(_LIST_REVISIONS, revision)}, [])
+        arguments['allOf'] = [
+            {'if': {'required': ['afterRuleId'], 'properties': {'afterRuleId': identifier}},
+             'then': {'required': list(_LIST_REVISIONS)}},
+            {'if': {'required': ['collectionToken']},
+             'then': {'required': ['afterRuleId'], 'properties': {'afterRuleId': identifier}}},
+        ]
+        row = obj({'ruleId': identifier, 'stateToken': token, 'programDigest': nullable(token),
+                   'sourceBuildId': nullable(text), 'definitionMetadataRevision': revision,
+                   'metadataCurrent': boolean, **state,
+                   'resultKey': text, 'parameterDeclarations': {'type': 'object'}},
+                  ['ruleId', 'stateToken', 'programDigest', 'sourceBuildId',
+                   'definitionMetadataRevision', 'metadataCurrent', *state])
+        result = obj({'rows': {'type': 'array', 'maxItems': _LIST_LIMIT, 'items': row},
+                      'collectionToken': token, 'metadataRevision': revision,
+                      'policyRevision': revision, 'hasMore': boolean,
+                      'nextAfterRuleId': nullable(identifier)})
+        result['allOf'] = [
+            {'if': {'properties': {'hasMore': {'const': True}}},
+             'then': {'properties': {'rows': {'minItems': 1}, 'nextAfterRuleId': identifier}},
+             'else': {'properties': {'nextAfterRuleId': {'type': 'null'}}}},
+        ]
+        examples = [
+            read_example(LIST, {'limit': 1}, name='Read the first current expression rule page',
+                         binding='Select an authorized application for the read. An empty page is valid.'),
+            read_example(LIST, {'limit': 1, 'afterRuleId': 'example-rule',
+                                'collectionToken': 'a' * 64, 'expectedMetadataRevision': 1,
+                                'expectedPolicyRevision': 1},
+                         name='Continue a current expression rule page',
+                         binding='Use the preceding page’s nextAfterRuleId, collectionToken, metadataRevision and policyRevision in the same application.'),
+        ]
+        rules.extend([
+            'The list includes saved inactive definitions and reports their state. An empty page is a successful read.',
+            'Continue only when hasMore is true. Keep the returned collectionToken and both revision pins. The token binds the rule family, application and observed state.',
+            'Restart from the first page after STALE_EXPRESSION_RULE_LIST_REVISION.',
+        ])
+    else:
+        arguments = obj({'ruleId': identifier})
+        program = obj({'languageVersion': {'type': 'integer', 'const': 2},
+                       'function': {'const': EXPRESSION_FUNCTION}, 'arguments': {'type': 'object'}})
+        source = obj({'programId': text, 'programSourceToken': text, 'sourceDigest': text,
+                      'buildId': nullable(text), 'active': boolean})
+        fields = {'ruleId': identifier, **state, 'stateToken': nullable(token),
+                  'programDigest': nullable(token), 'program': nullable(program),
+                  'source': nullable(source), 'definitionMetadataRevision': nullable(revision),
+                  'currentMetadataRevision': revision, 'policyRevision': revision,
+                  'updatedOperationId': nullable(text), 'updatedAt': nullable(text)}
+        result = obj(fields, [key for key in fields if key != 'status'])
+        examples = [read_example(READ, {'ruleId': 'example-rule'},
+                     name='Inspect an expression rule from the current list',
+                     binding='Replace example-rule with the ruleId returned by the authorized list.')]
+        rules.append('A rule ID without a matching expression rule returns defined=false. Read does not run the rule.')
+    return read_contract(function, arguments, result, owner='PostgresExpressionRules',
+                         examples=examples, semantic_rules=rules)
 
 
 def _active_members(db, scope: ApplicationScope, plan) -> None:
@@ -478,6 +564,7 @@ def _shape_pins(expression: dict) -> tuple[dict, ...]:
 class PostgresExpressionRules:
     SAVE, PUBLISH, READ, LIST = SAVE, PUBLISH, READ, LIST
     STORED_FUNCTION = EXPRESSION_FUNCTION
+    LIST_COLLECTION_FORMAT = 'openepm-expression-rule-list-v1'
     _parse = staticmethod(_program)
     _validate_definition = staticmethod(_active_members)
 
@@ -581,11 +668,16 @@ class PostgresExpressionRules:
                     (scope.workspace_id, scope.application_id)).fetchone()
                 if state is None:
                     raise ValueError('APPLICATION_UNAVAILABLE')
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'write')
+                # The fixed activation owner supplies the sealed build in its
+                # transaction. Public authoring can never supply this binding.
+                compiled_activation = _connection is not None and _source_build_id is not None
+                publishing_rule = (compiled_activation and self.SAVE=='application.rule.save'
+                                   and function in (self.SAVE,self.PUBLISH))
+                duty = 'rules.publish' if publishing_rule else None
+                PostgresAccessChecker.check_in_transaction(db,self.identity,scope,'write',action=duty)
                 PostgresAccessChecker.check_in_transaction(
                     db, self.identity, scope,
-                    'rule_design' if function == self.SAVE else 'rule_publish')
+                    'rule_design' if function == self.SAVE and not compiled_activation else 'rule_publish',action=duty)
                 prior = db.execute('''SELECT command_digest,actor_id,result
                     FROM epm.operation_receipt WHERE workspace_id=%s
                       AND application_id=%s AND operation_id=%s''',
@@ -857,95 +949,125 @@ class PostgresExpressionRules:
                         operation_id=idempotency_key,impact=impact)
                 return result
 
-    def read(self, scope: ApplicationScope, raw: dict) -> dict:
-        args = self._parse(raw, self.READ)
+    @contextmanager
+    def _read_cut(self, scope: ApplicationScope, function):
+        """Authorize a read and keep definitions and lifecycle checks on one cut."""
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
                 PostgresNumericFactStore._set_scope(db, scope)
+                PostgresAccessChecker.lock_directory_membership_for_assignment(db)
                 PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-                state = db.execute('''SELECT metadata_revision,
-                    policy_revision FROM epm.application_state
-                    WHERE workspace_id=%s AND application_id=%s''',
-                    (scope.workspace_id, scope.application_id)).fetchone()
+                opening_access = PostgresAccessChecker.check_in_transaction(
+                    db, self.identity, scope, 'read', function=function)
+                read_only = db.execute('SHOW transaction_read_only').fetchone()[
+                    'transaction_read_only'] == 'on'
+                keys = (scope.workspace_id, scope.application_id)
+                query = '''SELECT metadata_revision, policy_revision, schema_epoch,
+                    commit_revision FROM epm.application_state
+                    WHERE workspace_id=%s AND application_id=%s'''
+                state = db.execute(query if read_only else query + ' FOR SHARE', keys).fetchone()
                 if state is None:
                     raise ValueError('APPLICATION_UNAVAILABLE')
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
-                row = db.execute('''SELECT *
-                    FROM epm.expression_rule_definition
-                    WHERE workspace_id=%s AND application_id=%s AND rule_id=%s''',
-                    (scope.workspace_id, scope.application_id,
-                     args['ruleId'])).fetchone()
-                if row and row['definition_kind']!=STORED_KINDS[self.STORED_FUNCTION]:
-                    row=None
-                from .postgres_python_definitions import source_binding
-                source = source_binding(db, scope, row) if row else None
-                return {'ruleId': args['ruleId'],
-                        'source': source,
-                        'defined': row is not None,
-                        'stateToken': row['state_token'] if row else None,
-                        **current_state(row,resolution_context(db,scope,[row])),
-                        'program': row['program'] if row else None,
-                        'programDigest': row['program_digest'] if row else None,
-                        'definitionMetadataRevision': (
-                            row['metadata_revision'] if row else None),
-                        'currentMetadataRevision': state['metadata_revision'],
-                        'updatedOperationId': (
-                            row['updated_operation_id'] if row else None),
-                        'updatedAt': row['updated_at'].isoformat() if row else None,
-                        'policyRevision': state['policy_revision']}
+                yield db, state, opening_access
+                # The directory projection can change outside the workspace lock.
+                if PostgresAccessChecker.check_in_transaction(
+                        db, self.identity, scope, 'read', function=function) != opening_access:
+                    raise ValueError(READ_AUTHORIZATION_STALE)
+                # The deployment write gate can open read-only transactions, where
+                # PostgreSQL disallows row locks. Discard the result on a new cut.
+                if read_only and db.execute(query, keys).fetchone() != state:
+                    raise ProcessingBusy()
 
+    @lock_busy_boundary
+    def read(self, scope: ApplicationScope, raw: dict) -> dict:
+        args = self._parse(raw, self.READ)
+        with self._read_cut(scope, self.READ) as (db, state, access):
+            row = db.execute('''SELECT *
+                FROM epm.expression_rule_definition
+                WHERE workspace_id=%s AND application_id=%s AND rule_id=%s''',
+                (scope.workspace_id, scope.application_id, args['ruleId'])).fetchone()
+            if row and row['definition_kind'] != STORED_KINDS[self.STORED_FUNCTION]:
+                row = None
+            if access.authorization_model == "group_assignments":
+                from .postgres_group_rule_source import require_runnable_rule
+                require_runnable_rule(db, self.identity, scope, row)
+            from .postgres_python_definitions import source_binding
+            source = source_binding(db, scope, row) if row else None
+            return {'ruleId': args['ruleId'],
+                    'source': source,
+                    'defined': row is not None,
+                    'stateToken': row['state_token'] if row else None,
+                    **current_state(row, resolution_context(db, scope, [row])),
+                    'program': row['program'] if row else None,
+                    'programDigest': row['program_digest'] if row else None,
+                    'definitionMetadataRevision': row['metadata_revision'] if row else None,
+                    'currentMetadataRevision': state['metadata_revision'],
+                    'updatedOperationId': row['updated_operation_id'] if row else None,
+                    'updatedAt': row['updated_at'].isoformat() if row else None,
+                    'policyRevision': state['policy_revision']}
+
+    @lock_busy_boundary
     def list_published(self, scope: ApplicationScope, raw: dict) -> dict:
         """Page current definitions; no historical or unpublished copy exists."""
         args = self._parse(raw, self.LIST)
-        limit = args.get('limit', 100)
+        limit = args.get('limit', _LIST_LIMIT)
         after = args.get('afterRuleId')
-        with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-                state = db.execute('''SELECT metadata_revision,
-                    policy_revision FROM epm.application_state
-                    WHERE workspace_id=%s AND application_id=%s''',
-                    (scope.workspace_id, scope.application_id)).fetchone()
-                if state is None:
-                    raise ValueError('APPLICATION_UNAVAILABLE')
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
-                if any(state[f'{name}_revision'] !=
-                       args.get(f'expected{name.capitalize()}Revision',
-                                state[f'{name}_revision'])
-                       for name in ('metadata', 'policy')):
-                    raise ValueError('STALE_EXPRESSION_RULE_LIST_REVISION')
-                rows = db.execute('''SELECT v.*
-                    FROM epm.expression_rule_definition v
+        with self._read_cut(scope, self.LIST) as (db, state, access):
+            if any(state[f'{name}_revision'] !=
+                   args.get(f'expected{name.capitalize()}Revision',
+                            state[f'{name}_revision'])
+                   for name in ('metadata', 'policy')):
+                raise ValueError('STALE_EXPRESSION_RULE_LIST_REVISION')
+            operation = args.get('containsOperation')
+            identity_cut = {}
+            if access.authorization_model == 'group_assignments':
+                from .postgres_dimensional_scope import resolve_effective_dimensional_scope
+                authority = resolve_effective_dimensional_scope(db,self.identity,scope,access=access)
+                identity_cut = {'issuer':self.identity.issuer, 'subject':self.identity.subject_id,
+                                'authorizationScopeDigest':authority.scope_digest}
+            token = (_canonical_digest({'format': self.LIST_COLLECTION_FORMAT,
+                'scope': [scope.workspace_id, scope.application_id],
+                'state': state, 'containsOperation': operation, **identity_cut})
+                if self.LIST_COLLECTION_FORMAT is not None else None)
+            if 'collectionToken' in args and args['collectionToken'] != token:
+                raise ValueError('STALE_EXPRESSION_RULE_LIST_REVISION')
+            if access.authorization_model == 'group_assignments':
+                from .postgres_group_rule_directory import runnable_page
+                rows = (runnable_page(db, self.identity, scope, authority, state, after=after, limit=limit,
+                                      operation=operation, stored_function=self.STORED_FUNCTION)
+                        if STORED_KINDS[self.STORED_FUNCTION]=='ApplicationRule' else [])
+            else:
+                filter_sql, filter_parameters = '', ()
+                if operation is not None:
+                    filter_sql = ' AND v.program @> %s'
+                    filter_parameters = (Jsonb({'function': self.STORED_FUNCTION,
+                        'arguments': {'units': [{'operations': [{'function': operation}]}]}}),)
+                query = '''SELECT v.* FROM epm.expression_rule_definition v
                     WHERE v.workspace_id=%s AND v.application_id=%s
-                      AND v.definition_kind=%s
-                      AND (%s::text IS NULL OR v.rule_id>%s)
-                    ORDER BY v.rule_id LIMIT %s''',
-                    (scope.workspace_id, scope.application_id,
-                     STORED_KINDS[self.STORED_FUNCTION], after, after, limit + 1)).fetchall()
-                result = []
-                owner_context=resolution_context(db,scope,rows[:limit])
-                for row in rows[:limit]:
-                    if row['program'] is not None and _canonical_digest(row['program']) != row['program_digest']:
-                        raise ValueError('EXPRESSION_RULE_DEFINITION_CORRUPT')
-                    calculation = row['program']['arguments'] if row['program'] is not None else None
-                    result.append({
-                        'ruleId': row['rule_id'],
-                        'stateToken': row['state_token'],
-                        'programDigest': row['program_digest'],
-                        'sourceBuildId': row['source_build_id'],
-                        **current_state(row,owner_context),
-                        **(self._summary(calculation) if calculation is not None else {}),
-                        'definitionMetadataRevision':
-                            row['metadata_revision'],
-                        'metadataCurrent': row['metadata_revision'] ==
-                            state['metadata_revision'],
-                    })
-                return {'rows': result,
-                        'metadataRevision': state['metadata_revision'],
-                        'policyRevision': state['policy_revision'],
-                        'hasMore': len(rows) > limit,
-                        'nextAfterRuleId': (result[-1]['ruleId']
-                                            if len(rows) > limit else None)}
+                      AND v.definition_kind=%s AND (%s::text IS NULL OR v.rule_id>%s)'''
+                query += filter_sql + ' ORDER BY v.rule_id LIMIT %s'
+                rows = db.execute(query, (scope.workspace_id, scope.application_id,
+                    STORED_KINDS[self.STORED_FUNCTION], after, after, *filter_parameters, limit+1)).fetchall()
+            result = []
+            owner_context = resolution_context(db, scope, rows[:limit])
+            for row in rows[:limit]:
+                if row['program'] is not None and _canonical_digest(row['program']) != row['program_digest']:
+                    raise ValueError('EXPRESSION_RULE_DEFINITION_CORRUPT')
+                calculation = row['program']['arguments'] if row['program'] is not None else None
+                result.append({
+                    'ruleId': row['rule_id'],
+                    'stateToken': row['state_token'],
+                    'programDigest': row['program_digest'],
+                    'sourceBuildId': row['source_build_id'],
+                    **current_state(row, owner_context),
+                    **(self._summary(calculation) if calculation is not None else {}),
+                    'definitionMetadataRevision': row['metadata_revision'],
+                    'metadataCurrent': row['metadata_revision'] == state['metadata_revision'],
+                })
+            has_more = len(rows) > limit
+            return {'rows': result,
+                    **({'collectionToken': token} if token is not None else {}),
+                    'metadataRevision': state['metadata_revision'],
+                    'policyRevision': state['policy_revision'],
+                    'hasMore': has_more,
+                    'nextAfterRuleId': result[-1]['ruleId'] if has_more else None}

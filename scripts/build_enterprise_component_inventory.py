@@ -25,7 +25,7 @@ PRODUCTION_ROOTS = (
     "deploy/python-build", "deploy/identity", "deploy/operations", "deploy/proxy",
     "deploy/release", "deploy/postgres",
 )
-EXECUTABLE_SUFFIXES = {".py", ".sh", ".ts", ".tsx", ".js", ".mjs", ".sql"}
+EXECUTABLE_SUFFIXES = {".java", ".py", ".sh", ".ts", ".tsx", ".js", ".mjs", ".sql"}
 CONFIG_SUFFIXES = {".json", ".yaml", ".yml", ".toml", ".lock"}
 RETIRED_EXECUTABLES = (
     "scripts/activate_owner_laptop_uat_governance.py",
@@ -61,10 +61,15 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def tracked_files() -> frozenset[str]:
-    """Return the committed/staged source boundary, excluding local scratch."""
+def working_source_files() -> frozenset[str]:
+    """Inventory current nonignored source, including newly authored files.
+
+    This is a development evidence map, not the clean Git release-package
+    selector. A new executable must have an owner before it is staged; ignored
+    caches and private runtime remain outside this inventory.
+    """
     result = subprocess.run(
-        ["git", "ls-files", "-z", "--cached"],
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
         cwd=ROOT,
         check=True,
         capture_output=True,
@@ -157,7 +162,7 @@ def classify_test(path: Path) -> dict:
 def build() -> dict:
     base = json.loads(BASE.read_text())
     components = base["components"]
-    tracked = tracked_files()
+    tracked = working_source_files()
     source_files = []
     for root in PRODUCTION_ROOTS:
         for path in files_under(root, tracked):
@@ -193,9 +198,10 @@ def build() -> dict:
         for path in root.rglob("*")
         if (path.is_file() and "__pycache__" not in path.parts
             and path.relative_to(ROOT).as_posix() in tracked
-            and path.suffix in (".py", ".ts", ".tsx")
+            and path.suffix in (".py", ".ts", ".tsx", ".mjs")
             and (path.name.startswith("test_") or
                  ".test." in path.name or
+                 ".browser." in path.name or
                  path.name.startswith("qualify_"))))
     tests = [classify_test(path) for path in test_paths]
     test_categories = {}
@@ -207,8 +213,9 @@ def build() -> dict:
         for path in root.rglob("*")
         if path.is_file() and path.relative_to(ROOT).as_posix() in tracked
             and (path.suffix in CONFIG_SUFFIXES
-                               or path.name.startswith("Dockerfile")
-                               or ".env." in path.name)
+                 or path.name.startswith("Dockerfile")
+                 or path.parent.as_posix().endswith("/META-INF/services")
+                 or ".env." in path.name)
     } | {"pyproject.toml", "requirements-postgres.lock",
          "requirements-dev.txt", "web-ui/package.json"})
     documents = sorted({
@@ -230,7 +237,8 @@ def build() -> dict:
 
     return {
         "format": "openepm-enterprise-component-disposition-v1",
-        "asOf": "2026-11-11",
+        "asOf": "2026-11-25",
+        "sourceScope": "Current tracked and nonignored working files; development inventory, not release-package cleanliness or acceptance.",
         "authority": "PROJECT_INPUTS.md, docs/laptop-core-architecture-and-business-semantics-plan-2026-11-11.md and docs/enterprise-readiness-acceptance-register.json",
         "baseInventory": BASE.relative_to(ROOT).as_posix(),
         "summary": {

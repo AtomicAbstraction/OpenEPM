@@ -1,9 +1,18 @@
 import type { ApplicationCatalog } from "./types";
+import {
+  LEGACY_SEQUENCE_GUIDANCE,
+  RETIRED_FUNCTION,
+} from "./sequence-availability";
 
 const WORKFLOW_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,299}$/;
 const APPLICATION_RULE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const FUNCTION = /^[a-z][a-z0-9_.-]{0,127}$/;
 const DIGEST = /^[0-9a-f]{64}$/;
+const RETIRED_SEQUENCE_FUNCTIONS = new Set([
+  "rules.numeric_sequence.list",
+  "rules.numeric_sequence.read",
+  "rules.numeric_sequence.run",
+]);
 
 export type WorkflowDestinationResolution =
   | {
@@ -38,6 +47,14 @@ function exactKeys(value: Record<string, unknown>, keys: string[]) {
   );
 }
 
+function retiredSequenceBoundary(): WorkflowDestinationResolution {
+  return {
+    supported: false,
+    code: RETIRED_FUNCTION,
+    message: LEGACY_SEQUENCE_GUIDANCE,
+  };
+}
+
 export function resolveWorkflowDestination(
   destination: unknown,
   catalog: ApplicationCatalog | null,
@@ -65,8 +82,9 @@ export function resolveWorkflowDestination(
     if (!catalog?.functions["grid.definition.read"])
       return {
         supported: false,
-        code: "WORKFLOW_CUBE_VIEW_DESTINATION_UNAUTHORIZED",
-        message: "The current role cannot inspect the configured cube view.",
+        code: "WORKFLOW_CUBE_VIEW_DESTINATION_UNAVAILABLE",
+        message:
+          "The configured view cannot be opened in the current application context.",
       };
     return {
       supported: true,
@@ -91,11 +109,14 @@ export function resolveWorkflowDestination(
         message:
           "This workflow function destination is malformed and was not opened.",
       };
+    if (RETIRED_SEQUENCE_FUNCTIONS.has(destination.function))
+      return retiredSequenceBoundary();
     if (!catalog?.functions[destination.function])
       return {
         supported: false,
-        code: "WORKFLOW_FUNCTION_DESTINATION_UNAUTHORIZED",
-        message: `The current role cannot use ${destination.function}.`,
+        code: "WORKFLOW_FUNCTION_DESTINATION_UNAVAILABLE",
+        message:
+          "The configured function is not available in the current application context.",
       };
     return {
       supported: false,
@@ -131,6 +152,8 @@ export function resolveWorkflowDestination(
         message:
           "This workflow artifact destination is unsupported or malformed.",
       };
+    if (destination.artifactKind === "ApplicationSequence")
+      return retiredSequenceBoundary();
     const readFunctions = {
       ApplicationRule: "application.rule.read",
       CalculatedMember: "calculated.member.read",
@@ -142,9 +165,9 @@ export function resolveWorkflowDestination(
     if (!catalog?.functions[readFunction])
       return {
         supported: false,
-        code: "WORKFLOW_ARTIFACT_DESTINATION_UNAUTHORIZED",
+        code: "WORKFLOW_ARTIFACT_DESTINATION_UNAVAILABLE",
         message:
-          "The current role cannot inspect the configured current artifact.",
+          "Inspection of the configured artifact is not available in the current application context.",
       };
     return {
       supported: true,
@@ -160,6 +183,7 @@ export function resolveWorkflowDestination(
   return {
     supported: false,
     code: "WORKFLOW_DESTINATION_KIND_UNSUPPORTED",
-    message: `Destination kind ${destination.kind} is not supported by this release.`,
+    message:
+      "This type of workflow destination is unsupported in this release.",
   };
 }

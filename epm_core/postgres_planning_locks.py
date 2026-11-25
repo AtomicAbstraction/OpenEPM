@@ -19,7 +19,7 @@ from epm_core.postgres_connection import connect_postgres
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .current_object_contract import new_state_token,require_state_token
+from .current_object_contract import STATE_TOKEN_PATTERN, new_state_token, require_state_token
 from .persistence_contract import ApplicationScope
 from .postgres_access import PostgresAccessChecker,VerifiedIdentity
 from .postgres_jobs import _canonical_digest
@@ -33,6 +33,119 @@ ALL_FUNCTIONS=frozenset({
     'cube.write.scope.approve','cube.write.scope.reopen'})
 PUBLIC_READ='cube.write.scope.read'
 PUBLIC_WORKLIST='cube.write.scope.worklist'
+FUNCTIONS = ALL_FUNCTIONS | {PUBLIC_READ, PUBLIC_WORKLIST}
+
+
+def scope_program_contract(function: str) -> dict:
+    from .metadata_read_contract import DIALECT, read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    lock_id = {'type': 'string', 'pattern': '^' + _LOCK_ID.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    state_token = {'type': 'string', 'pattern': '^' + STATE_TOKEN_PATTERN.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    member_id = {'type': 'string', 'minLength': 1, 'maxLength': 200}
+    principal_id = {'type': 'string', 'minLength': 1, 'maxLength': 300}
+    principal = obj({'issuer': principal_id, 'subjectId': principal_id})
+    revision = {'type': 'integer', 'minimum': 0}
+    nullable_revision = {'type': ['integer', 'null'], 'minimum': 0}
+    scope = {'scopeMembers': {'type': 'object', 'maxProperties': 32,
+                              'propertyNames': member_id, 'additionalProperties': member_id},
+             'scopeAll': {'type': 'boolean'}}
+    lock_status = {'enum': ['Locked', 'Open']}
+    submission_status = {'enum': ['Submitted', 'Approved', 'Reopened']}
+    lock_revisions = {'lockedRevision': revision, 'reopenedRevision': nullable_revision}
+    submission_revisions = {'submittedRevision': revision, 'approvedRevision': nullable_revision}
+    sample_id, sample_token = 'a' * 32, 'b' * 64
+    reason = {'type': 'string', 'minLength': 1, 'maxLength': 500, 'pattern': r'^[^\u0000]*(?![\s\S])'}
+    result_fields = {'lockId': lock_id, 'committedRevision': revision}
+    target = None
+    if function == PUBLIC_READ:
+        arguments = obj({'lockId': lock_id})
+        fields = {'lockId': lock_id, 'status': lock_status, 'stateToken': state_token, **scope, **lock_revisions}
+        submission = obj({'status': submission_status, 'stateToken': state_token, 'reviewer': principal,
+                          **submission_revisions, 'reopenedRevision': nullable_revision})
+        result = obj({**fields, 'submission': submission}, list(fields))
+        examples = [read_example(function, {'lockId': sample_id}, name='Read the exact current lock and submission',
+                                binding='Use the lockId returned by the effect or your assigned worklist in the same application.')]
+    elif function == PUBLIC_WORKLIST:
+        nullable_id = {'anyOf': [lock_id, {'type': 'null'}]}
+        arguments = obj({'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100},
+                         'afterLockId': nullable_id, 'includeResolved': {'type': 'boolean'}}, [])
+        row = obj({'lockId': lock_id, 'lockStatus': lock_status, 'lockStateToken': state_token,
+                   **scope, **lock_revisions, 'submissionStatus': submission_status,
+                   'submissionStateToken': state_token, 'submitter': principal, **submission_revisions,
+                   'submissionReopenedRevision': nullable_revision})
+        result = obj({'items': {'type': 'array', 'maxItems': 100, 'items': row}, 'nextAfterLockId': nullable_id})
+        examples = [read_example(function, {'limit': 1, 'includeResolved': False},
+                        name='Open the assigned review worklist', binding='Select the application as the verified reviewer.'),
+                    read_example(function, {'limit': 1, 'afterLockId': sample_id, 'includeResolved': False},
+                        name='Continue the assigned review worklist', binding='Copy nextAfterLockId from the prior page and preserve the filter. A null cursor ends the list.')]
+    elif function in ('cube.write.scope.lock', 'cube.write.scope.submit'):
+        submit = function == 'cube.write.scope.submit'
+        fields = {**scope, 'reason': reason}
+        target_fields = dict(scope)
+        result_fields.update(scope, status={'const': 'Submitted' if submit else 'Locked'}, stateToken=state_token)
+        example = {'scopeMembers': {'example-dimension': 'example-member'},
+                   'scopeAll': False, 'reason': 'Review the agreed input scope'}
+        binding = 'Use stable active dimension and member IDs from the target application. Preview the exact business program before applying.'
+        if submit:
+            fields.update(reviewerIssuer=principal_id, reviewerSubjectId=principal_id)
+            target_fields['reviewer'] = principal
+            result_fields.update(reviewer=principal, submissionStateToken=state_token)
+            example.update(reviewerIssuer='https://identity.example', reviewerSubjectId='example-reviewer')
+            binding += ' Use the exact issuer and subject of an application administrator authorized to review this work.'
+        arguments = obj(fields)
+        arguments['allOf'] = [{'if': {'properties': {'scopeAll': {'const': True}}},
+            'then': {'properties': {'scopeMembers': {'maxProperties': 0}}},
+            'else': {'properties': {'scopeMembers': {'minProperties': 1}}}}]
+        target = obj(target_fields)
+        result = obj(result_fields)
+        examples = [read_example(function, example, name='Submit the reviewed scope' if submit else 'Lock the reviewed scope',
+                                 binding=binding)]
+    else:
+        approve = function == 'cube.write.scope.approve'
+        token_field = 'expectedSubmissionStateToken' if approve else 'expectedStateToken'
+        arguments = obj({'lockId': lock_id, token_field: state_token, 'reason': reason})
+        target = obj({'lockId': lock_id, 'submissionStateToken' if approve else 'stateToken': state_token})
+        if approve:
+            result = obj({**result_fields, 'status': {'const': 'Approved'}, 'submissionStateToken': state_token})
+            binding = 'Copy lockId and submissionStateToken from the assigned worklist or current scope read. Preview as the assigned reviewer.'
+        else:
+            fields = {**result_fields, 'status': {'const': 'Open'}, 'stateToken': state_token}
+            result = obj({**fields, 'submissionStatus': {'const': 'Reopened'},
+                          'submissionStateToken': state_token}, list(fields))
+            result['dependentRequired'] = {'submissionStatus': ['submissionStateToken'],
+                                           'submissionStateToken': ['submissionStatus']}
+            binding = 'Read the current lock and copy its lockId and stateToken. Preview the exact reopen intent.'
+        examples = [read_example(function, {'lockId': sample_id, token_field: sample_token,
+                    'reason': 'Confirm the reviewed scope transition'}, name='Approve the assigned submission' if approve else 'Reopen the current locked scope',
+                    binding=binding)]
+
+    contract = read_contract(function, arguments, result, owner='PostgresPlanningLocks', examples=examples,
+        semantic_rules=[
+            'Whole-application scope is explicit. A member-scoped effect checks each stable dimension and member.',
+            'Submit requires current write access. Lock, Approve and Reopen require current administrator access. Approval also requires the assigned reviewer identity.',
+            'A lock state token and a submission state token identify different states. Approve advances the submission; Reopen advances the lock and any linked submission.',
+            'The worklist contains only assignments to the current verified reader. Each page is current when it is read. Restart at the first page to see assignments added or changed during traversal.',
+        ])
+    if target is None:
+        contract['programContract']['recovery'] = 'Use the current scope read for a known lock ID. Restart the assigned worklist from its first page to refresh available actions.'
+    else:
+        preview = {'$schema': DIALECT, **obj({'languageVersion': {'type': 'integer', 'const': 2},
+            'function': {'const': function}, 'target': target, 'previewToken': {'type': 'string', 'minLength': 1, 'maxLength': 4096},
+            'revisionVector': obj(dict.fromkeys(('metadata', 'data', 'policy'), revision))})}
+        committed = {'$schema': DIALECT, **result}
+        contract.update(resultSchema=committed, resultSchemaScope='result')
+        contract['programContract']['outputSchemas'] = {
+            'preview': {'schema': preview, 'scope': 'envelope', 'surface': 'preview_v2_program or Browser /api/preview'},
+            'committedResult': {'schema': committed, 'scope': 'result',
+                                'surface': 'apply_v2_cube_write_scope_transition or Browser /api/planning-action'},
+        }
+        contract['programContract']['recovery'] = (
+            'Submit the unchanged previewed program with its signed admission ID. If the outcome is unknown, '
+            'reconcile the original admitted request with its original preview and admission ID. An expired '
+            'admission can retrieve the exact committed result. An expired request with no receipt stays expired. '
+            'After a definite stale refusal, read the current lock or submission and review a new preview before requesting another admission.')
+    return contract
 
 
 def _compile(program: object) -> dict:
@@ -520,10 +633,9 @@ class PostgresPlanningLocks:
                  include_resolved: bool=False) -> dict:
         """Read this verified reviewer's assigned submissions.
 
-        This is a technical read: it does not advance application revisions.
-        The exact reviewer identity is part of the query even though RLS and a
-        fresh Administrator grant are also enforced, so one administrator
-        cannot enumerate another reviewer's assignments.
+        This technical read keeps application revisions unchanged. It filters
+        on the exact reviewer identity as well as the current read grant.
+        Approval checks current administrator authority separately.
         """
         if type(limit) is not int or not 1<=limit<=100:
             raise ValueError('PLANNING_WORKLIST_LIMIT_INVALID')

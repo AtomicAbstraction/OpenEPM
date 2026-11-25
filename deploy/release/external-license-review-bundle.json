@@ -4,7 +4,7 @@
     "externalLegalDecisions": 2,
     "packages": 2
   },
-  "decisionPacketSha256": "43876f6863c9995ceade50ade57d51fdc024f7dab24a4bc4a02af8d9bf39cdeb",
+  "decisionPacketSha256": "d7131947723bdfa3d5ac5e0ead214ecb281c71aabb717ce09143c3615bff8538",
   "evidenceGroups": [
     {
       "classifications": [
@@ -214,16 +214,16 @@
   "sourceCompliancePermitted": false,
   "status": "unreviewed-no-selection",
   "targetWheelProvenance": {
-    "evidencePath": "docs/qualifications/calculation-engine-w12-target-wheel-provenance-2026-11-10.json",
-    "evidenceSha256": "c357c628214323504d3780475428b50143fa38bb544fabe754e6985e5b616ba6",
-    "lockSha256": "5901c2d0a3787e37fade607b1404a7f748b487d3807f5209909615e283c2e341",
-    "lockedPackages": 43,
-    "verifiedWheels": 86,
     "architectures": [
       "linux/amd64",
       "linux/arm64"
     ],
-    "residualPackageEvidenceExactMatch": true
+    "evidencePath": "docs/qualifications/improvement-current-target-wheel-provenance-2026-11-24.json",
+    "evidenceSha256": "c461f8df0d7410e8368336c730c23636c85206a467b9ad9153b1d7d7d262d6d4",
+    "lockSha256": "341bd4215b52f43184f6fcf00a89d34a1be62507138bf0286ecec26dd547e339",
+    "lockedPackages": 43,
+    "residualPackageEvidenceExactMatch": true,
+    "verifiedWheels": 86
   },
   "trustedPolicy": false
 }

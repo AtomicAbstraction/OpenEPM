@@ -61,6 +61,27 @@ it("fails unknown sections and malformed or unscoped selections back to safe nav
   ).toEqual({ section: "reference" });
 });
 
+it("migrates retired semantic-editor bookmarks to governed attributes", () => {
+  expect(
+    readMetadataDestination(
+      new URLSearchParams(
+        "metadataSection=semantics&dimension=Account&member=Sales",
+      ),
+    ),
+  ).toEqual({
+    section: "attributes",
+    dimensionId: "Account",
+    memberId: "Sales",
+  });
+  const query = new URLSearchParams();
+  writeMetadataDestination(query, {
+    section: "attributes",
+    dimensionId: "Account",
+  });
+  expect(query.get("metadataSection")).toBe("attributes");
+  expect(query.toString()).not.toContain("semantics");
+});
+
 it("limits the new draft-loss guard to metadata and member-list workspaces", () => {
   expect(metadataNavigationNeedsGuard("metadata")).toBe(true);
   expect(metadataNavigationNeedsGuard("lists")).toBe(true);
@@ -97,4 +118,46 @@ it("preserves exact named hierarchy identity and removes stale children when reu
       new URLSearchParams("metadataSection=relationships&hierarchy=H_ALT"),
     ),
   ).not.toHaveProperty("hierarchyId");
+});
+
+it("round-trips an explicit placement only with its dimension and member, preserving invalid refusal", () => {
+  for (const section of ["relationships", "tree"] as const) {
+    const query = new URLSearchParams();
+    writeMetadataDestination(query, {
+      section,
+      dimensionId: "Account",
+      memberId: "Cash",
+      hierarchyId: "H Reporting",
+      relationshipId: "flow/cash & edge",
+    });
+    expect(readMetadataDestination(query)).toEqual({
+      section,
+      dimensionId: "Account",
+      memberId: "Cash",
+      hierarchyId: "H Reporting",
+      relationshipId: "flow/cash & edge",
+    });
+    query.set("relationship", "\u0000invalid");
+    expect(readMetadataDestination(query).relationshipId).toBe("");
+    writeMetadataDestination(query, readMetadataDestination(query));
+    expect(query.has("relationship")).toBe(true);
+    expect(query.get("relationship")).toBe("");
+    for (const destination of [
+      { section, dimensionId: "Entity" },
+      { section, dimensionId: "Account", relationshipId: "edge" },
+      {
+        section: "members" as const,
+        dimensionId: "Account",
+        memberId: "Cash",
+        relationshipId: "edge",
+      },
+      { section: "dimensions" as const },
+    ]) {
+      writeMetadataDestination(query, destination);
+      expect(query.has("relationship")).toBe(false);
+      expect(readMetadataDestination(query)).not.toHaveProperty(
+        "relationshipId",
+      );
+    }
+  }
 });

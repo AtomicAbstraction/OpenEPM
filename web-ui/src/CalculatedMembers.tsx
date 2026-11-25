@@ -1,8 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { PythonDefinitionEditor } from "./PythonDefinitionEditor";
-import type { PythonSourceBinding } from "./PythonDefinitionEditor";
 import { pythonDefinitionTemplates } from "./python-definition-templates";
-import { readProgram } from "./api";
+import { ApiError, readProgram } from "./api";
+import {
+  definitionAvailabilityLabel,
+  isDefinitionLifecycle,
+  isDefinitionSourceBinding,
+} from "./definition-lifecycle";
+import type {
+  DefinitionLifecycle,
+  DefinitionSourceBinding,
+} from "./definition-lifecycle";
 import type { ApplicationCatalog, ApplicationSummary, Scope } from "./types";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
@@ -19,6 +27,31 @@ function nonNegativeInteger(value: unknown): value is number {
 
 function positiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) > 0;
+}
+
+const OPAQUE_VALUE = /^(?:[0-9a-f]{32,}|oa1_[A-Za-z0-9_-]+)$/i;
+
+export function readableCalculationLabel(value: string): string {
+  if (!value || OPAQUE_VALUE.test(value)) return "Current calculation scope";
+  const words = value
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .trim();
+  return words ? words[0].toUpperCase() + words.slice(1) : "Current";
+}
+
+function impactCount(value: Record<string, unknown> | null, key: string) {
+  const count = value?.[key];
+  return nonNegativeInteger(count) ? count : null;
+}
+
+function impactWarnings(value: Record<string, unknown> | null): string[] {
+  const cost = value?.cost;
+  if (!object(cost) || !Array.isArray(cost.warnings)) return [];
+  return cost.warnings
+    .filter((item): item is string => typeof item === "string")
+    .slice(0, 20)
+    .map(readableCalculationLabel);
 }
 
 function exactTarget(value: unknown): value is {
@@ -57,50 +90,69 @@ function exactDependencies(
   return true;
 }
 
-type Summary = {
-  definitionId: string;
-  stateToken: string;
-  status: "Saved" | "Active";
+type CompiledSummary = {
   programDigest: string;
   evaluation: "dynamic" | "materialized";
   dependencies: Array<{ definitionId: string }>;
-  metadataCurrent: boolean;
-  definitionMetadataRevision: number;
-  target: Record<string, unknown>;
-  resultUnit: string;
+  target: { dimensionId: string; memberId: string };
+  resultUnit: "amount" | "ratio";
 };
 
-type Detail = {
-  source?: PythonSourceBinding | null;
-  defined: boolean;
+type Summary = DefinitionLifecycle & {
   definitionId: string;
   stateToken: string;
-  status: "Saved" | "Active" | null;
-  program: {
-    function: string;
-    arguments: {
-      evaluation: "dynamic" | "materialized";
-      format: "openepm-calculated-member-v1";
-      definitionId: string;
-      name: string;
-      sourceSelection: Record<string, unknown>;
-      expression: unknown;
-      dependencies: Array<{ definitionId: string }>;
-      resultKey: string | null;
-      target: { dimensionId: string; memberId: string };
-      resultUnit: "amount" | "ratio";
-      maxSourceCells: number;
-      maxOutputCells: number;
-    };
+  metadataCurrent: boolean;
+  definitionMetadataRevision: number;
+} & (
+    | CompiledSummary
+    | {
+        programDigest: null;
+        evaluation?: never;
+        dependencies?: never;
+        target?: never;
+        resultUnit?: never;
+      }
+  );
+
+type CompiledProgram = {
+  function: string;
+  arguments: {
+    evaluation: "dynamic" | "materialized";
+    format: "openepm-calculated-member-v1";
+    definitionId: string;
+    name: string;
+    sourceSelection: Record<string, unknown>;
+    expression: unknown;
+    dependencies: Array<{ definitionId: string }>;
+    resultKey: string | null;
+    target: { dimensionId: string; memberId: string };
+    resultUnit: "amount" | "ratio";
+    maxSourceCells: number;
+    maxOutputCells: number;
   };
-  programDigest: string;
+};
+
+type Detail = DefinitionLifecycle & {
+  source: DefinitionSourceBinding | null;
+  definitionId: string;
+  stateToken: string;
   definitionMetadataRevision: number;
   currentMetadataRevision: number;
   updatedAt: string;
   policyRevision: number;
-};
+} & (
+    | { program: CompiledProgram; programDigest: string }
+    | {
+        program: null;
+        programDigest: null;
+      }
+  );
 
-type Target = { definitionId: string; stateToken: string; digest: string };
+type Target = {
+  definitionId: string;
+  stateToken: string;
+  digest: string | null;
+};
 
 type CalculationStatusRow = {
   bindingDigest: string;
@@ -146,20 +198,34 @@ function exactPage(value: unknown): Page {
 }
 
 function exactSummary(value: unknown): value is Summary {
-  if (!object(value)) return false;
+  if (!object(value) || !isDefinitionLifecycle(value)) return false;
   const item = value;
+  if (
+    !(
+      typeof item.definitionId === "string" &&
+      ID.test(item.definitionId) &&
+      typeof item.stateToken === "string" &&
+      DIGEST.test(item.stateToken) &&
+      typeof item.metadataCurrent === "boolean" &&
+      nonNegativeInteger(item.definitionMetadataRevision)
+    )
+  )
+    return false;
+  if (item.programDigest === null)
+    return (
+      !item.valid &&
+      !item.executable &&
+      (item.reason === "validation_required" ||
+        item.reason === "ownership_unresolved") &&
+      ["evaluation", "dependencies", "target", "resultUnit"].every(
+        (field) => !Object.hasOwn(item, field),
+      )
+    );
   return (
-    typeof item.definitionId === "string" &&
-    ID.test(item.definitionId) &&
-    typeof item.stateToken === "string" &&
-    DIGEST.test(item.stateToken) &&
     typeof item.programDigest === "string" &&
     DIGEST.test(item.programDigest) &&
     (item.evaluation === "dynamic" || item.evaluation === "materialized") &&
     exactDependencies(item.dependencies) &&
-    typeof item.metadataCurrent === "boolean" &&
-    nonNegativeInteger(item.definitionMetadataRevision) &&
-    (item.status === "Saved" || item.status === "Active") &&
     exactTarget(item.target) &&
     (item.resultUnit === "amount" || item.resultUnit === "ratio")
   );
@@ -169,15 +235,46 @@ export function exactCalculatedMemberDetail(
   value: unknown,
   target: Target,
 ): Detail {
-  if (!object(value)) throw new Error("INVALID_CALCULATED_MEMBER_RESPONSE");
+  if (!object(value) || !isDefinitionLifecycle(value))
+    throw new Error("INVALID_CALCULATED_MEMBER_RESPONSE");
   const item = value;
-  const program = object(item.program) ? item.program : null;
-  const args = program && object(program.arguments) ? program.arguments : null;
   if (
-    item.defined !== true ||
+    typeof item.definitionId !== "string" ||
+    !ID.test(item.definitionId) ||
+    typeof item.stateToken !== "string" ||
+    !DIGEST.test(item.stateToken) ||
     item.definitionId !== target.definitionId ||
     item.stateToken !== target.stateToken ||
     item.programDigest !== target.digest ||
+    !(
+      item.source === null ||
+      (isDefinitionSourceBinding(item.source) &&
+        item.sourceCurrent &&
+        item.source.active === item.active)
+    ) ||
+    !nonNegativeInteger(item.definitionMetadataRevision) ||
+    !nonNegativeInteger(item.currentMetadataRevision) ||
+    typeof item.updatedAt !== "string" ||
+    !Number.isFinite(Date.parse(item.updatedAt)) ||
+    !nonNegativeInteger(item.policyRevision)
+  )
+    throw new Error("INVALID_CALCULATED_MEMBER_RESPONSE");
+  if (item.program === null) {
+    if (
+      item.programDigest !== null ||
+      item.valid ||
+      item.executable ||
+      (item.reason !== "validation_required" &&
+        item.reason !== "ownership_unresolved")
+    )
+      throw new Error("INVALID_CALCULATED_MEMBER_RESPONSE");
+    return item as Detail;
+  }
+  const program = object(item.program) ? item.program : null;
+  const args = program && object(program.arguments) ? program.arguments : null;
+  if (
+    typeof item.programDigest !== "string" ||
+    !DIGEST.test(item.programDigest) ||
     program?.function !== "calculated.member.definition" ||
     !args ||
     Object.keys(args).sort().join("\u0000") !==
@@ -215,13 +312,7 @@ export function exactCalculatedMemberDetail(
     !positiveInteger(args.maxSourceCells) ||
     Number(args.maxSourceCells) > 1_000_000 ||
     !positiveInteger(args.maxOutputCells) ||
-    Number(args.maxOutputCells) > 100_000 ||
-    (item.status !== "Active" && item.status !== "Saved") ||
-    !nonNegativeInteger(item.definitionMetadataRevision) ||
-    !nonNegativeInteger(item.currentMetadataRevision) ||
-    typeof item.updatedAt !== "string" ||
-    !Number.isFinite(Date.parse(item.updatedAt)) ||
-    !nonNegativeInteger(item.policyRevision)
+    Number(args.maxOutputCells) > 100_000
   )
     throw new Error("INVALID_CALCULATED_MEMBER_RESPONSE");
   return item as Detail;
@@ -305,14 +396,30 @@ export function CalculatedMembers({
   const [page, setPage] = useState(0);
   const listRequest = useRef<AbortController | null>(null);
   const detailRequest = useRef<AbortController | null>(null);
+  const impactRequest = useRef<AbortController | null>(null);
   const detailHeading = useRef<HTMLHeadingElement | null>(null);
   const detailTrigger = useRef<HTMLButtonElement | null>(null);
   const inventoryHeading = useRef<HTMLHeadingElement | null>(null);
-  const authorized = Boolean(catalog?.functions["calculated.member.read"]);
+  const canRead = Boolean(catalog?.functions["calculated.member.read"]);
   const canList = Boolean(catalog?.functions["calculated.member.list"]);
   const scope = app
     ? { workspaceId: app.workspaceId, applicationId: app.applicationId }
     : null;
+  const contextKey = JSON.stringify([
+    app?.workspaceId,
+    app?.applicationId,
+    catalog?.applicationAccess,
+    catalog?.revisions.metadata,
+    catalog?.revisions.policy,
+    catalog?.revisions.security,
+    catalog?.revisions.schemaEpoch,
+    Object.keys(catalog?.functions || {}).sort(),
+  ]);
+  const activeContext = useRef(contextKey);
+  activeContext.current = contextKey;
+  const [stateContext, setStateContext] = useState(contextKey);
+  const isCurrent = (controller: AbortController) =>
+    !controller.signal.aborted && activeContext.current === contextKey;
 
   async function readList() {
     if (!scope || !canList) return;
@@ -323,25 +430,33 @@ export function CalculatedMembers({
     setListError("");
     try {
       const values = await allCurrent(scope, controller.signal);
-      if (controller.signal.aborted) return;
+      if (!isCurrent(controller)) return;
       setRows(values);
       setListState("loaded");
       setPage(0);
       return values;
     } catch (reason) {
-      if (controller.signal.aborted) return;
+      if (!isCurrent(controller)) return;
+      setRows([]);
       setListState("error");
       setListError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to read calculated members.",
+        reason instanceof ApiError &&
+          [
+            "RULE_READ_AUTHORIZATION_STALE",
+            "STALE_EXPRESSION_RULE_LIST_REVISION",
+          ].includes(reason.code)
+          ? "Calculated-member access or definitions changed. Choose Refresh calculated members to check again."
+          : reason instanceof Error
+            ? reason.message
+            : "Unable to read calculated members.",
       );
     }
   }
 
   async function readExact(next: Target) {
-    if (!scope || !authorized) return;
+    if (!scope || !canRead) return;
     detailRequest.current?.abort();
+    impactRequest.current?.abort();
     const controller = new AbortController();
     detailRequest.current = controller;
     setDetail(null);
@@ -358,36 +473,37 @@ export function CalculatedMembers({
         controller.signal,
       );
       const exact = exactCalculatedMemberDetail(value, next);
-      if (!controller.signal.aborted) {
+      if (isCurrent(controller)) {
         setDetail(exact);
-        if (catalog?.functions["calculation.status.read"])
-          setCalculationStatus(
-            await readProgram<CalculationStatus>(
-              scope,
-              "calculation.status.read",
-              {
-                definitionId: next.definitionId,
-                definitionStateToken: next.stateToken,
-                limit: 500,
-              },
-              controller.signal,
-            ),
+        if (catalog?.functions["calculation.status.read"]) {
+          const status = await readProgram<CalculationStatus>(
+            scope,
+            "calculation.status.read",
+            {
+              definitionId: next.definitionId,
+              definitionStateToken: next.stateToken,
+              limit: 500,
+            },
+            controller.signal,
           );
+          if (isCurrent(controller)) setCalculationStatus(status);
+        }
       }
     } catch (reason) {
-      if (!controller.signal.aborted)
+      if (isCurrent(controller))
         setDetailError(
           reason instanceof Error
             ? reason.message
             : "Unable to read calculated member.",
         );
     } finally {
-      if (!controller.signal.aborted) setReadingTarget(null);
+      if (isCurrent(controller)) setReadingTarget(null);
     }
   }
 
   function closeDetail(restoreFocus = false) {
     detailRequest.current?.abort();
+    impactRequest.current?.abort();
     setDetail(null);
     setCalculationStatus(null);
     setImpactExplanation(null);
@@ -403,19 +519,25 @@ export function CalculatedMembers({
 
   async function explainImpact(bindingDigest: string) {
     if (!scope || !catalog?.functions["calculation.impact.explain"]) return;
+    impactRequest.current?.abort();
+    const controller = new AbortController();
+    impactRequest.current = controller;
     setDetailError("");
     try {
-      setImpactExplanation(
-        await readProgram<Record<string, unknown>>(
-          scope,
-          "calculation.impact.explain",
-          { bindingDigest, mode: "affected" },
-        ),
+      const explanation = await readProgram<Record<string, unknown>>(
+        scope,
+        "calculation.impact.explain",
+        { bindingDigest, mode: "affected" },
+        controller.signal,
       );
+      if (isCurrent(controller)) setImpactExplanation(explanation);
     } catch (reason) {
-      setDetailError(
-        reason instanceof Error ? reason.message : "Unable to explain impact.",
-      );
+      if (isCurrent(controller))
+        setDetailError(
+          reason instanceof Error
+            ? reason.message
+            : "Unable to explain impact.",
+        );
     }
   }
 
@@ -424,6 +546,7 @@ export function CalculatedMembers({
   }, [detail]);
 
   useEffect(() => {
+    setStateContext(contextKey);
     setRows([]);
     setListState("unread");
     setListError("");
@@ -434,22 +557,22 @@ export function CalculatedMembers({
     return () => {
       listRequest.current?.abort();
       detailRequest.current?.abort();
+      impactRequest.current?.abort();
     };
-  }, [app?.workspaceId, app?.applicationId, authorized, canList]);
+  }, [contextKey, canRead, canList]);
 
   useEffect(() => {
     if (target) void readExact(target);
   }, [
-    app?.workspaceId,
-    app?.applicationId,
+    contextKey,
     target?.definitionId,
     target?.stateToken,
     target?.digest,
-    authorized,
+    canRead,
   ]);
 
   const filtered = rows.filter((row) =>
-    `${row.definitionId} ${row.evaluation} ${row.target.dimensionId} ${row.target.memberId}`
+    `${row.definitionId} ${row.evaluation ?? ""} ${row.target?.dimensionId ?? ""} ${row.target?.memberId ?? ""}`
       .toLocaleLowerCase()
       .includes(query.trim().toLocaleLowerCase()),
   );
@@ -459,13 +582,21 @@ export function CalculatedMembers({
   );
   const visible = filtered.slice(start, start + 50);
 
-  if (!authorized || !scope) {
-    return target ? (
-      <p className="inline-error" role="alert">
-        Calculated-member inspection is not authorized.
+  if (!scope)
+    return (
+      <p role="status">Select an application to inspect calculated members.</p>
+    );
+  if (!catalog)
+    return <p role="status">Checking calculated-member availability…</p>;
+  if (!canRead)
+    return (
+      <p role="status">
+        Calculated-member inspection is not available in the current application
+        context.
       </p>
-    ) : null;
-  }
+    );
+  if (stateContext !== contextKey)
+    return <p role="status">Loading current calculated members…</p>;
   return (
     <section
       className="panel capability-activity calculated-members"
@@ -526,10 +657,11 @@ export function CalculatedMembers({
       )}
       {!canList && (
         <p className="muted-copy">
-          The calculated-member inventory is not available to your current role.
+          The calculated-member inventory is not available in the current
+          application context.
         </p>
       )}
-      {rows.length > 0 && (
+      {listState === "loaded" && rows.length > 0 && (
         <>
           <div className="workspace-list-toolbar">
             <label>
@@ -553,7 +685,6 @@ export function CalculatedMembers({
             role="region"
             aria-label="Calculated-member inventory"
             tabIndex={0}
-            aria-busy={listState === "loading"}
           >
             <table
               className="react-cube-grid"
@@ -563,6 +694,7 @@ export function CalculatedMembers({
                 <tr>
                   <th>Definition</th>
                   <th>State</th>
+                  <th>Execution validity</th>
                   <th>Evaluation</th>
                   <th>Target</th>
                   <th>Metadata</th>
@@ -595,10 +727,12 @@ export function CalculatedMembers({
                       </button>
                     </th>
                     <td>{row.status}</td>
-                    <td>{row.evaluation}</td>
+                    <td>{definitionAvailabilityLabel(row)}</td>
+                    <td>{row.evaluation ?? "Compiled details unavailable"}</td>
                     <td>
-                      {String(row.target.dimensionId)} /{" "}
-                      {String(row.target.memberId)}
+                      {row.target
+                        ? `${row.target.dimensionId} / ${row.target.memberId}`
+                        : "Compiled details unavailable"}
                     </td>
                     <td>{row.metadataCurrent ? "Current" : "Stale"}</td>
                   </tr>
@@ -682,11 +816,14 @@ export function CalculatedMembers({
             </button>
           </div>
           <p>
-            {detail.status} · {detail.program.arguments.evaluation} ·{" "}
+            {detail.status} · {definitionAvailabilityLabel(detail)}
+          </p>
+          <p>
             {detail.definitionMetadataRevision ===
             detail.currentMetadataRevision
-              ? "Current"
-              : "Stale"}
+              ? "Metadata current"
+              : "Metadata changed"}
+            . Result freshness is inspected separately below.
           </p>
           {detail.source && app && catalog ? (
             <PythonDefinitionEditor
@@ -715,42 +852,60 @@ export function CalculatedMembers({
           ) : (
             <p>This calculation has no bound Python source.</p>
           )}
-          <dl className="calculated-member-facts">
-            <div>
-              <dt>Target</dt>
-              <dd>
-                <code>
-                  {detail.program.arguments.target.dimensionId}:
-                  {detail.program.arguments.target.memberId}
-                </code>
-              </dd>
-            </div>
-            <div>
-              <dt>Result unit</dt>
-              <dd>{detail.program.arguments.resultUnit}</dd>
-            </div>
-            <div>
-              <dt>Evaluation</dt>
-              <dd>
-                {detail.program.arguments.evaluation === "dynamic"
-                  ? "Calculated when requested"
-                  : "Stored calculation result"}
-              </dd>
-            </div>
-          </dl>
-          <h4>Dependencies</h4>
-          {detail.program.arguments.dependencies.length ? (
-            <ul>
-              {detail.program.arguments.dependencies.map((dependency) => (
-                <li key={dependency.definitionId}>{dependency.definitionId}</li>
-              ))}
-            </ul>
+          {detail.program ? (
+            <>
+              <dl className="calculated-member-facts">
+                <div>
+                  <dt>Target</dt>
+                  <dd>
+                    <code>
+                      {detail.program.arguments.target.dimensionId}:
+                      {detail.program.arguments.target.memberId}
+                    </code>
+                  </dd>
+                </div>
+                <div>
+                  <dt>Result unit</dt>
+                  <dd>{detail.program.arguments.resultUnit}</dd>
+                </div>
+                <div>
+                  <dt>Evaluation</dt>
+                  <dd>
+                    {detail.program.arguments.evaluation === "dynamic"
+                      ? "Calculated when requested"
+                      : "Stored calculation result"}
+                  </dd>
+                </div>
+              </dl>
+              <h4>Dependencies</h4>
+              {detail.program.arguments.dependencies.length ? (
+                <ul>
+                  {detail.program.arguments.dependencies.map((dependency) => (
+                    <li key={dependency.definitionId}>
+                      {dependency.definitionId}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p>No calculated-member dependencies.</p>
+              )}
+            </>
           ) : (
-            <p>No calculated-member dependencies.</p>
+            <p>
+              Current compiled details are unavailable. Target, evaluation,
+              result unit and dependencies cannot be inspected from this owner
+              payload.
+            </p>
           )}
           <h4>Calculation status</h4>
           {!catalog?.functions["calculation.status.read"] ? (
             <p>Status inspection is not available to your current client.</p>
+          ) : calculationStatus === null ? (
+            <p role="status">
+              {readingTarget
+                ? "Loading calculation status…"
+                : "Calculation status has not been read successfully."}
+            </p>
           ) : calculationStatus?.rows.length ? (
             <div className="react-grid-scroll">
               <table
@@ -771,16 +926,17 @@ export function CalculatedMembers({
                     <tr
                       key={`${row.bindingDigest}:${row.stage}:${row.partitionKey}`}
                     >
-                      <th>
-                        {row.stage} / {row.partitionKey}
-                      </th>
+                      <th>{readableCalculationLabel(row.partitionKey)}</th>
                       <td>
-                        {row.freshness} · {row.coverage}
+                        {readableCalculationLabel(row.freshness)} ·{" "}
+                        {readableCalculationLabel(row.coverage)}
                       </td>
                       <td>
-                        {row.reasons.length ? row.reasons.join(", ") : "None"}
+                        {row.reasons.length
+                          ? row.reasons.map(readableCalculationLabel).join(", ")
+                          : "None"}
                       </td>
-                      <td>{row.presence}</td>
+                      <td>{readableCalculationLabel(row.presence)}</td>
                       <td>
                         <button
                           type="button"
@@ -803,30 +959,30 @@ export function CalculatedMembers({
             </p>
           )}
           {impactExplanation && (
-            <details open>
-              <summary>Affected-work explanation</summary>
-              <pre
-                tabIndex={0}
-                role="region"
-                aria-label="Affected-work explanation"
-              >
-                {JSON.stringify(impactExplanation, null, 2)}
-              </pre>
-            </details>
-          )}
-          <details>
-            <summary>Compiled calculation inspection</summary>
-            <pre
-              tabIndex={0}
-              role="region"
-              aria-label="Calculated-member expression"
+            <section
+              className="calculation-impact-summary"
+              aria-label="Affected-work explanation"
             >
-              {JSON.stringify(detail.program.arguments, null, 2)}
-            </pre>
-          </details>
+              <h4>Affected-work explanation</h4>
+              <p>
+                {impactCount(impactExplanation, "affectedUnitCount") === 0
+                  ? "No calculation work is currently affected."
+                  : `${impactCount(impactExplanation, "affectedUnitCount") ?? "Some"} calculation ${impactCount(impactExplanation, "affectedUnitCount") === 1 ? "scope is" : "scopes are"} affected.`}
+              </p>
+              {impactWarnings(impactExplanation).length > 0 && (
+                <ul>
+                  {impactWarnings(impactExplanation).map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          )}
           <p className="authority-note">
             This view shows the definition, current calculation scope and a
             bounded server explanation. Test and Run remain separate actions.
+            Execution also requires current actor authority, environment,
+            dependency and execution checks.
           </p>
         </article>
       )}

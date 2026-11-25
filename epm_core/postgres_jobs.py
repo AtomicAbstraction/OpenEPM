@@ -6,6 +6,7 @@ transaction; selected calculations publish immutable result generations.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from hashlib import sha256
 import json
 import re
@@ -13,6 +14,7 @@ import uuid
 
 import psycopg
 from epm_core.postgres_connection import connect_postgres
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -24,6 +26,7 @@ from .postgres_access import (AccessDenied, PostgresAccessChecker,
                               VerifiedExecutionIdentity, VerifiedIdentity)
 from .postgres_dimensional_scope import resolve_effective_dimensional_scope
 from .postgres_numeric_store import PostgresNumericFactStore
+from .postgres_numeric_job_visibility import numeric_job_visibility
 from .postgres_processing_limits import (configure_lock_wait,
                                          configure_statement_timeout,
                                          lock_busy_boundary, BUSY_CODE)
@@ -35,6 +38,7 @@ from .postgres_calculation_status import (
 _DIGEST = re.compile(r'[0-9a-f]{64}\Z')
 _JOB_ID = re.compile(r'[0-9a-f]{32}\Z')
 _KEY = re.compile(r'[A-Za-z0-9._-]{8,128}\Z')
+JOB_READ_AUTHORIZATION_STALE = 'JOB_READ_AUTHORIZATION_STALE'
 _NUMERIC_FUNCTION = 'facts.numeric.batch'
 _NUMERIC_COMPILER = 'numeric-fixed-v1'
 _TEXT_FUNCTION = 'facts.text.batch'
@@ -57,6 +61,29 @@ _AUTHORIZATION_FUNCTION_PAIRS = frozenset((
     ('consolidation.inventory.unrealized_profit.request',
      'consolidation.inventory.unrealized_profit.request'),
 ))
+
+
+def job_submission_schema() -> dict:
+    """Describe the bare submit/replay response, not a job read or receipt.
+
+    This is pure schema data owned beside the queue's response constructors;
+    it does not validate, authorize or change runtime job transitions. A replay
+    can observe any native epm.job status (0012_durable_jobs.sql), including a
+    terminal outcome. Owner-specific publication fields remain with that owner.
+    """
+    return {
+        '$schema': 'https://json-schema.org/draft/2020-12/schema',
+        'type': 'object',
+        'properties': {
+            'jobId': {'type': 'string', 'pattern': r'^[0-9a-f]{32}(?![\s\S])'},
+            'status': {'type': 'string', 'enum': [
+                'accepted', 'ready', 'running', 'staged', 'published',
+                'failed', 'cancel_requested', 'cancelled', 'needs_inspection']},
+            'duplicate': {'type': 'boolean'},
+        },
+        'required': ['jobId', 'status', 'duplicate'],
+        'additionalProperties': False,
+    }
 
 
 def _validate_authorization_function(function_name, authorization_function):
@@ -404,11 +431,7 @@ class PostgresJobQueue:
                 authorization_scope_digest=resolve_effective_dimensional_scope(
                     db,self.identity,scope,access=access,
                     function=function_name).scope_digest
-                prior=db.execute('''SELECT job_id,status,request_digest,
-                    expected_metadata_revision,expected_data_revision,
-                    expected_policy_revision,verified_groups,
-                    authorization_scope_digest,token_issued_at
-                    FROM epm.job WHERE workspace_id=%s AND application_id=%s
+                prior=db.execute('''SELECT * FROM epm.job WHERE workspace_id=%s AND application_id=%s
                     AND issuer=%s AND subject_id=%s AND idempotency_key=%s''',
                     (scope.workspace_id,scope.application_id,self.identity.issuer,
                      self.identity.subject_id,idempotency_key)).fetchone()
@@ -425,12 +448,100 @@ class PostgresJobQueue:
                     verified_groups=access.groups,
                     execution_authority=execution_authority)
                 descriptor['tokenIssuedAt']=prior['token_issued_at']
+                from .postgres_job_origin import matches_retained_request
                 if (tuple(prior['verified_groups'])!=access.groups
                         or prior['authorization_scope_digest'] is None
                         or prior['authorization_scope_digest']!=
                         authorization_scope_digest
-                        or _canonical_digest(descriptor)!=prior['request_digest']):
+                        or not matches_retained_request(prior['request_digest'],descriptor,execution_authority)):
                     raise ValueError('QUEUE_IDEMPOTENCY_CONFLICT')
+                if execution_authority is not None:
+                    _require_python_job_authority(db,scope,prior,replay_only=True)
+                return {'jobId':prior['job_id'],'status':prior['status'],'duplicate':True}
+
+    @lock_busy_boundary
+    def replay_calculated_member(self, scope: ApplicationScope, *,
+            idempotency_key: str, program: dict, preview: dict,
+            depends_on_job_ids: tuple[str, ...] = ()) -> dict | None:
+        """Read the original materialization, without resolving its current owner.
+
+        The language owner authenticates the retained preview before this call.
+        Its public-request digest and normalized-program digest bind both sides
+        of the original lowering; the durable descriptor binds all job inputs.
+        """
+        from .postgres_calculated_members import (MATERIALIZE, parse_evaluation_request,
+            recheck_materialization_run_access)
+        args=parse_evaluation_request(program,function=MATERIALIZE)
+        if (not isinstance(scope,ApplicationScope)
+                or not isinstance(idempotency_key,str) or not _KEY.fullmatch(idempotency_key)
+                or not isinstance(depends_on_job_ids,tuple) or len(depends_on_job_ids)>16
+                or any(not isinstance(value,str) or not _JOB_ID.fullmatch(value)
+                       for value in depends_on_job_ids)
+                or len(set(depends_on_job_ids))!=len(depends_on_job_ids)):
+            raise ValueError('JOB_REPLAY_ARGUMENTS_INVALID')
+        required={'scope','identity','function','programDigest','requestDigest',
+                  'revisions','expiresAt','expectedTargetStateToken'}
+        if (not isinstance(preview,dict) or not required<=set(preview)
+                or set(preview)-required-{'resourceClass','publishedInputs','contextDependencies'}
+                or preview.get('requestDigest')!=_canonical_digest(program)
+                or preview.get('function')!=MATERIALIZE
+                or preview.get('scope')!=[scope.workspace_id,scope.application_id]
+                or preview.get('identity')!=[self.identity.issuer,self.identity.subject_id]
+                or not isinstance(preview.get('programDigest'),str)
+                or not _DIGEST.fullmatch(preview['programDigest'])
+                or preview.get('resourceClass','short') not in ('short','medium')
+                or any(key in preview and not isinstance(preview[key],list)
+                       for key in ('publishedInputs','contextDependencies'))
+                or not isinstance(preview.get('revisions'),dict)
+                or set(preview['revisions'])!={'metadata_revision','data_revision','policy_revision'}
+                or any(type(value) is not int or value<0 for value in preview['revisions'].values())):
+            raise ValueError('STALE_OR_MISMATCHED_V2_PREVIEW')
+        with connect_postgres(self.dsn,row_factory=dict_row) as db:
+            with db.transaction():
+                db.execute('SET TRANSACTION READ ONLY')
+                PostgresNumericFactStore._set_scope(db,scope)
+                PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
+                access=PostgresAccessChecker.check_in_transaction(db,self.identity,scope,
+                    'write',function=MATERIALIZE,arguments=args)
+                recheck_materialization_run_access(db, self.identity, scope, access)
+                prior=db.execute('''SELECT job_id,status,function_name,normalized_program,
+                    program_digest,request_digest,compiler_version,plan_digest,resource_class,
+                    expected_metadata_revision,expected_data_revision,expected_policy_revision,
+                    verified_groups,authorization_scope_digest,token_issued_at
+                    FROM epm.job WHERE workspace_id=%s AND application_id=%s
+                    AND issuer=%s AND subject_id=%s AND idempotency_key=%s''',(
+                    scope.workspace_id,scope.application_id,self.identity.issuer,
+                    self.identity.subject_id,idempotency_key)).fetchone()
+                if prior is None:
+                    return None
+                normalized=prior['normalized_program']
+                pin=normalized.get('calculatedMember') if isinstance(normalized,dict) else None
+                if (prior['function_name']!='facts.expression.calculate'
+                        or not isinstance(pin,dict) or pin.get('definitionId')!=args['definitionId']
+                        or ('expectedStateToken' in args and (
+                            pin.get('stateToken')!=args['expectedStateToken']
+                            or pin.get('programDigest')!=args['expectedProgramDigest']))
+                        or _canonical_digest(normalized)!=prior['program_digest']
+                        or preview['programDigest']!=prior['program_digest']
+                        or preview['expectedTargetStateToken']!=normalized.get('expectedTargetStateToken')
+                        or any(preview.get(key,[])!=normalized.get(key,[])
+                               for key in ('publishedInputs','contextDependencies'))
+                        or preview.get('resourceClass','short')!=prior['resource_class']):
+                    raise ValueError('QUEUE_IDEMPOTENCY_CONFLICT')
+                authority=_verify_job_replay_authorization(db,scope,self.identity,prior,
+                    access=access,function_name=prior['function_name'])
+                revisions=preview['revisions']
+                descriptor=_job_request_descriptor(scope,self.identity,
+                    function_name=prior['function_name'],program_digest=prior['program_digest'],
+                    compiler_version=prior['compiler_version'],plan_digest=prior['plan_digest'],
+                    revisions=(revisions['metadata_revision'],revisions['data_revision'],
+                               revisions['policy_revision']),
+                    resource_class=prior['resource_class'],dependencies=depends_on_job_ids,
+                    authorization_scope_digest=authority,verified_groups=access.groups)
+                descriptor['tokenIssuedAt']=prior['token_issued_at']
+                if _canonical_digest(descriptor)!=prior['request_digest']:
+                    raise ValueError('QUEUE_IDEMPOTENCY_CONFLICT')
+                recheck_materialization_run_access(db, self.identity, scope, access)
                 return {'jobId':prior['job_id'],'status':prior['status'],'duplicate':True}
 
     def submit_numeric(self, scope: ApplicationScope, *, idempotency_key: str,
@@ -527,27 +638,29 @@ class PostgresJobQueue:
                 or len(set(depends_on_job_ids)) != len(depends_on_job_ids)
                 ):
             raise ValueError('Normalized program or dependencies are invalid')
-        from .postgres_job_origin import ApplicationRuleAdmission
+        from .postgres_job_origin import ApplicationRuleAdmission,PythonPlanAdmission
+        python_admission=execution_authority if isinstance(execution_authority,PythonPlanAdmission) else None
+        python_authority=(python_admission.legacy_descriptor() if python_admission is not None else execution_authority)
         rule_admission = execution_authority if isinstance(execution_authority, ApplicationRuleAdmission) else None
         authority_keys={'python_workflow_id','delegation_id','delegation_state_token',
                         'schedule_id','schedule_state_token'}
-        if execution_authority is not None and rule_admission is None and (
-                type(execution_authority) is not dict
-                or set(execution_authority)!=authority_keys
-                or type(execution_authority['python_workflow_id']) is not str
-                or not _JOB_ID.fullmatch(execution_authority['python_workflow_id'])
-                or type(execution_authority['delegation_id']) is not str
+        if python_authority is not None and rule_admission is None and (
+                type(python_authority) is not dict
+                or set(python_authority)!=authority_keys
+                or type(python_authority['python_workflow_id']) is not str
+                or not _JOB_ID.fullmatch(python_authority['python_workflow_id'])
+                or type(python_authority['delegation_id']) is not str
                 or re.fullmatch(r'[A-Za-z0-9._-]{1,200}',
-                    execution_authority['delegation_id']) is None
-                or not is_state_token(execution_authority['delegation_state_token'])
-                or ((execution_authority['schedule_id'] is None) !=
-                    (execution_authority['schedule_state_token'] is None))
-                or (execution_authority['schedule_id'] is not None and (
-                    type(execution_authority['schedule_id']) is not str
+                    python_authority['delegation_id']) is None
+                or not is_state_token(python_authority['delegation_state_token'])
+                or ((python_authority['schedule_id'] is None) !=
+                    (python_authority['schedule_state_token'] is None))
+                or (python_authority['schedule_id'] is not None and (
+                    type(python_authority['schedule_id']) is not str
                     or re.fullmatch(r'[A-Za-z0-9._-]{1,200}',
-                        execution_authority['schedule_id']) is None
+                        python_authority['schedule_id']) is None
                     or not is_state_token(
-                        execution_authority['schedule_state_token'])))):
+                        python_authority['schedule_state_token'])))):
             raise ValueError('PYTHON_JOB_EXECUTION_AUTHORITY_INVALID')
         try:
             program_json = json.dumps(normalized_program, sort_keys=True,
@@ -558,9 +671,14 @@ class PostgresJobQueue:
         if len(program_json.encode('utf-8')) > 8_000_000:
             raise ValueError('Normalized program exceeds 8 MB')
         program_digest = sha256(program_json.encode('utf-8')).hexdigest()
+        materialization = (function_name == 'facts.expression.calculate'
+                           and normalized_program.get('calculatedMember') is not None)
+        if materialization:
+            from .postgres_calculated_members import recheck_materialization_run_access
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
                 PostgresNumericFactStore._set_scope(db, scope)
+                PostgresAccessChecker.lock_directory_membership_for_assignment(db)
                 PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
                 state = db.execute('''SELECT a.status AS application_status,
                     s.processing_mode, s.metadata_revision, s.data_revision,
@@ -576,8 +694,12 @@ class PostgresJobQueue:
                     'admin' if function_name in ('consolidation.acquisition.journal.publish',
                         'consolidation.journal.from_calculation.publish',
                         'facts.projections.rebuild','facts.projections.cleanup') else 'write',
-                    function=authorization_function or function_name,
-                    arguments=normalized_program)
+                    function=('application.rule.run' if rule_admission is not None and function_name=='facts.numeric.sequence'
+                              else authorization_function or function_name), arguments=normalized_program)
+                if rule_admission is not None and function_name=='facts.numeric.sequence':
+                    PostgresAccessChecker.require_capability_in_transaction(db,scope,function_name,normalized_program)
+                if materialization:
+                    recheck_materialization_run_access(db, self.identity, scope, access)
                 authorization_scope_digest=resolve_effective_dimensional_scope(
                     db,self.identity,scope,access=access,
                     function=authorization_function or function_name).scope_digest
@@ -604,13 +726,14 @@ class PostgresJobQueue:
                 if previous:
                     replay_descriptor={**request_descriptor,
                         'tokenIssuedAt':previous['token_issued_at']}
+                    from .postgres_job_origin import matches_retained_request
                     matches=(tuple(previous['verified_groups'])==
                         access.groups
                         and previous['authorization_scope_digest'] is not None
                         and previous['authorization_scope_digest']==
                         authorization_scope_digest
-                        and previous['request_digest']==
-                        _canonical_digest(replay_descriptor))
+                        and matches_retained_request(previous['request_digest'],
+                            replay_descriptor,execution_authority))
                     if not matches and function_name in ('consolidation.full.aggregate',
                             'currency.calculation.translation.publish',
                             'currency.translation.publish',
@@ -633,6 +756,8 @@ class PostgresJobQueue:
                             previous['plan_digest'],normalized_program) and
                             previous['request_digest']==_canonical_digest(original_request))
                     if not matches: raise ValueError('QUEUE_IDEMPOTENCY_CONFLICT')
+                    if materialization:
+                        recheck_materialization_run_access(db, self.identity, scope, access)
                     return {'jobId': previous['job_id'],
                             'status': previous['status'], 'duplicate': True}
                 if (state['application_status'] != 'Active'
@@ -641,6 +766,17 @@ class PostgresJobQueue:
                 _validate_submission_revisions(state,function_name,
                     expected_metadata_revision,expected_data_revision,
                     expected_policy_revision)
+                if access.authorization_model == 'group_assignments' and function_name in (
+                        _NUMERIC_FUNCTION, 'facts.numeric.sequence'):
+                    from .postgres_planning_write_guard import enforce_active_planning_policy
+                    if function_name == _NUMERIC_FUNCTION:
+                        checked = _decode_numeric_program(normalized_program)
+                        enforce_active_planning_policy(db, scope, workflow_role=access.role,
+                            identity=self.identity, writes=tuple((m.coordinate, m.kind.value.capitalize()) for m in checked))
+                    else:
+                        from .postgres_numeric_sequence import decode_program, enforce_sequence_target_policy
+                        enforce_sequence_target_policy(db, scope, decode_program(normalized_program),
+                                                       access.role, identity=self.identity)
                 if function_name == 'facts.projections.cleanup':
                     from .postgres_projection_cleanup import decode_program as decode_cleanup, resolve_target, COMPILER as cleanup_compiler, PLAN_DIGEST as cleanup_plan
                     checked=decode_cleanup(normalized_program)
@@ -841,7 +977,15 @@ class PostgresJobQueue:
                     verify_admission(db, scope, self.identity, rule_admission,
                         function_name=function_name, idempotency_key=idempotency_key,
                         dependencies=depends_on_job_ids)
-                python_authority = execution_authority if rule_admission is None else None
+                if rule_admission is not None:
+                    python_authority=None
+                elif python_authority is not None:
+                    from .postgres_job_origin import verify_python_admission
+                    verify_python_admission(db,scope,self.identity,python_admission,
+                        function_name=function_name,idempotency_key=idempotency_key,
+                        dependencies=depends_on_job_ids)
+                if materialization:
+                    recheck_materialization_run_access(db, self.identity, scope, access)
                 db.execute('''INSERT INTO epm.job
                     (workspace_id,application_id,job_id,issuer,subject_id,
                      idempotency_key,function_name,normalized_program,
@@ -882,24 +1026,62 @@ class PostgresJobQueue:
                          for predecessor in depends_on_job_ids])
                 return {'jobId': job_id, 'status': status, 'duplicate': False}
 
-    def read(self, scope: ApplicationScope, job_id: str) -> dict:
-        if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
+    def read(self, scope: ApplicationScope, job_id: str | None = None, *,
+             operation_id: str | None = None) -> dict:
+        """Read an owned job by job ID or the original submission key."""
+        if (job_id is None) == (operation_id is None):
+            raise ValueError('JOB_REFERENCE_REQUIRED')
+        if job_id is not None and (
+                not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id)):
             raise ValueError('Job ID must be lowercase UUID hex')
+        if operation_id is not None and (
+                not isinstance(operation_id, str) or not _KEY.fullmatch(operation_id)):
+            raise ValueError('JOB_OPERATION_ID_INVALID')
+        column, reference = (('job_id', job_id) if job_id is not None
+                             else ('idempotency_key', operation_id))
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
+            db.execute('SET TRANSACTION READ ONLY')
             PostgresNumericFactStore._set_scope(db, scope)
+            PostgresAccessChecker.lock_directory_membership_for_assignment(db)
             PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-            PostgresAccessChecker.check_in_transaction(
-                db, self.identity, scope, 'read')
-            row = db.execute('''SELECT job_id,status,claim_generation,attempts,
-                next_attempt_at,receipt_revision,error_code,result,issuer,subject_id
-                FROM epm.job WHERE workspace_id=%s AND application_id=%s
-                AND job_id=%s''',
-                (scope.workspace_id, scope.application_id, job_id)).fetchone()
-            if (row is None or row['issuer'] != self.identity.issuer
-                    or row['subject_id'] != self.identity.subject_id):
+            access = PostgresAccessChecker.check_in_transaction(
+                db, self.identity, scope, 'read', function=_NUMERIC_FUNCTION)
+            statement = f'''SELECT job_id,status,claim_generation,attempts,
+                next_attempt_at,receipt_revision,error_code,result
+                FROM epm.job j WHERE workspace_id=%s AND application_id=%s
+                AND issuer=%s AND subject_id=%s AND {column}=%s'''
+            bindings = ()
+            if access.authorization_model == 'group_assignments':
+                eligible, bindings = numeric_job_visibility(db,scope,self.identity,access)
+                statement = sql.SQL(statement+' AND ')+eligible
+            row = db.execute(statement,
+                (scope.workspace_id,scope.application_id,
+                 self.identity.issuer,self.identity.subject_id,reference,*bindings)).fetchone()
+            self._recheck_read_access(db, scope, access)
+            if row is None:
                 raise ValueError('JOB_UNAVAILABLE')
-            return {key: value for key, value in row.items()
-                    if key not in ('issuer', 'subject_id')}
+            return row
+
+    def read_rule_child_outcome(self, scope, job_id):
+        """Observe checkpoint status only after verification of this actor and the retained parent."""
+        with connect_postgres(self.dsn, row_factory=dict_row) as db:
+            with db.transaction():
+                db.execute('SET TRANSACTION READ ONLY')
+                PostgresNumericFactStore._set_scope(db, scope)
+                PostgresAccessChecker.lock_directory_membership_for_assignment(db)
+                access = PostgresAccessChecker.check_in_transaction(db,self.identity,scope,'read',
+                    function='application.rule.run.read')
+                if access.authorization_model == 'group_assignments':
+                    job = db.execute("""SELECT job_id,issuer,subject_id,idempotency_key,status,receipt_revision
+                        FROM epm.job WHERE workspace_id=%s AND application_id=%s AND job_id=%s
+                          AND issuer=%s AND subject_id=%s AND admission_origin_kind='application_rule'
+                          AND function_name IN ('facts.numeric.batch','facts.numeric.sequence')""",
+                        (scope.workspace_id,scope.application_id,job_id,self.identity.issuer,self.identity.subject_id)).fetchone()
+                    if not job:
+                        raise ValueError('JOB_UNAVAILABLE')
+                    _require_python_job_authority(db, scope, job, replay_only=True)
+                    return {'status':job['status'],'receipt_revision':job['receipt_revision']}
+        return self.read(scope, job_id)
 
     def events(self, scope: ApplicationScope, *, after_sequence: int = 0,
                limit: int = 100) -> dict:
@@ -910,18 +1092,30 @@ class PostgresJobQueue:
             raise ValueError('An application scope and bounded event cursor are required')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
+                db.execute('SET TRANSACTION READ ONLY')
                 PostgresNumericFactStore._set_scope(db, scope)
+                PostgresAccessChecker.lock_directory_membership_for_assignment(db)
                 PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
-                rows = db.execute('''SELECT sequence,job_id,status,
-                    claim_generation,receipt_revision,error_code,occurred_at
-                    FROM epm.job_event WHERE workspace_id=%s
-                    AND application_id=%s AND issuer=%s AND subject_id=%s
-                    AND sequence>%s ORDER BY sequence LIMIT %s''',
+                access = PostgresAccessChecker.check_in_transaction(
+                    db, self.identity, scope, 'read', function=_NUMERIC_FUNCTION)
+                statement = '''SELECT e.sequence,e.job_id,e.status,e.claim_generation,
+                    e.receipt_revision,e.error_code,e.occurred_at FROM epm.job_event e
+                    WHERE e.workspace_id=%s AND e.application_id=%s AND e.issuer=%s
+                    AND e.subject_id=%s AND e.sequence>%s'''
+                tail = ' ORDER BY e.sequence LIMIT %s'
+                bindings = ()
+                if access.authorization_model == 'group_assignments':
+                    eligible, bindings = numeric_job_visibility(db,scope,self.identity,access)
+                    statement = sql.SQL(statement+''' AND EXISTS (SELECT 1 FROM epm.job j
+                        WHERE (j.workspace_id,j.application_id,j.job_id)=(e.workspace_id,e.application_id,e.job_id)
+                        AND ''')+eligible+sql.SQL(')'+tail)
+                else:
+                    statement += tail
+                rows = db.execute(statement,
                     (scope.workspace_id, scope.application_id,
                      self.identity.issuer, self.identity.subject_id,
-                     after_sequence, limit + 1)).fetchall()
+                     after_sequence, *bindings, limit + 1)).fetchall()
+                self._recheck_read_access(db, scope, access)
                 page = rows[:limit]
                 return {'events': [{**dict(row),
                                     'occurred_at': row['occurred_at'].isoformat()}
@@ -930,23 +1124,39 @@ class PostgresJobQueue:
                                          else after_sequence),
                         'hasMore': len(rows) > limit}
 
+    def _recheck_read_access(self, db, scope, access):
+        # Directory reconciliation can commit outside the workspace fence.
+        if PostgresAccessChecker.check_in_transaction(db, self.identity, scope, 'read', function=_NUMERIC_FUNCTION) != access:
+            raise ValueError(JOB_READ_AUTHORIZATION_STALE)
+
     def request_cancel(self, scope: ApplicationScope, job_id: str, *,
-                       allow_application_admin: bool = False) -> dict:
+                       allow_application_admin: bool = False, _connection=None) -> dict:
         if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
             raise ValueError('Job ID must be lowercase UUID hex')
         if type(allow_application_admin) is not bool:
             raise ValueError('Application-admin cancellation flag must be Boolean')
-        with connect_postgres(self.dsn, row_factory=dict_row) as db:
+        connection=(nullcontext(_connection) if _connection is not None
+                    else connect_postgres(self.dsn,row_factory=dict_row))
+        with connection as db:
             with db.transaction():
                 PostgresNumericFactStore._set_scope(db, scope)
+                if not allow_application_admin and _connection is None:
+                    PostgresAccessChecker.lock_directory_membership_for_assignment(db)
                 PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'write')
-                row = db.execute('''SELECT status,issuer,subject_id,function_name
-                    FROM epm.job WHERE workspace_id=%s AND application_id=%s
-                    AND job_id=%s FOR UPDATE''',
+                owner_function = _NUMERIC_FUNCTION if not allow_application_admin and _connection is None else None
+                access = PostgresAccessChecker.check_in_transaction(
+                    db, self.identity, scope, 'write',function=owner_function)
+                statement = '''SELECT status,issuer,subject_id,function_name FROM epm.job j
+                    WHERE workspace_id=%s AND application_id=%s AND job_id=%s'''
+                bindings = ()
+                if access.authorization_model == 'group_assignments':
+                    eligible, bindings = numeric_job_visibility(db,scope,self.identity,access,lock_state=True)
+                    statement = sql.SQL(statement+' AND ')+eligible+sql.SQL(' FOR UPDATE OF j')
+                else:
+                    statement += ' FOR UPDATE'
+                row = db.execute(statement,
                     (scope.workspace_id, scope.application_id,
-                     job_id)).fetchone()
+                     job_id,*bindings)).fetchone()
                 owner = (row is not None and
                     row['issuer'] == self.identity.issuer and
                     row['subject_id'] == self.identity.subject_id)
@@ -1059,10 +1269,10 @@ class PostgresJobQueue:
             scope, idempotency_key=idempotency_key, **arguments)
 
 
-def _require_python_job_authority(db,scope,job) -> None:
-    """Common publisher fence for typed origin and existing Python delegation."""
+def _require_python_job_authority(db,scope,job,*,replay_only=False) -> None:
+    """Fence typed origin, current parent run permission and Python delegation."""
     from .postgres_job_origin import require_publication_origin
-    require_publication_origin(db, scope, job)
+    require_publication_origin(db, scope, job, for_effect=not replay_only)
     workflow_id=job.get('python_workflow_id')
     if workflow_id is None:
         if re.fullmatch(r'py-[0-9a-f]{32}-[1-9][0-9]*',job['idempotency_key']):
@@ -1073,6 +1283,8 @@ def _require_python_job_authority(db,scope,job) -> None:
     assert_source_job_purpose(job.get('function_name'))
     bound=db.execute('''SELECT b.delegation_id,b.delegation_state_token,
         b.schedule_id,b.schedule_state_token,w.issuer,w.subject_id,w.build_id,
+        w.verified_groups,w.authorization_scope_digest,w.token_issued_at,
+        w.authority_kind,
         a.canonical_plan
         FROM epm.python_program_workflow w
         JOIN epm.python_program_build b USING(workspace_id,application_id,build_id)
@@ -1094,6 +1306,13 @@ def _require_python_job_authority(db,scope,job) -> None:
                 job['execution_schedule_state_token'])):
         raise ValueError('PYTHON_JOB_EXECUTION_AUTHORITY_INVALID')
     assert_source_plan_purpose(bound['canonical_plan'], allow_definition=False)
+    # Child WRITE authority is not parent execution authority. Reconstruct only
+    # the retained parent identity, and recheck its current run permission under
+    # the publisher's transaction/workspace fence before any child effect.
+    from .postgres_access import durable_execution_identity
+    PostgresAccessChecker.check_in_transaction(
+        db,durable_execution_identity(bound),scope,'rule_run',
+        function='python.program.run',arguments={'buildId':bound['build_id']})
     current=db.execute('''SELECT epm.execution_delegation_is_current(
         %s,%s,%s,%s,%s,%s,%s,%s) AS allowed''',(
         scope.workspace_id,scope.application_id,job['execution_delegation_id'],
@@ -1143,6 +1362,7 @@ class PostgresNumericJobPublisher:
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
                 PostgresNumericFactStore._set_scope(db, scope)
+                PostgresAccessChecker.lock_directory_membership_for_assignment(db)
                 PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
                 state = db.execute('''SELECT metadata_revision,data_revision,
                     policy_revision FROM epm.application_state
@@ -1150,8 +1370,6 @@ class PostgresNumericJobPublisher:
                     (scope.workspace_id, scope.application_id)).fetchone()
                 if state is None:
                     raise ValueError('APPLICATION_UNAVAILABLE')
-                access=PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'write')
                 control_claim=claim.get('function_name') in _CONTROL_FENCED_NUMERIC_FUNCTIONS
                 job = db.execute('''SELECT issuer,subject_id,status,
                     idempotency_key,claim_generation,claimant,lease_until,function_name,
@@ -1168,6 +1386,9 @@ class PostgresNumericJobPublisher:
                 if (job is None or job['issuer'] != self.identity.issuer
                         or job['subject_id'] != self.identity.subject_id):
                     raise ValueError('JOB_UNAVAILABLE')
+                access=PostgresAccessChecker.check_in_transaction(
+                    db, self.identity, scope, 'write', function=job['function_name'],
+                    arguments=job['normalized_program'])
                 valid = db.execute('''SELECT %s::timestamptz > clock_timestamp()
                     AS unexpired''', (job['lease_until'],)).fetchone()
                 if (job['status'] != 'running'

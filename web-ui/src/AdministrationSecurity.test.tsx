@@ -7,7 +7,10 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
-import { installOperationAdmissionFixture } from "./test-setup";
+import {
+  installOperationAdmissionFixture,
+  operationAdmissionResponse,
+} from "./test-setup";
 import {
   accessMutationBody,
   accessListArguments,
@@ -25,6 +28,7 @@ import {
 import {
   discardUnsavedWork,
   resetUnsavedWorkForTests,
+  setDraftIdentity,
   setUnsavedWork,
   unsavedWorkSnapshot,
 } from "./unsaved-work";
@@ -40,6 +44,22 @@ const app = {
   name: "Plan",
   status: "Active",
 };
+
+function securityWriteResponse(body: {
+  workspaceId: string;
+  applicationId: string;
+  program: { function: string };
+}) {
+  return Response.json({
+    languageVersion: 2,
+    function: body.program.function,
+    result: {
+      workspaceId: body.workspaceId,
+      applicationId: body.applicationId,
+      changed: true,
+    },
+  });
+}
 
 const catalog = {
   applicationAccess: { role: "Administrator", workspaceAdministrator: false },
@@ -117,6 +137,31 @@ it("exports the safe audit projection as exact CSV", () => {
     "occurredAt,actor,action,target,outcome\r\n" +
       "2026-11-05T12:00:00+00:00,Alice Owner,Granted application access,Bob Planner,Accepted",
   );
+});
+
+it("retains requester benefit and staged status in the audit CSV action column", () => {
+  const csv = securityAuditCsv([
+    {
+      auditId: 7,
+      occurredAt: "2026-11-25",
+      actorName: "Planner",
+      action: "Changed group authorization",
+      targetName: "Forecast",
+      outcome: "Accepted",
+      detailsKey: "internal-receipt",
+      authorizationMode: "legacy",
+      requesterBenefit: {
+        classification: "new_grant_path",
+        grants: [],
+        grantsComplete: false,
+      },
+    },
+  ]);
+  expect(csv.split("\r\n")[0]).toBe("occurredAt,actor,action,target,outcome");
+  expect(csv).toContain(
+    "Changed group authorization · Staged · New grant through the requester’s group",
+  );
+  expect(csv).not.toContain("internal-receipt");
 });
 
 it("collects a complete strictly descending bounded security audit", async () => {
@@ -903,8 +948,15 @@ it("locks an access mutation and retains committed status separately when its in
   });
   expect(screen.getByLabelText("Application user")).toHaveValue("subject-a");
   await waitFor(() => expect(writes).toBe(1));
+  const writeBody = bodies.find((body) => body.confirmed)!;
   await act(async () =>
-    commit(new Response(JSON.stringify({ result: { changed: true } }))),
+    commit(
+      securityWriteResponse({
+        workspaceId: writeBody.workspaceId,
+        applicationId: writeBody.applicationId,
+        program: writeBody.program,
+      }),
+    ),
   );
   expect(await screen.findByRole("status")).toHaveTextContent(
     "application access change was committed",
@@ -917,13 +969,272 @@ it("locks an access mutation and retains committed status separately when its in
   fireEvent.click(screen.getByRole("button", { name: "Read access" }));
   await waitFor(() => expect(bodies.length).toBeGreaterThanOrEqual(5));
   expect(writes).toBe(1);
-  const writeBody = bodies.find((body) => body.confirmed);
   expect(writeBody?.program).toEqual({
     languageVersion: 2,
     function: "security.application.access.set",
     arguments: { subjectId: "subject-a", action: "grant", role: "Reader" },
   });
   expect(writeBody?.idempotencyKey).toMatch(/^oa1_/);
+});
+
+const protectedAuditEvent = {
+  auditId: 9,
+  occurredAt: "2026-11-05T12:00:00Z",
+  actorName: "Protected audit actor",
+  action: "Granted application access",
+  targetName: "Protected audit subject",
+  outcome: "Accepted",
+  detailsKey: null,
+};
+
+it.each([
+  [
+    "access",
+    "Read access",
+    "Application access",
+    "security.application.access.list",
+    { grants: [sampleGrant], nextAfterSubjectId: null },
+  ],
+  [
+    "groups",
+    "Read access",
+    "Application group access",
+    "security.application.group-access.list",
+    {
+      grants: [
+        {
+          ...sampleGrant,
+          groupId: "group-a",
+          groupName: "planners",
+          directoryStatus: "Active",
+        },
+      ],
+      nextAfterGroupId: null,
+    },
+  ],
+  [
+    "policy",
+    "Read policy",
+    "Active policy",
+    "security.application.dimension-policy.read",
+    securityFixture("security.application.dimension-policy.read"),
+  ],
+  [
+    "audit",
+    "Read audit",
+    "Scrollable security records",
+    "security.application.audit.list",
+    { events: [protectedAuditEvent], nextBeforeAuditId: null },
+  ],
+] as const)(
+  "withdraws the previous %s snapshot while a new read is pending or denied",
+  async (view, button, snapshot, functionName, result) => {
+    let finishRead!: (value: Response) => void;
+    const fetch = vi
+      .fn()
+      .mockImplementationOnce(async () => Response.json({ result }))
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            finishRead = resolve;
+          }),
+      )
+      .mockImplementationOnce(async () => Response.json({ result }));
+    vi.stubGlobal("fetch", fetch);
+    render(
+      <AdministrationSecurity
+        app={app}
+        view={view}
+        catalog={{ ...catalog, functions: { [functionName]: {} } }}
+      />,
+    );
+    const refresh = screen.getByRole("button", { name: button });
+    fireEvent.click(refresh);
+    await screen.findByLabelText(snapshot);
+
+    refresh.focus();
+    fireEvent.click(refresh);
+    expect(screen.getByRole("status")).toHaveTextContent("Loading");
+    expect(screen.queryByLabelText(snapshot)).not.toBeInTheDocument();
+    expect(refresh).toHaveFocus();
+    fireEvent.click(refresh);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    await act(async () =>
+      finishRead(
+        Response.json({ error: "APPLICATION_ACCESS_DENIED" }, { status: 403 }),
+      ),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "unavailable under your current access",
+    );
+    expect(screen.queryByLabelText(snapshot)).not.toBeInTheDocument();
+    expect(refresh).toHaveFocus();
+
+    fireEvent.click(refresh);
+    expect(await screen.findByLabelText(snapshot)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(3);
+    for (const [path, init] of fetch.mock.calls) {
+      expect(path).toBe("/api/security");
+      expect(JSON.parse(init.body)).toMatchObject({
+        workspaceId: "ws",
+        applicationId: "app",
+        program: { function: functionName },
+      });
+    }
+  },
+);
+
+it.each([
+  [
+    "Load older security events",
+    403,
+    "APPLICATION_ACCESS_DENIED",
+    "unavailable under your current access",
+  ],
+  [
+    "Export complete CSV",
+    403,
+    "APPLICATION_ACCESS_DENIED",
+    "unavailable under your current access",
+  ],
+  [
+    "Load older security events",
+    409,
+    "SECURITY_READ_AUTHORIZATION_STALE",
+    "Security access changed while loading",
+  ],
+  [
+    "Export complete CSV",
+    409,
+    "SECURITY_READ_AUTHORIZATION_STALE",
+    "Security access changed while loading",
+  ],
+])(
+  "clears already loaded sensitive audit rows when %s returns %s",
+  async (action, status, code, guidance) => {
+    const fetch = vi
+      .fn()
+      .mockImplementationOnce(async () =>
+        Response.json({
+          result: { events: [protectedAuditEvent], nextBeforeAuditId: 9 },
+        }),
+      )
+      .mockImplementationOnce(async () => Response.json({ code }, { status }))
+      .mockImplementationOnce(async () =>
+        Response.json({ result: { events: [], nextBeforeAuditId: null } }),
+      );
+    vi.stubGlobal("fetch", fetch);
+    render(
+      <AdministrationSecurity
+        app={app}
+        view="audit"
+        catalog={{
+          ...catalog,
+          functions: { "security.application.audit.list": {} },
+        }}
+      />,
+    );
+    const read = screen.getByRole("button", { name: "Read audit" });
+    fireEvent.click(read);
+    await screen.findByText(protectedAuditEvent.actorName);
+    const trigger = screen.getByRole("button", { name: action });
+    trigger.focus();
+    fireEvent.click(trigger);
+    expect(await screen.findByRole("alert")).toHaveTextContent(guidance);
+    expect(
+      screen.queryByText(protectedAuditEvent.actorName),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Load older security events" }),
+    ).not.toBeInTheDocument();
+    expect(
+      action === "Load older security events" ? read : trigger,
+    ).toHaveFocus();
+    fireEvent.click(read);
+    expect(
+      await screen.findByText(
+        "No application security audit events were returned.",
+      ),
+    ).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledTimes(3);
+  },
+);
+
+it("withdraws the access list when an inspect request loses current authority", async () => {
+  const fetch = vi.fn(async (_path: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    if (body.program.function === "security.application.dimension-access.read")
+      return Response.json(
+        { error: "APPLICATION_ACCESS_DENIED" },
+        { status: 403 },
+      );
+    return Response.json({ result: securityFixture(body.program.function) });
+  });
+  vi.stubGlobal("fetch", fetch);
+  render(<AdministrationSecurity app={app} catalog={catalog} />);
+  const read = screen.getByRole("button", { name: "Read access" });
+  fireEvent.click(read);
+  const inspect = await screen.findByRole("button", { name: "Inspect" });
+  inspect.focus();
+  fireEvent.click(inspect);
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "unavailable under your current access",
+  );
+  expect(screen.queryByText(sampleGrant.displayName)).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Inspect" }),
+  ).not.toBeInTheDocument();
+  expect(read).toHaveFocus();
+});
+
+it("keeps the current audit page and can retry a throttled continuation", async () => {
+  const firstPage = { events: [protectedAuditEvent], nextBeforeAuditId: 9 };
+  const older = {
+    ...protectedAuditEvent,
+    auditId: 8,
+    actorName: "Older audit actor",
+  };
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce(Response.json({ result: firstPage }))
+    .mockResolvedValueOnce(
+      Response.json(
+        { error: "CAPACITY_LIMIT", message: "Try reading older events again." },
+        { status: 429 },
+      ),
+    )
+    .mockResolvedValueOnce(
+      Response.json({ result: { events: [older], nextBeforeAuditId: null } }),
+    );
+  vi.stubGlobal("fetch", fetch);
+  render(
+    <AdministrationSecurity
+      app={app}
+      view="audit"
+      catalog={{
+        ...catalog,
+        functions: { "security.application.audit.list": {} },
+      }}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Read audit" }));
+  await screen.findByText(protectedAuditEvent.actorName);
+  const loadOlder = screen.getByRole("button", {
+    name: "Load older security events",
+  });
+  loadOlder.focus();
+  fireEvent.click(loadOlder);
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Try reading older events again.",
+  );
+  expect(loadOlder).toHaveFocus();
+  expect(screen.getByText(protectedAuditEvent.actorName)).toBeInTheDocument();
+  fireEvent.click(loadOlder);
+  expect(await screen.findByText(older.actorName)).toBeInTheDocument();
+  expect(JSON.parse(fetch.mock.calls[1][1].body)).toEqual(
+    JSON.parse(fetch.mock.calls[2][1].body),
+  );
 });
 
 it("cancels an abandoned security read without exposing it in the next application", async () => {
@@ -1069,4 +1380,566 @@ it("keeps unrelated retained drafts when clean security inventory actions open o
   expect(unsavedWorkSnapshot()).toEqual([
     { id: "retained-rule", label: "Unsaved rule definition" },
   ]);
+});
+
+const groupCatalog = {
+  ...catalog,
+  functions: {
+    "security.application.group-access.list": {},
+    "security.application.group-access.set": {},
+    "security.application.group-dimension-access.read": {},
+    "security.application.group-dimension-access.set": {},
+    "security.application.dimension-tags.read": {},
+    "security.rule.group-access.set": {},
+  },
+};
+const planningGroup = {
+  groupId: "hidden-keycloak-group-id",
+  groupName: "finance-planning",
+  displayName: "Finance Planning",
+  directoryStatus: "Active",
+  role: "Reader",
+  readTags: {},
+  writeTags: {},
+  rulePermissions: { design: false, publish: false, run: true },
+  grantedAt: "2026-11-07T08:00:00Z",
+};
+
+it("reviews named group grants without opening the platform directory", async () => {
+  const writes: Array<{
+    workspaceId: string;
+    applicationId: string;
+    idempotencyKey: string;
+    program: { function: string; arguments: Record<string, unknown> };
+  }> = [];
+  const calls: string[] = [];
+  vi.stubGlobal(
+    "confirm",
+    vi.fn(() => true),
+  );
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(String(input));
+      const body = JSON.parse(String(init?.body));
+      if (body.confirmed) {
+        writes.push(body);
+        return securityWriteResponse(body);
+      }
+      switch (body.program.function) {
+        case "security.application.group-access.list":
+          return Response.json({
+            result: {
+              grants: [
+                planningGroup,
+                {
+                  ...planningGroup,
+                  groupId: "hidden-separate-group-id",
+                  groupName: "regional-finance",
+                },
+                {
+                  ...planningGroup,
+                  groupId: "hidden-orphan-group-id",
+                  displayName: null,
+                  groupName: null,
+                  directoryStatus: null,
+                },
+              ],
+              nextAfterGroupId: null,
+            },
+          });
+        case "security.application.group-dimension-access.read":
+          return Response.json({
+            result: {
+              groupId: planningGroup.groupId,
+              role: "Reader",
+              readTags: {},
+              writeTags: {},
+              securityRevision: 7,
+            },
+          });
+        case "security.application.dimension-tags.read":
+          return Response.json({
+            result: securityFixture(body.program.function),
+          });
+        default:
+          throw new Error("Unexpected group security call");
+      }
+    }),
+  );
+  installOperationAdmissionFixture("g");
+  render(
+    <AdministrationSecurity app={app} catalog={groupCatalog} view="groups" />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Read access" }));
+  const table = await screen.findByRole("table", {
+    name: "Application group access",
+  });
+  const planningLabel = `${planningGroup.displayName} (${planningGroup.groupName})`;
+  expect(within(table).getByText(planningLabel)).toBeInTheDocument();
+  expect(
+    within(table).getByText("Finance Planning (regional-finance)"),
+  ).toBeInTheDocument();
+  expect(
+    within(table).getByText("Unavailable directory identity"),
+  ).toBeInTheDocument();
+  expect(document.body).not.toHaveTextContent("hidden-keycloak-group-id");
+  expect(document.body).not.toHaveTextContent("hidden-orphan-group-id");
+  expect(
+    screen.queryByRole("button", { name: "Read eligible groups" }),
+  ).not.toBeInTheDocument();
+
+  fireEvent.click(
+    within(table).getByRole("button", {
+      name: `Inspect dimensional access for ${planningLabel}`,
+    }),
+  );
+  const readTags = await screen.findByRole("textbox", {
+    name: "Entity assigned read tags",
+  });
+  fireEvent.change(readTags, { target: { value: "North" } });
+  fireEvent.click(
+    screen.getByLabelText(
+      "I reviewed this exact group and dimensional assignment.",
+    ),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Apply reviewed dimensional access" }),
+  );
+  await screen.findByText(/dimensional assignments change was committed/);
+
+  const active = await screen.findByRole("button", {
+    name: `Manage rule permissions for ${planningLabel}`,
+  });
+  fireEvent.click(active);
+  fireEvent.click(screen.getByLabelText("Design"));
+  fireEvent.click(
+    screen.getByLabelText(
+      "I reviewed this exact group, action and permission set.",
+    ),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Apply reviewed rule permissions" }),
+  );
+  await screen.findByText(/rule permissions change was committed/);
+
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: `Manage role for ${planningLabel}`,
+    }),
+  );
+  fireEvent.change(screen.getByLabelText("Action"), {
+    target: { value: "revoke" },
+  });
+  expect(screen.getByText(/revoke this group grant/)).toBeInTheDocument();
+  fireEvent.click(
+    screen.getByLabelText("I reviewed this group, action and role."),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Apply reviewed access" }),
+  );
+  await screen.findByText(/application access change was committed/);
+
+  expect(writes).toHaveLength(3);
+  expect(writes.map(({ program }) => program)).toEqual([
+    {
+      languageVersion: 2,
+      function: "security.application.group-dimension-access.set",
+      arguments: {
+        groupId: planningGroup.groupId,
+        readTags: { Entity: ["North"] },
+        writeTags: {},
+        expectedSecurityRevision: 7,
+      },
+    },
+    {
+      languageVersion: 2,
+      function: "security.rule.group-access.set",
+      arguments: {
+        groupId: planningGroup.groupId,
+        action: "set",
+        permissions: { design: true, publish: false, run: true },
+      },
+    },
+    {
+      languageVersion: 2,
+      function: "security.application.group-access.set",
+      arguments: {
+        groupId: planningGroup.groupId,
+        action: "revoke",
+        role: null,
+      },
+    },
+  ]);
+  for (const write of writes) {
+    expect(write.idempotencyKey).toMatch(/^oa1_/);
+    expect([write.workspaceId, write.applicationId]).toEqual(["ws", "app"]);
+  }
+  expect(calls).not.toContain("/api/platform/browser/read");
+});
+
+it("loads only eligible new groups through the separately granted server directory", async () => {
+  let directoryCalls = 0;
+  let applied: unknown;
+  vi.stubGlobal(
+    "confirm",
+    vi.fn(() => true),
+  );
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (String(input) === "/api/platform/browser/read") {
+        directoryCalls += 1;
+        expect(body.program.function).toBe("identity.group.list");
+        return Response.json({
+          items: [
+            {
+              groupId: "managed-finance",
+              groupName: "forecast",
+              displayName: "Forecast Reviewers",
+              shortDescription: "",
+              semanticDescription: "",
+              status: "Active",
+            },
+            {
+              groupId: "retired-finance",
+              groupName: "retired",
+              displayName: "Archived Group",
+              shortDescription: "",
+              semanticDescription: "",
+              status: "Inactive",
+            },
+          ],
+          nextOffset: null,
+        });
+      }
+      if (body.confirmed) {
+        applied = body;
+        return securityWriteResponse(body);
+      }
+      expect(body.program.function).toBe(
+        "security.application.group-access.list",
+      );
+      return Response.json({ result: { grants: [], nextAfterGroupId: null } });
+    }),
+  );
+  installOperationAdmissionFixture("b");
+  render(
+    <AdministrationSecurity
+      app={app}
+      catalog={groupCatalog}
+      view="groups"
+      canReadDirectoryGroups
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Read access" }));
+  await screen.findByText("No application groups were returned.");
+  fireEvent.click(screen.getByRole("button", { name: "Review group access" }));
+  expect(directoryCalls).toBe(0);
+  fireEvent.click(screen.getByRole("button", { name: "Read eligible groups" }));
+  await screen.findByRole("option", { name: "Forecast Reviewers (forecast)" });
+  expect(
+    screen.queryByRole("option", { name: "Archived Group (retired)" }),
+  ).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Application group"), {
+    target: { value: "managed-finance" },
+  });
+  fireEvent.click(
+    screen.getByLabelText("I reviewed this group, action and role."),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Apply reviewed access" }),
+  );
+  await screen.findByText(/application access change was committed/);
+  expect(applied).toMatchObject({
+    workspaceId: "ws",
+    applicationId: "app",
+    confirmed: true,
+    program: {
+      function: "security.application.group-access.set",
+      arguments: {
+        groupId: "managed-finance",
+        action: "grant",
+        role: "Reader",
+      },
+    },
+  });
+  expect(directoryCalls).toBe(1);
+});
+
+const recoveryCatalog = {
+  ...groupCatalog,
+  functions: {
+    ...groupCatalog.functions,
+    "security.application.receipt.read": {},
+    "security.application.audit.list": {},
+  },
+};
+
+function reviewExistingGroupRole() {
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: "Manage role for Finance Planning (finance-planning)",
+    }),
+  );
+  fireEvent.change(screen.getByLabelText("Role"), {
+    target: { value: "Editor" },
+  });
+  fireEvent.click(
+    screen.getByLabelText("I reviewed this group, action and role."),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Apply reviewed access" }),
+  );
+}
+
+function groupAccessResponse() {
+  return Response.json({
+    result: { grants: [planningGroup], nextAfterGroupId: null },
+  });
+}
+
+type RecordedSecurityRequest = {
+  workspaceId: string;
+  applicationId: string;
+  idempotencyKey: string;
+  confirmed?: boolean;
+  program: { function: string; arguments: Record<string, unknown> };
+};
+
+it("restores the original security receipt check across app, actor and section changes without writing again", async () => {
+  const effects: RecordedSecurityRequest[] = [];
+  const receiptReads: RecordedSecurityRequest[] = [];
+  let admissions = 0;
+  const copy = vi.fn(async () => {});
+  vi.stubGlobal("navigator", { clipboard: { writeText: copy } });
+  vi.stubGlobal(
+    "confirm",
+    vi.fn(() => true),
+  );
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as RecordedSecurityRequest;
+      if (String(input) === "/api/operation-admission") {
+        admissions += 1;
+        return operationAdmissionResponse();
+      }
+      if (body.confirmed) {
+        effects.push(body);
+        throw new TypeError("Connection lost after commit");
+      }
+      if (body.program.function === "security.application.receipt.read") {
+        receiptReads.push(body);
+        return Response.json({
+          result: {
+            workspaceId: app.workspaceId,
+            applicationId:
+              receiptReads.length === 1 ? "different-app" : app.applicationId,
+            outcome: "Committed",
+            operationId: effects[0].idempotencyKey,
+            actorDigest: "a".repeat(64),
+            commandDigest: "b".repeat(64),
+            payloadDigest: "c".repeat(64),
+            committedAt: "2026-11-19T12:00:00Z",
+          },
+        });
+      }
+      if (body.program.function === "security.application.audit.list")
+        return Response.json({
+          result: { events: [], nextBeforeAuditId: null },
+        });
+      return groupAccessResponse();
+    }),
+  );
+
+  setDraftIdentity("original-admin");
+  const renderScope = (
+    target = app,
+    view: "groups" | "audit" = "groups",
+    key = "owner",
+  ) => (
+    <AdministrationSecurity
+      key={key}
+      app={target}
+      catalog={recoveryCatalog}
+      view={view}
+    />
+  );
+  const workspace = render(renderScope());
+  fireEvent.click(screen.getByRole("button", { name: "Read access" }));
+  await screen.findByRole("rowheader", {
+    name: "Finance Planning (finance-planning)",
+  });
+  reviewExistingGroupRole();
+  await screen.findByText("The reply did not confirm the security change.");
+  expect(
+    screen.getByRole("button", { name: "Apply reviewed access" }),
+  ).toBeDisabled();
+  expect(
+    screen.queryByRole("button", { name: "Retry original security change" }),
+  ).toBeNull();
+
+  workspace.rerender(renderScope({ ...app, applicationId: "independent" }));
+  expect(
+    screen.queryByRole("region", { name: "Original security change" }),
+  ).toBeNull();
+  setDraftIdentity("different-admin");
+  workspace.rerender(renderScope(app, "groups", "other"));
+  expect(
+    screen.queryByRole("region", { name: "Original security change" }),
+  ).toBeNull();
+
+  setDraftIdentity("original-admin");
+  workspace.rerender(renderScope(app, "audit"));
+  await screen.findByText("The original security change is unconfirmed.");
+  const check = screen.getByRole("button", {
+    name: "Check original security change",
+  });
+  await waitFor(() => expect(check).toBeEnabled());
+  fireEvent.click(
+    screen.getByRole("button", { name: "Copy receipt check for MCP" }),
+  );
+  const expectedProgram = {
+    languageVersion: 2,
+    function: "security.application.receipt.read",
+    arguments: { operationId: effects[0].idempotencyKey },
+  };
+  await waitFor(() =>
+    expect(copy).toHaveBeenCalledWith(
+      JSON.stringify({
+        workspace_id: app.workspaceId,
+        application_id: app.applicationId,
+        program: expectedProgram,
+      }),
+    ),
+  );
+  fireEvent.click(check);
+  await screen.findByText(
+    "The receipt could not confirm the original security change.",
+  );
+  fireEvent.click(check);
+  await screen.findByText(
+    "The original application access change was recorded.",
+  );
+  expect(receiptReads).toEqual(
+    Array.from({ length: 2 }, () => ({
+      workspaceId: app.workspaceId,
+      applicationId: app.applicationId,
+      program: expectedProgram,
+    })),
+  );
+  expect(admissions).toBe(1);
+  expect(effects).toHaveLength(1);
+  expect(unsavedWorkSnapshot()).toEqual([]);
+});
+
+it.each([
+  { status: 403, code: "APPLICATION_GRANT_REQUIRED" },
+  { status: 400, code: "OPERATION_ADMISSION_EXPIRED" },
+])(
+  "replays only the original admitted security packet after missing receipt and keeps uncertainty on $code",
+  async ({ status, code }) => {
+    const effects: RecordedSecurityRequest[] = [];
+    let admissions = 0;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as RecordedSecurityRequest;
+        if (String(input) === "/api/operation-admission") {
+          admissions += 1;
+          return operationAdmissionResponse();
+        }
+        if (body.confirmed) {
+          effects.push(body);
+          return effects.length === 1
+            ? Response.json({ code: "GATEWAY_UNAVAILABLE" }, { status: 502 })
+            : Response.json({ code }, { status });
+        }
+        if (body.program.function === "security.application.receipt.read")
+          return Response.json(
+            { code: "SECURITY_RECEIPT_UNAVAILABLE" },
+            { status: 400 },
+          );
+        return groupAccessResponse();
+      }),
+    );
+
+    render(
+      <AdministrationSecurity
+        app={app}
+        catalog={recoveryCatalog}
+        view="groups"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Read access" }));
+    await screen.findByRole("rowheader", {
+      name: "Finance Planning (finance-planning)",
+    });
+    reviewExistingGroupRole();
+    await screen.findByText("The reply did not confirm the security change.");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Check original security change" }),
+    );
+    await screen.findByText(
+      "There is no visible receipt yet. The original outcome is still unknown.",
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Retry original security change" }),
+    );
+    await screen.findByText(
+      "The retry could not confirm the original security change.",
+    );
+    expect(admissions).toBe(1);
+    expect(effects).toEqual([effects[0], effects[0]]);
+    expect(
+      screen.getByRole("button", { name: "Apply reviewed access" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Check original security change" }),
+    ).toBeEnabled();
+  },
+);
+
+it("keeps a first scoped rejection separate from an unknown security change", async () => {
+  vi.stubGlobal(
+    "confirm",
+    vi.fn(() => true),
+  );
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      return body.confirmed
+        ? Response.json({ code: "APPLICATION_GRANT_REQUIRED" }, { status: 403 })
+        : groupAccessResponse();
+    }),
+  );
+  installOperationAdmissionFixture("e");
+  render(
+    <AdministrationSecurity
+      app={app}
+      catalog={recoveryCatalog}
+      view="groups"
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Read access" }));
+  await screen.findByRole("rowheader", {
+    name: "Finance Planning (finance-planning)",
+  });
+  reviewExistingGroupRole();
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "APPLICATION_GRANT_REQUIRED",
+  );
+  expect(
+    screen.queryByRole("region", { name: "Original security change" }),
+  ).toBeNull();
+  expect(
+    screen.getByRole("button", { name: "Apply reviewed access" }),
+  ).toBeEnabled();
 });

@@ -1,4 +1,4 @@
-"""Transport-neutral discovery of the server's MCP execution policy."""
+"""Authoritative execution budgets for MCP tools and browser API operations."""
 TOOL_SECONDS = 30
 TERMINATION_SECONDS = 1
 # Eight remains the qualified upper bound for a listener.  A laptop deployment
@@ -32,11 +32,25 @@ def tool_execution_policy(processes_per_listener=PROCESSES_PER_LISTENER):
     if (type(processes_per_listener) is not int
             or not 1 <= processes_per_listener <= PROCESSES_PER_LISTENER):
         raise ValueError('Tool process count is outside the qualified bound')
+    return _operation_execution_policy(processes_per_listener,
+        PROCESSES_PER_LISTENER,
+        'MCP tool execution and process-slot waiting; excludes HTTP authentication/startup')
+
+
+def web_operation_policy():
+    """Describe the fixed browser pool; MCP deployment settings do not own it."""
+    return _operation_execution_policy(WEB_PROCESSES_PER_LISTENER,
+        WEB_PROCESSES_PER_LISTENER,
+        'Browser API operation execution and process-slot waiting; excludes HTTP authentication/startup')
+
+
+def _operation_execution_policy(processes_per_listener, maximum_processes_per_listener,
+                                scope):
     return {'executionSeconds': TOOL_SECONDS,
         'terminationGraceSeconds': TERMINATION_SECONDS,
         'processesPerListener': processes_per_listener,
-        'maximumProcessesPerListener': PROCESSES_PER_LISTENER,
-        'scope': 'MCP tool execution and process-slot waiting; excludes HTTP authentication/startup',
+        'maximumProcessesPerListener': maximum_processes_per_listener,
+        'scope': scope,
         'deadlineCode': DEADLINE_CODE, 'capacityCode': CAPACITY_CODE,
         'timeoutImpliesRollback': False, 'automaticRetry': False,
         'databaseSessionLimits': 'remaining budget at connection creation; shorter settings preserved',

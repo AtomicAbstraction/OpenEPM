@@ -1,10 +1,8 @@
-"""Read-only PostgreSQL binding for private layout-generation validation.
+"""Validate the existing private facts and persist their immutable certificate.
 
-Migration 0107 represents a private generation as an exact staged coordinate
-mapping. Until a later materializer adds separate private fact tables, its
-target fact view is the deterministic relational projection of pinned current
-facts through that mapping. This service validates that complete private view;
-it never persists a certificate or activates a layout.
+The maintained worker leases this fixed phase on the original request. It uses
+admitted dependency intent and current authority; certification never activates
+or publishes the private generation.
 """
 from __future__ import annotations
 
@@ -16,13 +14,16 @@ from psycopg.types.json import Jsonb
 
 from .persistence_contract import ApplicationScope
 from .populated_layout_generation_validation import (
-    MAX_COORDINATES, validate_populated_layout_generation,
+    MAX_COORDINATES, canonical_dependency_context, validate_populated_layout_generation,
 )
 from .populated_layout_mapping import LayoutPins
-from .postgres_access import PostgresAccessChecker, VerifiedIdentity
+from .postgres_access import PostgresAccessChecker, VerifiedIdentity, durable_execution_identity
+from .postgres_execution_scope import remaining_milliseconds
+from .postgres_processing_limits import configure_lock_wait, configure_statement_timeout
 from .postgres_connection import connect_postgres
 from .postgres_dimensional_scope import resolve_effective_dimensional_scope
 from .postgres_numeric_store import PostgresNumericFactStore
+from .postgres_populated_layout_preview import authorize_layout_plan_read
 
 
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
@@ -40,13 +41,14 @@ class PostgresPopulatedLayoutGenerationValidator:
 
     def validate(self, scope: ApplicationScope, request_id: str, *,
                  merge_policy: str, affected_dependencies: list,
-                 compatibility_decisions: list) -> dict:
+                 compatibility_decisions: list, worker_claim: dict | None = None) -> dict:
         if (not isinstance(scope, ApplicationScope)
                 or not isinstance(request_id, str)
                 or not _HEX32.fullmatch(request_id)):
             raise ValueError("LAYOUT_GENERATION_VALIDATION_REQUEST_INVALID")
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             db.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY")
+            configure_lock_wait(db); configure_statement_timeout(db, 5000)
             PostgresNumericFactStore._set_scope(db, scope)
             access = PostgresAccessChecker.check_in_transaction(
                 db, self.identity, scope, "admin")
@@ -56,7 +58,8 @@ class PostgresPopulatedLayoutGenerationValidator:
             request = self._request(db, scope, request_id)
             if request is None:
                 raise ValueError("LAYOUT_REPLACEMENT_NOT_FOUND")
-            self._require_authority(request, authorization_scope_digest)
+            self._require_authority(request, authorization_scope_digest, access.groups)
+            self._require_claim(request, worker_claim)
             if request["status"] != "Staged":
                 raise ValueError("LAYOUT_REPLACEMENT_NOT_STAGED")
             pins = LayoutPins(request["metadata_revision"], request["data_revision"],
@@ -78,7 +81,23 @@ class PostgresPopulatedLayoutGenerationValidator:
             if len(plan_mapping) != len(mappings):
                 raise ValueError("LAYOUT_REPLACEMENT_PLAN_INVALID")
 
+            dependency_context = self._dependency_context(db, scope, request_id,
+                compatibility_decisions)
+            expected_dependencies = [{'kind': row['kind'], 'id': row['id']}
+                for row in dependency_context['dependencies']]
+            if (not isinstance(affected_dependencies, list) or len(affected_dependencies) > 10000
+                    or any(not isinstance(row, dict) or set(row) != {'kind', 'id'}
+                        or row['kind'] not in ('rule', 'publication')
+                        or not isinstance(row['id'], str) or not row['id']
+                        for row in affected_dependencies)
+                    or {(row['kind'], row['id']) for row in affected_dependencies}
+                       != {(row['kind'], row['id']) for row in expected_dependencies}):
+                raise ValueError('LAYOUT_DEPENDENCY_INVENTORY_MISMATCH')
+            if request["dependency_decisions"] != dependency_context["decisions"]:
+                raise ValueError("LAYOUT_VALIDATION_INTENT_MISMATCH")
+            authorize_layout_plan_read(db, self.identity, scope, access, plan)
             source_ids = sorted(plan_mapping)
+            configure_statement_timeout(db, 5000)
             source_rows = db.execute("""SELECT source.coordinate_id AS source_coordinate_id,
                 n.present AS numeric_present,n.amount,
                 t.present AS text_present,t.text_value,
@@ -98,6 +117,7 @@ class PostgresPopulatedLayoutGenerationValidator:
                 ORDER BY source.coordinate_id LIMIT %s""",
                 (scope.workspace_id, scope.application_id, source_ids,
                  MAX_COORDINATES + 1)).fetchall()
+            configure_statement_timeout(db, 5000)
             staged_rows = db.execute("""SELECT source_coordinate_id,target_members
                 FROM epm.layout_replacement_staged_mapping(%s,%s,%s)""",
                 (scope.workspace_id, scope.application_id, request_id)).fetchall()
@@ -105,6 +125,7 @@ class PostgresPopulatedLayoutGenerationValidator:
                 raise ValueError("LAYOUT_GENERATION_COORDINATE_LIMIT")
             source_cells = []
             for row in source_rows:
+                remaining_milliseconds()
                 source_id = row["source_coordinate_id"]
                 detail_items = row["detail_items"] or []
                 source_cells.append({
@@ -120,6 +141,7 @@ class PostgresPopulatedLayoutGenerationValidator:
                                          for item in detail_items]}})
             relational_mappings = []
             for row in staged_rows:
+                remaining_milliseconds()
                 source_id = row["source_coordinate_id"]
                 if plan_mapping.get(source_id) != row["target_members"]:
                     raise ValueError("LAYOUT_GENERATION_MAPPING_TAMPERED")
@@ -128,11 +150,13 @@ class PostgresPopulatedLayoutGenerationValidator:
 
             referenced = {dimension: set() for dimension in target_dimensions}
             for mapping in mappings:
+                remaining_milliseconds()
                 members = mapping.get("targetMembers", {})
                 for dimension in target_dimensions:
                     if dimension in members:
                         referenced[dimension].add(members[dimension])
             member_ids = sorted({member for values in referenced.values() for member in values})
+            configure_statement_timeout(db, 5000)
             member_rows = db.execute("""SELECT dimension_id,member_id FROM epm.member
                 WHERE workspace_id=%s AND application_id=%s AND status='Active'
                 AND dimension_id=ANY(%s::text[]) AND member_id=ANY(%s::text[])""",
@@ -140,6 +164,7 @@ class PostgresPopulatedLayoutGenerationValidator:
                  target_dimensions, member_ids)).fetchall()
             valid_members = {dimension: [] for dimension in target_dimensions}
             for row in member_rows:
+                remaining_milliseconds()
                 if row["member_id"] in referenced.get(row["dimension_id"], set()):
                     valid_members[row["dimension_id"]].append(row["member_id"])
             for values in valid_members.values():
@@ -159,12 +184,14 @@ class PostgresPopulatedLayoutGenerationValidator:
                     raise ValueError("LAYOUT_PROPOSED_METADATA_INVALID")
                 valid_members[proposed_id] = proposed_members
 
+            configure_statement_timeout(db, 5000)
             materialization = db.execute("""SELECT status,target_count,content_digest
                 FROM epm.layout_replacement_materialization WHERE workspace_id=%s
                 AND application_id=%s AND request_id=%s""",
                 (scope.workspace_id, scope.application_id, request_id)).fetchone()
             if materialization is None or materialization["status"] != "Complete":
                 raise ValueError("LAYOUT_MATERIALIZATION_NOT_COMPLETE")
+            configure_statement_timeout(db, 5000)
             private_rows = db.execute("""SELECT c.target_members,c.source_coordinate_ids,
                 n.present AS numeric_present,n.amount,t.present AS text_present,t.text_value,
                 d.present AS detail_present,d.items AS detail_items,d.total AS detail_total
@@ -183,6 +210,7 @@ class PostgresPopulatedLayoutGenerationValidator:
                 raise ValueError("LAYOUT_GENERATION_COORDINATE_LIMIT")
             staged_cells = []
             for row in private_rows:
+                remaining_milliseconds()
                 if row["numeric_present"] is None or row["text_present"] is None or row["detail_present"] is None:
                     raise ValueError("LAYOUT_PRIVATE_FACT_PARTIAL")
                 staged_cells.append({"targetMembers": row["target_members"],
@@ -197,6 +225,7 @@ class PostgresPopulatedLayoutGenerationValidator:
                                    "amount": Decimal(item["amount"])}
                                   for item in (row["detail_items"] or [])]}})
 
+            remaining_milliseconds()
             certificate = validate_populated_layout_generation(
                 request_id=request_id, plan_digest=request["plan_digest"], pins=pins,
                 generation_id=request["target_generation_id"],
@@ -205,70 +234,115 @@ class PostgresPopulatedLayoutGenerationValidator:
                 source_cells=source_cells, staged_cells=staged_cells,
                 valid_target_members=valid_members,
                 affected_dependencies=affected_dependencies,
-                compatibility_decisions=compatibility_decisions)
+                compatibility_decisions=compatibility_decisions,
+                dependency_context=dependency_context)
+            if self._dependency_context(db, scope, request_id,
+                    compatibility_decisions) != dependency_context:
+                raise ValueError('LAYOUT_DEPENDENCY_CERTIFICATE_STALE')
             final_request = self._request(db, scope, request_id)
             if (final_request is None or final_request["status"] != "Staged"
                     or final_request["claim_generation"] != request["claim_generation"]
                     or final_request["plan_digest"] != request["plan_digest"]
                     or final_request["target_generation_id"] != request["target_generation_id"]):
                 raise ValueError("LAYOUT_GENERATION_STATE_CHANGED")
-            self._require_authority(final_request, authorization_scope_digest)
+            self._require_authority(final_request, authorization_scope_digest, access.groups)
+            self._require_claim(final_request, worker_claim)
             self._require_pins(self._state(db, scope), pins)
+            remaining_milliseconds()
             return certificate
 
     def persist(self, scope: ApplicationScope, request_id: str,
-                certificate: dict) -> dict:
+                certificate: dict, *, worker_claim: dict | None = None) -> dict:
         """Persist one immutable certificate and fenced terminal state."""
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
+                configure_lock_wait(db); configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
                 access = PostgresAccessChecker.check_in_transaction(
                     db, self.identity, scope, "admin")
                 authorization_scope_digest = resolve_effective_dimensional_scope(
                     db, self.identity, scope, access=access,
                     function="metadata.layout.populated.replace.request").scope_digest
+                if not isinstance(certificate, dict) or 'dependencyContext' not in certificate:
+                    raise ValueError('LAYOUT_DEPENDENCY_CERTIFICATE_REQUIRED')
+                context = canonical_dependency_context(certificate['dependencyContext'])
+                if self._dependency_context(db, scope, request_id, context['decisions']) != context:
+                    raise ValueError('LAYOUT_DEPENDENCY_CERTIFICATE_STALE')
                 request = self._request(db, scope, request_id)
                 if request is None or request["status"] != "Staged":
                     raise ValueError("LAYOUT_REPLACEMENT_NOT_STAGED")
-                self._require_authority(request, authorization_scope_digest)
+                self._require_authority(request, authorization_scope_digest, access.groups)
+                if request["dependency_decisions"] != context["decisions"]:
+                    raise ValueError("LAYOUT_VALIDATION_INTENT_MISMATCH")
                 pins = LayoutPins(request["metadata_revision"],request["data_revision"],
                     request["policy_revision"],request["schema_epoch"],request["source_commit_revision"])
                 self._require_pins(self._state(db, scope), pins)
+                authorize_layout_plan_read(db, self.identity, scope, access, request["plan"])
+                configure_statement_timeout(db, 5000)
                 material = db.execute("""SELECT status,target_count,content_digest FROM
                     epm.layout_replacement_materialization WHERE workspace_id=%s
                     AND application_id=%s AND request_id=%s""",
                     (scope.workspace_id,scope.application_id,request_id)).fetchone()
                 if material is None or material["status"]!="Complete":
                     raise ValueError("LAYOUT_MATERIALIZATION_NOT_COMPLETE")
-                status=db.execute("""SELECT epm.layout_replacement_validation_publish
-                    (%s,%s,%s,%s,%s,%s) AS status""",
-                    (scope.workspace_id,scope.application_id,request_id,
-                     material["content_digest"],material["target_count"],
-                     Jsonb(certificate))).fetchone()["status"]
+                self._require_claim(request, worker_claim)
+                arguments=(scope.workspace_id,scope.application_id,request_id,
+                    material["content_digest"],material["target_count"],Jsonb(certificate))
+                if worker_claim is None:
+                    statement="SELECT epm.layout_replacement_validation_publish(%s,%s,%s,%s,%s,%s) AS status"
+                else:
+                    statement="SELECT epm.layout_replacement_validation_publish_claimed(%s,%s,%s,%s,%s,%s,%s,%s) AS status"
+                    arguments=(*arguments,worker_claim["claimant"],worker_claim["claim_generation"])
+                configure_statement_timeout(db, 5000)
+                status=db.execute(statement,arguments).fetchone()["status"]
                 return {"requestId":request_id,"status":status,
                         "validationDigest":certificate["validationDigest"]}
 
     @staticmethod
+    def _dependency_context(db, scope, request_id, decisions):
+        configure_statement_timeout(db, 5000)
+        row = db.execute('SELECT epm.layout_replacement_validation_context(%s,%s,%s,%s) AS context',
+            (scope.workspace_id, scope.application_id, request_id, Jsonb(decisions))).fetchone()
+        return canonical_dependency_context(row['context'] if row else None)
+
+    @staticmethod
     def _request(db, scope: ApplicationScope, request_id: str):
+        configure_statement_timeout(db, 5000)
         return db.execute("""SELECT status,claim_generation,plan,plan_digest,
             metadata_revision,data_revision,policy_revision,schema_epoch,
             source_commit_revision,target_generation_id,expected_coordinate_count,
-            issuer,subject_id,verified_groups,authorization_scope_digest
+            issuer,subject_id,verified_groups,authorization_scope_digest,
+            token_issued_at,authority_kind,dependency_decisions,worker_phase,claimant,
+            lease_until>clock_timestamp() AS claim_live
             FROM epm.layout_replacement_request WHERE workspace_id=%s
             AND application_id=%s AND request_id=%s""",
             (scope.workspace_id, scope.application_id, request_id)).fetchone()
 
-    def _require_authority(self, request, authorization_scope_digest):
+    def _require_authority(self, request, authorization_scope_digest, verified_groups):
+        sealed=durable_execution_identity(request)
+        if sealed.issued_at != self.identity.issued_at:
+            raise ValueError("LAYOUT_REPLACEMENT_AUTHORIZATION_SCOPE_CHANGED")
         if (request["issuer"] != self.identity.issuer
                 or request["subject_id"] != self.identity.subject_id
-                or tuple(request["verified_groups"]) != self.identity.groups
+                or tuple(request["verified_groups"]) != verified_groups
                 or request["authorization_scope_digest"] is None
                 or request["authorization_scope_digest"] !=
                 authorization_scope_digest):
             raise ValueError("LAYOUT_REPLACEMENT_AUTHORIZATION_SCOPE_CHANGED")
 
     @staticmethod
+    def _require_claim(request, claim):
+        remaining_milliseconds()
+        if claim is not None and (claim.get("phase") != "Validate"
+                or request["status"] != "Staged" or request["worker_phase"] != "Validate"
+                or request["claimant"] != claim.get("claimant")
+                or request["claim_generation"] != claim.get("claim_generation")
+                or request["claim_live"] is not True):
+            raise ValueError("LAYOUT_VALIDATION_STALE_WORKER")
+
+    @staticmethod
     def _state(db, scope: ApplicationScope):
+        configure_statement_timeout(db, 5000)
         return db.execute("""SELECT metadata_revision,data_revision,policy_revision,
             schema_epoch,commit_revision,commit_open FROM epm.application_state
             WHERE workspace_id=%s AND application_id=%s""",

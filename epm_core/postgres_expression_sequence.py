@@ -14,6 +14,8 @@ from epm_core.postgres_connection import connect_postgres
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from .operation_admission_contract import (authenticate_operation_admission,
+                                           is_signed_operation_id)
 from .persistence_contract import ApplicationScope
 from .postgres_access import PostgresAccessChecker,VerifiedIdentity
 from .postgres_dimensional_scope import resolve_effective_dimensional_scope
@@ -54,6 +56,14 @@ def _program(raw: object, function: str) -> dict:
             or not isinstance(raw['arguments'], dict)):
         raise ValueError('V2_RULE_SEQUENCE_FUNCTION_INVALID')
     args = raw['arguments']
+    if function == READ and set(args) == {'originalRequest'}:
+        original = args['originalRequest']
+        if (not isinstance(original, dict)
+                or set(original) != {'program', 'idempotencyKey'}
+                or not is_signed_operation_id(original['idempotencyKey'])):
+            raise ValueError('V2_RULE_SEQUENCE_ARGUMENTS_INVALID')
+        _program(original['program'], FUNCTION)
+        return args
     if function in (READ, CANCEL):
         if (set(args) != {'sequenceId'}
                 or not isinstance(args['sequenceId'], str)
@@ -75,6 +85,134 @@ def _program(raw: object, function: str) -> dict:
                    for values in bindings.values())):
         raise ValueError('V2_RULE_SEQUENCE_ARGUMENTS_INVALID')
     return args
+
+
+def read_program_contract() -> dict:
+    from .metadata_read_contract import read_contract, read_example
+    from .operation_admission_contract import signed_operation_id_schema
+    from .postgres_numeric_catalog import obj, program_schema
+
+    sequence_id = {'type': 'string', 'pattern': r'^[0-9a-f]{32}(?![\s\S])'}
+    rule_id = {'type': 'string', 'pattern': r'^[A-Za-z0-9._-]{1,100}(?![\s\S])'}
+    run_args = obj({'ruleIds': {'type': 'array', 'items': rule_id,
+        'minItems': 2, 'maxItems': 8, 'uniqueItems': True},
+        'bindings': {'type': 'object', 'propertyNames': rule_id,
+                     'additionalProperties': {'type': 'object'}}}, ['ruleIds'])
+    original = obj({'program': program_schema(FUNCTION, run_args),
+                    'idempotencyKey': signed_operation_id_schema()})
+    arguments = obj({'sequenceId': sequence_id, 'originalRequest': original}, [])
+    arguments['oneOf'] = [{'required': [key]} for key in arguments['properties']]
+    identifier = {'type': 'string', 'minLength': 1}
+    nullable_identifier = {'type': ['string', 'null'], 'minLength': 1}
+    step = obj({'ordinal': {'type': 'integer', 'minimum': 1, 'maximum': 8},
+        'ruleId': rule_id, 'jobId': {'anyOf': [sequence_id, {'type': 'null'}]},
+        'jobStatus': {'enum': ['not_admitted', 'accepted', 'ready', 'running',
+            'staged', 'published', 'failed', 'cancel_requested', 'cancelled',
+            'needs_inspection', 'unavailable']},
+        'receiptId': nullable_identifier,
+        'receiptRevision': {'type': ['integer', 'null'], 'minimum': 1}})
+    result = obj({'sequenceId': sequence_id,
+        'status': {'enum': ['accepted', 'running', 'published', 'failed',
+                            'cancel_requested', 'cancelled']},
+        'currentStep': {'type': 'integer', 'minimum': 0, 'maximum': 8},
+        'stepCount': {'type': 'integer', 'minimum': 2, 'maximum': 8},
+        'jobIds': {'type': 'array', 'items': identifier, 'maxItems': 8},
+        'errorCode': nullable_identifier,
+        'createdAt': {'type': 'string', 'format': 'date-time'},
+        'updatedAt': {'type': 'string', 'format': 'date-time'},
+        'commitState': {'enum': ['none_observed', 'partially_committed', 'committed', 'uncertain']},
+        'steps': {'type': 'array', 'items': step, 'minItems': 2, 'maxItems': 8}})
+    return read_contract(READ, arguments, result, owner='PostgresExpressionSequence',
+        examples=[
+            read_example(READ, {'sequenceId': 'a' * 32},
+                name='Inspect the sequence acknowledged by the server',
+                binding='Replace the illustrative sequenceId with the acknowledged sequenceId.'),
+            read_example(READ, {'originalRequest': {
+                'program': {'languageVersion': 2, 'function': FUNCTION,
+                            'arguments': {'ruleIds': ['first-rule', 'second-rule']}},
+                'idempotencyKey': f"oa1_1_{'0' * 32}_{'A' * 43}"}},
+                name='Recover an original sequence after a lost acknowledgement',
+                binding='Replace the illustrative program and key with the exact originally submitted program and signed operation ID, in the same workspace and application.')],
+        semantic_rules=[
+            'Use exactly one selector under current READ and the original caller’s effective dimensional scope. The signed original request remains usable after expiration for lookup only.',
+            'RULE_SEQUENCE_UNAVAILABLE leaves the original outcome unresolved. This read never admits, retries or advances work.',
+            'Parent status describes orchestration. Per-step receipts show observed commits, including a committed child the coordinator has not yet checkpointed. Failure and cancellation do not reverse those commits.',
+            'A missing retained child or a child needing inspection makes commitState uncertain. A receipt records historical publication, independent of current result freshness.'])
+
+
+def _step_job_key(sequence_id: str, index: int) -> str:
+    return f'rule-seq-{sequence_id}-{index}'
+
+
+def _request_digest(scope, identity, program, *, issued_at):
+    return _canonical_digest({
+        'scope': [scope.workspace_id, scope.application_id],
+        'identity': [identity.issuer, identity.subject_id],
+        'tokenIssuedAt': issued_at, 'program': program})
+
+
+def _matches_step_job(job: dict, step: dict) -> bool:
+    normalized = job['normalized_program']
+    pin = normalized.get('savedRule')
+    return (job['function_name'] == 'facts.expression.calculate'
+            and job['program_digest'] == _canonical_digest(normalized)
+            and normalized.get('resultKey') == step['resultKey']
+            and isinstance(pin, dict)
+            and pin.get('bindings') == step.get('bindings')
+            and pin.get('memberParameters', []) == step.get('memberParameters', [])
+            and all(pin.get(key) == step[key]
+                    for key in ('ruleId', 'stateToken', 'programDigest')))
+
+
+def _observed_steps(db, scope: ApplicationScope, row: dict) -> tuple[list, str]:
+    steps = row['manifest']['steps']
+    job_ids = row['job_ids']
+    if len(job_ids) > len(steps):
+        raise ValueError('RULE_SEQUENCE_JOB_HISTORY_INVALID')
+    # A worker can commit a child admission and lose its parent checkpoint.
+    # The next exact deterministic key is the only unlinked child to inspect.
+    next_key = (_step_job_key(row['sequence_id'], len(job_ids))
+                if len(job_ids) < len(steps) else None)
+    jobs = db.execute('''SELECT job_id,idempotency_key,status,receipt_revision,
+        function_name,program_digest,normalized_program FROM epm.job
+        WHERE workspace_id=%s AND application_id=%s AND issuer=%s AND subject_id=%s
+          AND (job_id=ANY(%s::text[]) OR idempotency_key=%s)''',
+        (scope.workspace_id, scope.application_id, row['issuer'], row['subject_id'],
+         job_ids, next_key)).fetchall()
+    by_id = {job['job_id']: job for job in jobs}
+    by_key = {job['idempotency_key']: job for job in jobs}
+    observed = []
+    committed = 0
+    uncertain = False
+    for index, step in enumerate(steps):
+        attached = index < len(job_ids)
+        job_id = job_ids[index] if attached else None
+        candidate = by_id.get(job_id) if attached else (
+            by_key.get(next_key) if index == len(job_ids) else None)
+        status = 'unavailable' if attached else 'not_admitted'
+        receipt = None
+        if candidate is not None:
+            if (candidate['idempotency_key'] == _step_job_key(row['sequence_id'], index)
+                    and _matches_step_job(candidate, step)):
+                job_id = candidate['job_id']
+                status = candidate['status']
+                if status == 'published':
+                    receipt = candidate['receipt_revision']
+                    if receipt is None:
+                        status = 'unavailable'
+            else:
+                status = 'unavailable'
+        uncertain |= status in ('unavailable', 'needs_inspection')
+        committed += receipt is not None
+        observed.append({'ordinal': index + 1, 'ruleId': step['ruleId'],
+                         'jobId': job_id, 'jobStatus': status,
+                         'receiptId': job_id if receipt is not None else None,
+                         'receiptRevision': receipt})
+    if uncertain:
+        return observed, 'uncertain'
+    if committed == len(steps):
+        return observed, 'committed'
+    return observed, 'partially_committed' if committed else 'none_observed'
 
 
 def _manifest(db, scope: ApplicationScope, rule_ids: list[str],
@@ -217,16 +355,10 @@ class PostgresExpressionSequence:
             function=FUNCTION).scope_digest
 
     def _require_current_scope(self, db, scope: ApplicationScope,
-                               sequence_id: str, *, access=None) -> None:
-        row = db.execute('''SELECT authorization_scope_digest FROM
-            epm.expression_rule_sequence WHERE workspace_id=%s
-              AND application_id=%s AND sequence_id=%s''',
-            (scope.workspace_id, scope.application_id,
-             sequence_id)).fetchone()
+                               admitted_digest: str | None, *, access) -> None:
         current = self._authorization_scope_digest(
             db, scope, access=access)
-        if (row is None or row['authorization_scope_digest'] is None
-                or row['authorization_scope_digest'] != current):
+        if admitted_digest != current:
             raise ValueError('RULE_SEQUENCE_AUTHORIZATION_SCOPE_CHANGED')
 
     def preview(self, scope: ApplicationScope, raw: dict, *,
@@ -285,11 +417,8 @@ class PostgresExpressionSequence:
             authority_kind = 'Technical'
         else:
             raise ValueError('DURABLE_HUMAN_TOKEN_ISSUED_AT_REQUIRED')
-        request_digest = _canonical_digest({
-            'scope': [scope.workspace_id, scope.application_id],
-            'identity': [self.identity.issuer, self.identity.subject_id],
-            'tokenIssuedAt': self.identity.issued_at,
-            'program': raw})
+        request_digest = _request_digest(scope, self.identity, raw,
+                                         issued_at=self.identity.issued_at)
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
                 PostgresNumericFactStore._set_scope(db, scope)
@@ -360,28 +489,49 @@ class PostgresExpressionSequence:
 
     def read(self, scope: ApplicationScope, raw: dict) -> dict:
         args = _program(raw, READ)
+        original = args.get('originalRequest')
+        sequence_id = args.get('sequenceId')
+        operation_id = None
+        if original is not None:
+            operation_id = original['idempotencyKey']
+            authenticate_operation_admission(self.preview_secret, scope, self.identity,
+                operation_id=operation_id, function=FUNCTION,
+                intent_digest=_canonical_digest(original['program']))
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
+                db.execute('SET TRANSACTION READ ONLY')
+                configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
                 access = PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
+                    db, self.identity, scope, 'read', function=READ)
                 row = db.execute('''SELECT sequence_id,issuer,subject_id,
                     manifest,status,current_step,job_ids,error_code,
-                    created_at,updated_at FROM epm.expression_rule_sequence
+                    created_at,updated_at,request_digest,token_issued_at,
+                    authorization_scope_digest FROM epm.expression_rule_sequence
                     WHERE workspace_id=%s AND application_id=%s
-                      AND sequence_id=%s''',
+                      AND issuer=%s AND subject_id=%s
+                      AND (sequence_id=%s OR idempotency_key=%s)''',
                     (scope.workspace_id, scope.application_id,
-                     args['sequenceId'])).fetchone()
-                if (row is None or (row['issuer'], row['subject_id']) !=
-                        (self.identity.issuer, self.identity.subject_id)):
+                     self.identity.issuer, self.identity.subject_id,
+                     sequence_id, operation_id)).fetchone()
+                if (row is None or (original is not None
+                        and row['request_digest'] != _request_digest(
+                            scope, self.identity, original['program'],
+                            issued_at=row['token_issued_at']))):
                     raise ValueError('RULE_SEQUENCE_UNAVAILABLE')
                 self._require_current_scope(
-                    db, scope, row['sequence_id'], access=access)
+                    db, scope, row['authorization_scope_digest'], access=access)
+                steps, commit_state = _observed_steps(db, scope, row)
+                if PostgresAccessChecker.check_in_transaction(
+                        db, self.identity, scope, 'read', function=READ) != access:
+                    raise ValueError('RULE_SEQUENCE_AUTHORIZATION_SCOPE_CHANGED')
                 return {'sequenceId': row['sequence_id'],
                         'status': row['status'],
                         'currentStep': row['current_step'],
                         'stepCount': len(row['manifest']['steps']),
                         'jobIds': row['job_ids'],
+                        'commitState': commit_state,
+                        'steps': steps,
                         'errorCode': row['error_code'],
                         'createdAt': row['created_at'].isoformat(),
                         'updatedAt': row['updated_at'].isoformat()}
@@ -442,7 +592,7 @@ class PostgresExpressionSequence:
                           AND idempotency_key=%s FOR UPDATE''',
                         (scope.workspace_id, scope.application_id,
                          row['issuer'], row['subject_id'],
-                         f'rule-seq-{args["sequenceId"]}-{current}')).fetchone()
+                         _step_job_key(args['sequenceId'], current))).fetchone()
                     if job:
                         job_ids.append(job['job_id'])
                 if job:
@@ -565,7 +715,7 @@ class PostgresExpressionSequenceCoordinator:
                             'status': 'cancel_requested'}
                 existing = None
                 if len(job_ids) <= step_index:
-                    idem = f'rule-seq-{row["sequence_id"]}-{step_index}'
+                    idem = _step_job_key(row['sequence_id'], step_index)
                     existing = worker.execute('''SELECT job_id,status,
                         function_name,program_digest,normalized_program
                         FROM epm.job
@@ -602,20 +752,7 @@ class PostgresExpressionSequenceCoordinator:
                                     'currentStep': step_index + 1}
                     if existing is not None:
                         step = manifest['steps'][step_index]
-                        normalized = existing['normalized_program']
-                        pin = normalized.get('savedRule')
-                        if (existing['function_name'] !=
-                                'facts.expression.calculate'
-                            or existing['program_digest'] !=
-                                _canonical_digest(normalized)
-                            or normalized.get('resultKey') != step['resultKey']
-                            or pin is None
-                            or pin.get('bindings') != step.get('bindings')
-                            or pin.get('memberParameters', []) !=
-                                step.get('memberParameters', [])
-                            or any(pin.get(key) != step[key]
-                            for key in ('ruleId','stateToken',
-                                        'programDigest'))):
+                        if not _matches_step_job(existing, step):
                             raise ValueError('RULE_SEQUENCE_ADOPTED_JOB_MISMATCH')
                         if existing['status'] in (
                                 'published', 'failed', 'cancelled',

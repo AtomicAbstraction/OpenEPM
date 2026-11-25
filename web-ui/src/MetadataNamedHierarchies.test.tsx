@@ -16,6 +16,7 @@ import {
 } from "./metadata-hierarchies";
 import type { ApplicationCatalog } from "./types";
 import { installOperationAdmissionFixture } from "./test-setup";
+import { discardUnsavedWork, unsavedWorkSnapshot } from "./unsaved-work";
 
 const app = {
   workspaceId: "ws",
@@ -38,6 +39,9 @@ const catalog: ApplicationCatalog = {
       "metadata.relationship.status.set",
       "metadata.relationship.aggregation-operator.set",
       "metadata.hierarchy.build",
+      "metadata.hierarchy.relationships.preview",
+      "metadata.hierarchy.relationships.apply",
+      "application.operation.receipt.read",
       ...[
         "list",
         "members.list",
@@ -86,13 +90,14 @@ const page = <T,>(rows: T[]) => ({
   hasMore: false,
   nextAfterId: null,
 });
-function mockReads() {
+function mockReads(hierarchies = trees) {
   const calls: Array<Record<string, any>> = [];
   const fetcher = vi.fn(async (_url: string, init: RequestInit) => {
     const body = JSON.parse(String(init.body));
     calls.push(body);
     const p = body.program;
-    if (p.function === "metadata.hierarchy.list") return response(page(trees));
+    if (p.function === "metadata.hierarchy.list")
+      return response(page(hierarchies));
     if (p.function === "metadata.hierarchy.members.list")
       return response(
         page(
@@ -124,13 +129,84 @@ function mockReads() {
         ],
       });
     }
+    if (p.function === "metadata.hierarchy.relationships.preview")
+      return response({
+        previewToken: "signed-hierarchy-preview",
+        hierarchyId: p.arguments.hierarchyId,
+        memberCount: 3,
+        graphDigest: "a".repeat(64),
+        closureDigest: "b".repeat(64),
+        edgeCount: 2,
+        closureCount: 5,
+        affectedPathCount: 1,
+        affectedRelationshipIds: ["hidden"],
+      });
+    if (p.function === "metadata.hierarchy.relationships.apply")
+      return placementApplied(p.arguments.hierarchyId);
+    if (p.function === "metadata.hierarchy.build")
+      return hierarchyBuilt(p.arguments.hierarchyId, body.idempotencyKey);
+    if (
+      _url === "/api/metadata-action" &&
+      p.function.startsWith("metadata.hierarchy.")
+    )
+      return namedHierarchyApplied(p.function, body.idempotencyKey);
     return response({ metadataRevision: 47, operationId: "saved" });
   });
   vi.stubGlobal("fetch", fetcher);
   installOperationAdmissionFixture("5");
   return { calls, fetcher };
 }
+function namedHierarchyApplied(functionName: string, operationId: string) {
+  return new Response(
+    JSON.stringify({
+      languageVersion: 2,
+      function: functionName,
+      result: { operationId, committedRevision: 49, changedCount: 1 },
+    }),
+    { status: 200 },
+  );
+}
+function hierarchyBuilt(hierarchyId: string, operationId: string) {
+  return Response.json({
+    languageVersion: 2,
+    function: "metadata.hierarchy.build",
+    result: {
+      operationId,
+      hierarchyId,
+      stateToken: "c".repeat(64),
+      closureCount: 4,
+      membershipSemantics: "unique_member",
+      committedRevision: 49,
+    },
+  });
+}
+function placementApplied(hierarchyId: string) {
+  return new Response(
+    JSON.stringify({
+      languageVersion: 2,
+      function: "metadata.hierarchy.relationships.apply",
+      result: {
+        kind: "hierarchy.build",
+        operation: "relationship.patch",
+        hierarchyId,
+        metadataRevision: 47,
+        committedRevision: 49,
+        stateToken: "c".repeat(64),
+        graphDigest: "a".repeat(64),
+        closureDigest: "b".repeat(64),
+        memberCount: 3,
+        edgeCount: 2,
+        closureCount: 5,
+        affectedPathCount: 1,
+        affectedRelationshipIds: ["hidden"],
+      },
+    }),
+    { status: 200 },
+  );
+}
+
 afterEach(() => {
+  discardUnsavedWork();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -165,7 +241,7 @@ it("switches independent named trees with isolated roots and placement-specific 
   await waitFor(() =>
     expect(
       within(screen.getByRole("tree")).getByRole("button", {
-        name: "Select B in hierarchy",
+        name: "Select B in hierarchy under Root",
       }),
     ).toBeVisible(),
   );
@@ -179,7 +255,9 @@ it("switches independent named trees with isolated roots and placement-specific 
     }),
   ).toBeNull();
   fireEvent.click(
-    within(tree).getByRole("button", { name: "Select B in hierarchy" }),
+    within(tree).getByRole("button", {
+      name: "Select B in hierarchy under Root",
+    }),
   );
   expect(
     screen.getByLabelText("Selected metadata properties"),
@@ -191,6 +269,45 @@ it("switches independent named trees with isolated roots and placement-specific 
       .map((c) => c.program.arguments.hierarchyId),
   ).toEqual(["H_DEFAULT", "H_ALT"]);
 });
+
+async function openPlacementReview() {
+  await screen.findByText(/1 current relationships/);
+  fireEvent.change(screen.getByRole("combobox", { name: "Hierarchy" }), {
+    target: { value: "H_ALT" },
+  });
+  await waitFor(() =>
+    expect(
+      screen.getByRole("combobox", { name: "Hierarchy" }),
+    ).not.toBeDisabled(),
+  );
+  expect(screen.queryByLabelText("Stable ID")).toBeNull();
+  fireEvent.click(screen.getByLabelText("Parent member"));
+  const parentChooser = await screen.findByRole("dialog", {
+    name: "Choose one Account member",
+  });
+  fireEvent.click(
+    within(parentChooser).getByRole("button", { name: "Apply selection" }),
+  );
+  fireEvent.click(screen.getByLabelText("Child member"));
+  const chooser = await screen.findByRole("dialog", {
+    name: "Choose one Account member",
+  });
+  const cChoice = (
+    await within(chooser).findByText("C", { selector: "strong" })
+  ).closest("button");
+  expect(cChoice).not.toBeNull();
+  fireEvent.click(cChoice!);
+  fireEvent.click(
+    within(chooser).getByRole("button", { name: "Add selected member" }),
+  );
+  fireEvent.click(
+    within(chooser).getByRole("button", { name: "Apply selection" }),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Preview exact changes" }),
+  );
+  await screen.findByText("Exact server preview");
+}
 
 it("creates a placement and builds only the selected canonical hierarchy", async () => {
   const { calls } = mockReads();
@@ -210,37 +327,27 @@ it("creates a placement and builds only the selected canonical hierarchy", async
       onChanged={changed}
     />,
   );
-  await screen.findByText(/1 current relationships/);
-  fireEvent.change(screen.getByRole("combobox", { name: "Hierarchy" }), {
-    target: { value: "H_ALT" },
-  });
-  await waitFor(() =>
-    expect(
-      screen.getByRole("combobox", { name: "Hierarchy" }),
-    ).not.toBeDisabled(),
+  await openPlacementReview();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Apply reviewed changeset" }),
   );
-  fireEvent.change(screen.getByLabelText("Stable ID"), {
-    target: { value: "new-placement" },
-  });
-  fireEvent.change(screen.getByLabelText("Parent member"), {
-    target: { value: "Root" },
-  });
-  fireEvent.change(screen.getByLabelText("Child member"), {
-    target: { value: "C" },
-  });
-  fireEvent.click(screen.getByLabelText(/I reviewed this exact parent-child/));
-  fireEvent.click(screen.getByRole("button", { name: "Create relationship" }));
   await waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
   expect(
-    calls.find((c) => c.program.function === "metadata.relationship.create")
-      ?.program.arguments,
-  ).toEqual({
+    calls.find(
+      (c) => c.program.function === "metadata.hierarchy.relationships.preview",
+    )?.program.arguments,
+  ).toMatchObject({
     dimensionId: "Account",
     hierarchyId: "H_ALT",
-    relationshipId: "new-placement",
-    parentMemberId: "Root",
-    childMemberId: "C",
     expectedMetadataRevision: 46,
+    expectedHierarchyStateToken: "8".repeat(64),
+    changes: [
+      {
+        action: "Create",
+        parentMemberId: "Root",
+        childMemberId: "C",
+      },
+    ],
   });
   view.unmount();
   render(
@@ -269,8 +376,154 @@ it("creates a placement and builds only the selected canonical hierarchy", async
     dimensionId: "Account",
     hierarchyId: "H_DEFAULT",
     expectedMetadataRevision: 46,
+    expectedStateToken: "3".repeat(64),
+  });
+  await screen.findByText("The reviewed hierarchy was built.");
+});
+
+it("omits the prior token when the reviewed named hierarchy is unbuilt", async () => {
+  const { calls } = mockReads(
+    trees.map((tree) =>
+      tree.isDefault
+        ? {
+            ...tree,
+            stateToken: null,
+            builtMetadataRevision: null,
+            current: false,
+          }
+        : tree,
+    ),
+  );
+  vi.stubGlobal(
+    "confirm",
+    vi.fn(() => true),
+  );
+  render(
+    <MetadataRelationships
+      app={app}
+      catalog={catalog}
+      dimensionId="Account"
+      members={members}
+      metadataRevision={46}
+      mode="relationships"
+      onChanged={async () => {}}
+    />,
+  );
+  await screen.findByText(/1 current relationships/);
+  fireEvent.click(screen.getByLabelText(/I reviewed this dimension/));
+  fireEvent.click(screen.getByRole("button", { name: "Build hierarchy" }));
+  await screen.findByText("The reviewed hierarchy was built.");
+  expect(
+    calls.find((c) => c.program.function === "metadata.hierarchy.build")
+      ?.program.arguments,
+  ).toEqual({
+    dimensionId: "Account",
+    hierarchyId: "H_DEFAULT",
+    expectedMetadataRevision: 46,
   });
 });
+
+it.each(["lost", "wrong hierarchy"])(
+  "reconciles a %s build reply using its original historical receipt",
+  async (result) => {
+    mockReads();
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    const supportedFetch = globalThis.fetch;
+    const writes: Array<Record<string, any>> = [];
+    const receipts: Array<Record<string, any>> = [];
+    const refresh = vi.fn(async () => {});
+    let receiptFunction = "metadata.hierarchy.rename";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body));
+        if (url === "/api/metadata-action") {
+          writes.push(body);
+          if (result === "lost") throw new TypeError("Failed to fetch");
+          return hierarchyBuilt("H_ALT", body.idempotencyKey);
+        }
+        if (body.program.function === "application.operation.receipt.read") {
+          receipts.push(body);
+          return response({
+            operationId: writes[0].idempotencyKey,
+            actorId: "owner",
+            commandDigest: "e".repeat(64),
+            committedRevision: 48,
+            committedAt: "2026-11-21T11:12:00Z",
+            outcome: { function: receiptFunction },
+          });
+        }
+        return supportedFetch(url, init);
+      }),
+    );
+    function editor(access: ApplicationCatalog) {
+      return (
+        <MetadataRelationships
+          app={app}
+          catalog={access}
+          dimensionId="Account"
+          members={members}
+          metadataRevision={46}
+          mode="relationships"
+          onChanged={refresh}
+        />
+      );
+    }
+    const original = render(editor(catalog));
+    await screen.findByText(/1 current relationships/);
+    fireEvent.click(screen.getByLabelText(/I reviewed this dimension/));
+    fireEvent.click(screen.getByRole("button", { name: "Build hierarchy" }));
+    const pending = await screen.findByRole("heading", {
+      name: "Hierarchy build awaiting confirmation",
+    });
+    await waitFor(() => expect(pending).toHaveFocus());
+    expect(screen.queryByText("The reviewed hierarchy was built.")).toBeNull();
+    expect(refresh).not.toHaveBeenCalled();
+    original.unmount();
+    const { "metadata.hierarchy.build": _build, ...readerFunctions } =
+      catalog.functions;
+    render(
+      editor({
+        ...catalog,
+        functions: readerFunctions,
+        applicationAccess: { ...catalog.applicationAccess, role: "Reader" },
+      }),
+    );
+    const receipt = await screen.findByRole("button", {
+      name: "Check original hierarchy build receipt",
+    });
+    await waitFor(() => expect(receipt).toBeEnabled());
+    fireEvent.click(receipt);
+    await screen.findByText(
+      "The receipt could not confirm the original hierarchy build.",
+    );
+    expect(refresh).not.toHaveBeenCalled();
+    receiptFunction = "metadata.hierarchy.build";
+    fireEvent.click(receipt);
+    const recorded = await screen.findByText(
+      "The original hierarchy build was recorded.",
+    );
+    await waitFor(() => expect(recorded).toHaveFocus());
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveLength(1);
+    expect(
+      receipts.map((body) => [
+        body.workspaceId,
+        body.applicationId,
+        body.program.arguments,
+      ]),
+    ).toEqual(
+      Array.from({ length: 2 }, () => [
+        "ws",
+        "app",
+        { operationId: writes[0].idempotencyKey },
+      ]),
+    );
+  },
+);
 
 it("hides old hierarchy context immediately and discards late responses after authority changes", async () => {
   let resolve!: (value: Response) => void;
@@ -318,11 +571,9 @@ it("hides old hierarchy context immediately and discards late responses after au
     />,
   );
   expect(priorSignal?.aborted).toBe(true);
-  await screen.findByRole("option", { name: "New authorized tree · H_NEW" });
+  await screen.findByRole("option", { name: "New authorized tree" });
   await act(async () => resolve(response(page(trees))));
-  expect(
-    screen.queryByRole("option", { name: "Alternate · H_ALT" }),
-  ).toBeNull();
+  expect(screen.queryByRole("option", { name: "Alternate" })).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Tree View" }));
   expect(
     within(screen.getByRole("tree")).getByRole("button", {
@@ -421,6 +672,7 @@ it("uses ordinary typed controls for hierarchy creation, renaming and membership
 
 it("paginates hierarchy membership with revision pins and rejects foreign or stale pages", async () => {
   const calls: Record<string, unknown>[] = [];
+  const nextPageToken = "2000000000." + "a".repeat(64);
   const result = await collectHierarchyMembers(
     "Account",
     "H_ALT",
@@ -432,6 +684,7 @@ it("paginates hierarchy membership with revision pins and rejects foreign or sta
             ...page([{ memberId: "A", status: "Active" as const }]),
             hasMore: true,
             nextAfterId: "A",
+            nextPageToken,
           }
         : page([{ memberId: "B", status: "Inactive" as const }]);
     },
@@ -441,6 +694,7 @@ it("paginates hierarchy membership with revision pins and rejects foreign or sta
     hierarchyId: "H_ALT",
     afterId: "A",
     expectedMetadataRevision: 46,
+    expectedPageToken: nextPageToken,
   });
   await expect(
     collectMetadataHierarchies("Account", 46, async () => ({
@@ -574,7 +828,7 @@ it("pins a changed placement operator to its exact named-graph relationship", as
   fireEvent.click(screen.getByRole("button", { name: "Tree View" }));
   fireEvent.click(
     within(screen.getByRole("tree")).getByRole("button", {
-      name: "Select B in hierarchy",
+      name: "Select B in hierarchy under Root",
     }),
   );
   expect(screen.getByLabelText("Placement aggregation operator")).toHaveValue(
@@ -595,9 +849,399 @@ it("pins a changed placement operator to its exact named-graph relationship", as
       ),
     ).toBe(true),
   );
-  expect(calls.at(-1)?.program.arguments).toEqual({
+  const mutation = calls.find(
+    (call) =>
+      call.program.function ===
+      "metadata.relationship.aggregation-operator.set",
+  );
+  expect(mutation?.program.arguments).toEqual({
     relationshipId: "H_ALT-edge",
     aggregationOperatorOverride: "Subtract",
     expectedMetadataRevision: 46,
   });
+});
+
+it("checks only the original receipt after a lost response and preserves the attempt across remount", async () => {
+  mockReads();
+  vi.stubGlobal(
+    "confirm",
+    vi.fn(() => true),
+  );
+  const changed = vi.fn(async () => {});
+  const fetchWithAdmission = globalThis.fetch;
+  const packets: Array<{ path: string; body: any }> = [];
+  let operationId: string;
+  let receiptActor = "wrong-actor";
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      packets.push({ path: url, body });
+      if (url === "/api/metadata-action") {
+        operationId = body.idempotencyKey;
+        throw new TypeError("Failed to fetch");
+      }
+      if (body.program.function === "application.operation.receipt.read") {
+        return response({
+          operationId,
+          actorId: receiptActor,
+          committedRevision: 49,
+          committedAt: "2026-11-20T14:25:00Z",
+          commandDigest: "d".repeat(64),
+          outcome: {},
+        });
+      }
+      return fetchWithAdmission(url, init);
+    }),
+  );
+  function editor(currentApp = app, access = catalog) {
+    return (
+      <MetadataRelationships
+        app={currentApp}
+        catalog={access}
+        dimensionId="Account"
+        members={members}
+        metadataRevision={46}
+        mode="relationships"
+        onChanged={changed}
+      />
+    );
+  }
+  const first = render(editor());
+  await openPlacementReview();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Apply reviewed changeset" }),
+  );
+  const heading = await screen.findByRole("heading", {
+    name: "Placement change awaiting confirmation",
+  });
+  await waitFor(() => expect(heading).toHaveFocus());
+  expect(
+    screen.queryByRole("button", { name: "Apply reviewed changeset" }),
+  ).toBeNull();
+  expect(
+    screen.getByRole("button", { name: "Preview exact changes" }),
+  ).toBeDisabled();
+  expect(
+    packets.filter(({ path }) => path === "/api/metadata-action"),
+  ).toHaveLength(1);
+  first.unmount();
+
+  const other = render(editor({ ...app, applicationId: "other" }));
+  await screen.findByText(/current relationships/);
+  expect(
+    screen.queryByRole("button", { name: "Check original placement receipt" }),
+  ).toBeNull();
+  other.unmount();
+  const readerCatalog: ApplicationCatalog = {
+    ...catalog,
+    applicationAccess: { ...catalog.applicationAccess, role: "Reader" },
+    functions: Object.fromEntries(
+      Object.entries(catalog.functions).filter(
+        ([name]) => name !== "metadata.hierarchy.relationships.apply",
+      ),
+    ),
+  };
+  render(editor(app, readerCatalog));
+  const check = await screen.findByRole("button", {
+    name: "Check original placement receipt",
+  });
+  await waitFor(() => expect(check).toBeEnabled());
+  fireEvent.click(check);
+  await screen.findByText(
+    "The receipt could not confirm the original placement change.",
+  );
+  expect(changed).not.toHaveBeenCalled();
+  receiptActor = "owner";
+  fireEvent.click(check);
+  await screen.findByText("The original placement creation was recorded.");
+  await screen.findByText(/1 current relationships/);
+  expect(changed).toHaveBeenCalledTimes(1);
+  const receipts = packets.filter(
+    ({ body }) =>
+      body.program.function === "application.operation.receipt.read",
+  );
+  expect(
+    receipts.map(({ path, body }) => [
+      path,
+      body.workspaceId,
+      body.applicationId,
+      body.program.arguments,
+    ]),
+  ).toEqual(
+    Array.from({ length: 2 }, () => [
+      "/api/read",
+      "ws",
+      "app",
+      { operationId },
+    ]),
+  );
+  expect(
+    packets.filter(({ path }) => path === "/api/metadata-action"),
+  ).toHaveLength(1);
+  expect(
+    packets.filter(({ path }) => path === "/api/operation-admission"),
+  ).toHaveLength(1);
+});
+
+it("retries only the exact admitted placement packet after an absent receipt", async () => {
+  mockReads();
+  vi.stubGlobal(
+    "confirm",
+    vi.fn(() => true),
+  );
+  const changed = vi.fn(async () => {});
+  const fetchWithAdmission = globalThis.fetch;
+  const sent: unknown[] = [];
+  let admissions = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (url === "/api/operation-admission") admissions += 1;
+      if (url === "/api/metadata-action") {
+        sent.push(body);
+        if (sent.length === 1) throw new TypeError("Failed to fetch");
+        return placementApplied(body.program.arguments.hierarchyId);
+      }
+      if (body.program.function === "application.operation.receipt.read") {
+        return new Response(
+          JSON.stringify({ code: "OPERATION_RECEIPT_NOT_FOUND" }),
+          { status: 400 },
+        );
+      }
+      return fetchWithAdmission(url, init);
+    }),
+  );
+  render(
+    <MetadataRelationships
+      app={app}
+      catalog={catalog}
+      dimensionId="Account"
+      members={members}
+      metadataRevision={46}
+      mode="relationships"
+      onChanged={changed}
+    />,
+  );
+  await openPlacementReview();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Apply reviewed changeset" }),
+  );
+  const check = await screen.findByRole("button", {
+    name: "Check original placement receipt",
+  });
+  await waitFor(() => expect(check).toBeEnabled());
+  expect(
+    screen.queryByRole("button", { name: "Retry original placement change" }),
+  ).toBeNull();
+  fireEvent.click(check);
+  const retry = await screen.findByRole("button", {
+    name: "Retry original placement change",
+  });
+  expect(
+    screen.getByText(
+      "No receipt is visible yet. The original placement change remains unconfirmed.",
+    ),
+  ).toBeVisible();
+  fireEvent.click(retry);
+  await screen.findByText(
+    "The reviewed placement creation was applied atomically.",
+  );
+  expect(admissions).toBe(1);
+  expect(sent).toHaveLength(2);
+  expect(sent[0]).toEqual(sent[1]);
+  expect(changed).toHaveBeenCalledTimes(1);
+});
+
+function fillNewHierarchy(id: string, name: string) {
+  fireEvent.click(
+    screen.getByText("Create hierarchy", { selector: "summary" }),
+  );
+  fireEvent.change(screen.getByLabelText("New hierarchy ID"), {
+    target: { value: id },
+  });
+  fireEvent.change(screen.getByLabelText("New hierarchy name"), {
+    target: { value: name },
+  });
+}
+
+function hierarchyEditorProps(onChanged: () => Promise<void>) {
+  return {
+    app,
+    catalog,
+    dimensionId: "Account",
+    metadataRevision: 46,
+    members,
+    current: true,
+    onChanged,
+    hierarchies: [],
+    memberships: [],
+  };
+}
+
+it("recovers the original named hierarchy creation after remount under current read access", async () => {
+  mockReads();
+  const changed = vi.fn(async () => {});
+  const props = hierarchyEditorProps(changed);
+  const fetchWithAdmission = globalThis.fetch;
+  const effectPackets: Record<string, any>[] = [];
+  const receiptRequests: Record<string, any>[] = [];
+  let admissions = 0;
+  let changedCount = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (path: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (path === "/api/operation-admission") admissions += 1;
+      if (path === "/api/metadata-action") {
+        effectPackets.push(body);
+        throw new TypeError("Failed to fetch");
+      }
+      if (body.program.function === "application.operation.receipt.read") {
+        receiptRequests.push(body);
+        return response({
+          operationId: effectPackets[0].idempotencyKey,
+          actorId: "owner",
+          committedRevision: 49,
+          committedAt: "2026-11-20T14:25:00Z",
+          commandDigest: "d".repeat(64),
+          outcome: { changedCount },
+        });
+      }
+      return fetchWithAdmission(path, init);
+    }),
+  );
+  const original = render(<MetadataHierarchyEditor {...props} />);
+  fillNewHierarchy("H_FIRST", "First hierarchy");
+  fireEvent.click(screen.getByRole("button", { name: /^Create hierarchy$/ }));
+  const pending = await screen.findByRole("heading", {
+    name: "Hierarchy change awaiting confirmation",
+  });
+  await waitFor(() => expect(pending).toHaveFocus());
+  expect(
+    screen.getByRole("button", { name: /^Create hierarchy$/ }),
+  ).toBeDisabled();
+  original.unmount();
+
+  const other = render(
+    <MetadataHierarchyEditor
+      {...props}
+      app={{ ...app, applicationId: "other" }}
+    />,
+  );
+  expect(
+    screen.queryByRole("button", { name: "Check original hierarchy receipt" }),
+  ).toBeNull();
+  other.unmount();
+  render(
+    <MetadataHierarchyEditor
+      {...props}
+      hierarchy={hierarchy("H_FIRST", "First hierarchy", true)}
+      hierarchies={[hierarchy("H_FIRST", "First hierarchy", true)]}
+      catalog={{
+        ...catalog,
+        applicationAccess: { ...catalog.applicationAccess, role: "Reader" },
+        functions: { "application.operation.receipt.read": {} },
+      }}
+    />,
+  );
+  const check = await screen.findByRole("button", {
+    name: "Check original hierarchy receipt",
+  });
+  await waitFor(() => expect(check).toBeEnabled());
+  fireEvent.click(check);
+  await screen.findByText(
+    "The receipt could not confirm the original hierarchy change.",
+  );
+  expect(changed).not.toHaveBeenCalled();
+
+  changedCount = 1;
+  fireEvent.click(check);
+  await screen.findByText("The original hierarchy change was recorded.");
+  expect(changed).toHaveBeenCalledTimes(1);
+  await waitFor(() => expect(unsavedWorkSnapshot()).toHaveLength(0));
+  expect(effectPackets).toHaveLength(1);
+  expect(admissions).toBe(1);
+  expect(receiptRequests).toEqual(
+    Array.from({ length: 2 }, () => ({
+      workspaceId: "ws",
+      applicationId: "app",
+      program: {
+        languageVersion: 2,
+        function: "application.operation.receipt.read",
+        arguments: { operationId: effectPackets[0].idempotencyKey },
+      },
+    })),
+  );
+});
+
+it("retries the exact hierarchy packet after an absent receipt and keeps a denied retry unconfirmed", async () => {
+  mockReads();
+  const changed = vi.fn(async () => {});
+  const props = hierarchyEditorProps(changed);
+  const fetchWithAdmission = globalThis.fetch;
+  const writes: unknown[] = [];
+  let admissions = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (path: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (path === "/api/operation-admission") admissions += 1;
+      if (path === "/api/metadata-action") {
+        writes.push(body);
+        if (writes.length === 1) throw new TypeError("Failed to fetch");
+        if (writes.length === 2)
+          return new Response(
+            JSON.stringify({ code: "APPLICATION_GRANT_REQUIRED" }),
+            { status: 403 },
+          );
+        return namedHierarchyApplied(
+          body.program.function,
+          body.idempotencyKey,
+        );
+      }
+      if (body.program.function === "application.operation.receipt.read")
+        return new Response(
+          JSON.stringify({ code: "OPERATION_RECEIPT_NOT_FOUND" }),
+          { status: 400 },
+        );
+      return fetchWithAdmission(path, init);
+    }),
+  );
+  render(<MetadataHierarchyEditor {...props} />);
+  fillNewHierarchy("H_FIRST", "First hierarchy");
+  fireEvent.click(screen.getByRole("button", { name: /^Create hierarchy$/ }));
+  const check = await screen.findByRole("button", {
+    name: "Check original hierarchy receipt",
+  });
+  await waitFor(() => expect(check).toBeEnabled());
+  expect(
+    screen.queryByRole("button", { name: "Retry original hierarchy change" }),
+  ).toBeNull();
+  fireEvent.click(check);
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: "Retry original hierarchy change",
+    }),
+  );
+  await screen.findByText(
+    "The original hierarchy change is still unconfirmed.",
+  );
+  expect(changed).not.toHaveBeenCalled();
+  expect(
+    screen.getByRole("button", { name: /^Create hierarchy$/ }),
+  ).toBeDisabled();
+  fireEvent.click(check);
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: "Retry original hierarchy change",
+    }),
+  );
+  await screen.findByText("Hierarchy change saved.");
+  expect(admissions).toBe(1);
+  expect(writes).toHaveLength(3);
+  expect(writes[1]).toEqual(writes[0]);
+  expect(writes[2]).toEqual(writes[0]);
+  expect(changed).toHaveBeenCalledTimes(1);
 });

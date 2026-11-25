@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ApiError, request } from "./api";
 
 const PREFIX = "workspace.application.purge.";
@@ -27,6 +27,27 @@ type Intent = {
   };
 };
 const operationKey = () => `purge-ui-${crypto.randomUUID()}`;
+export function applicationPurgeRecoveryKey(
+  issuer: string,
+  subject: string,
+  workspaceId: string,
+): string | null {
+  if (!issuer || !subject || !workspaceId) return null;
+  return `openepm:application-purge:v2:${encodeURIComponent(JSON.stringify([issuer, subject, workspaceId]))}`;
+}
+function hasLegacyIntent(subject: string, workspaceId: string): boolean {
+  try {
+    // An old record has no issuer binding. Preserve it without inspecting its
+    // payload, assigning it to this account or exposing its target identity.
+    return (
+      localStorage.getItem(
+        `openepm:application-purge:${subject}:${workspaceId}`,
+      ) !== null
+    );
+  } catch {
+    return false;
+  }
+}
 function retainedIntent(key: string, workspaceId: string): Intent | null {
   try {
     const raw = localStorage.getItem(key);
@@ -91,21 +112,61 @@ function retainedIntent(key: string, workspaceId: string): Intent | null {
   return null;
 }
 
-export function ApplicationPurge({
+type Props = {
+  workspaceId: string;
+  applicationId: string;
+  issuer: string;
+  subject: string;
+  deleted: (workspaceId: string, applicationId: string) => Promise<void>;
+};
+
+export function ApplicationPurge(props: Props) {
+  const storageKey = applicationPurgeRecoveryKey(
+    props.issuer,
+    props.subject,
+    props.workspaceId,
+  );
+  if (!storageKey)
+    return (
+      <p>
+        Application deletion requires a verified sign-in authority and account.
+      </p>
+    );
+  // Reset both retained and inspected state before rendering a different
+  // identity/workspace, including when the parent keeps this component mounted.
+  return (
+    <ApplicationPurgePanel
+      key={storageKey}
+      {...props}
+      storageKey={storageKey}
+    />
+  );
+}
+
+function ApplicationPurgePanel({
   workspaceId,
   applicationId,
   subject,
   deleted,
-}: {
-  workspaceId: string;
-  applicationId: string;
-  subject: string;
-  deleted: (workspaceId: string, applicationId: string) => Promise<void>;
-}) {
-  const storageKey = `openepm:application-purge:${subject}:${workspaceId}`;
+  storageKey,
+}: Props & { storageKey: string }) {
   const [pending, setPending] = useState(() =>
     retainedIntent(storageKey, workspaceId),
   );
+  const [legacyIntent] = useState(() => hasLegacyIntent(subject, workspaceId));
+  const lifetime = useRef({ mounted: true, generation: 0 });
+  useEffect(() => {
+    lifetime.current.mounted = true;
+    return () => {
+      lifetime.current.mounted = false;
+      lifetime.current.generation += 1;
+    };
+  }, []);
+  function ticket() {
+    const generation = lifetime.current.generation;
+    return () =>
+      lifetime.current.mounted && lifetime.current.generation === generation;
+  }
   const [target, setTarget] = useState(
     pending?.program.arguments.applicationId || applicationId,
   );
@@ -127,6 +188,7 @@ export function ApplicationPurge({
     setPending(intent);
   }
   async function inspect() {
+    const current = ticket();
     const inspected = await request<Prepared>("/api/application-purge", {
       workspaceId,
       idempotencyKey: null,
@@ -136,6 +198,7 @@ export function ApplicationPurge({
         arguments: { applicationId: target },
       },
     });
+    if (!current()) return;
     if (
       pending &&
       inspected.manifest.createdAt !== pending.program.arguments.createdAt
@@ -149,22 +212,25 @@ export function ApplicationPurge({
     return inspected;
   }
   async function inspectTarget() {
+    const current = ticket();
     setBusy(true);
     setError("");
     setMessage("");
     try {
       await inspect();
     } catch (reason) {
+      if (!current()) return;
       setError(
         reason instanceof Error
           ? reason.message
           : "Unable to inspect the application.",
       );
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
   async function execute(intent: Intent) {
+    const current = ticket();
     setBusy(true);
     setError("");
     setMessage("");
@@ -175,6 +241,9 @@ export function ApplicationPurge({
         "/api/application-purge",
         intent,
       );
+      // A reply to the previous identity cannot clear its recovery witness,
+      // advance its workflow or start a read under the replacement session.
+      if (!current()) return;
       if (result.status === "Deleted") {
         retain(null);
         setPrepared(null);
@@ -204,6 +273,7 @@ export function ApplicationPurge({
           "Unexpected deletion result. Retry the same request to reconcile its outcome.",
         );
     } catch (reason) {
+      if (!current()) return;
       if (
         reason instanceof ApiError &&
         [
@@ -222,7 +292,7 @@ export function ApplicationPurge({
           : "The request was interrupted. Retry the same request.",
       );
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
   function begin() {
@@ -255,6 +325,21 @@ export function ApplicationPurge({
       <p>
         Workspace: <code>{workspaceId}</code>
       </p>
+      <p>
+        This browser stores the exact deletion retry request for this sign-in
+        authority, account and workspace. It survives reload and sign-out until
+        the request is reconciled as deleted or definitively rejected. It
+        contains the target ID, creation time and request identity, not
+        application data. Current authorization is checked on every request.
+      </p>
+      {legacyIntent && (
+        <p role="status">
+          An older deletion retry record has no sign-in authority binding. It is
+          preserved but cannot be restored to this account. Use
+          current-authorized application status inspection to reconcile the
+          original operation.
+        </p>
+      )}
       <label>
         Application ID to delete
         <input

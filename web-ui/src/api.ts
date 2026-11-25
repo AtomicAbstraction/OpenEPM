@@ -43,29 +43,74 @@ export class ApiError extends Error {
   }
 }
 
+export function isApplicationAccessDenied(reason: unknown) {
+  return (
+    reason instanceof ApiError &&
+    reason.kind === "authorization" &&
+    [
+      "APPLICATION_GRANT_REQUIRED",
+      "APPLICATION_UNAVAILABLE",
+      "WORKSPACE_UNAVAILABLE",
+    ].includes(reason.code)
+  );
+}
+
+export function isDefiniteEffectRefusal(
+  reason: unknown,
+  refusalCodes: ReadonlySet<string>,
+): reason is ApiError {
+  return (
+    reason instanceof ApiError &&
+    [400, 403, 409, 422].includes(reason.status) &&
+    reason.retryable !== true &&
+    refusalCodes.has(reason.code)
+  );
+}
+
+type BrowserIdentity = { binding: string | null };
+let activeBrowserIdentity: BrowserIdentity = { binding: null };
+
+function assertBrowserIdentityCurrent(identity: BrowserIdentity) {
+  if (identity !== activeBrowserIdentity)
+    throw new DOMException("Browser identity changed", "AbortError");
+}
+
 export async function request<T>(
   path: string,
   body?: unknown,
   signal?: AbortSignal,
+  expectedIdentityBinding?: string | null,
 ): Promise<T> {
+  const identity = activeBrowserIdentity;
+  const binding =
+    expectedIdentityBinding === undefined
+      ? identity.binding
+      : expectedIdentityBinding;
+  function assertCurrent() {
+    signal?.throwIfAborted();
+    if (expectedIdentityBinding === undefined)
+      assertBrowserIdentityCurrent(identity);
+  }
+  const headers: Record<string, string> = { accept: "application/json" };
+  if (body !== undefined) headers["content-type"] = "application/json";
+  if (binding) headers["x-openepm-browser-identity"] = binding;
   let response: Response;
+  assertCurrent();
   try {
     response = await fetch(path, {
       method: body === undefined ? "GET" : "POST",
-      headers:
-        body === undefined
-          ? { accept: "application/json" }
-          : { accept: "application/json", "content-type": "application/json" },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body),
       credentials: "same-origin",
       cache: "no-store",
       signal,
     });
   } catch (error) {
-    if (!signal?.aborted) classifyBrowserFailure(error);
+    assertCurrent();
+    classifyBrowserFailure(error);
     throw error;
   }
-  signal?.throwIfAborted();
+  assertCurrent();
   if (response.redirected) {
     const error = new ApiError(401, "AUTHENTICATION_REDIRECTED");
     setBrowserLifecycle("expired", error.code, true);
@@ -79,12 +124,12 @@ export async function request<T>(
   } catch (error) {
     // A navigation-owned cancellation can arrive after the headers, while
     // the body is still being read. It is not a malformed server response.
-    signal?.throwIfAborted();
+    assertCurrent();
     if (error instanceof DOMException && error.name === "AbortError")
       throw error;
     /* Malformed content is handled below. */
   }
-  signal?.throwIfAborted();
+  assertCurrent();
   if (!response.ok) {
     const failure =
       typeof payload === "object" && payload
@@ -121,7 +166,10 @@ export async function request<T>(
     );
     if (error.kind === "authentication")
       setBrowserLifecycle("expired", code, true);
-    else if (error.kind === "unavailable")
+    else if (
+      error.kind === "unavailable" ||
+      (error.status === 409 && error.code === "BROWSER_IDENTITY_CHANGED")
+    )
       setBrowserLifecycle("unavailable", code);
     throw error;
   }
@@ -158,15 +206,20 @@ const operationAdmissions = new Map<
   string,
   { operationId: string; expiresAt: number }
 >();
-let operationAdmissionIdentity: string | undefined;
 const MAX_OPERATION_ADMISSIONS = 256;
+
+export function adoptBrowserIdentity(identity: SessionIdentity) {
+  if (activeBrowserIdentity.binding === identity.identityBinding) return;
+  operationAdmissions.clear();
+  activeBrowserIdentity = { binding: identity.identityBinding };
+}
 
 export function resetOperationAdmissionsForTests(): void {
   operationAdmissions.clear();
-  operationAdmissionIdentity = undefined;
+  activeBrowserIdentity = { binding: null };
 }
 
-function canonicalJson(value: unknown): string {
+export function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value !== null && typeof value === "object")
     return `{${Object.entries(value as Record<string, unknown>)
@@ -184,6 +237,7 @@ export async function admitApplicationEffect(
   >,
   signal?: AbortSignal,
 ): Promise<string> {
+  const identity = activeBrowserIdentity;
   const now = Math.floor(Date.now() / 1000);
   for (const [key, value] of operationAdmissions)
     if (value.expiresAt <= now + 30) operationAdmissions.delete(key);
@@ -204,6 +258,7 @@ export async function admitApplicationEffect(
     },
     signal,
   );
+  assertBrowserIdentityCurrent(identity);
   if (
     typeof admission.operationId !== "string" ||
     !/^oa1_[0-9a-z]{1,13}_[0-9a-f]{32}_[A-Za-z0-9_-]{43}$/.test(
@@ -236,11 +291,52 @@ export async function requestAdmittedEffect<T>(
   },
   signal?: AbortSignal,
 ): Promise<T> {
+  const identity = activeBrowserIdentity;
   const operationId = await admitApplicationEffect(body, signal);
+  assertBrowserIdentityCurrent(identity);
   return request<T>(path, { ...body, idempotencyKey: operationId }, signal);
 }
 
 /** Admit an effect whose legacy fixed program owns its persisted retry field. */
+export type AdmittedEffectPacket = {
+  path: string;
+  body: Scope & {
+    program: Record<string, unknown>;
+    idempotencyKey: string;
+    [key: string]: unknown;
+  };
+};
+
+/** Capture the actual admitted identity before the first possible effect.
+ * Keep this packet through an uncertain response; re-admission is a new intent.
+ */
+export async function prepareAdmittedProgramEffect(
+  path: string,
+  body: Scope & {
+    program: Record<string, unknown>;
+    [key: string]: unknown;
+  },
+  clientIntentKey: string,
+  signal?: AbortSignal,
+): Promise<AdmittedEffectPacket> {
+  const identity = activeBrowserIdentity;
+  const captured = structuredClone(body);
+  const operationId = await admitApplicationEffect(
+    { ...captured, idempotencyKey: clientIntentKey },
+    signal,
+  );
+  assertBrowserIdentityCurrent(identity);
+  return { path, body: { ...captured, idempotencyKey: operationId } };
+}
+
+/** Replay never renews admission, rebuilds the preview or changes the intent. */
+export function replayAdmittedEffect<T>(
+  packet: AdmittedEffectPacket,
+  signal?: AbortSignal,
+): Promise<T> {
+  return request<T>(packet.path, packet.body, signal);
+}
+
 export async function requestAdmittedProgramEffect<T>(
   path: string,
   body: Scope & {
@@ -250,11 +346,15 @@ export async function requestAdmittedProgramEffect<T>(
   clientIntentKey: string,
   signal?: AbortSignal,
 ): Promise<T> {
-  const operationId = await admitApplicationEffect(
-    { ...body, idempotencyKey: clientIntentKey },
+  const identity = activeBrowserIdentity;
+  const packet = await prepareAdmittedProgramEffect(
+    path,
+    body,
+    clientIntentKey,
     signal,
   );
-  return request<T>(path, { ...body, idempotencyKey: operationId }, signal);
+  assertBrowserIdentityCurrent(identity);
+  return replayAdmittedEffect<T>(packet, signal);
 }
 
 async function submitWithPreview<T>(
@@ -262,6 +362,7 @@ async function submitWithPreview<T>(
   signal: AbortSignal | undefined,
   accept: (preview: PreviewEnvelope) => boolean,
 ): Promise<T | null> {
+  const identity = activeBrowserIdentity;
   if (body.confirmed !== true)
     throw new ApiError(400, "PREVIEW_CONFIRMATION_REQUIRED");
   const preview = await request<PreviewEnvelope>(
@@ -273,6 +374,7 @@ async function submitWithPreview<T>(
     },
     signal,
   );
+  assertBrowserIdentityCurrent(identity);
   if (
     typeof preview.previewToken !== "string" ||
     preview.previewToken.length < 16 ||
@@ -280,7 +382,9 @@ async function submitWithPreview<T>(
   )
     throw new ApiError(502, "INVALID_SERVER_PREVIEW");
   if (!accept(preview)) return null;
+  assertBrowserIdentityCurrent(identity);
   const operationId = await admitApplicationEffect(body, signal);
+  assertBrowserIdentityCurrent(identity);
   return request<T>(
     "/api/submit",
     {
@@ -338,19 +442,30 @@ export async function reviewAndSubmit<T>(
 
 export async function listApplications(
   signal?: AbortSignal,
+  expectedIdentityBinding?: string,
 ): Promise<ApplicationSummary[]> {
+  const identity = activeBrowserIdentity;
   const applications: ApplicationSummary[] = [];
   type Cursor = { workspaceId: string; applicationId: string };
   let after: Cursor | null = null;
   const seenApplications = new Set<string>();
   const seenCursors = new Set<string>();
   do {
+    if (expectedIdentityBinding === undefined)
+      assertBrowserIdentityCurrent(identity);
     const query = after
       ? `?afterWorkspaceId=${encodeURIComponent(after.workspaceId)}&afterApplicationId=${encodeURIComponent(after.applicationId)}`
       : "";
     const page = applicationPage(
-      await request<unknown>(`/api/applications${query}`, undefined, signal),
+      await request<unknown>(
+        `/api/applications${query}`,
+        undefined,
+        signal,
+        expectedIdentityBinding,
+      ),
     );
+    if (expectedIdentityBinding === undefined)
+      assertBrowserIdentityCurrent(identity);
     for (const application of page.applications) {
       const identity = `${application.workspaceId}\u0000${application.applicationId}`;
       if (seenApplications.has(identity))
@@ -372,22 +487,27 @@ export async function listApplications(
 }
 
 export const readSession = (signal?: AbortSignal) =>
-  request<SessionIdentity>("/api/session-identity", undefined, signal).then(
-    (identity) => {
-      const currentIdentity = canonicalJson({
-        issuer: identity.issuer || "",
-        subject: identity.subject,
-      });
-      if (
-        operationAdmissionIdentity !== undefined &&
-        operationAdmissionIdentity !== currentIdentity
-      )
-        operationAdmissions.clear();
-      operationAdmissionIdentity = currentIdentity;
-      setBrowserLifecycle("authenticated", undefined, true);
-      return identity;
-    },
-  );
+  request<SessionIdentity>(
+    "/api/session-identity",
+    undefined,
+    signal,
+    null,
+  ).then((identity) => {
+    if (
+      !identity ||
+      typeof identity.subject !== "string" ||
+      !identity.subject ||
+      typeof identity.identityBinding !== "string" ||
+      !/^[0-9a-f]{64}$/.test(identity.identityBinding) ||
+      (identity.issuer !== undefined && typeof identity.issuer !== "string") ||
+      (identity.displayIdentity !== undefined &&
+        typeof identity.displayIdentity !== "string") ||
+      (identity.applicationMcpEndpoint != null &&
+        typeof identity.applicationMcpEndpoint !== "string")
+    )
+      throw new ApiError(502, "INVALID_SESSION_IDENTITY", undefined, true);
+    return identity;
+  });
 export const readRuntime = (signal?: AbortSignal) =>
   request<{
     readOnlyReview: boolean;
@@ -397,7 +517,7 @@ export const readRuntime = (signal?: AbortSignal) =>
       sourceTree?: string;
       packagedSchema?: number;
     };
-  }>("/api/runtime", undefined, signal);
+  }>("/api/runtime", undefined, signal, null);
 
 const APPLICATION_CATALOG_MAX_ROWS = 100_000;
 
@@ -459,12 +579,15 @@ function applicationPage(value: unknown): {
     },
   };
 }
-export const readPlatformCatalog = (signal?: AbortSignal) =>
+export const readPlatformCatalog = (
+  signal: AbortSignal,
+  identityBinding: string,
+) =>
   request<{
     languageVersion: number;
     authorized?: boolean;
     functions: Record<string, unknown>;
-  }>("/api/platform/browser/catalog", {}, signal);
+  }>("/api/platform/browser/catalog", {}, signal, identityBinding);
 export const readPlatformProgram = <T>(
   functionName: string,
   args: Record<string, unknown>,

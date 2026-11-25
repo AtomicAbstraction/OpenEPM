@@ -26,7 +26,7 @@ from .postgres_connection import connect_postgres
 from .postgres_dimensional_scope import resolve_effective_dimensional_scope
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_processing_limits import configure_lock_wait,configure_statement_timeout
-from .postgres_source_batch import PostgresSourceBatch
+from .postgres_source_batch import PostgresSourceBatch, source_publication_receipt_schema
 
 
 REQUEST = 'facts.transfer.import.request'
@@ -83,6 +83,70 @@ def _exception_location(error: Exception) -> str:
     return f'{os.path.basename(frame.filename)}:{frame.lineno}:{frame.name}'
 
 
+def import_program_contract(function: str) -> dict | None:
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    identifier = {'type': 'string', 'pattern': '^' + _ID.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    count = {'type': 'integer', 'minimum': 0, 'maximum': 2**63 - 1}
+    receipt = {'oneOf': [source_publication_receipt_schema(), {'type': 'null'}],
+               'description': 'Original publication receipt owned by the source batch publisher.'}
+    operation = {'type': 'string', 'pattern': '^' + _KEY.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    status = {
+        'requestId': identifier,
+        'batchId': identifier,
+        'status': {'enum': ['Accepted', 'Claimed', 'Publishing', 'Completed', 'Failed', 'Cancelled']},
+        'claimGeneration': count,
+        'cancelRequested': {'type': 'boolean'},
+        'result': receipt,
+        'errorCode': {'type': ['string', 'null'], 'maxLength': 200,
+                      'description': 'A retained failure code. With Accepted, a worker retry is pending.'},
+    }
+    rules = ['The core checks current application WRITE and the original calling identity.',
+             'Accepted, Claimed and Publishing are unfinished. Completed carries the original publication receipt.',
+             'Accepted with an errorCode means the worker will retry the same request. Read its current status.',
+             'Failed and Cancelled are terminal. A true cancelRequested flag records intent; use status for the outcome.',
+             'The source batch publisher owns the details of the retained receipt.']
+    recovery = ('Keep the same identity. A missing status may permit an explicit retry of the '
+                'exact original request under its original admission rules.')
+    if function == REQUEST:
+        arguments = obj({'idempotencyKey': operation, 'batchId': identifier,
+                         'previewToken': {'type': 'string', 'minLength': 1, 'maxLength': 16384}})
+        status['duplicate'] = {'type': 'boolean'}
+        examples = [read_example(function, {
+            'idempotencyKey': 'original-import-operation', 'batchId': 'a' * 32,
+            'previewToken': 'example-confirmed-import-preview'},
+            name='Submit the reviewed source batch',
+            binding='Use the ready batch ID and exact token from facts.source.preview. Use a fresh key for each new intent.')]
+        rules.append('An authorized exact replay returns the existing request with duplicate=true. A changed batch or token under the same key conflicts.')
+        recovery = ('If acknowledgement is lost, read by original operationId before retrying. '
+                    'Use the original MCP key or the server-issued Browser admission ID and the same identity.')
+    elif function == READ:
+        arguments = obj({'requestId': identifier, 'operationId': operation}, [])
+        arguments['oneOf'] = [{'required': [key]} for key in arguments['properties']]
+        examples = [read_example(function, {'requestId': 'a' * 32},
+            name='Read the status of an accepted import',
+            binding='Use the requestId returned by facts.transfer.import.request in this application.'),
+        read_example(function, {'operationId': 'original-import-operation'},
+            name='Inspect an import after losing the original acknowledgement',
+            binding='Use the server-issued Browser admission ID or the original MCP idempotencyKey in the same application.'),
+        ]
+        rules.insert(1, 'Supply exactly one selector. The original operation remains readable after admission expiry. An unavailable result leaves the outcome unconfirmed.')
+    elif function == CANCEL:
+        arguments = obj({'requestId': identifier})
+        examples = [read_example(function, {'requestId': 'a' * 32},
+            name='Request cancellation of an import',
+            binding='Use the owned requestId returned by facts.transfer.import.request.')]
+        rules.append('Cancellation stops accepted work or records intent for claimed work. An already published import retains its original receipt.')
+        recovery = 'Read the original request under the same identity to confirm the outcome of an uncertain cancellation.'
+    else:
+        return None
+    contract = read_contract(function, arguments, obj(status), owner='PostgresImportExecution',
+        examples=examples, semantic_rules=rules)
+    contract['programContract']['recovery'] = recovery
+    return contract
+
+
 def catalog() -> dict:
     return {
         REQUEST: {
@@ -92,19 +156,20 @@ def catalog() -> dict:
                           'previewToken': 'signed exact publication preview'},
             'result': 'durable accepted import execution identity',
             'previewRequired': True, 'idempotencyRequired': True,
-            'workClass': 'short'},
+            'workClass': 'short', **import_program_contract(REQUEST)},
         READ: {
             'mode': 'read', 'permission': 'write',
-            'arguments': {'requestId': 'owned import execution identity'},
+            'arguments': {'requestId': 'owned execution identity, exclusive with operationId',
+                          'operationId': 'original operation identity, exclusive with requestId'},
             'result': 'actual execution, lease and receipt status',
             'previewRequired': False, 'idempotencyRequired': False,
-            'workClass': 'short'},
+            'workClass': 'short', **import_program_contract(READ)},
         CANCEL: {
             'mode': 'technical_cancel', 'permission': 'write',
             'arguments': {'requestId': 'owned import execution identity'},
             'result': 'actual status after cancellation request',
             'previewRequired': False, 'idempotencyRequired': True,
-            'workClass': 'short'},
+            'workClass': 'short', **import_program_contract(CANCEL)},
     }
 
 
@@ -125,13 +190,26 @@ class PostgresImportExecution:
             raise ValueError('IMPORT_EXECUTION_IDENTITY_INVALID')
         self.dsn, self.identity = dsn, identity
 
-    def _connection(self, scope: ApplicationScope):
+    def _connection(self, scope: ApplicationScope, *, read_only=False):
         db = connect_postgres(self.dsn, row_factory=dict_row)
+        if read_only:
+            db.execute('SET TRANSACTION READ ONLY')
         PostgresNumericFactStore._set_scope(db, scope)
         return db
 
     def request(self, scope: ApplicationScope, *, idempotency_key: str,
                 batch_id: str, preview_token: str) -> dict:
+        return self._request(scope, idempotency_key=idempotency_key,
+            batch_id=batch_id, preview_token=preview_token, replay_only=False)
+
+    def replay(self, scope: ApplicationScope, *, idempotency_key: str,
+               batch_id: str, preview_token: str) -> dict | None:
+        """Read the original exact request under current write authority only."""
+        return self._request(scope, idempotency_key=idempotency_key,
+            batch_id=batch_id, preview_token=preview_token, replay_only=True)
+
+    def _request(self, scope: ApplicationScope, *, idempotency_key: str,
+                 batch_id: str, preview_token: str, replay_only: bool) -> dict | None:
         if (not isinstance(idempotency_key, str)
                 or not _KEY.fullmatch(idempotency_key)
                 or not isinstance(batch_id, str) or not _ID.fullmatch(batch_id)
@@ -142,7 +220,7 @@ class PostgresImportExecution:
                           'actor': [self.identity.issuer,
                                     self.identity.subject_id],
                           'batchId': batch_id, 'previewToken': preview_token})
-        with self._connection(scope) as db, db.transaction():
+        with self._connection(scope, read_only=replay_only) as db, db.transaction():
             configure_statement_timeout(db, 5000)
             access=PostgresAccessChecker.check_in_transaction(
                 db, self.identity, scope, 'write')
@@ -164,6 +242,8 @@ class PostgresImportExecution:
                 if prior['request_digest'] != digest:
                     raise ValueError('IMPORT_EXECUTION_REQUEST_CONFLICT')
                 return _wire(prior, duplicate=True)
+            if replay_only:
+                return None
             batch = db.execute('''SELECT status,row_count FROM epm.source_batch
                 WHERE workspace_id=%s AND application_id=%s AND batch_id=%s
                 AND issuer=%s AND subject_id=%s''',
@@ -191,23 +271,30 @@ class PostgresImportExecution:
                  authority_kind)).fetchone()
             return _wire(row, duplicate=False)
 
-    def _owned(self, db, scope, request_id: str, *, lock=False):
-        if not isinstance(request_id, str) or not _ID.fullmatch(request_id):
-            raise ValueError('IMPORT_EXECUTION_REQUEST_ID_INVALID')
-        row = db.execute('''SELECT * FROM epm.source_import_execution
-            WHERE workspace_id=%s AND application_id=%s AND request_id=%s
-            AND issuer=%s AND subject_id=%s''' + (' FOR UPDATE' if lock else ''),
-            (scope.workspace_id, scope.application_id, request_id,
-             self.identity.issuer, self.identity.subject_id)).fetchone()
-        if row is None:
-            raise ValueError('IMPORT_EXECUTION_UNAVAILABLE')
-        return row
-
-    def read(self, scope: ApplicationScope, request_id: str) -> dict:
-        with self._connection(scope) as db, db.transaction():
+    def read(self, scope: ApplicationScope, request_id: str | None = None, *,
+             operation_id: str | None = None) -> dict:
+        if (request_id is None) == (operation_id is None):
+            raise ValueError('IMPORT_EXECUTION_ARGUMENTS_INVALID')
+        if operation_id is not None:
+            if not isinstance(operation_id, str) or not _KEY.fullmatch(operation_id):
+                raise ValueError('IMPORT_EXECUTION_OPERATION_ID_INVALID')
+            column, value = 'idempotency_key', operation_id
+        else:
+            if not isinstance(request_id, str) or not _ID.fullmatch(request_id):
+                raise ValueError('IMPORT_EXECUTION_REQUEST_ID_INVALID')
+            column, value = 'request_id', request_id
+        with self._connection(scope, read_only=True) as db, db.transaction():
+            configure_statement_timeout(db, 5000)
             PostgresAccessChecker.check_in_transaction(
                 db, self.identity, scope, 'write')
-            return _wire(self._owned(db, scope, request_id))
+            row = db.execute(f'''SELECT * FROM epm.source_import_execution
+                WHERE workspace_id=%s AND application_id=%s AND {column}=%s
+                AND issuer=%s AND subject_id=%s''',
+                (scope.workspace_id, scope.application_id, value,
+                 self.identity.issuer, self.identity.subject_id)).fetchone()
+            if row is None:
+                raise ValueError('IMPORT_EXECUTION_UNAVAILABLE')
+            return _wire(row)
 
     def cancel(self, scope: ApplicationScope, request_id: str) -> dict:
         return self.request_cancel_as_task_controller(
@@ -434,7 +521,13 @@ class PostgresImportExecutionWorker:
                         scope.application_id,request_id,generation,
                         self.worker_id)).fetchone()
                     if row is not None:return _wire(row)
-                code,terminal=_classify_worker_error(error)
+            # Source receipts remain runtime-owned. Only the technical failure
+            # transition uses the worker credential authorized by migration 0272;
+            # the original generation/claimant fence rejects a successor's claim.
+            code,terminal=_classify_worker_error(error)
+            with connect_postgres(self.dsn, row_factory=dict_row) as db, db.transaction():
+                configure_statement_timeout(db,5000);configure_lock_wait(db)
+                PostgresNumericFactStore._set_scope(db, scope)
                 outcome=db.execute('''SELECT
                     epm.source_import_execution_worker_settle_failure(
                       %s,%s,%s,%s,%s,%s,%s) AS outcome''',(
@@ -482,6 +575,8 @@ class PostgresImportExecutionPublic:
             return self.repository.request(
                 scope, idempotency_key=args['idempotencyKey'],
                 batch_id=args['batchId'], preview_token=args['previewToken'])
+        if function == READ and set(args) == {'operationId'}:
+            return self.repository.read(scope, operation_id=args['operationId'])
         if set(args) != {'requestId'}:
             raise ValueError('IMPORT_EXECUTION_ARGUMENTS_INVALID')
         if function == READ:

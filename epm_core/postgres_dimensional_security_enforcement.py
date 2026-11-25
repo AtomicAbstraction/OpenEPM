@@ -5,7 +5,7 @@ from collections.abc import Callable, Iterable
 
 from .dimensional_security_policy import AccessKind, MixedSelection
 from .persistence_contract import ApplicationScope, Coordinate
-from .postgres_access import AccessDenied, VerifiedIdentity
+from .postgres_access import AccessDecision, AccessDenied, VerifiedIdentity
 from .postgres_dimensional_security import PostgresDimensionalSecurityResolver
 
 
@@ -22,7 +22,8 @@ def authorize_coordinate(db, identity: VerifiedIdentity,
 def authorize_coordinates(db, identity: VerifiedIdentity,
                           scope: ApplicationScope,
                           coordinates: Iterable[Coordinate], *,
-                          kind: AccessKind) -> None:
+                          kind: AccessKind,
+                          expected_access: AccessDecision | None = None) -> None:
     """Authorize a bounded collection of coordinates without caller policy input."""
     points=tuple(coordinates)
     if any(not isinstance(point,Coordinate) for point in points):
@@ -37,7 +38,8 @@ def authorize_coordinates(db, identity: VerifiedIdentity,
         resolved=(PostgresDimensionalSecurityResolver.
             resolve_many_active_in_transaction(
                 db,identity,scope,kind=kind,
-                coordinates=coordinates[offset:offset+1000]))
+                coordinates=coordinates[offset:offset+1000],
+                expected_access=expected_access))
         if resolved is None:
             continue
         for item in resolved:
@@ -47,23 +49,27 @@ def authorize_coordinates(db, identity: VerifiedIdentity,
 
 def coordinate_read_allowed(db, identity: VerifiedIdentity,
                             scope: ApplicationScope,
-                            coordinate: Coordinate) -> bool:
+                            coordinate: Coordinate, *,
+                            expected_access: AccessDecision | None = None) -> bool:
     """Return the current exact-coordinate READ decision without broad-scan rules."""
     resolved = PostgresDimensionalSecurityResolver.resolve_active_in_transaction(
         db, identity, scope, kind=AccessKind.READ,
-        coordinate=dict(coordinate.members))
+        coordinate=dict(coordinate.members), expected_access=expected_access)
     return resolved is None or resolved.decision.allowed
 
 
 def filter_read_rows(db, identity: VerifiedIdentity,
                      scope: ApplicationScope,
-                     rows: Iterable[dict]) -> list[dict]:
+                     rows: Iterable[dict], *,
+                     expected_access: AccessDecision | None = None,
+                     allow_unbound: bool = False) -> list[dict]:
     """Filter one bounded raw cube page through the active read policy.
 
     A reject-all policy cannot be proved over an unbounded scan page-by-page,
     so broad reads fail closed whenever that policy is active.  Filtering
-    profiles return only allowed full coordinates.  Callers must advance their
-    continuation over the raw page, not over this filtered result.
+    profiles return only allowed full coordinates. Source evidence may also
+    contain application records without a cube coordinate. Only that owner
+    opts in to retaining those rows after checking application access.
     """
     source = tuple(rows)
     coordinates: list[dict[str, str]] = []
@@ -71,18 +77,22 @@ def filter_read_rows(db, identity: VerifiedIdentity,
         members = row.get("members")
         if type(members) is not dict:
             raise ValueError("DIMENSIONAL_SELECTION_COORDINATE_INVALID")
-        coordinates.append(members)
+        if members or not allow_unbound:
+            coordinates.append(members)
     resolved = PostgresDimensionalSecurityResolver.resolve_many_active_in_transaction(
         db, identity, scope, kind=AccessKind.READ,
-        coordinates=tuple(coordinates))
+        coordinates=tuple(coordinates), expected_access=expected_access)
     if resolved is None:
         return list(source)
+    if len(resolved) != len(coordinates):
+        raise ValueError("DIMENSIONAL_AUTHORIZATION_PAGE_INVALID")
     if any(item.mixed_selection is MixedSelection.REJECT_ALL
            for item in resolved):
         raise AccessDenied(
             "DIMENSIONAL_SELECTION_REJECT_ALL_REQUIRES_EXPLICIT_COORDINATES")
-    return [row for row, item in zip(source, resolved, strict=True)
-            if item.decision.allowed]
+    decisions = iter(resolved)
+    return [row for row in source
+            if (allow_unbound and not row['members']) or next(decisions).decision.allowed]
 
 
 def authorized_read_page(
@@ -91,7 +101,9 @@ def authorized_read_page(
         fetch: Callable[[object, int], list[dict]],
         cursor_key: Callable[[dict], object],
         order_key: Callable[[object], object] = lambda value: value,
-        candidate_limit: int = 10_000) -> tuple[list[dict], bool, object | None]:
+        candidate_limit: int = 10_000,
+        expected_access: AccessDecision | None = None,
+        allow_unbound: bool = False) -> tuple[list[dict], bool, object | None]:
     """Build a stable visible page without exposing denied-row positions."""
     if (type(limit) is not int or not 1 <= limit <= 500
             or type(candidate_limit) is not int
@@ -103,6 +115,11 @@ def authorized_read_page(
     exhausted = False
     while len(permitted) <= limit and not exhausted:
         fetch_limit = min(500, candidate_limit - scanned)
+        # Read just the rest of the page and its lookahead while every
+        # candidate has been visible. If filtering drops rows, scan larger
+        # bounded batches to prove completeness without one query per row.
+        if len(permitted) == scanned:
+            fetch_limit = min(fetch_limit, limit + 1 - len(permitted))
         if fetch_limit <= 0:
             raise AccessDenied("DIMENSIONAL_AUTHORIZATION_COMPLETENESS_LIMIT")
         raw = fetch(raw_after, fetch_limit)
@@ -118,7 +135,8 @@ def authorized_read_page(
                 or any(right <= left
                        for left, right in zip(ordered, ordered[1:]))):
             raise ValueError("DIMENSIONAL_AUTHORIZATION_PAGE_ORDER_INVALID")
-        permitted.extend(filter_read_rows(db, identity, scope, raw))
+        permitted.extend(filter_read_rows(db, identity, scope, raw,
+            expected_access=expected_access, allow_unbound=allow_unbound))
         scanned += len(raw)
         raw_after = keys[-1]
         exhausted = len(raw) < fetch_limit

@@ -13,6 +13,7 @@ import urllib.parse
 from build_openepm_clean_linux_runner_config import build as build_runner_config
 from build_openepm_clean_linux_profiles import (publication_contract,
     qualification_source_digest, QUALIFICATION_SOURCE)
+from qualify_openepm_clean_linux_release import QualificationError, verify_mcp_identity_request
 
 
 class BundleError(ValueError):
@@ -52,6 +53,11 @@ FIXED = {
     "openepm_release_policy_contract.py": (SCRIPT_DIR / "openepm_release_policy_contract.py", 0o444),
     "owner-decision-packet.json": (ROOT / "deploy/release/owner-decision-packet.json", 0o444),
     "openepm_release_inventory.py": (SCRIPT_DIR / "openepm_release_inventory.py", 0o444),
+    "openepm_release_status.py": (SCRIPT_DIR / "openepm_release_status.py", 0o444),
+    "openepm_release_ingress.py": (SCRIPT_DIR / "openepm_release_ingress.py", 0o444),
+    "ENTERPRISE_OPERATIONS_RUNBOOK.md": (ROOT / "docs/ENTERPRISE_OPERATIONS_RUNBOOK.md", 0o444),
+    "openepm_release_upgrade.py": (SCRIPT_DIR / "openepm_release_upgrade.py", 0o444),
+    "openepm_release_restore_target.py": (SCRIPT_DIR / "openepm_release_restore_target.py", 0o444),
     "openepm_signing_trust_policy.py": (SCRIPT_DIR / "openepm_signing_trust_policy.py", 0o444),
     "verify_openepm_release_bootstrap.py": (SCRIPT_DIR / "verify_openepm_release_bootstrap.py", 0o555),
     "create_openepm_source_backup_attestation.py": (SCRIPT_DIR / "create_openepm_source_backup_attestation.py", 0o444),
@@ -62,6 +68,12 @@ FIXED = {
     "epmctl": (ROOT / "deploy/release/epmctl", 0o555),
     "compose.yaml": (ROOT / "deploy/release/compose.yaml", 0o444),
     "compose.identity.yaml": (ROOT / "deploy/release/compose.identity.yaml", 0o444),
+    "release-assets/proxy/openepm-base.yaml.template": (
+        ROOT / "deploy/proxy/openepm-base.yaml.template", 0o444),
+    "release-assets/proxy/traefik.yaml": (
+        ROOT / "deploy/proxy/traefik.yaml", 0o444),
+    "release-assets/operations/otel-collector.yaml": (
+        ROOT / "deploy/operations/otel-collector.yaml", 0o444),
 }
 SUPPLIED = {
     "release-manifest.json": "release_manifest",
@@ -246,7 +258,7 @@ def portable_context(path: Path) -> dict:
         raise BundleError("qualification context mcpEndpoint is invalid") from error
     if parsed is None or parsed.scheme != "https" or not parsed.hostname \
             or parsed.username is not None or parsed.password is not None \
-            or parsed.fragment or port == 0:
+            or parsed.query or parsed.fragment or port == 0:
         raise BundleError("qualification context mcpEndpoint must be credential-free HTTPS")
     if value.get("sandboxLauncherJournalUnit") != \
             "openepm-sandbox-launcher.service":
@@ -286,6 +298,10 @@ def validate_plan_bindings(plan_path: Path, incoming: dict[str, Path],
     if not isinstance(expected_release, str) or sha(
             incoming["release-manifest.json"]) != expected_release:
         raise BundleError("release manifest differs from the qualification plan")
+    try:
+        verify_mcp_identity_request(json_object(incoming["mcp-request.json"], "MCP request"))
+    except QualificationError as error:
+        raise BundleError(str(error)) from error
     profiles = (("headless-runsc-profile.json", "image", "builder"),
                 ("python-build-publication-probe.json", "builderImage", "builder"))
     for name, field, component in profiles:
@@ -321,8 +337,10 @@ def assemble(*, output: Path, plan: Path, supplied: dict[str, Path]) -> dict:
     output.mkdir(mode=0o755)
     try:
         for name, (path, mode) in FIXED.items():
-            shutil.copyfile(path, output / name)
-            (output / name).chmod(mode)
+            destination = output / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, destination)
+            destination.chmod(mode)
         for name, path in incoming.items():
             shutil.copyfile(path, output / name)
             (output / name).chmod(0o555 if name in EXECUTABLES else 0o444)

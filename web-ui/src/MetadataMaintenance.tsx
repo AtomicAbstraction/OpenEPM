@@ -1,6 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { requestAdmittedEffect } from "./api";
 import { validMetadataText } from "./MetadataCreate";
+import {
+  focusWhenInteractive,
+  MetadataReceiptRecovery,
+} from "./MetadataReceiptRecovery";
+import {
+  useMetadataMutationRecovery,
+  type MetadataMutationRecord,
+} from "./metadata-mutation-recovery";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
 import { usePreservedDraft } from "./unsaved-work";
 import { useStableMutationIntentKey } from "./mutation-intent";
@@ -33,6 +41,66 @@ type Action =
   | "member-describe"
   | "member-numeric-kind"
   | "member-status";
+
+type DraftField =
+  | "dimensionName"
+  | "dimensionShort"
+  | "dimensionDetailed"
+  | "dimensionDeleteText"
+  | "memberName"
+  | "memberShort"
+  | "memberDetailed"
+  | "memberNumericKind";
+
+type DraftValues = Partial<Record<DraftField, string>>;
+type MaintenanceDraft = {
+  owner: string;
+  revision: number | null;
+  values: DraftValues;
+};
+
+const reviewedFields: Record<Action, readonly DraftField[]> = {
+  "dimension-rename": ["dimensionName"],
+  "dimension-describe": ["dimensionShort", "dimensionDetailed"],
+  "dimension-status": [],
+  "dimension-delete": ["dimensionDeleteText"],
+  "member-rename": ["memberName"],
+  "member-describe": ["memberShort", "memberDetailed"],
+  "member-numeric-kind": ["memberNumericKind"],
+  "member-status": [],
+};
+
+const dimensionFunctions = [
+  "metadata.dimension.rename",
+  "metadata.dimension.describe",
+  "metadata.dimension.status.set",
+] as const;
+const memberFunctions = [
+  "metadata.member.rename",
+  "metadata.member.describe",
+  "metadata.member.numeric-kind.set",
+  "metadata.member.status.set",
+] as const;
+const maintenanceFunctions = [...dimensionFunctions, ...memberFunctions];
+
+const uncommittedMaintenanceRefusals = new Set([
+  "ACTIVE_DIMENSION_REQUIRED",
+  "ACTIVE_MEMBER_REQUIRED",
+  "APPLICATION_UNAVAILABLE",
+  "DIMENSION_STATUS_UNCHANGED",
+  "DIMENSION_UNAVAILABLE",
+  "MEMBER_NUMERIC_KIND_INVALID",
+  "MEMBER_NUMERIC_KIND_UNCHANGED",
+  "MEMBER_STATUS_UNCHANGED",
+  "MEMBER_UNAVAILABLE",
+  "METADATA_DESCRIPTION_UNCHANGED",
+  "METADATA_NAME_UNCHANGED",
+  "METADATA_REFERENCE_AMBIGUOUS",
+  "MODEL_ROLE_ALREADY_ACTIVE",
+  "PROGRAMMABLE_REQUIRED_DIMENSION",
+  "SAVED_GRID_REFERENCE_INTEGRITY_INVALID",
+  "SEMANTIC_REFERENCE_MEMBER_UNAVAILABLE",
+]);
 
 export const metadataMaintenanceBody = (
   app: ApplicationSummary,
@@ -79,27 +147,86 @@ export function MetadataMaintenance({
   const mutationIntentKey = useStableMutationIntentKey(
     "metadata-maintenance-ui",
   );
-  const [dimensionName, setDimensionName] = useState("");
-  const [dimensionShort, setDimensionShort] = useState("");
-  const [dimensionDetailed, setDimensionDetailed] = useState("");
-  const [dimensionDeleteText, setDimensionDeleteText] = useState("");
   const [memberId, setMemberId] = useState("");
-  const [memberName, setMemberName] = useState("");
-  const [memberShort, setMemberShort] = useState("");
-  const [memberDetailed, setMemberDetailed] = useState("");
-  const [memberNumericKind, setMemberNumericKind] = useState("");
-  const [reviewedAction, setReviewedAction] = useState<Action | "">("");
-  const [draftRevision, setDraftRevision] = useState(metadataRevision);
-  const [draftTouched, setDraftTouched] = useState(false);
-  const dimensionIdentity = useRef<string | undefined>(undefined);
-  const memberIdentity = useRef<string | undefined>(undefined);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [result, setResult] = useState("");
+  const [savedDraft, setSavedDraft] = useState<MaintenanceDraft | null>(null);
+  const [review, setReview] = useState<{
+    owner: string;
+    revision: number | null;
+    action: Action;
+  } | null>(null);
+  const [recorded, setRecorded] = useState<{
+    owner: string;
+    revision: number;
+    source: MetadataMutationRecord;
+  } | null>(null);
+  const [refreshing, setRefreshing] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const [deletionError, setDeletionError] = useState<{
+    owner: string;
+    message: string;
+  } | null>(null);
 
   const effectiveMemberId =
     selectedMemberId === undefined ? memberId : selectedMemberId;
   const member = members.find((item) => item.member_id === effectiveMemberId);
+  const editor = JSON.stringify([
+    mode,
+    dimension?.dimension_id,
+    mode === "dimension" ? null : effectiveMemberId,
+  ]);
+  const actorId = catalog?.applicationAccess.subjectId;
+  const owner = JSON.stringify([
+    app?.workspaceId,
+    app?.applicationId,
+    catalog?.applicationAccess.issuer,
+    actorId,
+    editor,
+  ]);
+  const currentOwner = useRef(owner);
+  currentOwner.current = owner;
+  const authority = JSON.stringify([
+    owner,
+    catalog?.applicationAccess.role,
+    catalog?.revisions.metadata,
+    catalog?.revisions.policy,
+    catalog?.revisions.security,
+    catalog?.revisions.capability,
+  ]);
+  const draft = savedDraft?.owner === owner ? savedDraft : null;
+  const draftRevision = draft ? draft.revision : metadataRevision;
+  const baseFields: Record<DraftField, string> = {
+    dimensionName: dimension?.name || "",
+    dimensionShort: dimension?.short_description || "",
+    dimensionDetailed: dimension?.detailed_description || "",
+    dimensionDeleteText: "",
+    memberName: member?.name || "",
+    memberShort: member?.short_description || "",
+    memberDetailed: member?.detailed_description || "",
+    memberNumericKind: member?.numeric_value_kind || "",
+  };
+  const fields = { ...baseFields, ...draft?.values };
+  const {
+    dimensionName,
+    dimensionShort,
+    dimensionDetailed,
+    dimensionDeleteText,
+    memberName,
+    memberShort,
+    memberDetailed,
+    memberNumericKind,
+  } = fields;
+  const reviewedAction =
+    review?.owner === owner && review.revision === metadataRevision
+      ? review.action
+      : null;
+  const result = recorded?.owner === owner ? recorded : null;
+  const resultStatus = useRef<HTMLParagraphElement>(null);
+  const receiptFocusOwner = useRef<string | null>(null);
+  const deletionMessage =
+    deletionError?.owner === owner ? deletionError.message : "";
+  const needsRefresh =
+    result !== null &&
+    (metadataRevision === null || metadataRevision <= result.revision);
   const canDimensionRename = Boolean(
     catalog?.functions["metadata.dimension.rename"],
   );
@@ -122,88 +249,82 @@ export function MetadataMaintenance({
   const canMemberStatus = Boolean(
     catalog?.functions["metadata.member.status.set"],
   );
-  const hasAnyAction = Boolean(
-    catalog &&
-      [
-        "metadata.dimension.rename",
-        "metadata.dimension.describe",
-        "metadata.dimension.status.set",
-        "metadata.dimension.delete",
-        "metadata.member.rename",
-        "metadata.member.describe",
-        "metadata.member.numeric-kind.set",
-        "metadata.member.status.set",
-      ].some((name) => catalog.functions[name]),
-  );
+  const functions =
+    mode === "dimension"
+      ? dimensionFunctions
+      : mode === "member"
+        ? memberFunctions
+        : maintenanceFunctions;
+  const hasAnyAction =
+    (mode !== "member" && canDimensionDelete) ||
+    functions.some((name) => Boolean(catalog?.functions[name]));
   const snapshotAvailable = Boolean(dimension && metadataRevision !== null);
+  const recovery = useMetadataMutationRecovery<{
+    actorId: string;
+    metadataRevision: number;
+    owner: string;
+    submittedFields: DraftValues;
+  }>(
+    app,
+    catalog,
+    authority,
+    {
+      editor: `metadata-maintenance-change:${editor}`,
+      pendingLabel: "Metadata change with an unconfirmed outcome",
+      functions,
+      subject: "metadata change",
+      closePrompt:
+        "Close this unconfirmed metadata change? Read the current model before reviewing another change.",
+      refuses: (code) =>
+        uncommittedMaintenanceRefusals.has(code) ||
+        code.startsWith("DIMENSION_HAS_") ||
+        code.startsWith("MEMBER_HAS_"),
+    },
+    (attempt, source) => {
+      if (currentOwner.current !== attempt.owner) return;
+      setSavedDraft((current) => {
+        if (!current || current.owner !== attempt.owner) return current;
+        const values = { ...current.values };
+        for (const field of Object.keys(
+          attempt.submittedFields,
+        ) as DraftField[]) {
+          if (values[field] === attempt.submittedFields[field])
+            delete values[field];
+        }
+        return Object.keys(values).length ? { ...current, values } : null;
+      });
+      setReview(null);
+      if (source === "receipt") receiptFocusOwner.current = attempt.owner;
+      setRecorded({
+        owner: attempt.owner,
+        revision: attempt.metadataRevision,
+        source,
+      });
+      void refreshModel();
+    },
+  );
+  const busy =
+    recovery.busy ||
+    recovery.pending ||
+    refreshing === owner ||
+    deleting === owner;
   const snapshotCurrent =
-    snapshotAvailable && draftRevision === metadataRevision;
-  const dimensionDraftChanged = Boolean(
-    dimension &&
-      (dimensionName !== dimension.name ||
-        dimensionShort !== (dimension.short_description || "") ||
-        dimensionDetailed !== (dimension.detailed_description || "") ||
-        dimensionDeleteText !== ""),
-  );
-  const memberDraftChanged = Boolean(
-    member &&
-      (memberName !== member.name ||
-        memberShort !== (member.short_description || "") ||
-        memberDetailed !== (member.detailed_description || "") ||
-        memberNumericKind !== (member.numeric_value_kind || "")),
-  );
+    snapshotAvailable && draftRevision === metadataRevision && !needsRefresh;
+
+  useLayoutEffect(() => setReview(null), [authority, metadataRevision]);
+
   usePreservedDraft(
     app?.workspaceId || "none",
     app?.applicationId || "none",
-    `metadata-maintenance:${mode}:${dimension?.dimension_id || "none"}:${effectiveMemberId || "none"}`,
+    `metadata-maintenance:${editor}`,
     "Unsaved dimension or member changes",
-    dimensionDraftChanged || memberDraftChanged,
-    {
-      draftRevision,
-      dimensionName,
-      dimensionShort,
-      dimensionDetailed,
-      dimensionDeleteText,
-      memberId,
-      memberName,
-      memberShort,
-      memberDetailed,
-      memberNumericKind,
-      reviewedAction,
-    },
-    (draft) => {
-      setDimensionName(draft.dimensionName);
-      setDimensionShort(draft.dimensionShort);
-      setDimensionDetailed(draft.dimensionDetailed);
-      setDimensionDeleteText(draft.dimensionDeleteText);
-      setMemberId(draft.memberId);
-      setMemberName(draft.memberName);
-      setMemberShort(draft.memberShort);
-      setMemberDetailed(draft.memberDetailed);
-      setMemberNumericKind(draft.memberNumericKind);
-      setReviewedAction("");
-      setDraftRevision(draft.draftRevision);
-      setDraftTouched(true);
+    Boolean(draft),
+    draft,
+    (restored) => {
+      if (restored?.owner === owner) setSavedDraft(restored);
+      setReview(null);
     },
   );
-
-  useEffect(() => {
-    setReviewedAction("");
-    const changedIdentity =
-      dimensionIdentity.current !== dimension?.dimension_id;
-    dimensionIdentity.current = dimension?.dimension_id;
-    if (!changedIdentity && draftTouched && draftRevision !== metadataRevision)
-      return;
-    if (changedIdentity) setDraftTouched(false);
-    setDraftRevision(metadataRevision);
-    setDimensionName(dimension?.name || "");
-    setDimensionShort(dimension?.short_description || "");
-    setDimensionDetailed(dimension?.detailed_description || "");
-    setDimensionDeleteText("");
-    setReviewedAction("");
-    setError("");
-    setResult("");
-  }, [dimension?.dimension_id, metadataRevision]);
 
   useEffect(() => {
     const nextMemberId = members.some(
@@ -217,25 +338,44 @@ export function MetadataMaintenance({
   }, [members, effectiveMemberId, selectedMemberId]);
 
   useEffect(() => {
-    setReviewedAction("");
-    const changedIdentity = memberIdentity.current !== member?.member_id;
-    memberIdentity.current = member?.member_id;
-    if (!changedIdentity && draftTouched && draftRevision !== metadataRevision)
-      return;
-    if (changedIdentity) setDraftTouched(false);
-    setDraftRevision(metadataRevision);
-    setMemberName(member?.name || "");
-    setMemberShort(member?.short_description || "");
-    setMemberDetailed(member?.detailed_description || "");
-    setMemberNumericKind(member?.numeric_value_kind || "");
-    setReviewedAction("");
-    setResult("");
-  }, [member?.member_id, metadataRevision]);
+    if (
+      result?.source === "receipt" &&
+      receiptFocusOwner.current === owner &&
+      refreshing !== owner
+    ) {
+      receiptFocusOwner.current = null;
+      return focusWhenInteractive(resultStatus.current);
+    }
+  }, [owner, refreshing, result]);
 
-  function invalidate() {
-    setDraftTouched(true);
-    setReviewedAction("");
-    setResult("");
+  function setField(field: DraftField, value: string) {
+    setSavedDraft((current) => {
+      const currentDraft = current?.owner === owner ? current : null;
+      const values = { ...currentDraft?.values };
+      if (value === baseFields[field]) delete values[field];
+      else values[field] = value;
+      return Object.keys(values).length
+        ? {
+            owner,
+            revision: currentDraft ? currentDraft.revision : metadataRevision,
+            values,
+          }
+        : null;
+    });
+    setReview(null);
+    setDeletionError(null);
+    if (!needsRefresh) setRecorded(null);
+  }
+
+  async function refreshModel() {
+    setRefreshing(owner);
+    try {
+      await onChanged();
+    } catch {
+      // The current snapshot still gates review. The recorded outcome is retained.
+    } finally {
+      setRefreshing((key) => (key === owner ? null : key));
+    }
   }
 
   async function execute(
@@ -246,57 +386,72 @@ export function MetadataMaintenance({
   ) {
     if (
       !app ||
+      metadataRevision === null ||
       !snapshotCurrent ||
       busy ||
       reviewedAction !== action ||
       !window.confirm(confirmation)
     )
       return;
-    setBusy(true);
-    setError("");
-    setResult("");
-    try {
-      await requestAdmittedEffect<{
-        receiptId?: string;
-        result?: { receiptId?: string };
-      }>(
-        "/api/metadata-action",
-        metadataMaintenanceBody(
-          app,
-          functionName,
-          args,
-          mutationIntentKey({
-            workspaceId: app.workspaceId,
-            applicationId: app.applicationId,
-            functionName,
-            args,
-          }),
-        ),
+    const body = metadataMaintenanceBody(
+      app,
+      functionName,
+      args,
+      mutationIntentKey({
+        workspaceId: app.workspaceId,
+        applicationId: app.applicationId,
+        functionName,
+        args,
+      }),
+    );
+    if (action !== "dimension-delete") {
+      if (!actorId) return;
+      const submittedFields = Object.fromEntries(
+        reviewedFields[action].map((field) => [field, fields[field]]),
       );
-      setResult("The reviewed metadata change was applied.");
-      setReviewedAction("");
-      setDraftTouched(false);
+      await recovery.submit(body, {
+        actorId,
+        metadataRevision,
+        owner,
+        submittedFields,
+      });
+      return;
+    }
+    setDeleting(owner);
+    setDeletionError(null);
+    try {
+      await requestAdmittedEffect("/api/metadata-action", body);
+      if (currentOwner.current !== owner) return;
+      setRecorded({ owner, revision: metadataRevision, source: "reply" });
+      setReview(null);
+      setSavedDraft(null);
       await onChanged();
     } catch (reason) {
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to apply metadata change",
-      );
+      setDeletionError({
+        owner,
+        message:
+          reason instanceof Error
+            ? reason.message
+            : "Unable to apply metadata change",
+      });
     } finally {
-      setBusy(false);
+      setDeleting((key) => (key === owner ? null : key));
     }
   }
 
-  function review(action: Action, valid: boolean, label: string) {
+  function reviewAction(action: Action, valid: boolean, label: string) {
     return (
       <label className="review-check">
         <input
           type="checkbox"
           checked={reviewedAction === action}
-          disabled={!valid}
+          disabled={!valid || busy}
           onChange={(event) =>
-            setReviewedAction(event.target.checked ? action : "")
+            setReview(
+              event.target.checked
+                ? { owner, revision: metadataRevision, action }
+                : null,
+            )
           }
         />
         {label}
@@ -304,7 +459,7 @@ export function MetadataMaintenance({
     );
   }
 
-  if (!hasAnyAction) return null;
+  if (!hasAnyAction && !recovery.pending && !result) return null;
 
   const dimensionRenameValid = Boolean(
     snapshotCurrent &&
@@ -357,24 +512,41 @@ export function MetadataMaintenance({
           model. Dependency guards remain server-owned.
         </p>
       </div>
-      {snapshotAvailable && draftRevision !== metadataRevision && (
-        <div className="inline-error" role="status">
-          <p>
-            Metadata changed since this draft began. Your entries are retained;
-            review them against the current model before saving.
-          </p>
-          <button
-            type="button"
-            onClick={() => {
-              setDraftRevision(metadataRevision);
-              setReviewedAction("");
-            }}
-          >
-            Review against current metadata
-          </button>
-        </div>
-      )}
-      {!snapshotAvailable && (
+      <MetadataReceiptRecovery
+        object="metadata"
+        recovery={recovery}
+        onClose={() => {
+          if (recovery.closeRecovery()) {
+            setReview(null);
+            void refreshModel();
+          }
+        }}
+      />
+      {hasAnyAction &&
+        snapshotAvailable &&
+        draftRevision !== metadataRevision && (
+          <div className="inline-error" role="status">
+            <p>
+              Metadata changed since this draft began. Your entries are
+              retained; review them against the current model before saving.
+            </p>
+            <button
+              type="button"
+              disabled={busy || needsRefresh}
+              onClick={() => {
+                setSavedDraft((current) =>
+                  current?.owner === owner
+                    ? { ...current, revision: metadataRevision }
+                    : current,
+                );
+                setReview(null);
+              }}
+            >
+              Review against current metadata
+            </button>
+          </div>
+        )}
+      {hasAnyAction && !snapshotAvailable && (
         <p className="inline-error" role="status">
           Read the current dimension catalogue before maintaining metadata.
         </p>
@@ -390,13 +562,12 @@ export function MetadataMaintenance({
                   value={dimensionName}
                   maxLength={200}
                   onChange={(event) => {
-                    setDimensionName(event.target.value);
-                    invalidate();
+                    setField("dimensionName", event.target.value);
                   }}
                 />
               </label>
               <div className="reviewed-inline-action">
-                {review(
+                {reviewAction(
                   "dimension-rename",
                   dimensionRenameValid,
                   "I reviewed this exact dimension name against the current model.",
@@ -433,8 +604,7 @@ export function MetadataMaintenance({
                   value={dimensionShort}
                   maxLength={500}
                   onChange={(event) => {
-                    setDimensionShort(event.target.value);
-                    invalidate();
+                    setField("dimensionShort", event.target.value);
                   }}
                 />
               </label>
@@ -444,13 +614,12 @@ export function MetadataMaintenance({
                   value={dimensionDetailed}
                   maxLength={10000}
                   onChange={(event) => {
-                    setDimensionDetailed(event.target.value);
-                    invalidate();
+                    setField("dimensionDetailed", event.target.value);
                   }}
                 />
               </label>
               <div className="reviewed-inline-action">
-                {review(
+                {reviewAction(
                   "dimension-describe",
                   dimensionDescribeValid,
                   "I reviewed these exact dimension descriptions against the current model.",
@@ -482,7 +651,7 @@ export function MetadataMaintenance({
           )}
           {canDimensionStatus && (
             <div className="reviewed-inline-action">
-              {review(
+              {reviewAction(
                 "dimension-status",
                 snapshotCurrent,
                 `I reviewed changing this dimension to ${dimension.status === "Active" ? "Inactive" : "Active"} in the current model.`,
@@ -515,13 +684,12 @@ export function MetadataMaintenance({
                 <input
                   value={dimensionDeleteText}
                   onChange={(event) => {
-                    setDimensionDeleteText(event.target.value);
-                    invalidate();
+                    setField("dimensionDeleteText", event.target.value);
                   }}
                 />
               </label>
               <div className="reviewed-inline-action">
-                {review(
+                {reviewAction(
                   "dimension-delete",
                   dimensionDeleteText === dimension.dimension_id,
                   "I reviewed this exact inactive dimension deletion against the current model.",
@@ -567,7 +735,7 @@ export function MetadataMaintenance({
                   if (selectedMemberId === undefined)
                     setMemberId(event.target.value);
                   onSelectedMemberIdChange?.(event.target.value);
-                  invalidate();
+                  setReview(null);
                 }}
               >
                 {members.map((item) => (
@@ -586,13 +754,12 @@ export function MetadataMaintenance({
                   value={memberName}
                   maxLength={200}
                   onChange={(event) => {
-                    setMemberName(event.target.value);
-                    invalidate();
+                    setField("memberName", event.target.value);
                   }}
                 />
               </label>
               <div className="reviewed-inline-action">
-                {review(
+                {reviewAction(
                   "member-rename",
                   memberRenameValid,
                   "I reviewed this exact member name against the current model.",
@@ -630,8 +797,7 @@ export function MetadataMaintenance({
                   value={memberShort}
                   maxLength={500}
                   onChange={(event) => {
-                    setMemberShort(event.target.value);
-                    invalidate();
+                    setField("memberShort", event.target.value);
                   }}
                 />
               </label>
@@ -641,13 +807,12 @@ export function MetadataMaintenance({
                   value={memberDetailed}
                   maxLength={10000}
                   onChange={(event) => {
-                    setMemberDetailed(event.target.value);
-                    invalidate();
+                    setField("memberDetailed", event.target.value);
                   }}
                 />
               </label>
               <div className="reviewed-inline-action">
-                {review(
+                {reviewAction(
                   "member-describe",
                   memberDescribeValid,
                   "I reviewed these exact member descriptions against the current model.",
@@ -685,8 +850,7 @@ export function MetadataMaintenance({
                 <select
                   value={memberNumericKind}
                   onChange={(event) => {
-                    setMemberNumericKind(event.target.value);
-                    invalidate();
+                    setField("memberNumericKind", event.target.value);
                   }}
                 >
                   <option value="">Unspecified</option>
@@ -695,7 +859,7 @@ export function MetadataMaintenance({
                 </select>
               </label>
               <div className="reviewed-inline-action">
-                {review(
+                {reviewAction(
                   "member-numeric-kind",
                   memberNumericValid,
                   "I reviewed this exact member numeric kind against the current model.",
@@ -727,7 +891,7 @@ export function MetadataMaintenance({
           )}
           {member && canMemberStatus && (
             <div className="reviewed-inline-action">
-              {review(
+              {reviewAction(
                 "member-status",
                 snapshotCurrent,
                 `I reviewed changing this member to ${member.status === "Active" ? "Inactive" : "Active"} in the current model.`,
@@ -755,12 +919,36 @@ export function MetadataMaintenance({
           )}
         </details>
       )}
-      {error && (
+      {deletionMessage && (
         <div className="inline-error" role="alert">
-          {error}
+          {deletionMessage}
         </div>
       )}
-      {result && <p role="status">{result}</p>}
+      {result && (
+        <p
+          role="status"
+          tabIndex={result.source === "receipt" ? -1 : undefined}
+          ref={resultStatus}
+        >
+          {result.source === "receipt"
+            ? "The original metadata change was recorded."
+            : "The reviewed metadata change was applied."}
+        </p>
+      )}
+      {hasAnyAction && needsRefresh && (
+        <div>
+          <p role="status">
+            Read the current model before reviewing another metadata change.
+          </p>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void refreshModel()}
+          >
+            Refresh current model
+          </button>
+        </div>
+      )}
       <p className="authority-note">
         Referential integrity, populated-data guards and all lifecycle effects
         remain fixed-core responsibilities.

@@ -377,6 +377,60 @@ def process_next_calculation_impact(db, scope, *, claim_id: str,
             'status': 'applied'}
 
 
+def calculation_impact_failure_code(code: str | None) -> str:
+    """Project only fixed worker diagnostics outside the processing exception."""
+    if code in ('CALCULATION_IMPACT_FANOUT_LIMIT', 'CALCULATION_IMPACT_SOURCE_REFERENCE_LIMIT',
+                'CALCULATION_IMPACT_PROCESSING_TIMEOUT'):
+        return code
+    return 'CALCULATION_IMPACT_PROCESSING_FAILED'
+
+
+def advance_calculation_impact(dsn: str, *, claimant: str, scope=None) -> dict | None:
+    """Run one worker quantum from the outbox, including when no job is queued."""
+    from hashlib import sha256
+    from psycopg.errors import QueryCanceled
+    from psycopg.rows import dict_row
+    from .persistence_contract import ApplicationScope
+    from .postgres_connection import connect_postgres
+    from .postgres_numeric_store import PostgresNumericFactStore
+    from .postgres_processing_limits import configure_statement_timeout
+
+    if (not isinstance(claimant, str) or not claimant
+            or (scope is not None and not isinstance(scope, ApplicationScope))):
+        raise ValueError('CALCULATION_IMPACT_CLAIM_INVALID')
+    keys = (scope.workspace_id, scope.application_id) if scope is not None else (None, None)
+    claim = 'impact-' + sha256(claimant.encode('utf-8')).hexdigest()[:32]
+    with connect_postgres(dsn, row_factory=dict_row) as db, db.transaction():
+        configure_statement_timeout(db, 5000)
+        db.execute("SET LOCAL lock_timeout='100ms'")
+        head = db.execute('SELECT * FROM epm.calculation_impact_worker_scope(%s,%s)', keys).fetchone()
+        if head is None:
+            return None
+        selected = ApplicationScope(head['workspace_id'], head['application_id'])
+        PostgresNumericFactStore._set_scope(db, selected)
+        try:
+            with db.transaction():
+                result = process_next_calculation_impact(db, selected, claim_id=claim)
+        except (ValueError, QueryCanceled) as error:
+            # The savepoint rolls back fanout and the watermark. Retain the
+            # failed head with a retry delay so other applications can advance.
+            code = str(error) if isinstance(error, ValueError) else 'CALCULATION_IMPACT_PROCESSING_TIMEOUT'
+            code = calculation_impact_failure_code(code)
+            failed = db.execute('''UPDATE epm.calculation_impact_progress
+                SET status='failed',attempt_count=attempt_count+1,claim_id=%s,
+                    claimed_at=clock_timestamp(),applied_at=NULL,failure_code=%s,
+                    updated_at=clock_timestamp()
+                WHERE workspace_id=%s AND application_id=%s AND impact_epoch=%s
+                  AND status IN ('pending','failed') RETURNING impact_epoch''',
+                (claim, code, selected.workspace_id, selected.application_id, head['impact_epoch'])).fetchone()
+            if failed is None:
+                raise ValueError('CALCULATION_IMPACT_WORKER_HEAD_CHANGED')
+            return {'status': 'needs_inspection', 'impactEpoch': failed['impact_epoch'], 'errorCode': code}
+        if result is None or result['impactEpoch'] != head['impact_epoch']:
+            raise ValueError('CALCULATION_IMPACT_WORKER_HEAD_CHANGED')
+        return {**result, 'status': 'completed'}
+
+
 def drain_calculation_impacts(dsn: str, scope, *, claimant: str,
                               limit: int = 1000) -> dict[str, int]:
     """Apply a bounded contiguous prefix for one worker-owned application."""

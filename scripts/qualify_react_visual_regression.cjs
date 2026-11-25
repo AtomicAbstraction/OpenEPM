@@ -506,6 +506,7 @@ async function installDeterministicApi(page) {
       await route.fulfill(
         response({
           subject: "visual-owner",
+          identityBinding: "a".repeat(64),
           displayIdentity: "owner@openepm.dev",
           applicationMcpEndpoint:
             "https://mcp.openepm.dev/api/application/mcp/personal/visual-owner",

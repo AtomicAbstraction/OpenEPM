@@ -1,20 +1,27 @@
 """Verified workspace-bound MCP facade for the PostgreSQL lifecycle core."""
 from __future__ import annotations
 
+from . import application_authorization_migration as auth_migration
+from . import postgres_authorization_migration
+from . import postgres_workspace_access_review as workspace_review
 from .mcp_function_routing import with_mcp_tools
 
 from .postgres_verified_principal import principal_claims
 from .postgres_access import (AccessDenied, VerifiedIdentity, assert_lifecycle_role,
                               assert_security_writer_role)
-from .postgres_workspace_lifecycle import PostgresWorkspaceLifecycle
+from .postgres_workspace_lifecycle import FUNCTION as CREATE_APPLICATION, PostgresWorkspaceLifecycle
 from .postgres_application_purge import PostgresApplicationPurge, catalog as application_purge_catalog
 from .postgres_workspace_reset import PostgresWorkspaceResetPreview
-from .postgres_security_language import PostgresSecurityLanguage
+from .postgres_security_language import (
+    WORKSPACE_FUNCTION, WORKSPACE_GROUP_FUNCTION, WORKSPACE_GROUP_LIST_FUNCTION,
+    PostgresSecurityLanguage)
 from .postgres_capability_contract import (
     FUNCTION_REGISTRY_FORMAT,function_registry_digest)
 from .processing_operation_registry import (
     PROCESSING_REGISTRY_FORMAT,admit_operation,operation_contracts,
     processing_registry_digest)
+from .public_program_diagnostics import (
+    ProgramValidationError, validate_program_envelope, validate_program_structure)
 
 
 class PostgresWorkspaceMCPApplication:
@@ -65,6 +72,9 @@ class PostgresWorkspaceMCPApplication:
         if active and self.security_dsn:
             functions.update(PostgresSecurityLanguage.workspace_catalog()
                              ['functions'])
+        if not self.reset_secret:
+            for name in auth_migration.FUNCTIONS:
+                functions.pop(name,None)
         if self.reset_secret:
             reset = PostgresWorkspaceResetPreview(
                 self.lifecycle_dsn, identity=service.identity,
@@ -99,31 +109,46 @@ class PostgresWorkspaceMCPApplication:
 
     def create(self, assertion: str, program: dict, *,
                idempotency_key: str) -> dict:
+        validate_program_envelope(program, scope='workspace')
+        if program['function'] != CREATE_APPLICATION:
+            raise ProgramValidationError('unknown_workspace_function')
         admit_operation(program,scope='workspace',
                         handler_boundary='workspace_lifecycle_adapter')
-        return self._authorized_lifecycle(assertion).create(
+        lifecycle = self._authorized_lifecycle(assertion)
+        validate_program_structure(program, scope='workspace')
+        return lifecycle.create(
             self.workspace_id, program, idempotency_key=idempotency_key)
+
+    def _authorized_security(self, assertion: str, program: dict,
+                             functions: tuple[str, ...]) -> PostgresSecurityLanguage:
+        validate_program_envelope(program, scope='workspace')
+        if program['function'] not in functions:
+            raise ProgramValidationError('unknown_workspace_function')
+        admit_operation(program, scope='workspace', handler_boundary='workspace_security_adapter')
+        if not self.security_dsn:
+            raise ValueError('POSTGRES_SECURITY_SERVICE_NOT_CONFIGURED')
+        identity = self._authorized_lifecycle(assertion).identity
+        validate_program_structure(program, scope='workspace')
+        return PostgresSecurityLanguage(self.security_dsn, identity=identity)
 
     def access(self, assertion: str, program: dict, *,
                idempotency_key: str) -> dict:
-        admit_operation(program,scope='workspace',
-                        handler_boundary='workspace_security_adapter')
-        if not self.security_dsn:
-            raise ValueError('POSTGRES_SECURITY_SERVICE_NOT_CONFIGURED')
-        identity=self._authorized_lifecycle(assertion).identity
-        return PostgresSecurityLanguage(self.security_dsn,
-            identity=identity).execute_workspace(
-            self.workspace_id, program, idempotency_key=idempotency_key)
+        security=self._authorized_security(assertion,program,(WORKSPACE_FUNCTION,WORKSPACE_GROUP_FUNCTION,auth_migration.ACTIVATE))
+        if program['function']==auth_migration.ACTIVATE:
+            return postgres_authorization_migration.execute(self.security_dsn,self.workspace_id,security.identity,
+                program,secret=self.reset_secret,operation_id=idempotency_key)
+        return security.execute_workspace(self.workspace_id,program,idempotency_key=idempotency_key)
 
     def read_access(self, assertion: str, program: dict) -> dict:
-        admit_operation(program,scope='workspace',
-                        handler_boundary='workspace_security_adapter')
-        if not self.security_dsn:
-            raise ValueError('POSTGRES_SECURITY_SERVICE_NOT_CONFIGURED')
-        identity=self._authorized_lifecycle(assertion).identity
-        return PostgresSecurityLanguage(self.security_dsn,
-            identity=identity
-            ).list_workspace_group_access(self.workspace_id, program)
+        security = self._authorized_security(assertion, program,
+            (WORKSPACE_GROUP_LIST_FUNCTION, auth_migration.REVIEW, *workspace_review.FUNCTIONS))
+        if program['function']==auth_migration.REVIEW:
+            return postgres_authorization_migration.execute(self.security_dsn,self.workspace_id,security.identity,
+                program,secret=self.reset_secret)
+        if program['function'] in workspace_review.FUNCTIONS:
+            return workspace_review.read(self.security_dsn,self.workspace_id,security.identity,program,
+                                         secret=self.reset_secret or workspace_review.PROCESS_REVIEW_KEY)
+        return security.list_workspace_group_access(self.workspace_id, program)
 
     def prepare_reset(self, assertion: str, program: dict) -> dict:
         admit_operation(program,scope='workspace',

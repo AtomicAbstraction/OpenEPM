@@ -11,7 +11,6 @@ import hashlib
 import json
 import re
 import shlex
-import subprocess
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -36,20 +35,26 @@ except ModuleNotFoundError as error:
         verify_release as verify_sdk_release,
     )
 try:
-    from scripts.openepm_release_policy_contract import validate as validate_policy
+    from scripts.openepm_release_policy_contract import (
+        parse_json_object, validate as validate_policy,
+    )
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
-    from openepm_release_policy_contract import validate as validate_policy  # type: ignore[no-redef]
+    from openepm_release_policy_contract import (  # type: ignore[no-redef]
+        parse_json_object, validate as validate_policy,
+    )
 try:
     from scripts.openepm_signing_trust_policy import (
-        TrustPolicyError, eligible_keys, select_key, verify as verify_trust_policy,
+        TrustPolicyError, eligible_keys, read_signed_payload, select_key, selected_key_bytes,
+        verify as verify_trust_policy, verify_signature,
     )
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
     from openepm_signing_trust_policy import (  # type: ignore[no-redef]
-        TrustPolicyError, eligible_keys, select_key, verify as verify_trust_policy,
+        TrustPolicyError, eligible_keys, read_signed_payload, select_key, selected_key_bytes,
+        verify as verify_trust_policy, verify_signature,
     )
 COMPONENTS = (
     "application", "database", "builder", "identity",
@@ -291,7 +296,7 @@ def _load_json(path: Path) -> dict:
     return value
 
 
-def _relative_file(root: Path, item: dict, label: str) -> Path:
+def _verified_file(root: Path, item: dict, label: str) -> tuple[Path, bytes]:
     if not isinstance(item, dict) or set(item) != {"path", "sha256"}:
         raise ManifestError(f"{label} must contain only path and sha256")
     relative = item["path"]
@@ -309,14 +314,19 @@ def _relative_file(root: Path, item: dict, label: str) -> Path:
                    if parent != root.parent)
             or not path.resolve().is_relative_to(root.resolve())):
         raise ManifestError(f"{label} artifact is missing or symbolic: {relative}")
-    actual = hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual != expected:
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected:
         raise ManifestError(f"{label} checksum mismatch: {relative}")
+    return path, raw
+
+
+def _relative_file(root: Path, item: dict, label: str) -> Path:
+    path, _ = _verified_file(root, item, label)
     return path
 
 
 def _sdk(root: Path, value: object, source_commit: str,
-         trusted_public_key: Path) -> dict:
+         trusted_public_key: bytes) -> dict:
     required = {"package", "source", "signing", "artifacts", "publicKey"}
     if not isinstance(value, dict) or set(value) != required:
         raise ManifestError("signed SDK release fields are invalid")
@@ -326,9 +336,8 @@ def _sdk(root: Path, value: object, source_commit: str,
         raise ManifestError("signed SDK artifact inventory is invalid")
     paths = {name: _relative_file(root, artifacts[name], f"sdk.{name}")
              for name in labels}
-    public_key = _relative_file(root, value["publicKey"], "sdk.publicKey")
-    if (not trusted_public_key.is_file() or trusted_public_key.is_symlink()
-            or public_key.read_bytes() != trusted_public_key.read_bytes()):
+    _, public_key = _verified_file(root, value["publicKey"], "sdk.publicKey")
+    if public_key != trusted_public_key:
         raise ManifestError("bundled SDK key differs from signing trust policy")
     directory = paths["manifest"].parent
     if any(path.parent != directory for path in paths.values()):
@@ -350,24 +359,6 @@ def _sdk(root: Path, value: object, source_commit: str,
     return value
 
 
-def _verify_detached_signature(payload: Path, signature: Path,
-                               public_key: Path, label: str) -> None:
-    for path, kind in ((payload, "payload"), (signature, "signature"),
-                       (public_key, "trusted public key")):
-        if not path.is_file() or path.is_symlink():
-            raise ManifestError(f"{label} {kind} is missing or symbolic")
-    try:
-        subprocess.run([
-            "openssl", "pkeyutl", "-verify", "-rawin", "-pubin",
-            "-inkey", str(public_key), "-in", str(payload),
-            "-sigfile", str(signature),
-        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-           timeout=30)
-    except (OSError, subprocess.CalledProcessError,
-            subprocess.TimeoutExpired) as error:
-        raise ManifestError(f"{label} signature verification failed") from error
-
-
 def _environment(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -386,9 +377,13 @@ def validate(manifest_path: Path, environment_path: Path, host_arch: str, *,
              trust_policy_signature: Path | None = None,
              minimum_trust_policy_sequence: int | None = None,
              manifest_signature: Path | None = None,
-             verification_time: datetime | None = None) -> dict:
+             verification_time: datetime | None = None, expected_manifest_sha256: str | None = None) -> dict:
     root = manifest_path.resolve().parent
-    value = _load_json(manifest_path)
+    try:
+        payload = read_signed_payload(manifest_path, "release manifest", expected_sha256=expected_manifest_sha256)
+        value = parse_json_object(payload, "release manifest")
+    except ValueError as error:
+        raise ManifestError(str(error)) from error
     if value.get("format") == "openepm-release-manifest-v3":
         if (trusted_root_public_key is None or trust_policy is None
                 or trust_policy_signature is None
@@ -409,9 +404,9 @@ def validate(manifest_path: Path, environment_path: Path, host_arch: str, *,
         verified_release_keys = []
         for key_id, public_key in release_keys:
             try:
-                _verify_detached_signature(manifest_path, manifest_signature,
-                                           public_key, "release manifest")
-            except ManifestError:
+                verify_signature(payload, manifest_signature, selected_key_bytes(policy, key_id, public_key),
+                                 "release manifest")
+            except TrustPolicyError:
                 continue
             verified_release_keys.append(key_id)
         if len(verified_release_keys) != 1:
@@ -424,8 +419,8 @@ def validate(manifest_path: Path, environment_path: Path, host_arch: str, *,
         if not isinstance(sdk_key_id, str):
             raise ManifestError("signed SDK key identity is missing")
         try:
-            sdk_public_key = select_key(trust_policy, policy,
-                key_id=sdk_key_id, purpose="sdk", now=now)
+            sdk_public_key = selected_key_bytes(policy, sdk_key_id, select_key(
+                trust_policy, policy, key_id=sdk_key_id, purpose="sdk", now=now))
         except TrustPolicyError as error:
             raise ManifestError(f"signed SDK key is not trusted: {error}") from error
         return _validate_v3(root, value, environment_path, host_arch,
@@ -434,7 +429,7 @@ def validate(manifest_path: Path, environment_path: Path, host_arch: str, *,
 
 
 def _validate_v3(root: Path, value: dict, environment_path: Path,
-                 host_arch: str, trusted_sdk_public_key: Path) -> dict:
+                 host_arch: str, trusted_sdk_public_key: bytes) -> dict:
     required = {"format", "status", "release", "sourceCommit",
         "schemaMigration", "architectures", "images", "sdk", "source",
         "sourceBinding", "sourceSbom", "resolvedReleasePolicy",
@@ -508,14 +503,14 @@ def _validate_v3(root: Path, value: dict, environment_path: Path,
         artifact_loader=lambda record, label: _relative_file(root, record, label),
         json_loader=lambda path, _label: _load_json(path),
         error_type=ManifestError)
-    policy = _load_json(_relative_file(
-        root, value["resolvedReleasePolicy"], "resolvedReleasePolicy"))
+    _, policy_bytes = _verified_file(root, value["resolvedReleasePolicy"], "resolvedReleasePolicy")
     try:
+        policy = parse_json_object(policy_bytes, "resolved release policy")
         packet_path = root / "owner-decision-packet.json"
         validate_policy(policy, packet_path if packet_path.is_file() else None,
                         artifact_root=root)
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        raise ManifestError("resolved release policy is incomplete")
+    except (OSError, ValueError) as error:
+        raise ManifestError(f"resolved release policy is incomplete: {error}") from error
     return value
 
 
@@ -529,6 +524,7 @@ def main() -> int:
     parser.add_argument("--browser-session-store-config", type=Path,
                         default=BROWSER_STORE)
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--expected-manifest-sha256")
     parser.add_argument("--environment", type=Path)
     parser.add_argument("--host-architecture", choices=("linux/amd64", "linux/arm64"))
     parser.add_argument("--trusted-root-public-key", type=Path)
@@ -538,7 +534,7 @@ def main() -> int:
     parser.add_argument("--manifest-signature", type=Path)
     args = parser.parse_args()
     if args.browser_gateway:
-        if (args.manifest is not None or args.environment is not None
+        if (args.manifest is not None or args.expected_manifest_sha256 is not None or args.environment is not None
                 or args.host_architecture is not None or not args.issuer
                 or not args.web_origin):
             parser.error("browser gateway validation arguments are invalid")
@@ -560,7 +556,7 @@ def main() -> int:
             trust_policy=args.trust_policy,
             trust_policy_signature=args.trust_policy_signature,
             minimum_trust_policy_sequence=args.minimum_trust_policy_sequence,
-            manifest_signature=args.manifest_signature,
+            manifest_signature=args.manifest_signature, expected_manifest_sha256=args.expected_manifest_sha256,
         )
     except ManifestError as error:
         parser.error(str(error))

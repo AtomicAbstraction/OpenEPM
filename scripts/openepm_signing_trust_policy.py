@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import subprocess
 from urllib.parse import urlsplit
 
 try:
-    from scripts.build_openepm_sdk_release import openssl_binary
+    from scripts.build_openepm_sdk_release import verify_ed25519
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
-    from build_openepm_sdk_release import openssl_binary
+    from build_openepm_sdk_release import verify_ed25519
 
 
 class TrustPolicyError(ValueError):
@@ -73,22 +75,40 @@ def referenced_key(root: Path, record: object, label: str) -> Path:
     return path
 
 
-def verify_signature(content: Path, signature: Path, public_key: Path,
-                     label: str) -> None:
-    if (not content.is_file() or content.is_symlink()
-            or not 1 <= content.stat().st_size <= MAXIMUM_POLICY_BYTES
-            or not signature.is_file() or signature.is_symlink()
-            or not 1 <= signature.stat().st_size <= MAXIMUM_SIGNATURE_BYTES
-            or not public_key.is_file() or public_key.is_symlink()
-            or not 1 <= public_key.stat().st_size <= MAXIMUM_PUBLIC_KEY_BYTES):
+def read_signed_payload(path: Path, label: str, *, expected_sha256: str | None = None,
+                        maximum_bytes: int = MAXIMUM_POLICY_BYTES) -> bytes:
+    try:
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise TrustPolicyError(f"{label} is not a regular file")
+            payload = stream.read(maximum_bytes + 1)
+    except OSError as error:
+        raise TrustPolicyError(f"{label} is unavailable or symbolic") from error
+    if not 1 <= len(payload) <= maximum_bytes:
         raise TrustPolicyError(f"{label} trust material is unavailable or invalid")
-    result = subprocess.run([openssl_binary(), "pkeyutl", "-verify", "-rawin",
-        "-pubin", "-inkey", str(public_key.resolve()), "-in",
-        str(content.resolve()), "-sigfile", str(signature.resolve())],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        check=False)
-    if result.returncode:
-        raise TrustPolicyError(f"{label} signature is invalid")
+    if expected_sha256 is not None and hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise TrustPolicyError(f"{label} differs from the expected digest")
+    return payload
+
+
+def selected_key_bytes(policy: dict, key_id: str, path: Path) -> bytes:
+    record = next(key for key in policy["keys"] if key["keyId"] == key_id)
+    return read_signed_payload(path, f"key {key_id}", expected_sha256=record["publicKey"]["sha256"],
+                               maximum_bytes=MAXIMUM_PUBLIC_KEY_BYTES)
+
+
+def verify_signature(content: Path | bytes, signature: Path, public_key: Path | bytes,
+                     label: str) -> None:
+    payload = read_signed_payload(content, label) if isinstance(content, Path) else content
+    if (not signature.is_file() or signature.is_symlink()
+            or not 1 <= signature.stat().st_size <= MAXIMUM_SIGNATURE_BYTES):
+        raise TrustPolicyError(f"{label} trust material is unavailable or invalid")
+    if isinstance(public_key, Path):
+        public_key = read_signed_payload(public_key, label, maximum_bytes=MAXIMUM_PUBLIC_KEY_BYTES)
+    try:
+        verify_ed25519(payload, signature, public_key)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        raise TrustPolicyError(f"{label} signature is invalid") from error
 
 
 def verify(policy_path: Path, *, signature_path: Path, root_public_key: Path,
@@ -97,10 +117,10 @@ def verify(policy_path: Path, *, signature_path: Path, root_public_key: Path,
         raise TrustPolicyError("verification time must be an exact second UTC instant")
     if type(minimum_sequence) is not int or minimum_sequence < 1:
         raise TrustPolicyError("minimum trust-policy sequence is invalid")
-    verify_signature(policy_path, signature_path, root_public_key,
-                     "signing trust policy")
+    payload = read_signed_payload(policy_path, "signing trust policy")
+    verify_signature(payload, signature_path, root_public_key, "signing trust policy")
     try:
-        policy = json.loads(policy_path.read_text(encoding="ascii"))
+        policy = json.loads(payload.decode("ascii"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise TrustPolicyError(f"signing trust policy is invalid: {error}") from error
     if (not isinstance(policy, dict) or set(policy) != POLICY_FIELDS
@@ -108,7 +128,7 @@ def verify(policy_path: Path, *, signature_path: Path, root_public_key: Path,
             or type(policy.get("sequence")) is not int
             or policy["sequence"] < minimum_sequence
             or policy.get("rotationPolicy") != ROTATION
-            or canonical(policy) != policy_path.read_bytes()):
+            or canonical(policy) != payload):
         raise TrustPolicyError("signing trust policy contract is invalid or rolled back")
     issued, expires = instant(policy["issuedAt"], "issuedAt"), instant(
         policy["expiresAt"], "expiresAt")

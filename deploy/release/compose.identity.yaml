@@ -38,10 +38,19 @@ services:
       KC_BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/keycloak_admin_password
       KC_HTTPS_CERTIFICATE_FILE: /run/secrets/keycloak_internal_tls_certificate
       KC_HTTPS_CERTIFICATE_KEY_FILE: /run/secrets/keycloak_internal_tls_private_key
+      KC_HTTP_MANAGEMENT_HOST: 127.0.0.1
+      KC_HTTP_MANAGEMENT_SCHEME: http
     networks: [application, control]
     depends_on: {control-db: {condition: service_healthy}}
     healthcheck:
-      test: ["CMD", "/bin/bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/9000; printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; grep -q 'HTTP/1.1 200 OK' <&3"]
+      test:
+        - CMD
+        - /bin/bash
+        - -ec
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000;
+          printf '%s\r\n' 'GET /health/ready HTTP/1.1' 'Host: localhost' 'Connection: close' '' >&3;
+          grep -q 'HTTP/1.1 200 OK' <&3
       interval: 10s
       timeout: 4s
       retries: 30

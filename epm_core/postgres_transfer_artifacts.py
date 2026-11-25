@@ -15,7 +15,8 @@ from epm_core.postgres_processing_limits import configure_statement_timeout
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .export_artifact_manifest import export_artifact_manifest_matches
+from .export_artifact_manifest import (
+    export_artifact_manifest_matches, export_type_counts_schema, sealed_manifest_schema)
 from .persistence_contract import ApplicationScope
 from .postgres_access import PostgresAccessChecker, VerifiedIdentity
 from .postgres_dimensional_scope import resolve_effective_dimensional_scope
@@ -23,7 +24,8 @@ from .postgres_jobs import _canonical_digest
 from .postgres_numeric_store import PostgresNumericFactStore
 from .source_import_diagnostics import (
     CONTRACT_VERSION as DIAGNOSTIC_CONTRACT, DiagnosticCode,
-    SourceDiagnostic, source_diagnostics_digest_matches)
+    SourceDiagnostic, diagnostic_summary_properties, diagnostics_artifact_schema,
+    source_diagnostics_digest_matches)
 
 
 _ID = re.compile(r'[0-9a-f]{32}\Z')
@@ -34,9 +36,85 @@ _TABLES = {'import': 'source_import_diagnostic_artifact',
            'export': 'fact_export_artifact'}
 IMPORT_READ = 'facts.transfer.import.diagnostics.read'
 IMPORT_LIST = 'facts.transfer.import.diagnostics.list'
+IMPORT_DIAGNOSTIC_READS = frozenset((IMPORT_READ, IMPORT_LIST))
 EXPORT_READ = 'facts.transfer.export.manifest.read'
 EXPORT_LIST = 'facts.transfer.export.manifest.list'
-READ_FUNCTIONS = frozenset((IMPORT_READ, IMPORT_LIST, EXPORT_READ, EXPORT_LIST))
+EXPORT_MANIFEST_READS = frozenset((EXPORT_READ, EXPORT_LIST))
+READ_FUNCTIONS = IMPORT_DIAGNOSTIC_READS | EXPORT_MANIFEST_READS
+
+
+def transfer_artifact_program_contract(function: str) -> dict | None:
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    identifier = {'type': 'string', 'pattern': r'^[0-9a-f]{32}(?![\s\S])'}
+    digest = {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}
+    expiry = {'type': 'integer', 'minimum': 1, 'maximum': 2**63 - 1}
+    count = {'type': 'integer', 'minimum': 0}
+    timestamp = {'type': 'string', 'format': 'date-time'}
+    retention = {'enum': sorted(_RETENTION)}
+    if function in EXPORT_MANIFEST_READS:
+        rules = ['Use the original actor, current application READ, and the current dimensional authorization scope.',
+                 'Export manifests contain sealed metadata and page digests. Read row payload separately.']
+    elif function in IMPORT_DIAGNOSTIC_READS:
+        rules = ['Use the original actor with current application READ.',
+                 'Diagnostic messages are fixed by the compiler. The source identity and counts describe the retained artifact.']
+    else:
+        return None
+    if function in (EXPORT_READ, IMPORT_READ):
+        importing = function == IMPORT_READ
+        arguments = obj({'artifactId': identifier})
+        nullable = {'type': ['string', 'null']}
+        artifact = diagnostics_artifact_schema() if importing else sealed_manifest_schema()
+        result = obj({'artifactId': identifier, 'artifact': artifact,
+            'retention': obj({'status': retention, 'reason': nullable, 'issuer': nullable,
+                              'subjectId': nullable, 'updatedAt': {**timestamp, **nullable}}),
+            'expiresAt': expiry, 'expired': {'type': 'boolean'}, 'createdAt': timestamp,
+            'duplicate': {'type': 'boolean'}})
+        if importing:
+            examples = [read_example(function, {'artifactId': 'a' * 32},
+                name='Read retained import diagnostics',
+                binding='Use the diagnosticArtifactId from the batch preview or import receipt, or an artifactId from the diagnostics list.')]
+            rules.append('An authorized exact-ID read can return a retained expired artifact with expired=true.')
+            recovery = 'Check the identifier and current access. List visible artifacts under the original identity to recover a lost artifact ID.'
+        else:
+            examples = [read_example(function, {'artifactId': 'a' * 32}, name='Read a sealed export manifest',
+                binding='Use the artifactId from a completed export or the visible manifest list in this application.')]
+            rules.append('The retention state and expired flag describe whether the sealed payload may still be retrieved.')
+            recovery = ('Check the original export status and current access if the artifact is unavailable. '
+                        'Use facts.transfer.export.payload.page only for a retained, unexpired artifact.')
+    else:
+        cursor = {'type': 'string', 'minLength': 1, 'maxLength': 8192}
+        arguments = {'oneOf': [obj({'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100},
+            'includeExpired': {'type': 'boolean'}}, []), obj({'cursor': cursor})]}
+        lifetime = {'expiresAt': expiry, 'expired': {'type': 'boolean'},
+                    'retentionStatus': retention, 'createdAt': timestamp}
+        if function == IMPORT_LIST:
+            details = {'batchId': identifier, 'artifactDigest': digest,
+                       **diagnostic_summary_properties()}
+            list_name, item_name, order = 'List visible import diagnostics', 'diagnostic', 'creation'
+        else:
+            details = {'manifestDigest': digest, 'cumulativeDigest': digest,
+                'snapshotRevision': count, 'metadataRevision': count,
+                'securityRevision': {**count, 'type': ['integer', 'null']}, 'pageCount': count,
+                'rowCount': count, 'rowBytes': count, 'typeCounts': export_type_counts_schema()}
+            list_name, item_name, order = 'List visible finalized export manifests', 'manifest', 'publication'
+        summary = obj({'artifactId': identifier, **details, **lifetime})
+        result = obj({'artifacts': {'type': 'array', 'maxItems': 100, 'items': summary},
+            'nextCursor': {**cursor, 'type': ['string', 'null']}, 'hasMore': {'type': 'boolean'},
+            'expiredVisibility': {'enum': ['included', 'excluded']}})
+        examples = [read_example(function, {'limit': 25, 'includeExpired': False},
+            name=list_name, binding='Use the current authorized application.'),
+            read_example(function, {'cursor': f'example-signed-{item_name}-cursor'},
+                name=f'Continue the same {item_name} listing',
+                binding='Use the exact nextCursor returned by the previous page, by itself.')]
+        rules.extend(['The first page defaults to limit=50 and excludes expired artifacts.',
+                      f'Results are keyset-ordered by {order} time and artifact ID. A null nextCursor ends the listing.'])
+        recovery = 'Restart the first page with the intended filters if the signed continuation is no longer usable.'
+    contract = read_contract(function, arguments, result, owner='PostgresTransferArtifacts',
+        examples=examples, semantic_rules=rules)
+    contract['programContract']['recovery'] = recovery
+    return contract
 
 
 def transfer_artifact_catalog() -> dict:
@@ -47,23 +125,25 @@ def transfer_artifact_catalog() -> dict:
         IMPORT_READ: {**common,
             'arguments': {'artifactId': 'exact 32-character hexadecimal ID'},
             'result': ('verified bounded compiled diagnostics; exact-ID reads '
-                       'remain visible after expiry and return expired=true')},
+                       'remain visible after expiry and return expired=true'),
+            **transfer_artifact_program_contract(IMPORT_READ)},
         IMPORT_LIST: {**common,
             'arguments': {'limit': 'optional 1-100, default 50',
                           'includeExpired': 'optional boolean, default false',
                           'cursor': 'signed complete continuation request'},
             'result': ('bounded diagnostic-artifact summaries in stable '
-                       'createdAt/artifactId order; expired excluded by default')},
+                       'createdAt/artifactId order; expired excluded by default'),
+            **transfer_artifact_program_contract(IMPORT_LIST)},
         EXPORT_READ: {**common,
             'arguments': {'artifactId': 'exact 32-character hexadecimal ID'},
             'result': ('verified finalized export manifest metadata/pages only; '
-                       'no exported row payload or download')},
+                       'no exported row payload or download'), **transfer_artifact_program_contract(EXPORT_READ)},
         EXPORT_LIST: {**common,
             'arguments': {'limit': 'optional 1-100, default 50',
                           'includeExpired': 'optional boolean, default false',
                           'cursor': 'signed complete continuation request'},
             'result': ('bounded finalized-manifest summaries; no exported row '
-                       'payload or download')},
+                       'payload or download'), **transfer_artifact_program_contract(EXPORT_LIST)},
     }
 
 
@@ -174,10 +254,11 @@ class PostgresTransferArtifacts:
         self.identity = identity
         self.cursor_secret = cursor_secret
 
-    def _authorization_scope_digest(self, db, scope: ApplicationScope) -> str:
+    def _authorization_scope_digest(self, db, scope: ApplicationScope, *, function=EXPORT_READ, membership_fence=True) -> str:
+        if membership_fence:
+            PostgresAccessChecker.lock_directory_membership_for_assignment(db)
         return resolve_effective_dimensional_scope(
-            db, self.identity, scope,
-            function='facts.transfer.export.manifest.read').scope_digest
+            db, self.identity, scope, function=function).scope_digest
 
     @staticmethod
     def _arguments(scope, idempotency_key, expires_at):
@@ -293,10 +374,11 @@ class PostgresTransferArtifacts:
             with db.transaction():
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
+                if producer_request_id is None:
+                    # Unclaimed technical publication has no group-assigned entry point.
+                    PostgresAccessChecker.check_in_transaction(db, self.identity, scope, 'read')
                 authorization_scope_digest = self._authorization_scope_digest(
-                    db, scope)
+                    db, scope, membership_fence=producer_request_id is not None)
                 request_identity['authorizationScopeDigest'] = (
                     authorization_scope_digest)
                 request_digest = _canonical_digest(request_identity)
@@ -450,8 +532,8 @@ class PostgresTransferArtifacts:
                 db.execute('SET TRANSACTION READ ONLY')
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
+                if artifact_kind == 'import':
+                    PostgresAccessChecker.check_in_transaction(db, self.identity, scope, 'read')
                 authorization_scope_digest = (self._authorization_scope_digest(
                     db, scope) if artifact_kind == 'export' else None)
                 row = db.execute(f'''SELECT *,
@@ -516,10 +598,10 @@ class PostgresTransferArtifacts:
                 db.execute('SET TRANSACTION READ ONLY')
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
+                if artifact_kind == 'import':
+                    PostgresAccessChecker.check_in_transaction(db, self.identity, scope, 'read')
                 authorization_scope_digest = (self._authorization_scope_digest(
-                    db, scope) if artifact_kind == 'export' else None)
+                    db, scope, function=EXPORT_LIST) if artifact_kind == 'export' else None)
                 if artifact_kind == 'export':
                     visible_sql += ' AND t.authorization_scope_digest=%s'
                 rows = db.execute(f'''SELECT t.*,{order_sql} AS publication_at,
@@ -664,7 +746,7 @@ class PostgresTransferArtifacts:
                 PostgresAccessChecker.check_in_transaction(
                     db, self.identity, scope, 'admin')
                 authorization_scope_digest = (self._authorization_scope_digest(
-                    db, scope) if artifact_kind == 'export' else None)
+                    db, scope, membership_fence=False) if artifact_kind == 'export' else None)
                 row = db.execute(f'''UPDATE epm.{table} SET
                     retention_status=%s,retention_reason=%s,
                     retention_issuer=%s,retention_subject_id=%s,

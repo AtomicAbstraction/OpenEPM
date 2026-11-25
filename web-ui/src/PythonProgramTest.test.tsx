@@ -3,7 +3,10 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { PythonProgramTest } from "./PythonProgramTest";
 import { authoringContextKey } from "./python-authoring";
-import { installOperationAdmissionFixture } from "./test-setup";
+import {
+  installOperationAdmissionFixture,
+  operationAdmissionResponse,
+} from "./test-setup";
 import type { ComponentProps } from "react";
 function TestFixture(
   props: Omit<
@@ -59,7 +62,7 @@ it("uses pre-activation validated parameter declarations and sends separate type
       return new Response(
         JSON.stringify({
           result: {
-            buildId: "typed-test",
+            buildId: "1".repeat(32),
             status: "failed",
             purpose: "ImpactTest",
           },
@@ -132,7 +135,25 @@ it("uses pre-activation validated parameter declarations and sends separate type
 it("tests an exact current source without delegation and reads private impact with UTF-8 paging", async () => {
   const requests: Record<string, unknown>[] = [];
   let pages = 0;
-  const content = new TextEncoder().encode('{"effect":"€"}');
+  const content = new TextEncoder().encode(
+    JSON.stringify({
+      format: "openepm-python-impact-v1",
+      status: "complete",
+      sourceDigest: program.sourceDigest,
+      businessDataChanged: false,
+      baseline: {},
+      counts: { selected: 1, changed: 1, created: 1, cleared: 0 },
+      rows: [
+        {
+          seriesKey: "one",
+          members: { Account: "Narrative" },
+          before: { present: false },
+          after: { present: true, kind: "text", text: "€" },
+          delta: null,
+        },
+      ],
+    }),
+  );
   const split = content.indexOf(0xe2) + 1;
   const base64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
   vi.stubGlobal(
@@ -160,7 +181,7 @@ it("tests an exact current source without delegation and reads private impact wi
       return new Response(
         JSON.stringify({
           result: {
-            buildId: "test-1",
+            buildId: "2".repeat(32),
             status: body.action === "read" ? "sealed" : "accepted",
             purpose: "ImpactTest",
           },
@@ -203,15 +224,16 @@ it("tests an exact current source without delegation and reads private impact wi
     ).toBeEnabled(),
   );
   fireEvent.click(screen.getByRole("button", { name: "Next impact page" }));
-  fireEvent.click(screen.getByText("Technical impact artifact"));
-  await waitFor(() =>
-    expect(
-      screen.getByRole("region", { name: "Python impact artifact" }),
-    ).toHaveTextContent('{"effect":"€"}'),
-  );
+  expect(await screen.findByText("€")).toBeVisible();
+  expect(
+    screen.queryByText("Technical impact artifact"),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("region", { name: "Python impact artifact" }),
+  ).not.toBeInTheDocument();
   expect(requests.at(-1)).toMatchObject({
     action: "artifact",
-    buildId: "test-1",
+    buildId: "2".repeat(32),
     section: "Impact",
     cursor: "cursor-2",
   });
@@ -219,9 +241,7 @@ it("tests an exact current source without delegation and reads private impact wi
   fireEvent.change(screen.getByLabelText("Python test parameters"), {
     target: { value: "{}" },
   });
-  expect(
-    screen.queryByRole("region", { name: "Python impact artifact" }),
-  ).not.toBeInTheDocument();
+  expect(screen.queryByText("€")).not.toBeInTheDocument();
 });
 
 it("rejects another build purpose and invalid parameters before sending", async () => {
@@ -251,7 +271,7 @@ it("rejects another build purpose and invalid parameters before sending", async 
   ).not.toBeInTheDocument();
 });
 
-it("discards late responses when the application context changes", async () => {
+it("withholds a late acknowledgement after context change and retains its original lookup", async () => {
   let finish: (value: Response) => void = () => undefined;
   vi.stubGlobal(
     "fetch",
@@ -267,6 +287,7 @@ it("discards late responses when the application context changes", async () => {
     <TestFixture app={app} catalog={catalog} program={program} />,
   );
   fireEvent.click(screen.getByRole("button", { name: "Test source" }));
+  await screen.findByRole("region", { name: "Original Python impact test" });
   rerender(
     <TestFixture
       app={app}
@@ -277,14 +298,19 @@ it("discards late responses when the application context changes", async () => {
   finish(
     new Response(
       JSON.stringify({
-        result: { buildId: "test-1", status: "sealed", purpose: "ImpactTest" },
+        result: {
+          buildId: "2".repeat(32),
+          status: "sealed",
+          purpose: "ImpactTest",
+        },
       }),
     ),
   );
-  await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Test source" })).toBeEnabled(),
-  );
+  expect(screen.getByRole("button", { name: "Test source" })).toBeDisabled();
   expect(screen.queryByText("Test: sealed")).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Check original test" }),
+  ).toBeEnabled();
 });
 
 it("allows an expired result to be tested again and keeps that fresh intent stable after response loss", async () => {
@@ -294,6 +320,11 @@ it("allows an expired result to be tested again and keeps that fresh intent stab
     "fetch",
     vi.fn(async (_input, init) => {
       const body = JSON.parse(init.body);
+      if (body.action === "read")
+        return Response.json(
+          { code: "PYTHON_BUILD_UNAVAILABLE" },
+          { status: 400 },
+        );
       mutationKeys.push(body.idempotencyKey);
       if (first) {
         first = false;
@@ -302,7 +333,7 @@ it("allows an expired result to be tested again and keeps that fresh intent stab
       return new Response(
         JSON.stringify({
           result: {
-            buildId: "fresh-test",
+            buildId: "3".repeat(32),
             purpose: "ImpactTest",
             status: "sealed",
           },
@@ -336,17 +367,203 @@ it("allows an expired result to be tested again and keeps that fresh intent stab
   );
   fireEvent.click(screen.getByRole("button", { name: "Test source" }));
   await screen.findByText("Response lost");
-  fireEvent.click(screen.getByRole("button", { name: "Test source" }));
+  expect(screen.getByRole("button", { name: "Test source" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Check original test" }));
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Retry original test" }),
+  );
   await screen.findByText("Test: sealed");
   expect(mutationKeys).toHaveLength(2);
   expect(mutationKeys[0]).toBe(mutationKeys[1]);
-  expect(onSealedTest).toHaveBeenCalledWith(
-    expect.objectContaining({
-      buildId: "fresh-test",
-      programId: "forecast",
-      sourceToken: "c".repeat(64),
+  await waitFor(() =>
+    expect(onSealedTest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        buildId: "3".repeat(32),
+        programId: "forecast",
+        sourceToken: "c".repeat(64),
+      }),
+    ),
+  );
+});
+
+it("recovers a committed test by read under current authority through a same-tab remount", async () => {
+  const effects: string[] = [];
+  const lookups: Array<Record<string, unknown>> = [];
+  const copy = vi.fn(async () => {});
+  const onSealedTest = vi.fn();
+  vi.stubGlobal("navigator", { clipboard: { writeText: copy } });
+  const admission = vi.fn(() => operationAdmissionResponse("a"));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (path, init) => {
+      if (path === "/api/operation-admission") return admission();
+      const body = JSON.parse(String(init.body));
+      if (body.action === "request") {
+        effects.push(String(init.body));
+        return Response.json(
+          { code: "WEB_OPERATION_OUTCOME_UNKNOWN" },
+          { status: 503 },
+        );
+      }
+      lookups.push(body);
+      return Response.json({
+        result: {
+          buildId: "e".repeat(32),
+          purpose: "ImpactTest",
+          status: "sealed",
+        },
+      });
     }),
   );
+  const editor = {
+    ...catalog,
+    applicationAccess: {
+      ...catalog.applicationAccess,
+      issuer: "issuer",
+      subjectId: "owner",
+    },
+    functions: { ...catalog.functions, "python.program.read": {} },
+  };
+  const { unmount } = render(
+    <TestFixture app={app} catalog={editor} program={program} />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Test source" }));
+  await screen.findByText("WEB_OPERATION_OUTCOME_UNKNOWN");
+  expect(
+    screen.queryByRole("button", { name: "Retry original test" }),
+  ).toBeNull();
+  unmount();
+  const reader = {
+    ...editor,
+    revisions: { ...editor.revisions, security: 1 },
+    applicationAccess: { ...editor.applicationAccess, role: "Reader" },
+    functions: { "python.program.read": {} },
+  };
+  const fixture = (
+    target: ApplicationSummary,
+    authority: ApplicationCatalog,
+  ) => (
+    <TestFixture
+      app={target}
+      catalog={authority}
+      program={program}
+      onSealedTest={onSealedTest}
+    />
+  );
+  const view = render(fixture({ ...app, applicationId: "other" }, reader));
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("button", { name: "Check original test" }),
+    ).toBeNull(),
+  );
+  view.rerender(
+    fixture(app, {
+      ...reader,
+      applicationAccess: {
+        ...reader.applicationAccess,
+        subjectId: "different",
+      },
+    }),
+  );
+  expect(
+    screen.queryByRole("button", { name: "Check original test" }),
+  ).toBeNull();
+  view.rerender(fixture(app, reader));
+  const check = await screen.findByRole("button", {
+    name: "Check original test",
+  });
+  expect(screen.queryByRole("button", { name: "Test source" })).toBeNull();
+  expect(lookups).toHaveLength(0);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Copy original test lookup for MCP" }),
+  );
+  await waitFor(() => expect(copy).toHaveBeenCalledTimes(1));
+  check.focus();
+  fireEvent.click(check);
+  await screen.findByText(
+    "Test: sealed · source context or parameters changed",
+  );
+  expect(
+    screen.getByRole("heading", { name: "Test this source" }),
+  ).toHaveFocus();
+  expect(admission).toHaveBeenCalledTimes(1);
+  expect(effects).toHaveLength(1);
+  const { program: requestProgram, idempotencyKey } = JSON.parse(effects[0]);
+  const originalRequest = { program: requestProgram, idempotencyKey };
+  expect(lookups).toEqual([
+    {
+      workspaceId: "ws",
+      applicationId: "app",
+      action: "read",
+      originalRequest,
+    },
+  ]);
+  expect(copy).toHaveBeenCalledWith(
+    JSON.stringify({
+      tool: "read_v2_python_program_build",
+      arguments: {
+        workspace_id: "ws",
+        application_id: "app",
+        original_request: originalRequest,
+      },
+    }),
+  );
+  expect(onSealedTest.mock.calls.every(([value]) => value === null)).toBe(true);
+});
+
+it("never offers an effect after a denied check and closes only a confirmed missing expired original", async () => {
+  const effects: string[] = [];
+  let readCount = 0;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_path, init) => {
+      const body = JSON.parse(String(init.body));
+      if (body.action === "read") {
+        readCount += 1;
+        return readCount === 1
+          ? Response.json({ code: "PYTHON_BUILD_UNAVAILABLE" }, { status: 403 })
+          : Response.json(
+              { code: "PYTHON_BUILD_UNAVAILABLE" },
+              { status: 400 },
+            );
+      }
+      effects.push(String(init.body));
+      return effects.length === 1
+        ? Response.json(
+            { code: "WEB_OPERATION_OUTCOME_UNKNOWN" },
+            { status: 503 },
+          )
+        : Response.json(
+            { code: "OPERATION_ADMISSION_EXPIRED" },
+            { status: 400 },
+          );
+    }),
+  );
+  installOperationAdmissionFixture("b");
+  render(<TestFixture app={app} catalog={catalog} program={program} />);
+  fireEvent.click(screen.getByRole("button", { name: "Test source" }));
+  await screen.findByText("WEB_OPERATION_OUTCOME_UNKNOWN");
+  fireEvent.click(screen.getByRole("button", { name: "Check original test" }));
+  await screen.findByText("PYTHON_BUILD_UNAVAILABLE");
+  expect(
+    screen.queryByRole("button", { name: "Retry original test" }),
+  ).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Check original test" }));
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Retry original test" }),
+  );
+  expect(effects).toHaveLength(2);
+  expect(effects[0]).toBe(effects[1]);
+  const close = await screen.findByRole("button", {
+    name: "Close expired request",
+  });
+  expect(screen.getByRole("button", { name: "Test source" })).toBeDisabled();
+  fireEvent.click(close);
+  await screen.findByText(
+    "Original request closed. Review the current inputs before testing again.",
+  );
+  expect(screen.getByRole("button", { name: "Test source" })).toBeEnabled();
+  expect(effects).toHaveLength(2);
 });
 it("keeps source and rule parameters separate and binds activation eligibility to the exact tested definition", async () => {
   const calls: any[] = [],
@@ -365,14 +582,18 @@ it("keeps source and rule parameters separate and binds activation eligibility t
           ? {
               ...program,
               latestImpactTest: {
-                buildId: "typed-test",
+                buildId: "1".repeat(32),
                 purpose: "ImpactTest",
                 status: "sealed",
                 current: true,
                 definition,
               },
             }
-          : { buildId: "typed-test", purpose: "ImpactTest", status: "sealed" };
+          : {
+              buildId: "1".repeat(32),
+              purpose: "ImpactTest",
+              status: "sealed",
+            };
       return new Response(JSON.stringify({ result }));
     }),
   );
@@ -381,29 +602,42 @@ it("keeps source and rule parameters separate and binds activation eligibility t
     <TestFixture
       app={app}
       catalog={catalog}
-      program={program}
+      program={{
+        ...program,
+        validation: {
+          buildId: "valid",
+          purpose: "Validation",
+          status: "sealed",
+          current: true,
+          definition: {
+            ...definition,
+            parameters: [{ name: "factor", type: "Amount" }],
+          },
+        },
+      }}
       definitionKind="ApplicationRule"
+      definitionContextKey={authoringContextKey(app, catalog)}
       onSealedTest={onSealedTest}
     />,
   );
   fireEvent.change(screen.getByLabelText("Python test parameters"), {
     target: { value: '{"definitionVersion":2}' },
   });
-  fireEvent.change(screen.getByLabelText("Python rule test parameters"), {
-    target: { value: '{"factor":"2.00000001"}' },
+  fireEvent.change(screen.getByLabelText("factor"), {
+    target: { value: "2.00000001" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Test source" }));
   await waitFor(() =>
     expect(onSealedTest).toHaveBeenCalledWith(
-      expect.objectContaining({ buildId: "typed-test", definition }),
+      expect.objectContaining({ buildId: "1".repeat(32), definition }),
     ),
   );
   expect(calls[0].program.arguments).toMatchObject({
     parameters: { definitionVersion: 2 },
     definitionParameters: { factor: "2.00000001" },
   });
-  fireEvent.change(screen.getByLabelText("Python rule test parameters"), {
-    target: { value: '{"factor":"3"}' },
+  fireEvent.change(screen.getByLabelText("factor"), {
+    target: { value: "3" },
   });
   await waitFor(() => expect(onSealedTest).toHaveBeenLastCalledWith(null));
 });
@@ -429,7 +663,7 @@ it.each(["build", "program", "source", "purpose", "status", "current"])(
                       buildId:
                         mismatch === "build"
                           ? "different-test"
-                          : "displayed-test",
+                          : "4".repeat(32),
                       purpose: mismatch === "purpose" ? "Plan" : "ImpactTest",
                       status: mismatch === "status" ? "expired" : "sealed",
                       current: mismatch !== "current",
@@ -440,7 +674,7 @@ it.each(["build", "program", "source", "purpose", "status", "current"])(
                     },
                   }
                 : {
-                    buildId: "displayed-test",
+                    buildId: "4".repeat(32),
                     purpose: "ImpactTest",
                     status: "sealed",
                   },

@@ -10,8 +10,12 @@ from __future__ import annotations
 import argparse
 import base64
 from hashlib import sha256
+import importlib.util
+import json
 from pathlib import Path
 import re
+import sys
+import sysconfig
 import zipfile
 
 
@@ -36,7 +40,7 @@ def _digest(content: bytes) -> str:
     return "sha256=" + value.decode("ascii")
 
 
-def build(source_root: Path, destination: Path) -> Path:
+def _distribution_files(source_root: Path) -> dict[str, bytes]:
     package = source_root.resolve() / "openepm"
     if not package.is_dir() or package.is_symlink():
         raise ValueError("OPEN_EPM_SDK_SOURCE_INVALID")
@@ -70,6 +74,31 @@ def build(source_root: Path, destination: Path) -> Path:
                for name, content in sorted(files.items())]
     records.append(f"{record_name},,")
     files[record_name] = ("\n".join(records) + "\n").encode("utf-8")
+    return files
+
+
+def sdk_file_hashes(source_root: Path) -> dict[str, str]:
+    """Hash the exact payload admitted by the audited wheel builder."""
+    return {name: sha256(content).hexdigest()
+            for name, content in sorted(_distribution_files(source_root).items())}
+
+
+def installed_sdk_file_hashes(site_packages: Path) -> dict[str, str]:
+    """Read the complete installed package and wheel metadata, including RECORD."""
+    files = {}
+    for name in ("openepm", DIST_INFO):
+        directory = site_packages / name
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("OPEN_EPM_INSTALLED_SDK_INVALID")
+        for path in sorted(directory.iterdir()):
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("OPEN_EPM_INSTALLED_SDK_INVALID")
+            files[f"{name}/{path.name}"] = sha256(path.read_bytes()).hexdigest()
+    return files
+
+
+def build(source_root: Path, destination: Path) -> Path:
+    files = _distribution_files(source_root)
     destination.mkdir(mode=0o755, parents=True, exist_ok=True)
     target = destination / WHEEL
     temporary = destination / ("." + WHEEL + ".partial")
@@ -90,9 +119,19 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path,
                         default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--destination", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--destination", type=Path)
+    mode.add_argument("--inspect-installed-sdk", action="store_true")
     arguments = parser.parse_args()
-    print(build(arguments.source_root, arguments.destination))
+    if arguments.inspect_installed_sdk:
+        purelib = Path(sysconfig.get_path("purelib"))
+        spec = importlib.util.find_spec("openepm")
+        if not spec or spec.origin != str(purelib / "openepm/__init__.py"):
+            raise ValueError("OPEN_EPM_INSTALLED_SDK_IMPORT_PATH_INVALID")
+        print(json.dumps({"filesSha256": installed_sdk_file_hashes(purelib),
+                          "pythonVersion": sys.version.split()[0]}, sort_keys=True))
+    else:
+        print(build(arguments.source_root, arguments.destination))
 
 
 if __name__ == "__main__":

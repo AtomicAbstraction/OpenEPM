@@ -16,7 +16,7 @@ from typing import AbstractSet, Iterable
 _TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,19}\Z")
 _STRING = re.compile(r"read=([^;]*);write=([^;]*)\Z")
 _MAX_TAGS_PER_KIND = 100
-_MAX_SECURITY_STRING_LENGTH = 8192
+MAX_SECURITY_STRING_LENGTH = 8192
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +60,7 @@ def parse_security_string(
     untagged value and is normalized by :func:`render_security_string`.
     """
     if (not isinstance(value, str)
-            or len(value) > _MAX_SECURITY_STRING_LENGTH
+            or len(value) > MAX_SECURITY_STRING_LENGTH
             or value != value.strip()
             or any(ord(character) < 32 for character in value)):
         raise ValueError("SECURITY_STRING_INVALID")

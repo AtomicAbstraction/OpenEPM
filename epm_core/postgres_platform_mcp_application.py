@@ -11,11 +11,12 @@ import os
 
 from .postgres_verified_principal import principal_claims
 from .postgres_access import VerifiedIdentity, assert_nonowner_role
-from .postgres_platform_provision import PostgresPlatformProvisioner
+from .postgres_platform_provision import OPERATION_RECEIPT_READ, PostgresPlatformProvisioner
+from .public_program_diagnostics import validate_program_envelope, validate_program_structure
 from .keycloak_directory import KeycloakDirectory, KeycloakDirectoryApi
 from .postgres_identity_directory import (
-    ALL_FUNCTIONS as DIRECTORY_FUNCTIONS,
     READ_FUNCTIONS as DIRECTORY_READ_FUNCTIONS,
+    WRITE_FUNCTIONS as DIRECTORY_WRITE_FUNCTIONS,
     PostgresIdentityDirectory, catalog as directory_catalog,
 )
 
@@ -97,7 +98,12 @@ class PostgresPlatformMCPApplication:
     def create_for_identity(self,identity: VerifiedIdentity,program: dict,*,
                             idempotency_key: str) -> dict:
         identity=self._authorize_identity(identity)
-        if isinstance(program,dict) and program.get('function') in DIRECTORY_FUNCTIONS:
+        validate_program_envelope(program, scope='platform')
+        function = program['function']
+        if function == OPERATION_RECEIPT_READ or function in DIRECTORY_READ_FUNCTIONS:
+            raise ValueError('V2_FUNCTION_MODE_MISMATCH')
+        validate_program_structure(program, scope='platform')
+        if function in DIRECTORY_WRITE_FUNCTIONS:
             return self._directory_for_identity(identity).execute(
                 program,idempotency_key=idempotency_key)
         return self._provisioner_for_identity(identity).create(
@@ -110,8 +116,13 @@ class PostgresPlatformMCPApplication:
             issued_at=principal['issuedAt']),program)
 
     def read_for_identity(self,identity: VerifiedIdentity,program: dict) -> dict:
+        if isinstance(program,dict) and program.get('function') == OPERATION_RECEIPT_READ:
+            validate_program_envelope(program, scope='platform')
+            validate_program_structure(program, scope='platform')
+            return self._provisioner_for_identity(identity).read_operation_receipt(program)
         identity=self._authorize_identity(identity)
-        if (not isinstance(program,dict)
-                or program.get('function') not in DIRECTORY_READ_FUNCTIONS):
+        validate_program_envelope(program, scope='platform')
+        if program['function'] not in DIRECTORY_READ_FUNCTIONS:
             raise ValueError('V2_FUNCTION_MODE_MISMATCH')
+        validate_program_structure(program, scope='platform')
         return self._directory_for_identity(identity).read(program)

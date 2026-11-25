@@ -10,8 +10,13 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
+import json
 import re
 
+
+BROWSER_IDENTITY_HEADER = 'x-openepm-browser-identity'
+BROWSER_IDENTITY_INVALID = 'BROWSER_IDENTITY_BINDING_INVALID'
+BROWSER_IDENTITY_CHANGED = 'BROWSER_IDENTITY_CHANGED'
 
 _FORMAT_VERSION = 3
 _DIGEST = re.compile(r'[0-9a-f]{64}')
@@ -137,6 +142,26 @@ def bind_verified_principal(principal: VerifiedPrincipal):
 
 def current_verified_principal() -> VerifiedPrincipal | None:
     return _bound_principal.get()
+
+
+def browser_identity_binding(issuer: str, subject: str) -> str:
+    """An account precondition for a browser request, with no authority of its own."""
+    document = json.dumps(['openepm-browser-identity-v1', issuer, subject],
+                          ensure_ascii=True, separators=(',', ':'))
+    return hashlib.sha256(document.encode('ascii')).hexdigest()
+
+
+def validate_browser_identity(issuer: str, subject: str, expected: str | None) -> None:
+    from .postgres_auth import AuthError
+
+    if expected is None:
+        return
+    if _DIGEST.fullmatch(expected) is None:
+        raise AuthError('The browser identity binding is invalid', status=400,
+                        code=BROWSER_IDENTITY_INVALID)
+    if expected != browser_identity_binding(issuer, subject):
+        raise AuthError('The authenticated account changed', status=409,
+                        code=BROWSER_IDENTITY_CHANGED)
 
 
 def principal_claims(assertion: str, audience_kind: str) -> dict:

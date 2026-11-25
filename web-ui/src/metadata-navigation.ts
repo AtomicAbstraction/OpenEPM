@@ -2,8 +2,8 @@ export type MetadataSection =
   | "dimensions"
   | "members"
   | "relationships"
+  | "tree"
   | "attributes"
-  | "semantics"
   | "security-tags"
   | "settings"
   | "reference";
@@ -13,6 +13,7 @@ export type MetadataDestination = {
   dimensionId?: string;
   memberId?: string;
   hierarchyId?: string;
+  relationshipId?: string;
 };
 
 export type MetadataNavigationDimension = {
@@ -26,8 +27,8 @@ export const metadataSectionLabels: Record<MetadataSection, string> = {
   dimensions: "Dimensions",
   members: "Members",
   relationships: "Relationships",
+  tree: "Tree",
   attributes: "Attributes",
-  semantics: "Semantic guidance",
   "security-tags": "Security tags",
   settings: "Properties & access",
   reference: "Function reference",
@@ -36,8 +37,8 @@ export const metadataSectionLabels: Record<MetadataSection, string> = {
 export const dimensionSections: MetadataSection[] = [
   "members",
   "relationships",
+  "tree",
   "attributes",
-  "semantics",
   "security-tags",
   "settings",
 ];
@@ -45,6 +46,10 @@ export const dimensionSections: MetadataSection[] = [
 export function metadataSection(
   value: string | null | undefined,
 ): MetadataSection {
+  // Schema 247 replaced the duplicate semantic-column editor with governed
+  // attribute definitions. Keep old bookmarks useful without preserving a
+  // second executable editing surface.
+  if (value === "semantics") return "attributes";
   return value && Object.hasOwn(metadataSectionLabels, value)
     ? (value as MetadataSection)
     : "dimensions";
@@ -69,6 +74,15 @@ export function readMetadataDestination(
     ...(dimensionId && metadataRouteIdentifier(query.get("hierarchy"))
       ? { hierarchyId: metadataRouteIdentifier(query.get("hierarchy")) }
       : {}),
+    ...(dimensionId &&
+    metadataRouteIdentifier(query.get("member")) &&
+    (section === "relationships" || section === "tree") &&
+    query.has("relationship")
+      ? {
+          relationshipId:
+            metadataRouteIdentifier(query.get("relationship")) ?? "",
+        }
+      : {}),
     memberId: dimensionId
       ? metadataRouteIdentifier(query.get("member"))
       : undefined,
@@ -83,6 +97,7 @@ export function writeMetadataDestination(
   query.delete("dimension");
   query.delete("member");
   query.delete("hierarchy");
+  query.delete("relationship");
   query.set("metadataSection", section);
   if (section === "dimensions" || section === "reference") return;
   const dimension = metadataRouteIdentifier(destination.dimensionId);
@@ -90,6 +105,15 @@ export function writeMetadataDestination(
     query.set("dimension", dimension);
     const member = metadataRouteIdentifier(destination.memberId);
     if (member) query.set("member", member);
+    if (
+      member &&
+      (section === "relationships" || section === "tree") &&
+      destination.relationshipId !== undefined
+    )
+      query.set(
+        "relationship",
+        metadataRouteIdentifier(destination.relationshipId) ?? "",
+      );
     const hierarchy = metadataRouteIdentifier(destination.hierarchyId);
     if (hierarchy) query.set("hierarchy", hierarchy);
   }

@@ -24,6 +24,9 @@ MAX_ALLOWED_FUNCTIONS=20
 _ID=re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,299}\Z")
 _FUNCTION=re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_-]*)+\Z")
 _DIGEST=re.compile(r"[0-9a-f]{64}\Z")
+_DESTINATION_ARTIFACTS = (
+    "ApplicationRule", "CalculatedMember", "ApplicationSequence", "ApplicationSchedule",
+)
 
 
 def _identifier(value: object,field: str)->str:
@@ -58,22 +61,6 @@ class AssignmentRef:
             "assignmentId":self.assignment_id}
 
 
-def _freeze(value: object)->object:
-    if isinstance(value,dict):
-        return tuple((key,_freeze(item)) for key,item in sorted(value.items()))
-    if isinstance(value,list):return tuple(_freeze(item) for item in value)
-    return value
-
-
-def _thaw(value: object)->object:
-    if (isinstance(value,tuple) and value
-            and all(isinstance(item,tuple) and len(item)==2
-                    and isinstance(item[0],str) for item in value)):
-        return {key:_thaw(item) for key,item in value}
-    if isinstance(value,tuple):return [_thaw(item) for item in value]
-    return value
-
-
 @dataclass(frozen=True,slots=True)
 class Activity:
     activity_id: str
@@ -104,7 +91,7 @@ class ApplicationWorkflow:
     scope: ApplicationScope
     flow_id: str
     name: str
-    selection: tuple[tuple[str,object],...]
+    selection_json: str
     activities: tuple[Activity,...]
     digest: str
 
@@ -117,7 +104,7 @@ class ApplicationWorkflow:
         return {"format":FORMAT,"workspaceId":self.scope.workspace_id,
             "applicationId":self.scope.application_id,
             "flowId":self.flow_id,"name":self.name,
-            "selection":_thaw(self.selection),
+            "selection":json.loads(self.selection_json),
             "activities":[item.normalized() for item in self.activities]}
 
 
@@ -151,9 +138,7 @@ def _destination(raw: object)->tuple[tuple[str,object],...]:
                 raw["argumentsDigest"],"ARGUMENTS_DIGEST")}
     else:
         if (set(raw)!={"kind","artifactKind","artifactId","stateToken","digest"}
-                or raw.get("artifactKind") not in (
-                    "ApplicationRule","CalculatedMember",
-                    "ApplicationSequence","ApplicationSchedule")
+                or raw.get("artifactKind") not in _DESTINATION_ARTIFACTS
                 or type(raw.get("stateToken")) is not str
                 or _DIGEST.fullmatch(raw["stateToken"]) is None):
             raise ValueError("APPLICATION_WORKFLOW_DESTINATION_INVALID")
@@ -162,6 +147,52 @@ def _destination(raw: object)->tuple[tuple[str,object],...]:
             "stateToken":raw["stateToken"],
             "digest":_digest(raw["digest"],"ARTIFACT_DIGEST")}
     return tuple(sorted(normalized.items()))
+
+
+def _text_schema(pattern: re.Pattern) -> dict:
+    return {"type": "string", "pattern": "^" + pattern.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}
+
+
+def destination_schema(*, include_retired: bool = True) -> dict:
+    """Stored workflows can refer to artifact kinds that new workflows cannot target."""
+    from .postgres_numeric_catalog import obj
+
+    identifier, digest, function = map(_text_schema, (_ID, _DIGEST, _FUNCTION))
+    kinds = [kind for kind in _DESTINATION_ARTIFACTS if include_retired or kind != "ApplicationSequence"]
+    return {"oneOf": [
+        obj({"kind": {"const": "CubeView"}, "viewId": identifier, "digest": digest}),
+        obj({"kind": {"const": "Function"}, "function": function, "argumentsDigest": digest}),
+        obj({"kind": {"const": "Artifact"}, "artifactKind": {"enum": kinds},
+             "artifactId": identifier, "stateToken": digest, "digest": digest}),
+    ]}
+
+
+def workflow_definition_schema(*, include_retired: bool = True) -> dict:
+    """Project the compiled definition's wire shape with a shared cube-selection reference."""
+    from .postgres_numeric_catalog import obj
+
+    identifier, digest, function = map(_text_schema, (_ID, _DIGEST, _FUNCTION))
+    name = {"type": "string", "minLength": 1, "maxLength": 200}
+    assignment = obj({"assignmentSetId": identifier, "stateToken": digest,
+                      "digest": digest, "assignmentId": identifier})
+    evidence = {"oneOf": [
+        obj({"kind": {"const": "ManualAttestation"},
+             "statement": {"type": "string", "minLength": 1, "maxLength": 500}}),
+        obj({"kind": {"const": "OperationReceipt"}, "requireCurrent": {"type": "boolean"},
+             "allowedFunctions": {"type": "array", "minItems": 1, "maxItems": MAX_ALLOWED_FUNCTIONS,
+                                  "uniqueItems": True, "items": function}}),
+    ]}
+    activity = obj({"activityId": identifier, "name": name, "kind": {"enum": ["Action", "Review"]},
+        "dependsOn": {"type": "array", "maxItems": MAX_ACTIVITIES - 1, "uniqueItems": True, "items": identifier},
+        "returnTo": {"anyOf": [identifier, {"type": "null"}]}, "assignmentRef": assignment,
+        "destination": destination_schema(include_retired=include_retired), "evidenceContract": evidence})
+    activity["allOf"] = [{
+        "if": {"properties": {"kind": {"const": "Review"}}},
+        "then": {"properties": {"returnTo": identifier}},
+        "else": {"properties": {"returnTo": {"type": "null"}}}}]
+    return obj({"format": {"const": FORMAT}, "workspaceId": identifier, "applicationId": identifier,
+        "flowId": identifier, "name": name, "selection": {"$ref": "#/$defs/cubeSelection"},
+        "activities": {"type": "array", "minItems": 1, "maxItems": MAX_ACTIVITIES, "items": activity}})
 
 
 def _evidence_contract(raw: object)->tuple[tuple[str,object],...]:
@@ -223,21 +254,28 @@ def _validate_graph(activities: tuple[Activity,...])->None:
         if (item.activity_id in item.depends_on
                 or not set(item.depends_on)<=set(by_id)):
             raise ValueError("APPLICATION_WORKFLOW_DEPENDENCY_INVALID")
-    visiting:set[str]=set();visited:set[str]=set()
-    def visit(activity_id: str)->None:
-        if activity_id in visited:return
-        if activity_id in visiting:raise ValueError("APPLICATION_WORKFLOW_CYCLE")
+    visiting: set[str] = set()
+    ancestors_by_id: dict[str, set[str]] = {}
+
+    def visit(activity_id: str) -> set[str]:
+        if activity_id in ancestors_by_id:
+            return ancestors_by_id[activity_id]
+        if activity_id in visiting:
+            raise ValueError("APPLICATION_WORKFLOW_CYCLE")
         visiting.add(activity_id)
-        for predecessor in by_id[activity_id].depends_on:visit(predecessor)
-        visiting.remove(activity_id);visited.add(activity_id)
-    for activity_id in by_id:visit(activity_id)
-    def ancestors(activity_id: str)->set[str]:
-        result=set(by_id[activity_id].depends_on)
-        for predecessor in tuple(result):result.update(ancestors(predecessor))
-        return result
+        parents = by_id[activity_id].depends_on
+        ancestors = set(parents)
+        for predecessor in parents:
+            ancestors.update(visit(predecessor))
+        visiting.remove(activity_id)
+        ancestors_by_id[activity_id] = ancestors
+        return ancestors
+
+    for activity_id in by_id:
+        visit(activity_id)
     for item in activities:
-        if item.return_to is not None and item.return_to not in ancestors(
-                item.activity_id):
+        if (item.return_to is not None
+                and item.return_to not in ancestors_by_id[item.activity_id]):
             raise ValueError("APPLICATION_WORKFLOW_RETURN_TARGET_INVALID")
 
 
@@ -258,9 +296,10 @@ def compile_application_workflow(definition: object)->ApplicationWorkflow:
         _identifier(definition["applicationId"],"APPLICATION")),
         _identifier(definition["flowId"],"FLOW_ID"),
         _name(definition["name"],"NAME"),
-        _freeze(canonical_selection(definition["selection"])),activities,"")
+        json.dumps(canonical_selection(definition["selection"]), separators=(",", ":"),
+                   ensure_ascii=False, allow_nan=False),activities,"")
     canonical=json.dumps(model.normalized(),sort_keys=True,separators=(",",":"),
         ensure_ascii=False,allow_nan=False).encode()
     return ApplicationWorkflow(model.scope,model.flow_id,
-        model.name,model.selection,model.activities,
+        model.name,model.selection_json,model.activities,
         sha256(canonical).hexdigest())

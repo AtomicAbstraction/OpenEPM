@@ -1,9 +1,29 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { request } from "./api";
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { ApiError, request } from "./api";
+import { useManagedWorkspaces } from "./managed-workspaces";
+import { WorkspaceAccessReview } from "./WorkspaceAccessReview";
+import { BootstrapGroupPicker } from "./BootstrapGroupPicker";
+import type { BootstrapGroup } from "./workspace-access";
+import {
+  workspacePeople,
+  personApplications,
+  bootstrapGroups,
+} from "./workspace-access";
 import { ApplicationPurge } from "./ApplicationPurge";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
-import { setUnsavedWork, useUnsavedWork } from "./unsaved-work";
-import { useStableMutationIntentKey } from "./mutation-intent";
+import {
+  setUnsavedWork,
+  usePreservedDraft,
+  useUnsavedWork,
+  type DraftRecoveryLease,
+} from "./unsaved-work";
 
 const APPLICATION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const MAX_APPLICATION_PREFERENCES = 30;
@@ -71,9 +91,15 @@ function writeApplicationPreferences(
 export type CreatedApplication = ApplicationSummary & {
   enabledCapabilities: string[];
   capabilityRevision: number;
+  authorizationModel?: "group_assignments";
+  administratorGroupId?: string;
 };
 
-export function applicationCreateProgram(applicationId: string, name: string) {
+export function applicationCreateProgram(
+  applicationId: string,
+  name: string,
+  administratorGroupId?: string,
+) {
   return {
     languageVersion: 2,
     function: "workspace.application.create",
@@ -81,52 +107,160 @@ export function applicationCreateProgram(applicationId: string, name: string) {
       applicationId,
       name,
       kind: "multidimensional",
+      ...(administratorGroupId ? { administratorGroupId } : {}),
     },
   };
+}
+
+type CreationRequest = {
+  workspaceId: string;
+  idempotencyKey: string;
+  confirmed: true;
+  program: ReturnType<typeof applicationCreateProgram>;
+};
+
+type OriginalCreation = { owner: string; request: CreationRequest };
+type RecordedCreation = { application: CreatedApplication; open: boolean };
+
+const creationRefusals = new Set([
+  "APPLICATION_ID_OR_NAME_EXISTS",
+  "APPLICATION_GROUP_BOOTSTRAP_UNAVAILABLE",
+  "LAST_REACHABLE_APPLICATION_ADMINISTRATOR",
+  "CONFIRMATION_REQUIRED",
+  "PROGRAMMABLE_BLUEPRINT_SCHEMA_MISMATCH",
+  "V2_APPLICATION_CREATE_INVALID",
+  "WORKSPACE_ADMIN_REQUIRED",
+  "WORKSPACE_UNAVAILABLE",
+]);
+
+function confirmsCreation(
+  reply: unknown,
+  { workspaceId, program }: CreationRequest,
+): reply is CreatedApplication {
+  if (!reply || typeof reply !== "object" || Array.isArray(reply)) return false;
+  const application = reply as Partial<CreatedApplication>;
+  return (
+    application.workspaceId === workspaceId &&
+    application.applicationId === program.arguments.applicationId &&
+    application.name === program.arguments.name &&
+    application.kind === program.arguments.kind &&
+    application.status === "Active" &&
+    (program.arguments.administratorGroupId === undefined ||
+      (application.authorizationModel === "group_assignments" &&
+        application.administratorGroupId ===
+          program.arguments.administratorGroupId)) &&
+    application.capabilityRevision === 0 &&
+    Array.isArray(application.enabledCapabilities) &&
+    application.enabledCapabilities.length === 0
+  );
 }
 
 export function Applications({
   applications,
   selected,
   catalog,
+  issuer = "",
   subject = "",
   choose,
   created,
   deleted,
   selectWorkspace,
+  managedWorkspaceId = "",
+  selectManagedWorkspace,
   onRequestTransition = (action) => action(),
 }: {
   applications: ApplicationSummary[];
   selected: number;
   catalog: ApplicationCatalog | null;
+  issuer?: string;
   subject?: string;
   choose: (index: number) => void;
-  created: (application: CreatedApplication) => Promise<void>;
+  created: (
+    application: CreatedApplication,
+    signal: AbortSignal,
+    open: boolean,
+  ) => Promise<void>;
   deleted?: (workspaceId: string, applicationId: string) => Promise<void>;
   selectWorkspace?: (index: number) => void;
+  managedWorkspaceId?: string;
+  selectManagedWorkspace?: (workspaceId: string) => void;
   onRequestTransition?: (action: () => void) => void;
 }) {
-  const mutationIntentKey = useStableMutationIntentKey("application-ui");
-  const current = applications[selected];
+  const selectedApp = applications[selected];
+  const [locallyChosen, setLocallyChosen] = useState("");
+  const managed = useManagedWorkspaces(
+    JSON.stringify([issuer, subject]),
+    !selectedApp,
+    managedWorkspaceId || locallyChosen,
+    selectedApp?.workspaceId || "",
+  );
+  const workspaceId = managed.id;
+  const current =
+    selectedApp?.workspaceId === workspaceId ? selectedApp : undefined;
+  const applicationCatalog = current ? catalog : null;
+  const workspaceFunctions =
+    managed.management?.functions ||
+    applicationCatalog?.workspaceFunctions ||
+    [];
+  const creationOwner = JSON.stringify([issuer, subject, workspaceId]);
   const workspaceAdministrator =
-    catalog?.applicationAccess.workspaceAdministrator === true;
+    Boolean(managed.management) ||
+    applicationCatalog?.applicationAccess.workspaceAdministrator === true;
+  const canCreate = managed.management
+    ? workspaceFunctions.includes("workspace.application.create") &&
+      workspaceFunctions.includes(bootstrapGroups)
+    : workspaceAdministrator;
+  const guidedGroup = Boolean(workspaceFunctions.includes(bootstrapGroups));
+  const groupContext = JSON.stringify([
+    creationOwner,
+    catalog?.accessContext,
+    catalog?.revisions.security,
+    guidedGroup,
+  ]);
+  const [groupChoice, setGroupChoice] = useState<{
+    context: string;
+    group: BootstrapGroup;
+  } | null>(null);
+  const group =
+    groupChoice?.context === groupContext ? groupChoice.group : null;
+  const blueprintDimensions = (
+    managed.management?.applicationBlueprint ||
+    applicationCatalog?.applicationBlueprint
+  )?.dimensions;
   const [createOpen, setCreateOpen] = useState(false);
   const [blueprintHelpOpen, setBlueprintHelpOpen] = useState(false);
+  const blueprintHelpId = useId();
   const blueprintHelpRef = useRef<HTMLDivElement | null>(null);
   const [applicationId, setApplicationId] = useState("");
   const [name, setName] = useState("");
   const [reviewed, setReviewed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [savedCreation, setSavedCreation] = useState<OriginalCreation | null>(
+    null,
+  );
+  const pendingCreation =
+    savedCreation?.owner === creationOwner ? savedCreation : null;
+  const creationRecovery = usePreservedDraft(
+    workspaceId,
+    "",
+    `application-creation:${creationOwner}`,
+    "Unconfirmed application creation",
+    Boolean(pendingCreation),
+    pendingCreation,
+    setSavedCreation,
+  );
+  const activeCreation = useRef<AbortController | null>(null);
+  const activeOpening = useRef<AbortController | null>(null);
   const [committedApplication, setCommittedApplication] =
-    useState<CreatedApplication | null>(null);
+    useState<RecordedCreation | null>(null);
   const [opening, setOpening] = useState(false);
   const [openingError, setOpeningError] = useState("");
   const [message, setMessage] = useState("");
-  const creationDraftId = `application-create:${current?.workspaceId || "none"}`;
+  const creationDraftId = `application-create:${workspaceId || "none"}`;
   useUnsavedWork(
     creationDraftId,
     "Unsaved application creation",
-    Boolean(createOpen && (applicationId || name)),
+    Boolean(createOpen && !pendingCreation && (applicationId || name || group)),
   );
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
@@ -143,37 +277,42 @@ export function Applications({
           application.workspaceId,
           application.workspaceName || application.workspaceId,
         );
+    for (const workspace of managed.workspaces)
+      found.set(workspace.workspaceId, workspace.workspaceName);
     return [...found].map(([workspaceId, workspaceName]) => ({
       workspaceId,
       workspaceName,
     }));
-  }, [applications]);
-  const currentWorkspace = current
-    ? {
-        workspaceId: current.workspaceId,
-        workspaceName: current.workspaceName || current.workspaceId,
-      }
-    : undefined;
+  }, [applications, managed.workspaces]);
+  const currentWorkspace = workspaces.find(
+    (workspace) => workspace.workspaceId === workspaceId,
+  );
 
   useEffect(() => {
     setPreferences(readApplicationPreferences(subject));
   }, [subject]);
 
+  useLayoutEffect(() => {
+    setSubmitting(false);
+    setOpening(false);
+    setCommittedApplication(null);
+    setError("");
+    return () => {
+      activeCreation.current?.abort();
+      activeCreation.current = null;
+      activeOpening.current?.abort();
+      activeOpening.current = null;
+    };
+  }, [creationOwner]);
+
   useEffect(() => {
     if (!blueprintHelpOpen) return;
-    const dismiss = (event: PointerEvent) => {
+    const dismiss = (event: MouseEvent) => {
       if (blueprintHelpRef.current?.contains(event.target as Node)) return;
       setBlueprintHelpOpen(false);
     };
-    const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setBlueprintHelpOpen(false);
-    };
-    document.addEventListener("pointerdown", dismiss);
-    document.addEventListener("keydown", escape);
-    return () => {
-      document.removeEventListener("pointerdown", dismiss);
-      document.removeEventListener("keydown", escape);
-    };
+    document.addEventListener("click", dismiss);
+    return () => document.removeEventListener("click", dismiss);
   }, [blueprintHelpOpen]);
 
   const catalogEntries = useMemo(() => {
@@ -226,7 +365,13 @@ export function Applications({
     const index = applications.findIndex(
       (application) => application.workspaceId === workspaceId,
     );
-    if (index >= 0) (selectWorkspace || choose)(index);
+    if (index >= 0) {
+      setLocallyChosen("");
+      (selectWorkspace || choose)(index);
+    } else if (managed.workspaces.some((w) => w.workspaceId === workspaceId)) {
+      if (selectManagedWorkspace) selectManagedWorkspace(workspaceId);
+      else onRequestTransition(() => setLocallyChosen(workspaceId));
+    }
   }
 
   function remember(preference: ApplicationPreferences) {
@@ -257,13 +402,14 @@ export function Applications({
   const valid = useMemo(
     () =>
       Boolean(
-        current &&
-          workspaceAdministrator &&
+        currentWorkspace &&
+          canCreate &&
+          (!guidedGroup || group) &&
           APPLICATION_ID.test(trimmedId) &&
           trimmedName &&
-          trimmedName.length <= 500,
+          Array.from(trimmedName).length <= 200,
       ),
-    [current, workspaceAdministrator, trimmedId, trimmedName],
+    [currentWorkspace, canCreate, trimmedId, trimmedName, guidedGroup, group],
   );
 
   function invalidateReview() {
@@ -272,62 +418,159 @@ export function Applications({
     setError("");
   }
 
-  async function submit() {
-    if (!current || !valid || !reviewed || submitting || committedApplication)
+  function submit() {
+    if (
+      !currentWorkspace ||
+      !valid ||
+      !reviewed ||
+      pendingCreation ||
+      activeCreation.current ||
+      committedApplication
+    )
       return;
     if (
       !window.confirm(
-        `Create ${trimmedName} (${trimmedId}) in ${current.workspaceId}?`,
+        `Create ${trimmedName} (${trimmedId}) in ${workspaceId}${group ? ` with administrator group ${group.displayName || group.groupName || group.groupId} (${group.groupId})` : ""}?`,
       )
     )
       return;
+    const original: OriginalCreation = {
+      owner: creationOwner,
+      request: {
+        workspaceId,
+        confirmed: true,
+        idempotencyKey: `application-ui-${crypto.randomUUID()}`,
+        program: applicationCreateProgram(
+          trimmedId,
+          trimmedName,
+          group?.groupId,
+        ),
+      },
+    };
+    try {
+      const lease = creationRecovery.retain(original);
+      setSavedCreation(original);
+      void sendCreation(original, lease, true);
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Unable to retain the original request.",
+      );
+    }
+  }
+
+  function retryCreation() {
+    if (
+      !pendingCreation ||
+      !creationRecovery.lease ||
+      !workspaceAdministrator ||
+      activeCreation.current
+    )
+      return;
+    try {
+      const lease = creationRecovery.retain(
+        pendingCreation,
+        creationRecovery.lease,
+      );
+      void sendCreation(pendingCreation, lease, false);
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Unable to restore the original request.",
+      );
+    }
+  }
+
+  async function sendCreation(
+    original: OriginalCreation,
+    lease: DraftRecoveryLease,
+    initial: boolean,
+  ) {
+    const controller = new AbortController();
+    activeCreation.current = controller;
     setSubmitting(true);
     setError("");
     setMessage("");
     try {
-      const result = await request<CreatedApplication>(
+      const result = await request<unknown>(
         "/api/workspace-application",
-        {
-          workspaceId: current.workspaceId,
-          confirmed: true,
-          idempotencyKey: mutationIntentKey({
-            workspaceId: current.workspaceId,
-            program: applicationCreateProgram(trimmedId, trimmedName),
-          }),
-          program: applicationCreateProgram(trimmedId, trimmedName),
-        },
+        original.request,
+        controller.signal,
       );
-      setCommittedApplication(result);
+      if (!confirmsCreation(result, original.request)) {
+        setError("The response could not confirm the original application.");
+        return;
+      }
+      creationRecovery.release(lease, null);
+      setSavedCreation(null);
+      const committed = {
+        application: result,
+        open:
+          initial &&
+          (!original.request.program.arguments.administratorGroupId ||
+            Boolean(group?.actorMember)),
+      };
+      setCommittedApplication(committed);
       setApplicationId("");
       setName("");
       setReviewed(false);
       setCreateOpen(false);
+      setBlueprintHelpOpen(false);
       // The write is committed. Settle this editor before navigation can read
       // the registry, without discarding any other editor's work.
       setUnsavedWork(creationDraftId, "Unsaved application creation", false);
-      await refreshAndOpen(result);
+      await refreshCreation(committed);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Creation failed");
+      if (controller.signal.aborted) return;
+      if (
+        initial &&
+        reason instanceof ApiError &&
+        creationRefusals.has(reason.code)
+      ) {
+        creationRecovery.release(lease, null);
+        setSavedCreation(null);
+        setReviewed(false);
+        setError(reason.message);
+      } else {
+        setError("The original application creation is still unconfirmed.");
+      }
     } finally {
-      setSubmitting(false);
+      if (activeCreation.current === controller) {
+        activeCreation.current = null;
+        setSubmitting(false);
+      }
     }
   }
 
-  async function refreshAndOpen(application: CreatedApplication) {
+  async function refreshCreation({ application, open }: RecordedCreation) {
+    if (activeOpening.current) return;
+    const controller = new AbortController();
+    activeOpening.current = controller;
     setOpening(true);
     setOpeningError("");
     try {
-      await created(application);
+      await created(application, controller.signal, open);
+      if (controller.signal.aborted) return;
       setCommittedApplication(null);
-      setMessage(`${application.name} was created and opened.`);
-    } catch (reason) {
-      setOpeningError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to refresh and open the application.",
+      setMessage(
+        open
+          ? `${application.name} was created and opened.`
+          : `Creation of ${application.name} (${application.applicationId}) was recorded. The application catalogue is current.`,
       );
+    } catch (reason) {
+      if (!controller.signal.aborted)
+        setOpeningError(
+          reason instanceof Error
+            ? reason.message
+            : "Unable to refresh the application catalogue.",
+        );
     } finally {
-      setOpening(false);
+      if (activeOpening.current === controller) {
+        activeOpening.current = null;
+        setOpening(false);
+      }
     }
   }
 
@@ -347,21 +590,26 @@ export function Applications({
           onClick={() =>
             onRequestTransition(() => {
               setCreateOpen((value) => !value);
+              setBlueprintHelpOpen(false);
               setApplicationId("");
               setName("");
+              setGroupChoice(null);
               setReviewed(false);
             })
           }
           disabled={
-            !workspaceAdministrator ||
-            !current ||
+            !canCreate ||
+            !currentWorkspace ||
             submitting ||
+            Boolean(pendingCreation) ||
             Boolean(committedApplication)
           }
-          aria-expanded={createOpen}
+          aria-expanded={createOpen && !pendingCreation}
           aria-controls="create-application-panel"
         >
-          {createOpen ? "Close creation" : "Create application"}
+          {createOpen && !pendingCreation
+            ? "Close creation"
+            : "Create application"}
         </button>
       </div>
 
@@ -393,6 +641,22 @@ export function Applications({
             ))}
           </select>
         </label>
+        <div>
+          <button
+            type="button"
+            disabled={managed.busy}
+            onClick={managed.refresh}
+          >
+            Find managed workspaces
+          </button>
+          {managed.busy && <p role="status">Reading workspace access…</p>}
+          {managed.error && <p role="status">{managed.error}</p>}
+          {managed.missing && (
+            <p role="status">
+              This workspace is unavailable under your current access.
+            </p>
+          )}
+        </div>
         <div className="workspace-authority">
           <strong>
             {workspaceAdministrator
@@ -401,16 +665,32 @@ export function Applications({
           </strong>
           <p>
             {workspaceAdministrator
-              ? "You can create applications and manage access in this workspace."
+              ? canCreate
+                ? "You can create applications and manage access in this workspace."
+                : "You can review access in this workspace."
               : "Open any application granted to your account."}
           </p>
         </div>
       </section>
 
-      {workspaceAdministrator && currentWorkspace && deleted && (
+      {workspaceAdministrator &&
+        currentWorkspace &&
+        workspaceFunctions.includes(workspacePeople) &&
+        workspaceFunctions.includes(personApplications) && (
+          <WorkspaceAccessReview
+            key={JSON.stringify([
+              creationOwner,
+              applicationCatalog?.accessContext,
+              applicationCatalog?.revisions.security,
+            ])}
+            workspaceId={workspaceId}
+          />
+        )}
+      {workspaceAdministrator && current && currentWorkspace && deleted && (
         <ApplicationPurge
           workspaceId={currentWorkspace.workspaceId}
           applicationId={current?.applicationId || ""}
+          issuer={issuer}
           subject={subject}
           deleted={deleted}
         />
@@ -423,7 +703,7 @@ export function Applications({
         </p>
       )}
 
-      {createOpen && (
+      {createOpen && !pendingCreation && (
         <section
           className="create-application-panel"
           id="create-application-panel"
@@ -437,9 +717,10 @@ export function Applications({
               </h2>
               <p>
                 Start with eight empty dimensions: Account, Entity, Year,
-                Period, View, Value, Scenario and Data Type. You will be the
-                application's administrator and can define its members,
-                attributes and calculations.
+                Period, View, Value, Scenario and Data Type.{" "}
+                {guidedGroup
+                  ? "The selected group will manage application access. Business data permissions are assigned separately."
+                  : "You will be the application's administrator and can define its members, attributes and calculations."}
               </p>
             </div>
             <span className="workspace-pill">
@@ -479,15 +760,79 @@ export function Applications({
               <small>Human-readable display name.</small>
             </label>
           </div>
+          {guidedGroup && (
+            <BootstrapGroupPicker
+              key={groupContext}
+              workspaceId={workspaceId}
+              disabled={submitting}
+              selected={group}
+              choose={(value) => {
+                setGroupChoice(
+                  value ? { context: groupContext, group: value } : null,
+                );
+                invalidateReview();
+              }}
+            />
+          )}
           <div className={valid ? "creation-review ready" : "creation-review"}>
             <strong>
               {valid ? "Ready for review" : "Complete the required fields"}
             </strong>
             <p>
               {valid
-                ? `Create ${trimmedName} (${trimmedId}) in ${current?.workspaceId}.`
-                : "Use a valid stable ID and a nonempty application name."}
+                ? `Create ${trimmedName} (${trimmedId}) in ${workspaceId}.`
+                : guidedGroup
+                  ? "Provide a stable ID, an application name and an eligible administrator group."
+                  : "Use a valid stable ID and an application name of 1 to 200 characters."}
             </p>
+          </div>
+          <div className="application-blueprint-help" ref={blueprintHelpRef}>
+            <button
+              type="button"
+              className="secondary"
+              aria-expanded={blueprintHelpOpen}
+              aria-controls={blueprintHelpId}
+              onClick={() => setBlueprintHelpOpen((value) => !value)}
+              onKeyDown={(event) => {
+                if (!blueprintHelpOpen || event.key !== "Escape") return;
+                event.preventDefault();
+                event.stopPropagation();
+                setBlueprintHelpOpen(false);
+              }}
+            >
+              What is created automatically?
+            </button>
+            <div
+              id={blueprintHelpId}
+              role="region"
+              aria-label="Automatic application blueprint"
+              hidden={!blueprintHelpOpen}
+            >
+              {blueprintDimensions?.length ? (
+                <>
+                  <p>
+                    Each axis below is created automatically. A fact’s
+                    coordinate will include a member on each axis.
+                  </p>
+                  <dl className="application-blueprint-dimensions">
+                    {blueprintDimensions.map((dimension) => (
+                      <div key={dimension.dimensionId}>
+                        <dt>{dimension.name}</dt>
+                        <dd>{dimension.shortDescription}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                  <p>
+                    Add business members, hierarchies, formulas and custom
+                    attributes after creation.
+                  </p>
+                </>
+              ) : (
+                <p>
+                  The current workspace did not provide a blueprint preview.
+                </p>
+              )}
+            </div>
           </div>
           <label className="review-check">
             <input
@@ -496,50 +841,7 @@ export function Applications({
               disabled={!valid || submitting}
               onChange={(event) => setReviewed(event.target.checked)}
             />
-            <span>
-              I reviewed the workspace and application identity. The eight
-              required dimensions will be created automatically.
-            </span>
-            <span className="context-help" ref={blueprintHelpRef}>
-              <button
-                type="button"
-                className="help-bubble-button"
-                aria-label="What is created automatically?"
-                aria-expanded={blueprintHelpOpen}
-                aria-controls="blueprint-help-popover"
-                onClick={(event) => {
-                  event.preventDefault();
-                  setBlueprintHelpOpen((value) => !value);
-                }}
-              >
-                ?
-              </button>
-              {blueprintHelpOpen && (
-                <span
-                  className="help-popover"
-                  id="blueprint-help-popover"
-                  role="dialog"
-                  aria-label="Automatic application blueprint"
-                >
-                  <strong>Automatic application blueprint</strong>
-                  <span>
-                    Eight empty dimensions are created: Account, Entity, Year,
-                    Period, View, Value, Scenario and Data Type.
-                  </span>
-                  <span>
-                    Each receives its stable ID, display name, model role,
-                    semantic role, Sparse density and editable descriptions.
-                    Entity is marked Core entity; the other seven are Context
-                    dimensions. Names and descriptions do not enable
-                    calculations.
-                  </span>
-                  <span>
-                    No business members, hierarchies, formulas or custom
-                    attributes are created. You define those after creation.
-                  </span>
-                </span>
-              )}
-            </span>
+            <span>I reviewed the workspace and application identity.</span>
           </label>
           <div className="application-create-actions">
             <button
@@ -547,7 +849,11 @@ export function Applications({
               disabled={!valid || !reviewed || submitting}
               onClick={submit}
             >
-              {submitting ? "Creating…" : "Create and open"}
+              {submitting
+                ? "Creating…"
+                : guidedGroup && !group?.actorMember
+                  ? "Create for selected group"
+                  : "Create and open"}
             </button>
           </div>
           {error && (
@@ -558,31 +864,107 @@ export function Applications({
         </section>
       )}
 
+      {pendingCreation && (
+        <section
+          className="create-application-panel"
+          aria-labelledby="pending-creation-title"
+        >
+          <h2 id="pending-creation-title">Application creation unconfirmed</h2>
+          <p role="status">
+            {submitting
+              ? "Waiting for the original application creation."
+              : "The outcome is still unconfirmed."}
+          </p>
+          <p>
+            {pendingCreation.request.program.arguments.name} (
+            {pendingCreation.request.program.arguments.applicationId})
+          </p>
+          <p>
+            Workspace {pendingCreation.request.workspaceId}. Retry the same
+            request to recover an existing result or finish the confirmed
+            creation.
+          </p>
+          {!workspaceAdministrator && (
+            <p>Retry requires current Workspace Administrator access.</p>
+          )}
+          {error && (
+            <p className="inline-error" role="alert">
+              {error}
+            </p>
+          )}
+          <button
+            type="button"
+            className="primary-action"
+            onClick={retryCreation}
+            disabled={
+              submitting || !workspaceAdministrator || !creationRecovery.lease
+            }
+          >
+            Retry original creation
+          </button>
+          <details className="context-note">
+            <summary>Original MCP request</summary>
+            <p>
+              Use the workspace listener for{" "}
+              {pendingCreation.request.workspaceId} with the account that
+              approved the request.
+            </p>
+            <pre className="creation-request">
+              {JSON.stringify(
+                {
+                  tool: "execute_v2_workspace_program",
+                  arguments: {
+                    program: pendingCreation.request.program,
+                    idempotency_key: pendingCreation.request.idempotencyKey,
+                  },
+                },
+                null,
+                2,
+              )}
+            </pre>
+          </details>
+        </section>
+      )}
+
       {committedApplication && (
         <section
           className="create-application-panel"
           aria-labelledby="created-application-title"
         >
-          <h2 id="created-application-title">Application created</h2>
+          <h2 id="created-application-title">
+            {committedApplication.open
+              ? "Application created"
+              : "Application creation recorded"}
+          </h2>
           <p role="status">
-            {committedApplication.name} ({committedApplication.workspaceId} /{" "}
-            {committedApplication.applicationId}) was created successfully.
+            {committedApplication.application.name} (
+            {committedApplication.application.workspaceId} /{" "}
+            {committedApplication.application.applicationId}) was created
+            successfully.
             {opening
-              ? " Refreshing your application catalogue and opening the model…"
-              : " Refresh the catalogue to open the model."}
+              ? " Refreshing your application catalogue…"
+              : committedApplication.open
+                ? " Refresh the catalogue to open the model."
+                : " Refresh the catalogue to see current applications."}
           </p>
           {openingError && (
             <p className="inline-error" role="alert">
-              The application was created, but it could not be opened:{" "}
+              {committedApplication.open
+                ? "The application was created, but it could not be opened: "
+                : "The catalogue could not be refreshed: "}
               {openingError}
             </p>
           )}
           <button
             className="primary-action"
             disabled={opening}
-            onClick={() => void refreshAndOpen(committedApplication)}
+            onClick={() => void refreshCreation(committedApplication)}
           >
-            {opening ? "Opening…" : "Refresh and open"}
+            {opening
+              ? "Refreshing…"
+              : committedApplication.open
+                ? "Refresh and open"
+                : "Refresh catalogue"}
           </button>
         </section>
       )}
@@ -699,7 +1081,10 @@ export function Applications({
             <p>
               {favoritesOnly
                 ? "Star an accessible application to keep it at the top of your personal catalogue."
-                : "Try a different name, workspace or application ID."}
+                : currentWorkspace &&
+                    !applications.some((a) => a.workspaceId === workspaceId)
+                  ? "Your account has no admitted applications in this workspace."
+                  : "Try a different name, workspace or application ID."}
             </p>
           </div>
         )}

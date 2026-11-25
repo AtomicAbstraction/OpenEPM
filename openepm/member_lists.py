@@ -62,6 +62,43 @@ class MemberListExpression:
         )
 
     @classmethod
+    def navigation(
+        cls, operation: str, *, scope: str = "hierarchy",
+        hierarchy_id: str | None = None, member_id: str | None = None,
+        path_relationship_ids: tuple[str, ...] | None = None,
+        include_self: bool = False, all_parents: bool = False,
+    ) -> "MemberListExpression":
+        """Construct native navigation intent without metadata reads.
+
+        ``leaves`` selects all scoped leaves; ``leaf_descendants`` is relative
+        and includes its anchor only when explicitly requested and itself leaf.
+        Legacy ``hierarchy('base', ...)`` and ``hierarchy('leaves', ...)`` retain
+        their original meanings. A ``top`` query returns a typed scope, never
+        a data selection. Fixed core validates semantics and current paths.
+        """
+        if operation not in {"top", "all", "roots", "unplaced", "leaves", "self", "is_base",
+                "children", "descendants", "leaf_descendants", "parents",
+                "ancestors", "siblings", "same_level", "same_generation"}:
+            raise ValueError("unsupported native navigation operation")
+        if scope not in {"dimension", "hierarchy"}:
+            raise ValueError("unsupported native navigation scope")
+        if type(include_self) is not bool or type(all_parents) is not bool:
+            raise ValueError("navigation options must be boolean")
+        if scope == "hierarchy" and hierarchy_id is None:
+            raise ValueError("hierarchy navigation requires hierarchy_id")
+        if path_relationship_ids is not None and (member_id is None
+                or not isinstance(path_relationship_ids, tuple)
+                or len(path_relationship_ids) > 32):
+            raise ValueError("path requires an anchor and at most 32 relationship IDs")
+        return cls({"kind": "navigation", "operation": operation, "scope": scope,
+            "hierarchyId": None if hierarchy_id is None else _identifier(hierarchy_id, "hierarchy_id"),
+            "anchor": None if member_id is None else {
+                "memberId": _identifier(member_id, "member_id"),
+                "pathRelationshipIds": None if path_relationship_ids is None else
+                    [_identifier(item, "relationship_id") for item in path_relationship_ids]},
+            "includeSelf": include_self, "allParents": all_parents})
+
+    @classmethod
     def attribute(
         cls, attribute_id: str, operator: str, value: object
     ) -> "MemberListExpression":

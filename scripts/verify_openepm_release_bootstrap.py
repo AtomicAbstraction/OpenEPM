@@ -12,14 +12,14 @@ from pathlib import Path
 try:
     from scripts.openepm_signing_trust_policy import (
         TrustPolicyError, eligible_keys, verify as verify_trust_policy,
-        verify_signature,
+        read_signed_payload, selected_key_bytes, verify_signature,
     )
 except ModuleNotFoundError as error:
     if error.name != "scripts":
         raise
     from openepm_signing_trust_policy import (  # type: ignore[no-redef]
         TrustPolicyError, eligible_keys, verify as verify_trust_policy,
-        verify_signature,
+        read_signed_payload, selected_key_bytes, verify_signature,
     )
 
 
@@ -40,7 +40,7 @@ def verify(*, manifest_path: Path, manifest_signature: Path,
            inventory_path: Path, architecture: str, selected_operations: str,
            root_public_key: Path, trust_policy_path: Path,
            trust_policy_signature: Path, minimum_sequence: int,
-           now: datetime | None = None) -> int:
+           now: datetime | None = None, expected_manifest_sha256: str | None = None) -> int:
     now = now or datetime.now(timezone.utc).replace(microsecond=0)
     try:
         policy = verify_trust_policy(trust_policy_path,
@@ -51,10 +51,14 @@ def verify(*, manifest_path: Path, manifest_signature: Path,
                                      purpose="release", now=now)
     except TrustPolicyError as error:
         raise BootstrapError(f"signing trust policy is invalid: {error}") from error
+    try:
+        payload = read_signed_payload(manifest_path, "release manifest", expected_sha256=expected_manifest_sha256)
+    except TrustPolicyError as error:
+        raise BootstrapError(str(error)) from error
     matched = []
     for key_id, public_key in release_keys:
         try:
-            verify_signature(manifest_path, manifest_signature, public_key,
+            verify_signature(payload, manifest_signature, selected_key_bytes(policy, key_id, public_key),
                              "release manifest")
         except TrustPolicyError:
             continue
@@ -63,7 +67,7 @@ def verify(*, manifest_path: Path, manifest_signature: Path,
         raise BootstrapError(
             "release manifest must match exactly one eligible signing key")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"),
+        manifest = json.loads(payload.decode("utf-8"),
                               object_pairs_hook=unique_object)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise BootstrapError("signed release manifest is invalid") from error
@@ -104,6 +108,7 @@ def verify(*, manifest_path: Path, manifest_signature: Path,
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--expected-manifest-sha256")
     parser.add_argument("--manifest-signature", type=Path, required=True)
     parser.add_argument("--inventory", type=Path, required=True)
     parser.add_argument("--architecture", required=True)
@@ -114,7 +119,7 @@ def main() -> int:
     parser.add_argument("--minimum-trust-policy-sequence", type=int, required=True)
     arguments = parser.parse_args()
     try:
-        sequence = verify(manifest_path=arguments.manifest,
+        sequence = verify(manifest_path=arguments.manifest, expected_manifest_sha256=arguments.expected_manifest_sha256,
             manifest_signature=arguments.manifest_signature,
             inventory_path=arguments.inventory,
             architecture=arguments.architecture,

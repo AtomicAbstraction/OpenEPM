@@ -6,12 +6,15 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import {
   ApiError,
+  adoptBrowserIdentity,
+  isApplicationAccessDenied,
   listApplications,
   readCatalog,
   readPlatformCatalog,
@@ -25,12 +28,17 @@ import type {
   ApplicationSummary,
   SessionIdentity,
 } from "./types";
+import { applicationRoleLabel } from "./types";
+import { mergeTaskListPage, taskListBody } from "./task-list";
+import type { TaskListPage, TaskListRow } from "./task-list";
 import { GlobalSearch, HelpPanel, Notifications } from "./GlobalPanels";
+import { outcomeAuthorityKey } from "./ReceiptInspector";
 import { Applications } from "./Applications";
 import type { CreatedApplication } from "./Applications";
 import {
   browserLifecycleSnapshot,
   installConnectivityLifecycle,
+  setBrowserLifecycle,
   subscribeBrowserLifecycle,
 } from "./browser-lifecycle";
 import type { BrowserLifecycleSnapshot } from "./browser-lifecycle";
@@ -43,6 +51,17 @@ import {
 } from "./unsaved-work";
 import type { UnsavedWorkItem } from "./unsaved-work";
 import { resolveWorkflowDestination } from "./workflow-destination";
+import {
+  parseReferenceHandoff,
+  referenceDestination,
+  referenceHandoffHash,
+  retargetReferenceHandoff,
+} from "./reference-handoff";
+import type {
+  ReferenceHandoff,
+  ResolvedReferenceContext,
+  SavedViewContext,
+} from "./reference-handoff";
 import { MetadataNavigation } from "./MetadataNavigation";
 import {
   metadataSectionLabels,
@@ -50,6 +69,8 @@ import {
   writeMetadataDestination,
 } from "./metadata-navigation";
 import {
+  firstSecuritySection,
+  ruleSectionsFor,
   resolveWorkspaceSection,
   workspaceSections,
 } from "./workspace-navigation";
@@ -110,6 +131,10 @@ type Page =
   | "administration";
 
 type WorkFocus = {
+  referenceHandoff?: ReferenceHandoff;
+  handoffError?: string;
+  taskId?: string;
+  returnTaskId?: string;
   section?: string;
   workspaceId?: string;
   applicationId?: string;
@@ -117,6 +142,7 @@ type WorkFocus = {
   dimensionId?: string;
   memberId?: string;
   hierarchyId?: string;
+  relationshipId?: string;
   assignmentId?: string;
   occurrenceId?: string;
   activityId?: string;
@@ -138,6 +164,9 @@ export function presentationRouteHash(
   applicationIndex: number,
   focus: WorkFocus = {},
 ) {
+  if (focus.handoffError) return "#/reference?invalid=1";
+  if (focus.referenceHandoff)
+    return referenceHandoffHash(focus.referenceHandoff);
   const query = new URLSearchParams();
   if (isWorkspaceArea(page))
     query.set(
@@ -149,6 +178,8 @@ export function presentationRouteHash(
     ["users", "groups", "membership"].includes(focus.section || "")
   )
     query.set("section", focus.section!);
+  if (page === "applications" && focus.workspaceId)
+    query.set("workspace", focus.workspaceId);
   if (focus.workspaceId && focus.applicationId) {
     query.set("workspace", focus.workspaceId);
     query.set("application", focus.applicationId);
@@ -159,11 +190,15 @@ export function presentationRouteHash(
       dimensionId: focus.dimensionId,
       memberId: focus.memberId,
       hierarchyId: focus.hierarchyId,
+      relationshipId: focus.relationshipId,
     });
   if (page === "flows" && focus.occurrenceId) {
     query.set("occurrence", focus.occurrenceId);
     if (focus.activityId) query.set("activity", focus.activityId);
   }
+  if (page === "monitor" && focus.taskId) query.set("task", focus.taskId);
+  if (page !== "monitor" && focus.returnTaskId)
+    query.set("returnTask", focus.returnTaskId);
   if (page === "grid" && focus.viewId && focus.viewDigest) {
     query.set("view", focus.viewId);
     query.set("viewDigest", focus.viewDigest);
@@ -234,7 +269,38 @@ export function applicationPageVisible(
   page: Page,
   catalog: ApplicationCatalog | null,
 ) {
-  if (page === "administration" || page === "security")
+  if (page === "security")
+    return Boolean(catalog && firstSecuritySection(catalog.functions));
+  if (catalog?.applicationAccess.authorizationModel === "group_assignments") {
+    let prefixes: string[];
+    if (isWorkspaceArea(page)) {
+      prefixes = workspaceSections[page].flatMap((section) => section.prefixes);
+    } else if (page === "metadata") {
+      prefixes = [
+        "metadata.dimension.",
+        "metadata.member.",
+        "metadata.hierarchy.",
+      ];
+    } else if (page === "grid") {
+      prefixes = ["facts.cube.", "facts.generic.table.list", "facts.cell."];
+    } else if (page === "flows") {
+      prefixes = [
+        "application.workflow.",
+        "application.assignment.",
+        "application.decision.",
+      ];
+    } else if (page === "monitor") {
+      return Boolean(catalog.ownedJobOperations?.includes("events"));
+    } else if (page === "tasks") {
+      return false;
+    } else {
+      return true;
+    }
+    return Object.keys(catalog.functions).some((name) =>
+      prefixes.some((prefix) => name.startsWith(prefix)),
+    );
+  }
+  if (page === "administration")
     return Boolean(
       catalog?.applicationAccess.role === "Administrator" ||
         catalog?.applicationAccess.workspaceAdministrator,
@@ -293,6 +359,40 @@ export function readPresentationRoute() {
   const requested = match?.[1] || "";
   const candidate = (legacyAliases[requested] || requested) as Page | undefined;
   const query = new URLSearchParams(match?.[3] || "");
+  if (requested === "reference" || query.has("handoff")) {
+    try {
+      if (
+        requested !== "reference" ||
+        query.size !== 1 ||
+        !query.has("handoff")
+      )
+        throw new Error(
+          "Invalid reference link. Request a fresh reference from the originating client.",
+        );
+      const handoff = parseReferenceHandoff(query.get("handoff"));
+      const destination = referenceDestination(handoff);
+      return {
+        page: destination.page,
+        applicationIndex: 0,
+        focus: {
+          ...handoff.scope,
+          ...destination.focus,
+          referenceHandoff: handoff,
+        } as WorkFocus,
+      };
+    } catch (reason) {
+      return {
+        page: "home" as Page,
+        applicationIndex: 0,
+        focus: {
+          handoffError:
+            reason instanceof Error
+              ? reason.message
+              : "Invalid reference link.",
+        } as WorkFocus,
+      };
+    }
+  }
   const rawViewDigest = query.get("viewDigest") || "";
   const viewDigest = /^[0-9a-f]{64}$/.test(rawViewDigest)
     ? rawViewDigest
@@ -327,9 +427,12 @@ export function readPresentationRoute() {
             dimensionId: metadata.dimensionId,
             memberId: metadata.memberId,
             hierarchyId: metadata.hierarchyId,
+            relationshipId: metadata.relationshipId,
           }
         : {}),
       assignmentId: query.get("assignment") || undefined,
+      taskId: query.get("task") || undefined,
+      returnTaskId: query.get("returnTask") || undefined,
       viewId: query.get("view") || undefined,
       viewDigest,
       artifactKind:
@@ -367,9 +470,90 @@ function initials(value?: string) {
 }
 
 function sessionIdentityKey(identity: SessionIdentity | null) {
-  return identity
-    ? JSON.stringify([identity.issuer || "", identity.subject])
-    : "anonymous";
+  return identity?.identityBinding ?? "anonymous";
+}
+
+type PlatformAccess =
+  | {
+      state: "granted";
+      catalog: Awaited<ReturnType<typeof readPlatformCatalog>>;
+    }
+  | { state: "denied" | "unavailable" };
+
+async function readPlatformAccess(
+  signal: AbortSignal,
+  identityBinding: string,
+): Promise<PlatformAccess> {
+  try {
+    const catalog = await readPlatformCatalog(signal, identityBinding);
+    if (
+      catalog?.languageVersion !== 2 ||
+      !catalog.functions ||
+      typeof catalog.functions !== "object" ||
+      Array.isArray(catalog.functions) ||
+      (catalog.authorized !== undefined &&
+        typeof catalog.authorized !== "boolean")
+    )
+      return { state: "unavailable" };
+    return catalog.authorized === false
+      ? { state: "denied" }
+      : { state: "granted", catalog };
+  } catch (reason: unknown) {
+    if (reason instanceof ApiError) {
+      // The platform catalogue reports a confirmed denial as authorized: false.
+      // A transport refusal leaves the current grant unconfirmed.
+      if (
+        reason.kind === "authorization" ||
+        reason.kind === "request" ||
+        reason.kind === "capacity"
+      )
+        return { state: "unavailable" };
+    }
+    throw reason;
+  }
+}
+
+function validateApplicationCatalog(value: ApplicationCatalog) {
+  const access = value?.applicationAccess;
+  const revisions = value?.revisions;
+  if (
+    !access ||
+    (access.authorizationModel === "group_assignments"
+      ? access.role !== "Assigned" ||
+        !Array.isArray(access.roles) ||
+        !access.roles.every(
+          (role) => typeof role === "string" && role.trim().length > 0,
+        )
+      : (access.authorizationModel !== undefined &&
+          access.authorizationModel !== "legacy") ||
+        !["Reader", "Editor", "Administrator"].includes(access.role)) ||
+    typeof access.workspaceAdministrator !== "boolean" ||
+    (value.workspaceFunctions !== undefined &&
+      (!Array.isArray(value.workspaceFunctions) ||
+        !value.workspaceFunctions.every(
+          (name) => typeof name === "string" && name.length > 0,
+        ))) ||
+    (value.accessContext !== undefined &&
+      (typeof value.accessContext !== "string" ||
+        !/^[0-9a-f]{64}$/.test(value.accessContext))) ||
+    !value.functions ||
+    typeof value.functions !== "object" ||
+    Array.isArray(value.functions) ||
+    !Array.isArray(value.enabledCapabilities) ||
+    !value.enabledCapabilities.every(
+      (capability) => typeof capability === "string",
+    ) ||
+    !revisions ||
+    ![
+      revisions.metadata,
+      revisions.data,
+      revisions.policy,
+      revisions.security,
+      revisions.commit,
+    ].every((revision) => Number.isSafeInteger(revision) && revision >= 0)
+  )
+    throw new ApiError(502, "INVALID_APPLICATION_CATALOG", undefined, true);
+  return value;
 }
 
 function AppIcon() {
@@ -392,32 +576,58 @@ export function App() {
   const identityRef = useRef<SessionIdentity | null>(null);
   const [pendingIdentity, setPendingIdentity] =
     useState<SessionIdentity | null>(null);
-  const [catalog, setCatalog] = useState<ApplicationCatalog | null>(null);
-  const [catalogScopeKey, setCatalogScopeKey] = useState("");
+  const [catalogSnapshot, setCatalogSnapshot] = useState<{
+    scope: string;
+    value: ApplicationCatalog;
+  } | null>(null);
   const [catalogError, setCatalogError] = useState<{
     scope: string;
     message: string;
+    denied: boolean;
   } | null>(null);
-  const [platformCatalog, setPlatformCatalog] = useState<{
-    languageVersion: number;
-    functions: Record<string, unknown>;
+  const [catalogCheck, setCatalogCheck] = useState<{
+    scope: string;
+    request: AbortController;
   } | null>(null);
-  const [platformChecked, setPlatformChecked] = useState(false);
+  const [platformAccess, setPlatformAccess] = useState<PlatformAccess | null>(
+    null,
+  );
+  const platformCatalog =
+    platformAccess?.state === "granted" ? platformAccess.catalog : null;
   const [page, setPage] = useState<Page>(initialRoute.page);
   const [workFocus, setWorkFocus] = useState<WorkFocus>(initialRoute.focus);
   const [collapsed, setCollapsed] = useState(
     () =>
       typeof window !== "undefined" &&
-      Boolean(window.matchMedia?.("(max-width: 650px)").matches),
+      Boolean(window.matchMedia?.("(max-width: 950px)").matches),
   );
+  const [mobileViewport, setMobileViewport] = useState(() =>
+    Boolean(window.matchMedia?.("(max-width: 650px)").matches),
+  );
+  const mobileNavigationOpen = mobileViewport && !collapsed;
+  const mobileNavigationOpenRef = useRef(mobileNavigationOpen);
+  mobileNavigationOpenRef.current = mobileNavigationOpen;
+  const sidebarToggleRef = useRef<HTMLButtonElement | null>(null);
+  const sidebarCloseRef = useRef<HTMLButtonElement | null>(null);
+  const sidebarOpeningFocus = useRef(false);
+  const sidebarReturningFocus = useRef(false);
+  const collapseSidebar = useCallback(() => {
+    if (mobileNavigationOpenRef.current) sidebarReturningFocus.current = true;
+    else if (document.activeElement?.closest(".sidebar"))
+      sidebarToggleRef.current?.focus();
+    setCollapsed(true);
+  }, []);
   const [accountOpen, setAccountOpen] = useState(false);
   const accountButtonRef = useRef<HTMLButtonElement | null>(null);
   const accountCardRef = useRef<HTMLElement | null>(null);
   const [copyStatus, setCopyStatus] = useState("");
   const copyStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
+  const searchButtonRef = useRef<HTMLButtonElement | null>(null);
+  const routeDestinationFocus = useRef(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const workspaceModalOpen = searchOpen || helpOpen;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [browserLifecycle, setBrowserLifecycleState] =
@@ -426,10 +636,25 @@ export function App() {
     useState<UnsavedWorkItem[]>(unsavedWorkSnapshot);
   const [discardPromptOpen, setDiscardPromptOpen] = useState(false);
   const discardDialogRef = useRef<HTMLElement | null>(null);
-  const discardTriggerRef = useRef<HTMLElement | null>(null);
+  const discardTriggerRef = useRef<{
+    element: HTMLElement;
+    mobileNavigation: boolean;
+  } | null>(null);
+  // Focus follows the committed inert boundary, never the covered Menu button.
+  useLayoutEffect(() => {
+    if (discardPromptOpen) return;
+    if (mobileNavigationOpen && sidebarOpeningFocus.current) {
+      sidebarOpeningFocus.current = false;
+      sidebarCloseRef.current?.focus();
+    } else if (!mobileNavigationOpen && sidebarReturningFocus.current) {
+      sidebarReturningFocus.current = false;
+      sidebarToggleRef.current?.focus();
+    }
+  }, [mobileNavigationOpen, discardPromptOpen]);
   const [releaseAvailable, setReleaseAvailable] = useState(false);
   const runtimeBuild = useRef<string | null>(null);
   const pendingTransition = useRef<null | (() => void)>(null);
+  const pendingAbandonRecovery = useRef(false);
   const routeHistoryIndex = useRef(
     Number.isSafeInteger(window.history.state?.openEpmNavigationIndex)
       ? (window.history.state.openEpmNavigationIndex as number)
@@ -438,45 +663,274 @@ export function App() {
   const restoringHistory = useRef<string | null>(null);
   const afterHistoryRestore = useRef<null | (() => void)>(null);
   const approvedHistoryTarget = useRef<string | null>(null);
-  const explicitApplication = Boolean(
-    workFocus.workspaceId || workFocus.applicationId,
-  );
+  const managedWorkspaceOnly =
+    page === "applications" &&
+    Boolean(workFocus.workspaceId) &&
+    !workFocus.applicationId;
+  const explicitApplication =
+    !managedWorkspaceOnly &&
+    Boolean(workFocus.workspaceId || workFocus.applicationId);
   const exactApplicationIndex = applications.findIndex(
     (item) =>
       item.workspaceId === workFocus.workspaceId &&
       item.applicationId === workFocus.applicationId,
   );
-  const app =
-    applicationScopedPage(page) && explicitApplication
-      ? applications[exactApplicationIndex]
-      : applications[selected];
+  const usesApplicationContext =
+    applicationScopedPage(page) || page === "applications";
+  const selectedApplicationIndex = managedWorkspaceOnly
+    ? -1
+    : usesApplicationContext && explicitApplication
+      ? exactApplicationIndex
+      : selected;
+  const app = applications[selectedApplicationIndex];
+  const activeApplication = useRef(app);
+  activeApplication.current = app;
   const applicationKey = app
     ? JSON.stringify([app.workspaceId, app.applicationId])
     : "";
   const catalogScope = JSON.stringify([identityKey, applicationKey]);
-  const currentCatalog = catalogScope === catalogScopeKey ? catalog : null;
+  const currentCatalog =
+    catalogSnapshot?.scope === catalogScope ? catalogSnapshot.value : null;
+  const workspaceUnavailable = Boolean(
+    currentCatalog && !applicationPageVisible(page, currentCatalog),
+  );
+  const referenceRoute = JSON.stringify([
+    catalogScope,
+    page,
+    presentationRouteHash(page, selected, workFocus),
+  ]);
+  // Monitor's task and job projections depend on current grants even when
+  // the application, account and requested task in the URL stay the same.
+  const referenceScope = workspaceUnavailable
+    ? ""
+    : currentCatalog
+      ? JSON.stringify([
+          referenceRoute,
+          currentCatalog.accessContext,
+          ...(page === "monitor"
+            ? [
+                currentCatalog.applicationAccess.role,
+                currentCatalog.applicationAccess.workspaceAdministrator,
+                currentCatalog.revisions.security,
+                currentCatalog.revisions.policy,
+                currentCatalog.revisions.schemaEpoch,
+                currentCatalog.revisions.capability,
+              ]
+            : []),
+        ])
+      : referenceRoute;
+  const activeReferenceScope = useRef(referenceScope);
+  activeReferenceScope.current = referenceScope;
+  const [resolvedReference, setResolvedReference] = useState<{
+    scope: string;
+    context: ResolvedReferenceContext | null;
+  }>({ scope: "", context: null });
+  const onReferenceContextChange = useCallback(
+    (context: ResolvedReferenceContext | null) => {
+      if (activeReferenceScope.current !== referenceScope) return;
+      setResolvedReference({ scope: referenceScope, context });
+    },
+    [referenceScope],
+  );
+  const onViewContextChange = useCallback(
+    (context: SavedViewContext | null) => {
+      onReferenceContextChange(
+        context
+          ? {
+              target: { kind: "savedView", viewId: context.viewId },
+              observed: { viewDigest: context.viewDigest },
+              analyticalRead: context.analyticalRead,
+            }
+          : null,
+      );
+    },
+    [onReferenceContextChange],
+  );
+  const onTaskContextChange = useCallback(
+    (taskId: string | null) => {
+      onReferenceContextChange(
+        taskId
+          ? {
+              target: { kind: "task", taskId },
+              observed: {},
+            }
+          : null,
+      );
+    },
+    [onReferenceContextChange],
+  );
+  const currentReferenceContext =
+    currentCatalog &&
+    !workspaceUnavailable &&
+    resolvedReference.scope === referenceScope
+      ? resolvedReference.context
+      : null;
+  useEffect(() => {
+    if (workspaceUnavailable)
+      setResolvedReference({ scope: "", context: null });
+  }, [workspaceUnavailable]);
+  const currentReference = useMemo(() => {
+    if (!app || !currentReferenceContext) return null;
+    const incoming = workFocus.referenceHandoff;
+    const workflowOrigin = workFocus.occurrenceId
+      ? {
+          kind: "workflowActivity" as const,
+          occurrenceId: workFocus.occurrenceId,
+          ...(workFocus.activityId ? { activityId: workFocus.activityId } : {}),
+        }
+      : null;
+    const taskOrigin = workFocus.returnTaskId
+      ? {
+          kind: "task" as const,
+          taskId: workFocus.returnTaskId,
+        }
+      : null;
+    try {
+      return parseReferenceHandoff({
+        format: "openepm.reference-handoff/v1",
+        scope: {
+          workspaceId: app.workspaceId,
+          applicationId: app.applicationId,
+        },
+        origin: incoming?.origin || taskOrigin || workflowOrigin,
+        returnTo: incoming?.returnTo || taskOrigin || workflowOrigin,
+        pendingOperation: incoming?.pendingOperation || null,
+        ...currentReferenceContext,
+      });
+    } catch {
+      // A malformed legacy origin must not crash the workspace or disappear
+      // from an apparently exact handoff. The ordinary page remains usable.
+      return null;
+    }
+  }, [
+    app?.workspaceId,
+    app?.applicationId,
+    currentReferenceContext,
+    workFocus,
+  ]);
   const activeCatalogScope = useRef(catalogScope);
   activeCatalogScope.current = catalogScope;
-  const catalogLoadGeneration = useRef(0);
-  const refreshApplicationCatalog = useCallback(async () => {
-    if (!app)
-      throw new Error("Select an application before refreshing its context.");
-    const requestedScope = catalogScope;
-    const generation = ++catalogLoadGeneration.current;
-    const value = await readCatalog({
-      workspaceId: app.workspaceId,
-      applicationId: app.applicationId,
-    });
-    if (
-      activeCatalogScope.current !== requestedScope ||
-      generation !== catalogLoadGeneration.current
-    )
-      throw new DOMException("Application context changed", "AbortError");
-    setCatalog(value);
-    setCatalogScopeKey(requestedScope);
+  const shell = useRef<HTMLDivElement>(null);
+  const catalogCheckRoute = useRef(referenceRoute);
+  catalogCheckRoute.current = referenceRoute;
+  const catalogCheckFocus = useRef<{
+    element: HTMLElement;
+    route: string;
+  } | null>(null);
+  const catalogVisit = useRef<{
+    latest: {
+      controller: AbortController;
+      result: Promise<ApplicationCatalog>;
+    } | null;
+  } | null>(null);
+  useLayoutEffect(() => {
+    // A result belongs to this visit. Returning while another application is
+    // still loading requires a fresh check even if the earlier scope matches.
+    const visit: NonNullable<typeof catalogVisit.current> = { latest: null };
+    catalogVisit.current = visit;
+    setCatalogSnapshot(null);
     setCatalogError(null);
-    return value;
-  }, [app?.workspaceId, app?.applicationId, catalogScope]);
+    setCatalogCheck(null);
+    catalogCheckFocus.current = null;
+    return () => {
+      catalogVisit.current = null;
+      visit.latest?.controller.abort();
+    };
+  }, [catalogScope]);
+  const refreshApplicationCatalog = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!app)
+        throw new Error("Select an application before refreshing its context.");
+      const requestedScope = catalogScope;
+      const visit = catalogVisit.current;
+      if (!visit)
+        throw new DOMException("Application context changed", "AbortError");
+      const assertVisit = () => {
+        signal?.throwIfAborted();
+        if (
+          catalogVisit.current !== visit ||
+          activeCatalogScope.current !== requestedScope
+        )
+          throw new DOMException("Application context changed", "AbortError");
+      };
+      assertVisit();
+      const request = new AbortController();
+      const focused = document.activeElement;
+      if (focused instanceof HTMLElement && shell.current?.contains(focused))
+        catalogCheckFocus.current = {
+          element: focused,
+          route: catalogCheckRoute.current,
+        };
+      setCatalogCheck({ scope: requestedScope, request });
+      const abort = () => request.abort();
+      signal?.addEventListener("abort", abort, { once: true });
+      setCatalogError((previous) =>
+        previous?.scope === requestedScope && previous.denied ? null : previous,
+      );
+      const assertRequest = () => {
+        request.signal.throwIfAborted();
+        assertVisit();
+      };
+      const scope = {
+        workspaceId: app.workspaceId,
+        applicationId: app.applicationId,
+      };
+      const load = async () => {
+        try {
+          const value = validateApplicationCatalog(
+            await readCatalog(scope, request.signal),
+          );
+          assertRequest();
+          setCatalogSnapshot({ scope: requestedScope, value });
+          setCatalogError(null);
+          return value;
+        } catch (reason: unknown) {
+          assertRequest();
+          if (reason instanceof DOMException && reason.name === "AbortError")
+            throw reason;
+          const denied = isApplicationAccessDenied(reason);
+          if (denied) setCatalogSnapshot(null);
+          setCatalogError({
+            scope: requestedScope,
+            denied,
+            message:
+              reason instanceof Error
+                ? reason.message
+                : "CATALOG_REQUEST_FAILED",
+          });
+          throw reason;
+        } finally {
+          signal?.removeEventListener("abort", abort);
+          setCatalogCheck((current) =>
+            current?.request === request ? null : current,
+          );
+        }
+      };
+      // Only the latest request can update the catalogue or the tab lifecycle.
+      visit.latest?.controller.abort();
+      const loaded = { controller: request, result: load() };
+      visit.latest = loaded;
+      // A reconnect overtaken by another read must wait for that read before
+      // reopening the shell. An older response carries no current authority.
+      let observed = loaded;
+      for (;;) {
+        try {
+          const value = await observed.result;
+          assertVisit();
+          if (observed === visit.latest) return value;
+        } catch (reason) {
+          assertVisit();
+          if (observed === visit.latest) throw reason;
+        }
+        observed = visit.latest;
+      }
+    },
+    [app?.workspaceId, app?.applicationId, catalogScope],
+  );
+  const currentCatalogRefresh = useRef<typeof refreshApplicationCatalog | null>(
+    null,
+  );
+  currentCatalogRefresh.current = app ? refreshApplicationCatalog : null;
   const activeWorkspaceSection = isWorkspaceArea(page)
     ? workspaceSections[page].find(
         (item) =>
@@ -488,25 +942,90 @@ export function App() {
           ),
       )
     : undefined;
+  const activeCatalogError =
+    catalogError?.scope === catalogScope ? catalogError : null;
+  const catalogAccessDenied =
+    applicationScopedPage(page) && Boolean(activeCatalogError?.denied);
+  const awaitingApplicationCatalog =
+    applicationScopedPage(page) && Boolean(app) && !currentCatalog;
+  const checkingApplicationCatalog = Boolean(
+    applicationScopedPage(page) &&
+      currentCatalog &&
+      catalogCheck?.scope === catalogScope,
+  );
+  const catalogRefreshFailed = Boolean(
+    applicationScopedPage(page) &&
+      currentCatalog &&
+      activeCatalogError &&
+      !activeCatalogError.denied,
+  );
+  const blocked =
+    Boolean(pendingIdentity) ||
+    checkingApplicationCatalog ||
+    catalogRefreshFailed ||
+    ["expired", "offline", "unavailable", "revalidating"].includes(
+      browserLifecycle.state,
+    );
   const currentCatalogError =
-    catalogError?.scope === catalogScope ? catalogError.message : "";
+    catalogAccessDenied || awaitingApplicationCatalog || catalogRefreshFailed
+      ? ""
+      : activeCatalogError?.message;
+  const metadataNavigationScope =
+    currentCatalog &&
+    applicationPageVisible("metadata", currentCatalog) &&
+    Object.hasOwn(currentCatalog.functions, "metadata.dimension.list")
+      ? JSON.stringify([
+          catalogScope,
+          currentCatalog.accessContext,
+          currentCatalog.applicationAccess,
+          currentCatalog.revisions.security,
+          currentCatalog.revisions.policy,
+          currentCatalog.revisions.schemaEpoch,
+          currentCatalog.revisions.capability,
+        ])
+      : null;
+  const activeMetadataNavigation = useRef(metadataNavigationScope);
+  activeMetadataNavigation.current = metadataNavigationScope;
   const [metadataDimensionState, setMetadataDimensionState] = useState<{
-    applicationKey: string;
+    scope: string;
+    metadataRevision: number;
     dimensions: MetadataNavigationDimension[];
-  }>({ applicationKey: "", dimensions: [] });
+  } | null>(null);
   const metadataDimensions =
-    metadataDimensionState.applicationKey === applicationKey
+    metadataDimensionState &&
+    metadataDimensionState.scope === metadataNavigationScope &&
+    metadataDimensionState.metadataRevision >=
+      (currentCatalog?.revisions.metadata ?? 0)
       ? metadataDimensionState.dimensions
       : [];
   const onMetadataDimensionsChange = useCallback(
-    (dimensions: MetadataNavigationDimension[]) => {
-      setMetadataDimensionState({ applicationKey, dimensions });
+    (
+      dimensions: MetadataNavigationDimension[],
+      metadataRevision: number | null,
+    ) => {
+      if (
+        !metadataNavigationScope ||
+        activeMetadataNavigation.current !== metadataNavigationScope
+      )
+        return;
+      if (metadataRevision === null) {
+        setMetadataDimensionState(null);
+        return;
+      }
+      setMetadataDimensionState((previous) =>
+        previous?.scope === metadataNavigationScope &&
+        previous.metadataRevision > metadataRevision
+          ? previous
+          : { scope: metadataNavigationScope, metadataRevision, dimensions },
+      );
     },
-    [applicationKey],
+    [metadataNavigationScope],
   );
   useEffect(() => {
-    setMetadataDimensionState({ applicationKey, dimensions: [] });
-  }, [applicationKey, identityKey]);
+    setMetadataDimensionState((current) =>
+      current?.scope === metadataNavigationScope ? current : null,
+    );
+  }, [metadataNavigationScope]);
   useEffect(() => {
     if (
       page !== "metadata" ||
@@ -529,20 +1048,6 @@ export function App() {
     workFocus.metadataSection,
     metadataDimensions,
   ]);
-
-  function acceptSession(session: SessionIdentity) {
-    const current = identityRef.current;
-    if (
-      current &&
-      sessionIdentityKey(current) !== sessionIdentityKey(session) &&
-      unsavedWorkSnapshot().length > 0
-    ) {
-      setPendingIdentity(session);
-      return;
-    }
-    identityRef.current = session;
-    setIdentity(session);
-  }
 
   useEffect(() => subscribeBrowserLifecycle(setBrowserLifecycleState), []);
   useEffect(() => subscribeUnsavedWork(setUnsavedWorkState), []);
@@ -590,82 +1095,115 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    let active = true;
-    const controllers = new Set<AbortController>();
-    const revalidate = () => {
+    let pending: AbortController | undefined;
+    const revalidate = async (broadcast = true) => {
+      pending?.abort();
       const controller = new AbortController();
-      controllers.add(controller);
-      readSession(controller.signal)
-        .then((session) => {
-          if (active) {
-            acceptSession(session);
-            setError("");
-          }
-        })
-        .catch((reason: unknown) => {
-          if (
-            active &&
-            !(reason instanceof DOMException && reason.name === "AbortError")
-          )
-            setError(
-              reason instanceof Error ? reason.message : "REQUEST_FAILED",
-            );
-        })
-        .finally(() => controllers.delete(controller));
-    };
-    const uninstall = installConnectivityLifecycle(revalidate);
-    return () => {
-      active = false;
-      uninstall();
-      for (const controller of controllers) controller.abort();
-    };
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    Promise.all([
-      listApplications(controller.signal),
-      readSession(controller.signal),
-    ])
-      .then(([apps, session]) => {
-        if (controller.signal.aborted) return;
-        setApplications(apps);
-        acceptSession(session);
-        setSelected((current) => (current < apps.length ? current : 0));
-      })
-      .catch((reason: Error) => {
-        if (
-          !controller.signal.aborted &&
-          !(reason instanceof DOMException && reason.name === "AbortError")
-        )
-          setError(reason.message);
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
-      });
-    return () => controller.abort();
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    readPlatformCatalog(controller.signal)
-      .then((value) => {
-        if (!controller.signal.aborted)
-          setPlatformCatalog(value.authorized === false ? null : value);
-      })
-      .catch((reason: Error) => {
-        if (
-          controller.signal.aborted ||
-          (reason instanceof DOMException && reason.name === "AbortError")
-        )
+      pending = controller;
+      const { signal } = controller;
+      try {
+        const session = await readSession(signal);
+        signal.throwIfAborted();
+        const previous = identityRef.current;
+        const sameIdentity =
+          sessionIdentityKey(previous) === sessionIdentityKey(session);
+        if (!sameIdentity && previous && unsavedWorkSnapshot().length > 0) {
+          setPendingIdentity(session);
           return;
-        if (!(reason instanceof ApiError && reason.status === 403))
-          setError(reason.message);
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setPlatformChecked(true);
-      });
-    return () => controller.abort();
+        }
+        if (sameIdentity) {
+          setPendingIdentity(null);
+          const requestedScope = activeCatalogScope.current;
+          const requestedVisit = catalogVisit.current;
+          try {
+            await currentCatalogRefresh.current?.(signal);
+          } catch (reason: unknown) {
+            signal.throwIfAborted();
+            const authorizationDenied = isApplicationAccessDenied(reason);
+            const changedApplication =
+              reason instanceof DOMException &&
+              reason.name === "AbortError" &&
+              (requestedScope !== activeCatalogScope.current ||
+                requestedVisit !== catalogVisit.current);
+            if (!authorizationDenied && !changedApplication) {
+              if (browserLifecycleSnapshot().state === "revalidating")
+                setBrowserLifecycle(
+                  "unavailable",
+                  "CATALOG_REVALIDATION_FAILED",
+                );
+              return;
+            }
+          }
+        }
+        const [discovered, platform] = await Promise.all([
+          listApplications(signal, session.identityBinding),
+          readPlatformAccess(signal, session.identityBinding),
+        ]);
+        signal.throwIfAborted();
+        const active = activeApplication.current;
+        const activeIndex =
+          sameIdentity && active
+            ? discovered.findIndex(
+                (entry) =>
+                  entry.workspaceId === active.workspaceId &&
+                  entry.applicationId === active.applicationId,
+              )
+            : -1;
+        if (!sameIdentity) {
+          // A returning identity must start from freshly verified projections.
+          catalogVisit.current?.latest?.controller.abort();
+          setCatalogSnapshot(null);
+          setCatalogError(null);
+          setAccountOpen(false);
+          setSearchOpen(false);
+          setNotificationsOpen(false);
+        }
+        setApplications(discovered);
+        setPlatformAccess(platform);
+        setSelected((index) =>
+          previous || index >= discovered.length
+            ? Math.max(0, activeIndex)
+            : index,
+        );
+        identityRef.current = session;
+        adoptBrowserIdentity(session);
+        setIdentity(session);
+        setPendingIdentity(null);
+        setBrowserLifecycle("authenticated", undefined, broadcast);
+        setError("");
+      } catch (reason: unknown) {
+        if (
+          !signal.aborted &&
+          !(reason instanceof DOMException && reason.name === "AbortError")
+        ) {
+          const lifecycle = browserLifecycleSnapshot().state;
+          if (lifecycle === "bootstrapping" || lifecycle === "revalidating")
+            setBrowserLifecycle(
+              "unavailable",
+              "SESSION_CONTEXT_REVALIDATION_FAILED",
+            );
+          setError(reason instanceof Error ? reason.message : "REQUEST_FAILED");
+        }
+      } finally {
+        if (pending === controller) {
+          pending = undefined;
+          if (!signal.aborted) setLoading(false);
+          controller.abort();
+        }
+      }
+    };
+    const uninstall = installConnectivityLifecycle(
+      (broadcast) => void revalidate(broadcast),
+    );
+    const cancelBlockedRefresh = subscribeBrowserLifecycle(({ state }) => {
+      if (state === "offline" || state === "expired") pending?.abort();
+    });
+    void revalidate();
+    return () => {
+      cancelBlockedRefresh();
+      uninstall();
+      pending?.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -791,7 +1329,11 @@ export function App() {
     return () => window.removeEventListener("hashchange", restore);
   }, [page, selected, workFocus]);
 
-  function requestTransition(transition: () => void, preserveDrafts = false) {
+  function requestTransition(
+    transition: () => void,
+    preserveDrafts = false,
+    abandonRecovery = false,
+  ) {
     if (
       unsavedWorkSnapshot().length === 0 ||
       (preserveDrafts && canPreserveUnsavedWork())
@@ -799,11 +1341,18 @@ export function App() {
       transition();
       return;
     }
+    const active = document.activeElement;
     discardTriggerRef.current =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
+      active instanceof HTMLElement
+        ? {
+            element: active.closest("#global-search-panel")
+              ? (searchButtonRef.current ?? active)
+              : active,
+            mobileNavigation: mobileNavigationOpenRef.current,
+          }
         : null;
     pendingTransition.current = transition;
+    pendingAbandonRecovery.current = abandonRecovery;
     setDiscardPromptOpen(true);
   }
 
@@ -838,8 +1387,15 @@ export function App() {
     window.addEventListener("keydown", keyboard);
     return () => {
       window.removeEventListener("keydown", keyboard);
-      if (discardTriggerRef.current?.isConnected)
-        discardTriggerRef.current.focus();
+      const trigger = discardTriggerRef.current;
+      if (
+        trigger?.element.isConnected &&
+        document.activeElement === document.body
+      ) {
+        if (trigger.mobileNavigation && !mobileNavigationOpenRef.current)
+          sidebarToggleRef.current?.focus();
+        else trigger.element.focus();
+      }
       discardTriggerRef.current = null;
     };
   }, [discardPromptOpen]);
@@ -847,7 +1403,22 @@ export function App() {
   function navigationDestination(target: Page, focus: WorkFocus = {}) {
     return applicationScopedPage(target) && app
       ? {
+          ...(target === "grid" &&
+          page === "monitor" &&
+          currentReferenceContext?.target.kind === "task"
+            ? { returnTaskId: currentReferenceContext.target.taskId }
+            : {}),
           ...focus,
+          ...(target === "security" && !focus.section && currentCatalog
+            ? { section: firstSecuritySection(currentCatalog.functions) }
+            : {}),
+          ...(target === "rules" &&
+          !focus.section &&
+          !focus.artifactKind &&
+          currentCatalog?.applicationAccess.authorizationModel ===
+            "group_assignments"
+            ? { section: ruleSectionsFor(currentCatalog.functions)[0]?.id }
+            : {}),
           workspaceId: focus.workspaceId || app.workspaceId,
           applicationId: focus.applicationId || app.applicationId,
         }
@@ -862,7 +1433,11 @@ export function App() {
     );
   }
 
-  function navigate(target: Page, focus: WorkFocus = {}) {
+  function navigate(
+    target: Page,
+    focus: WorkFocus = {},
+    focusDestination = false,
+  ) {
     const destination = navigationDestination(target, focus);
     if (
       target === page &&
@@ -871,6 +1446,7 @@ export function App() {
     )
       return;
     const transition = () => {
+      if (focusDestination) routeDestinationFocus.current = true;
       setAccountOpen(false);
       routeHistoryIndex.current += 1;
       window.history.pushState(
@@ -880,29 +1456,41 @@ export function App() {
       );
       setWorkFocus(destination);
       setPage(target);
-      if (window.matchMedia?.("(max-width: 650px)").matches) setCollapsed(true);
+      if (window.matchMedia?.("(max-width: 950px)").matches) collapseSidebar();
     };
     requestTransition(transition, true);
   }
 
-  function navigateMetadata(destination: MetadataDestination) {
-    navigate("metadata", {
-      metadataSection: destination.section,
-      dimensionId: destination.dimensionId,
-      memberId: destination.memberId,
-      hierarchyId: Object.hasOwn(destination, "hierarchyId")
-        ? destination.hierarchyId || undefined
-        : destination.dimensionId === workFocus.dimensionId
-          ? workFocus.hierarchyId
-          : undefined,
-    });
+  function navigateMetadata(
+    destination: MetadataDestination,
+    focusDestination = false,
+  ) {
+    navigate(
+      "metadata",
+      {
+        metadataSection: destination.section,
+        dimensionId: destination.dimensionId,
+        memberId: destination.memberId,
+        relationshipId: destination.relationshipId,
+        hierarchyId: Object.hasOwn(destination, "hierarchyId")
+          ? destination.hierarchyId || undefined
+          : destination.dimensionId === workFocus.dimensionId
+            ? workFocus.hierarchyId
+            : undefined,
+      },
+      focusDestination,
+    );
   }
 
   function signOut() {
-    requestTransition(() => {
-      setAccountOpen(false);
-      window.location.assign(browserLogoutPath());
-    });
+    requestTransition(
+      () => {
+        setAccountOpen(false);
+        window.location.assign(browserLogoutPath());
+      },
+      false,
+      true,
+    );
   }
 
   function reloadRelease() {
@@ -910,78 +1498,62 @@ export function App() {
   }
 
   useEffect(() => {
-    const query = window.matchMedia?.("(max-width: 650px)");
-    if (!query) return;
-    const adapt = (event: MediaQueryListEvent | MediaQueryList) => {
-      if (event.matches) setCollapsed(true);
+    const compact = window.matchMedia?.("(max-width: 950px)");
+    const mobile = window.matchMedia?.("(max-width: 650px)");
+    const adaptCompact = (event: MediaQueryListEvent) => {
+      if (event.matches) collapseSidebar();
     };
-    query.addEventListener?.("change", adapt);
-    return () => query.removeEventListener?.("change", adapt);
-  }, []);
+    const adaptMobile = (event: MediaQueryListEvent) => {
+      // Either direction ends the overlay before its Close control disappears.
+      collapseSidebar();
+      setMobileViewport(event.matches);
+    };
+    compact?.addEventListener?.("change", adaptCompact);
+    mobile?.addEventListener?.("change", adaptMobile);
+    return () => {
+      compact?.removeEventListener?.("change", adaptCompact);
+      mobile?.removeEventListener?.("change", adaptMobile);
+    };
+  }, [collapseSidebar]);
 
   useEffect(() => {
-    if (!app) {
-      setCatalog(null);
-      setCatalogScopeKey("");
-      setCatalogError(null);
-      return;
-    }
+    if (!app) return;
     const controller = new AbortController();
-    const generation = ++catalogLoadGeneration.current;
-    readCatalog(
-      { workspaceId: app.workspaceId, applicationId: app.applicationId },
-      controller.signal,
-    )
-      .then((value) => {
-        if (
-          controller.signal.aborted ||
-          generation !== catalogLoadGeneration.current
-        )
-          return;
-        setCatalog(value);
-        setCatalogScopeKey(catalogScope);
-        setCatalogError(null);
-      })
-      .catch((reason: unknown) => {
-        if (
-          controller.signal.aborted ||
-          generation !== catalogLoadGeneration.current ||
-          (reason instanceof DOMException && reason.name === "AbortError")
-        )
-          return;
-        setCatalogError({
-          scope: catalogScope,
-          message:
-            reason instanceof Error ? reason.message : "CATALOG_REQUEST_FAILED",
-        });
-      });
+    void refreshApplicationCatalog(controller.signal).catch(() => undefined);
     return () => controller.abort();
-  }, [app?.workspaceId, app?.applicationId, identityKey]);
+  }, [refreshApplicationCatalog]);
 
   const visibleApplicationPages = useMemo(
     () =>
-      applicationPages.filter((item) =>
-        applicationPageVisible(item.id, currentCatalog),
-      ),
+      currentCatalog
+        ? applicationPages.filter((item) =>
+            applicationPageVisible(item.id, currentCatalog),
+          )
+        : [],
     [currentCatalog],
   );
+  const notificationScope =
+    app && currentCatalog
+      ? JSON.stringify([
+          identityKey,
+          outcomeAuthorityKey(app, currentCatalog),
+          currentCatalog.revisions.policy,
+        ])
+      : null;
   const visiblePrimary = useMemo(
     () => primary.filter((item) => item.id !== "server" || platformCatalog),
     [platformCatalog],
   );
 
   useEffect(() => {
-    if (platformChecked && page === "server" && !platformCatalog)
-      navigate("home");
-  }, [page, platformCatalog, platformChecked]);
-
-  useEffect(() => {
-    if (!currentCatalog || primary.some((item) => item.id === page)) return;
-    if (!applicationPageVisible(page, currentCatalog)) navigate("overview");
-  }, [currentCatalog, page]);
-
-  useEffect(() => {
     function shortcuts(event: KeyboardEvent) {
+      if (
+        blocked ||
+        mobileNavigationOpenRef.current ||
+        workspaceModalOpen ||
+        discardPromptOpen
+      )
+        return;
       if (event.key === "Escape") {
         setSearchOpen(false);
         setNotificationsOpen(false);
@@ -1011,9 +1583,13 @@ export function App() {
     }
     window.addEventListener("keydown", shortcuts);
     return () => window.removeEventListener("keydown", shortcuts);
-  }, []);
+  }, [blocked, workspaceModalOpen, discardPromptOpen]);
 
-  function chooseApplication(index: number, destination: Page = "overview") {
+  function chooseApplication(
+    index: number,
+    destination: Page = "overview",
+    focusDestination = false,
+  ) {
     const target = applications[index];
     if (!target) return;
     if (
@@ -1023,23 +1599,46 @@ export function App() {
       app?.applicationId === target.applicationId
     )
       return;
+    const destinationScope = {
+      workspaceId: target.workspaceId,
+      applicationId: target.applicationId,
+    };
     const transition = () => {
+      if (focusDestination) routeDestinationFocus.current = true;
       routeHistoryIndex.current += 1;
       window.history.pushState(
         { openEpmNavigationIndex: routeHistoryIndex.current },
         "",
-        presentationRouteHash(destination, index, {}),
+        presentationRouteHash(destination, index, destinationScope),
       );
       setSelected(index);
       setAccountOpen(false);
-      setWorkFocus({});
+      setWorkFocus(destinationScope);
       setPage(destination);
     };
     requestTransition(transition, true);
   }
 
-  async function applicationCreated(created: CreatedApplication) {
-    const apps = await listApplications();
+  async function applicationCreated(
+    created: CreatedApplication,
+    signal: AbortSignal,
+    open: boolean,
+  ) {
+    const originIdentity = identityKey;
+    const apps = await listApplications(signal);
+    signal.throwIfAborted();
+    if (sessionIdentityKey(identityRef.current) !== originIdentity)
+      throw new DOMException("Identity changed", "AbortError");
+    if (!open) {
+      const previous = apps.findIndex(
+        (item) =>
+          item.workspaceId === app?.workspaceId &&
+          item.applicationId === app?.applicationId,
+      );
+      setApplications(apps);
+      setSelected(Math.max(0, previous));
+      return;
+    }
     const index = apps.findIndex(
       (item) =>
         item.workspaceId === created.workspaceId &&
@@ -1061,7 +1660,10 @@ export function App() {
     workspaceId: string,
     _applicationId: string,
   ) {
+    const originIdentity = identityKey;
     const apps = await listApplications();
+    if (sessionIdentityKey(identityRef.current) !== originIdentity)
+      throw new DOMException("Identity changed", "AbortError");
     const index = Math.max(
       0,
       apps.findIndex((item) => item.workspaceId === workspaceId),
@@ -1084,15 +1686,37 @@ export function App() {
       primary.some((item) => item.id === target) ||
       applicationPages.some((item) => item.id === target)
     )
-      navigate(target as Page);
+      navigate(target as Page, {}, true);
   }
 
-  async function copyViewLink() {
+  async function copyViewLink(references = false) {
     if (copyStatusTimer.current) clearTimeout(copyStatusTimer.current);
     setCopyStatus("");
     try {
-      await navigator.clipboard.writeText(shareableViewUrl(window.location));
-      setCopyStatus("Link copied");
+      if (references && !currentReference) return;
+      await navigator.clipboard.writeText(
+        references
+          ? JSON.stringify(currentReference, null, 2)
+          : currentReference
+            ? `${window.location.origin}${window.location.pathname}${referenceHandoffHash(currentReference)}`
+            : page === "grid"
+              ? `${window.location.origin}${window.location.pathname}${presentationRouteHash(
+                  "grid",
+                  selected,
+                  {
+                    workspaceId: app?.workspaceId,
+                    applicationId: app?.applicationId,
+                  },
+                )}`
+              : shareableViewUrl(window.location),
+      );
+      setCopyStatus(
+        references
+          ? "References copied. Open them with your own authorized client."
+          : page === "grid" && !currentReference
+            ? "Page link copied. Unsaved or unresolved grid context is not included."
+            : "Link copied",
+      );
     } catch {
       setCopyStatus("Unable to copy link");
     }
@@ -1102,6 +1726,15 @@ export function App() {
     }, 2500);
   }
 
+  function openReference(handoff: ReferenceHandoff) {
+    const destination = referenceDestination(handoff);
+    navigate(
+      destination.page,
+      { ...handoff.scope, ...destination.focus, referenceHandoff: handoff },
+      true,
+    );
+  }
+
   useEffect(
     () => () => {
       if (copyStatusTimer.current) clearTimeout(copyStatusTimer.current);
@@ -1109,40 +1742,100 @@ export function App() {
     [],
   );
 
-  const blocked =
-    Boolean(pendingIdentity) ||
-    ["expired", "offline", "unavailable", "revalidating"].includes(
-      browserLifecycle.state,
-    );
+  const mainContent = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    if (
+      !routeDestinationFocus.current ||
+      blocked ||
+      workspaceModalOpen ||
+      discardPromptOpen
+    )
+      return;
+    routeDestinationFocus.current = false;
+    mainContent.current?.focus({ preventScroll: true });
+  }, [
+    blocked,
+    workspaceModalOpen,
+    discardPromptOpen,
+    page,
+    selected,
+    workFocus,
+  ]);
+  useLayoutEffect(() => {
+    if (catalogCheck || blocked) return;
+    const focused = catalogCheckFocus.current;
+    catalogCheckFocus.current = null;
+    if (
+      focused?.route === referenceRoute &&
+      document.activeElement === document.body
+    ) {
+      const element = focused.element;
+      if (element.isConnected && !element.closest("[inert]"))
+        element.focus({ preventScroll: true });
+      if (document.activeElement === document.body)
+        mainContent.current?.focus({ preventScroll: true });
+    }
+  }, [blocked, catalogCheck, referenceRoute]);
+  const monitorFocus = useRef<{
+    element: HTMLElement;
+    route: string;
+    scope: string;
+  } | null>(null);
+  useLayoutEffect(() => {
+    const previous = monitorFocus.current;
+    if (!previous || previous.scope === referenceScope || blocked) return;
+    monitorFocus.current = null;
+    if (
+      previous.route === referenceRoute &&
+      !previous.element.isConnected &&
+      document.activeElement === document.body &&
+      !mobileNavigationOpen
+    )
+      mainContent.current?.focus({ preventScroll: true });
+  }, [blocked, mobileNavigationOpen, referenceRoute, referenceScope]);
   const retry = () => window.dispatchEvent(new Event("online"));
+  const applicationContextUnavailable = {
+    kind: "unavailable" as const,
+    title: "Application context unavailable",
+    description:
+      "Open EPM could not confirm current access to this application. Your drafts stay in this tab while the workspace is paused.",
+    action: "Retry context check",
+    perform: () => {
+      routeDestinationFocus.current = true;
+      retry();
+    },
+  };
   const blockedPresentation = pendingIdentity
     ? {
         kind: "identity" as const,
         title: "Identity changed",
         description:
-          "This tab was opened by another identity. Its unpublished drafts cannot be transferred to the newly authenticated user.",
+          "This tab was opened by another identity. Its drafts and local recovery records cannot be transferred to the newly authenticated user. Unconfirmed requests may already have completed; clearing local recovery does not cancel them.",
         action: "Discard drafts and continue",
         perform: () => {
-          discardUnsavedWork();
-          identityRef.current = pendingIdentity;
-          setIdentity(pendingIdentity);
+          discardUnsavedWork({ abandonRecovery: true });
           setPendingIdentity(null);
+          retry();
         },
       }
     : browserLifecycle.state === "expired"
       ? {
           kind: "expired" as const,
-          title: "Your session has timed out",
+          title:
+            browserLifecycle.reason === "IDENTITY_INACTIVE" ||
+            browserLifecycle.reason === "IDENTITY_SESSION_REVOKED"
+              ? "Your sign-in is no longer valid"
+              : "Your session has timed out",
           description:
             unsavedWork.length > 0
-              ? "Your unpublished browser work is still held in this tab. Signing in again will discard it; review the list before continuing."
+              ? "Your drafts and local recovery records are still held in this tab. Signing in again will discard them. Unconfirmed requests may already have completed; clearing local recovery does not cancel them."
               : "For your security, this page is no longer active. Sign in again to continue.",
           action:
             unsavedWork.length > 0
               ? "Discard drafts and sign in"
               : "Sign in again",
           perform: () => {
-            discardUnsavedWork();
+            discardUnsavedWork({ abandonRecovery: true });
             window.location.assign(browserLogoutPath());
           },
         }
@@ -1151,19 +1844,28 @@ export function App() {
             kind: "offline" as const,
             title: "You are offline",
             description:
-              "Open EPM has stopped sending requests. Drafts remain in this tab and nothing has been published. Reconnect, then retry safely.",
+              "Open EPM has stopped sending requests. Drafts remain in this tab. Unconfirmed operations may have completed; reconnect and reconcile their original status before submitting more work.",
             action: "Retry connection",
             perform: retry,
           }
         : browserLifecycle.state === "unavailable"
-          ? {
-              kind: "unavailable" as const,
-              title: "Open EPM is temporarily unavailable",
-              description:
-                "The service did not confirm your session. Drafts remain in this tab while Open EPM blocks stale interaction.",
-              action: "Retry connection",
-              perform: retry,
-            }
+          ? (catalogRefreshFailed &&
+              browserLifecycle.reason !== "BROWSER_IDENTITY_CHANGED") ||
+            browserLifecycle.reason === "CATALOG_REVALIDATION_FAILED"
+            ? applicationContextUnavailable
+            : {
+                kind: "unavailable" as const,
+                title:
+                  browserLifecycle.reason === "BROWSER_IDENTITY_CHANGED"
+                    ? "Check the signed-in account"
+                    : "Open EPM is temporarily unavailable",
+                description:
+                  browserLifecycle.reason === "BROWSER_IDENTITY_CHANGED"
+                    ? "The signed-in account changed while this tab was open. Drafts remain with their original account while Open EPM checks the current session."
+                    : "The service did not confirm your session. Drafts remain in this tab while Open EPM blocks stale interaction.",
+                action: "Retry connection",
+                perform: retry,
+              }
           : browserLifecycle.state === "revalidating"
             ? {
                 kind: "revalidating" as const,
@@ -1171,7 +1873,16 @@ export function App() {
                 description:
                   "Open EPM is confirming your identity and current authority before interaction resumes.",
               }
-            : null;
+            : checkingApplicationCatalog
+              ? {
+                  kind: "revalidating" as const,
+                  title: "Checking the application context…",
+                  description:
+                    "Open EPM is confirming your current application access. Your drafts stay in this tab while the workspace is paused.",
+                }
+              : catalogRefreshFailed
+                ? applicationContextUnavailable
+                : null;
 
   const breadcrumbLink = (
     label: string,
@@ -1229,17 +1940,90 @@ export function App() {
   return (
     <>
       {blockedPresentation && (
-        <BrowserStateScreen {...blockedPresentation} pending={unsavedWork} />
+        <BrowserStateScreen
+          {...blockedPresentation}
+          pending={pendingIdentity ? [] : unsavedWork}
+        />
       )}
       <div
+        ref={shell}
         className={collapsed ? "shell collapsed" : "shell"}
         inert={blocked || undefined}
         aria-hidden={blocked || undefined}
       >
-        <a className="skip-link" href="#main-content">
+        <a
+          className="skip-link"
+          href="#main-content"
+          inert={mobileNavigationOpen || workspaceModalOpen || undefined}
+        >
           Skip to main content
         </a>
-        <aside className="sidebar" id="primary-navigation">
+        {mobileNavigationOpen && (
+          <div className="sidebar-scrim" aria-hidden="true" />
+        )}
+        <aside
+          className="sidebar"
+          id="primary-navigation"
+          role={
+            mobileNavigationOpen && !discardPromptOpen ? "dialog" : undefined
+          }
+          aria-modal={
+            mobileNavigationOpen && !discardPromptOpen ? true : undefined
+          }
+          aria-label={
+            mobileNavigationOpen && !discardPromptOpen
+              ? "Application navigation"
+              : undefined
+          }
+          inert={
+            workspaceModalOpen ||
+            (mobileNavigationOpen && discardPromptOpen) ||
+            undefined
+          }
+          onKeyDown={(event) => {
+            if (!mobileNavigationOpen || discardPromptOpen) return;
+            if (event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              collapseSidebar();
+              return;
+            }
+            if (event.key !== "Tab") return;
+            const controls = Array.from(
+              event.currentTarget.querySelectorAll<HTMLElement>(
+                "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
+              ),
+            ).filter(
+              (control) =>
+                !control.closest("[hidden], [inert]") &&
+                getComputedStyle(control).display !== "none" &&
+                getComputedStyle(control).visibility !== "hidden",
+            );
+            const first = controls[0],
+              last = controls.at(-1);
+            if (
+              first &&
+              last &&
+              ((event.shiftKey && document.activeElement === first) ||
+                (!event.shiftKey && document.activeElement === last))
+            ) {
+              event.preventDefault();
+              event.stopPropagation();
+              (event.shiftKey ? last : first).focus();
+            }
+          }}
+        >
+          {!collapsed && (
+            <button
+              className="sidebar-close"
+              ref={sidebarCloseRef}
+              type="button"
+              aria-label="Close sidebar"
+              onClick={collapseSidebar}
+            >
+              Close <span aria-hidden="true">×</span>
+            </button>
+          )}
           <div className="brand">
             <AppIcon />
             <strong>Open EPM</strong>
@@ -1280,48 +2064,63 @@ export function App() {
               </small>
             </span>
             <em>⌄</em>
+            <span
+              className="application-switcher-compact-label"
+              aria-hidden="true"
+            >
+              Choose application
+            </span>
           </button>
-          <nav aria-label="Application navigation" className="application-nav">
-            {navigationGroups.map((group) => (
-              <section
-                className="navigation-group"
-                key={group.label}
-                aria-label={group.label}
-              >
-                <div className="nav-group-label">{group.label}</div>
-                {visibleApplicationPages
-                  .filter((item) => group.pages.includes(item.id))
-                  .map((item) =>
-                    item.id === "metadata" ? (
-                      <MetadataNavigation
-                        key={`${identityKey}:${applicationKey}:metadata`}
-                        active={page === "metadata"}
-                        listsActive={page === "lists"}
-                        section={workFocus.metadataSection || "dimensions"}
-                        dimensionId={workFocus.dimensionId}
-                        dimensions={metadataDimensions}
-                        collapsed={collapsed}
-                        disabled={!app}
-                        onNavigate={navigateMetadata}
-                        onMemberLists={() => navigate("lists")}
-                      />
-                    ) : (
-                      <button
-                        key={item.id}
-                        className={page === item.id ? "active" : ""}
-                        aria-label={item.label}
-                        aria-current={page === item.id ? "page" : undefined}
-                        disabled={!app}
-                        onClick={() => navigate(item.id)}
-                      >
-                        <UiIcon name={item.id} />
-                        <b>{item.label}</b>
-                      </button>
-                    ),
-                  )}
-              </section>
-            ))}
-          </nav>
+          {visibleApplicationPages.length > 0 && (
+            <nav
+              aria-label="Application navigation"
+              className="application-nav"
+            >
+              {navigationGroups.map((group) => {
+                const destinations = visibleApplicationPages.filter((item) =>
+                  group.pages.includes(item.id),
+                );
+                if (!destinations.length) return null;
+                return (
+                  <section
+                    className="navigation-group"
+                    key={group.label}
+                    aria-label={group.label}
+                  >
+                    <div className="nav-group-label">{group.label}</div>
+                    {destinations.map((item) =>
+                      item.id === "metadata" ? (
+                        <MetadataNavigation
+                          key={`${identityKey}:${applicationKey}:metadata`}
+                          active={page === "metadata"}
+                          listsActive={page === "lists"}
+                          section={workFocus.metadataSection || "dimensions"}
+                          dimensionId={workFocus.dimensionId}
+                          dimensions={metadataDimensions}
+                          collapsed={collapsed}
+                          disabled={!app}
+                          onNavigate={navigateMetadata}
+                          onMemberLists={() => navigate("lists")}
+                        />
+                      ) : (
+                        <button
+                          key={item.id}
+                          className={page === item.id ? "active" : ""}
+                          aria-label={item.label}
+                          aria-current={page === item.id ? "page" : undefined}
+                          disabled={!app}
+                          onClick={() => navigate(item.id)}
+                        >
+                          <UiIcon name={item.id} />
+                          <b>{item.label}</b>
+                        </button>
+                      ),
+                    )}
+                  </section>
+                );
+              })}
+            </nav>
+          )}
           <div className="sidebar-foot">
             <span className="agent-dot" />{" "}
             <span>
@@ -1331,15 +2130,35 @@ export function App() {
           </div>
         </aside>
 
-        <header className="topbar">
+        <header
+          className="topbar"
+          inert={mobileNavigationOpen || workspaceModalOpen || undefined}
+        >
           <button
             className="menu-button"
+            ref={sidebarToggleRef}
             aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
             aria-controls="primary-navigation"
             aria-expanded={!collapsed}
-            onClick={() => setCollapsed((value) => !value)}
+            onClick={() => {
+              if (!collapsed) {
+                collapseSidebar();
+                return;
+              }
+              if (mobileViewport) {
+                setSearchOpen(false);
+                setNotificationsOpen(false);
+                setAccountOpen(false);
+                setHelpOpen(false);
+                sidebarOpeningFocus.current = true;
+              }
+              setCollapsed(false);
+            }}
           >
-            ☰
+            <span aria-hidden="true">☰</span>
+            <span className="sidebar-toggle-label" aria-hidden="true">
+              Menu
+            </span>
           </button>
           <Breadcrumbs items={breadcrumbItems} />
           <div className="top-actions">
@@ -1358,6 +2177,7 @@ export function App() {
               <UiIcon name="link" />
             </button>
             <button
+              ref={searchButtonRef}
               aria-label="Search"
               aria-keyshortcuts="Control+K Meta+K"
               title="Search (Ctrl/⌘ K)"
@@ -1372,19 +2192,21 @@ export function App() {
             >
               <UiIcon name="search" />
             </button>
-            <button
-              aria-label="Notifications"
-              aria-controls="notification-panel"
-              aria-expanded={notificationsOpen}
-              onClick={() => {
-                setNotificationsOpen((value) => !value);
-                setSearchOpen(false);
-                setAccountOpen(false);
-                setHelpOpen(false);
-              }}
-            >
-              <UiIcon name="notifications" />
-            </button>
+            {notificationScope && (
+              <button
+                aria-label="Notifications"
+                aria-controls="notification-panel"
+                aria-expanded={notificationsOpen}
+                onClick={() => {
+                  setNotificationsOpen((value) => !value);
+                  setSearchOpen(false);
+                  setAccountOpen(false);
+                  setHelpOpen(false);
+                }}
+              >
+                <UiIcon name="notifications" />
+              </button>
+            )}
             <button
               aria-label="Keyboard help"
               aria-keyshortcuts="Shift+/"
@@ -1428,15 +2250,19 @@ export function App() {
               signOut={signOut}
             />
           )}
-          <Notifications
-            open={notificationsOpen}
-            close={() => setNotificationsOpen(false)}
-            app={app}
-            goMonitor={() => navigate("monitor")}
-          />
+          {notificationScope && (
+            <Notifications
+              key={notificationScope}
+              open={notificationsOpen}
+              close={() => setNotificationsOpen(false)}
+              app={app}
+              goMonitor={() => navigate("monitor")}
+            />
+          )}
         </header>
 
         <GlobalSearch
+          key={`search:${identityKey}`}
           open={searchOpen}
           close={() => setSearchOpen(false)}
           applications={applications}
@@ -1444,15 +2270,28 @@ export function App() {
           targets={[...visiblePrimary, ...visibleApplicationPages]}
           catalog={currentCatalog}
           go={go}
-          chooseApplication={chooseApplication}
+          chooseApplication={(index) =>
+            chooseApplication(index, "overview", true)
+          }
         />
         <HelpPanel open={helpOpen} close={() => setHelpOpen(false)} />
 
         <main
           data-page={page}
+          inert={mobileNavigationOpen || workspaceModalOpen || undefined}
           id="main-content"
           tabIndex={-1}
           key={identityKey}
+          ref={mainContent}
+          onFocusCapture={(event) => {
+            const element = event.target;
+            monitorFocus.current =
+              page === "monitor" &&
+              element instanceof HTMLElement &&
+              element.closest(".monitor-page, .workflow-return")
+                ? { element, route: referenceRoute, scope: referenceScope }
+                : null;
+          }}
         >
           {releaseAvailable && (
             <section
@@ -1472,24 +2311,141 @@ export function App() {
               </button>
             </section>
           )}
-          {page !== "flows" && workFocus.occurrenceId && (
-            <section className="workflow-return" role="status">
-              <span>Working from an assigned workflow activity</span>
+          {currentReference && (
+            <section className="workflow-return" aria-label="Client handoff">
+              <span>
+                Share saved references. The receiving client checks its own
+                access and current state.
+              </span>
+              <button type="button" onClick={() => void copyViewLink(true)}>
+                Copy client references
+              </button>
+              {page === "monitor" &&
+                currentReference.target.kind === "task" && (
+                  <button
+                    type="button"
+                    onClick={() => navigate("grid", {}, true)}
+                  >
+                    Open Grid from this task
+                  </button>
+                )}
+            </section>
+          )}
+          {app && currentReferenceContext && !currentReference && (
+            <p role="alert">
+              This route contains an unsupported reference. Open a fresh view
+              before sharing client references.
+            </p>
+          )}
+          {page !== "monitor" &&
+            workFocus.returnTaskId &&
+            !workFocus.referenceHandoff && (
+              <section
+                className="workflow-return"
+                aria-label="Return to originating work"
+              >
+                <span>
+                  Return rereads the originating task without accepting or
+                  completing it.
+                </span>
+                <button
+                  type="button"
+                  disabled={loading || !app || !currentCatalog}
+                  onClick={() =>
+                    navigate(
+                      "monitor",
+                      {
+                        workspaceId: workFocus.workspaceId || app?.workspaceId,
+                        applicationId:
+                          workFocus.applicationId || app?.applicationId,
+                        taskId: workFocus.returnTaskId,
+                      },
+                      true,
+                    )
+                  }
+                >
+                  Return to task
+                </button>
+              </section>
+            )}
+          {workFocus.referenceHandoff?.returnTo && (
+            <section
+              className="workflow-return"
+              aria-label="Return to originating work"
+            >
+              <span>
+                Return rereads the originating work. It does not accept or
+                complete it.
+              </span>
               <button
                 type="button"
+                disabled={loading || !app || !currentCatalog}
                 onClick={() =>
-                  navigate("flows", {
-                    workspaceId: app?.workspaceId,
-                    applicationId: app?.applicationId,
-                    occurrenceId: workFocus.occurrenceId,
-                    activityId: workFocus.activityId,
-                  })
+                  openReference(
+                    retargetReferenceHandoff(
+                      workFocus.referenceHandoff!,
+                      workFocus.referenceHandoff!.returnTo!,
+                    ),
+                  )
                 }
               >
-                Return to workflow
+                {workFocus.referenceHandoff.returnTo.kind === "task"
+                  ? "Return to task"
+                  : "Return to workflow"}
               </button>
             </section>
           )}
+          {workFocus.referenceHandoff?.pendingOperation && (
+            <section
+              className="workflow-return"
+              aria-label="Referenced operation"
+            >
+              <span>
+                A referenced operation must be inspected before considering
+                another submission.
+              </span>
+              <button
+                type="button"
+                disabled={loading || !app || !currentCatalog}
+                onClick={() =>
+                  openReference(
+                    retargetReferenceHandoff(
+                      workFocus.referenceHandoff!,
+                      workFocus.referenceHandoff!.pendingOperation!,
+                    ),
+                  )
+                }
+              >
+                Inspect referenced operation
+              </button>
+            </section>
+          )}
+          {page !== "flows" &&
+            workFocus.occurrenceId &&
+            !workFocus.referenceHandoff && (
+              <section className="workflow-return" role="status">
+                <span>Working from an assigned workflow activity</span>
+                <button
+                  type="button"
+                  disabled={loading || !app || !currentCatalog}
+                  onClick={() =>
+                    navigate(
+                      "flows",
+                      {
+                        workspaceId: workFocus.workspaceId || app?.workspaceId,
+                        applicationId:
+                          workFocus.applicationId || app?.applicationId,
+                        occurrenceId: workFocus.occurrenceId,
+                        activityId: workFocus.activityId,
+                      },
+                      true,
+                    )
+                  }
+                >
+                  Return to workflow
+                </button>
+              </section>
+            )}
           <div className="print-context" aria-hidden="true">
             <strong>{app?.name || "Open EPM"}</strong>
             <span>{pageTitle(page)}</span>
@@ -1501,39 +2457,113 @@ export function App() {
           )}
           {loading ? (
             <Loading />
-          ) : (
+          ) : identity ? (
             <Suspense
               fallback={<div className="empty-state">Loading workspace…</div>}
             >
-              {applicationScopedPage(page) && explicitApplication && !app ? (
+              {workFocus.handoffError ? (
                 <section className="page" role="alert">
-                  <h1>Application unavailable</h1>
-                  <p>
-                    This link refers to an application outside your current
-                    access. Choose an application to continue.
-                  </p>
+                  <h1>Reference unavailable</h1>
+                  <p>{workFocus.handoffError}</p>
                   <button
-                    className="primary"
+                    type="button"
                     onClick={() => navigate("applications")}
                   >
                     Choose application
+                  </button>
+                </section>
+              ) : catalogAccessDenied ||
+                (usesApplicationContext && explicitApplication && !app) ? (
+                <section className="page" role="alert">
+                  <h1>Application unavailable</h1>
+                  <p>
+                    {catalogAccessDenied
+                      ? activeCatalogError?.message
+                      : "The linked application is unavailable under your current access."}
+                  </p>
+                  <div className="actions">
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => {
+                        if (app) {
+                          mainContent.current?.focus({ preventScroll: true });
+                          void refreshApplicationCatalog().catch(
+                            () => undefined,
+                          );
+                        } else {
+                          routeDestinationFocus.current = true;
+                          retry();
+                        }
+                      }}
+                    >
+                      Recheck application access
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => navigate("applications")}
+                    >
+                      Choose application
+                    </button>
+                  </div>
+                </section>
+              ) : awaitingApplicationCatalog ? (
+                activeCatalogError ? (
+                  <section className="page" role="alert">
+                    <h1>Application context unavailable</h1>
+                    <p>
+                      Open EPM could not confirm this application's current
+                      context.
+                    </p>
+                    <p>{activeCatalogError.message}</p>
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => {
+                        setCatalogError(null);
+                        void refreshApplicationCatalog().catch(() => undefined);
+                      }}
+                    >
+                      Retry context check
+                    </button>
+                  </section>
+                ) : (
+                  <Loading message="Checking the application context…" />
+                )
+              ) : workspaceUnavailable ? (
+                <section className="page" role="status">
+                  <h1>{pageTitle(page)} unavailable</h1>
+                  <p>
+                    This workspace is unavailable in the current application
+                    context.
+                  </p>
+                  <button type="button" onClick={() => navigate("overview")}>
+                    Open application overview
                   </button>
                 </section>
               ) : page === "home" ? (
                 <Home
                   app={app}
                   identity={identity}
-                  catalog={currentCatalog}
+                  availablePages={visibleApplicationPages}
+                  serverAvailable={Boolean(platformCatalog)}
                   go={navigate}
                 />
               ) : page === "applications" ? (
                 <Applications
-                  key={`${identityKey}:${app?.workspaceId || "none"}`}
+                  key={`${identityKey}:${managedWorkspaceOnly ? workFocus.workspaceId : app?.workspaceId || "none"}`}
                   applications={applications}
-                  selected={selected}
+                  selected={selectedApplicationIndex}
                   catalog={currentCatalog}
+                  issuer={identity?.issuer || ""}
                   subject={identity?.subject || ""}
-                  choose={chooseApplication}
+                  choose={(index) => chooseApplication(index, "overview", true)}
+                  managedWorkspaceId={
+                    managedWorkspaceOnly ? workFocus.workspaceId : undefined
+                  }
+                  selectManagedWorkspace={(workspaceId) =>
+                    navigate("applications", { workspaceId })
+                  }
                   selectWorkspace={(index) =>
                     chooseApplication(index, "applications")
                   }
@@ -1546,28 +2576,50 @@ export function App() {
                   key={applicationKey}
                   app={app}
                   catalog={currentCatalog}
-                  open={navigate}
+                  catalogueUnavailable={Boolean(activeCatalogError)}
+                  open={(target, focus) => navigate(target, focus, true)}
                 />
-              ) : page === "server" && platformCatalog ? (
-                <ServerAdministration
-                  key={workFocus.section || "users"}
-                  functions={platformCatalog.functions}
-                  section={workFocus.section}
-                  onNavigateSection={(section) =>
-                    navigate("server", { section })
-                  }
-                  onRequestTransition={requestTransition}
-                />
+              ) : page === "server" ? (
+                platformCatalog ? (
+                  <ServerAdministration
+                    key={`${identityKey}:${workFocus.section || "users"}`}
+                    functions={platformCatalog.functions}
+                    section={workFocus.section}
+                    onNavigateSection={(section) =>
+                      navigate("server", { section })
+                    }
+                    onRequestTransition={requestTransition}
+                  />
+                ) : (
+                  <section className="page" role="alert">
+                    <h1>Server administration unavailable</h1>
+                    <p>
+                      {platformAccess?.state === "denied"
+                        ? "Your current account does not have server administration access."
+                        : "Open EPM could not confirm server administration access."}
+                    </p>
+                    {platformAccess?.state !== "denied" && (
+                      <button type="button" className="primary" onClick={retry}>
+                        Retry access check
+                      </button>
+                    )}
+                    <button type="button" onClick={() => navigate("home")}>
+                      Go to Home
+                    </button>
+                  </section>
+                )
               ) : page === "overview" ? (
                 <Overview
                   app={app}
                   catalog={currentCatalog}
+                  catalogueUnavailable={Boolean(activeCatalogError)}
                   go={navigate}
                   onRequestTransition={requestTransition}
                 />
               ) : page === "grid" ? (
                 <Analyze
                   key={`${identityKey}:${applicationKey}`}
+                  interactionBlocked={blocked}
                   app={app}
                   catalog={currentCatalog}
                   index={selected}
@@ -1575,15 +2627,26 @@ export function App() {
                   onRequestTransition={requestTransition}
                   targetViewId={workFocus.viewId}
                   targetViewDigest={workFocus.viewDigest}
+                  targetAnalyticalRead={
+                    workFocus.referenceHandoff?.analyticalRead
+                  }
+                  onViewContextChange={onViewContextChange}
+                  onRefreshCatalog={refreshApplicationCatalog}
                 />
               ) : page === "flows" ? (
                 <GenericWorkflow
                   key={`${identityKey}:${applicationKey}`}
                   app={app}
                   catalog={currentCatalog}
+                  catalogueUnavailable={Boolean(activeCatalogError)}
+                  onRefreshCatalog={refreshApplicationCatalog}
                   onRequestTransition={requestTransition}
                   targetOccurrenceId={workFocus.occurrenceId}
                   targetActivityId={workFocus.activityId}
+                  openMyWork={() => go("work")}
+                  openOccurrence={(occurrenceId) =>
+                    navigate("flows", { occurrenceId }, true)
+                  }
                   openDestination={(destination, activityContext) => {
                     const common = {
                       workspaceId: app?.workspaceId,
@@ -1598,10 +2661,62 @@ export function App() {
                       currentCatalog,
                     );
                     if (!resolution.supported) return resolution.message;
-                    navigate(resolution.page, {
-                      ...common,
-                      ...resolution.focus,
-                    });
+                    if (workFocus.referenceHandoff) {
+                      const incoming = workFocus.referenceHandoff;
+                      const origin = common.occurrenceId
+                        ? {
+                            kind: "workflowActivity" as const,
+                            occurrenceId: common.occurrenceId,
+                            ...(common.activityId
+                              ? { activityId: common.activityId }
+                              : {}),
+                          }
+                        : incoming.target;
+                      const targetContext =
+                        resolution.page === "grid"
+                          ? {
+                              target: {
+                                kind: "savedView",
+                                viewId: resolution.focus.viewId,
+                              },
+                              observed: {
+                                viewDigest: resolution.focus.viewDigest,
+                              },
+                              analyticalRead: { semantics: "stored" },
+                            }
+                          : {
+                              target: {
+                                kind: "definition",
+                                artifactKind: resolution.focus.artifactKind,
+                                artifactId: resolution.focus.artifactId,
+                              },
+                              observed: {
+                                stateToken: resolution.focus.artifactStateToken,
+                                definitionDigest:
+                                  resolution.focus.artifactDigest,
+                              },
+                            };
+                      openReference(
+                        parseReferenceHandoff({
+                          format: incoming.format,
+                          scope: incoming.scope,
+                          origin,
+                          returnTo:
+                            incoming.returnTo ||
+                            (origin.kind === "workflowActivity"
+                              ? origin
+                              : null),
+                          pendingOperation: incoming.pendingOperation,
+                          ...targetContext,
+                        }),
+                      );
+                      return null;
+                    }
+                    navigate(
+                      resolution.page,
+                      { ...common, ...resolution.focus },
+                      true,
+                    );
                     return null;
                   }}
                 />
@@ -1610,7 +2725,8 @@ export function App() {
                   key={applicationKey}
                   app={app}
                   catalog={currentCatalog}
-                  open={navigate}
+                  catalogueUnavailable={Boolean(activeCatalogError)}
+                  open={(target, focus) => navigate(target, focus, true)}
                 />
               ) : page === "metadata" ? (
                 explicitApplication && !app ? (
@@ -1637,12 +2753,20 @@ export function App() {
                     dimensionId={workFocus.dimensionId}
                     memberId={workFocus.memberId}
                     hierarchyId={workFocus.hierarchyId}
-                    onNavigate={navigateMetadata}
+                    relationshipId={workFocus.relationshipId}
+                    onNavigate={(destination) =>
+                      navigateMetadata(
+                        destination,
+                        destination.section !==
+                          (workFocus.metadataSection || "dimensions"),
+                      )
+                    }
                     hrefForDestination={(destination) =>
                       navigationHref("metadata", {
                         metadataSection: destination.section,
                         dimensionId: destination.dimensionId,
                         memberId: destination.memberId,
+                        relationshipId: destination.relationshipId,
                         hierarchyId: Object.hasOwn(destination, "hierarchyId")
                           ? destination.hierarchyId || undefined
                           : destination.dimensionId === workFocus.dimensionId
@@ -1652,6 +2776,7 @@ export function App() {
                     }
                     onDimensionsChange={onMetadataDimensionsChange}
                     onRequestTransition={requestTransition}
+                    onRefreshCatalog={refreshApplicationCatalog}
                   />
                 )
               ) : page === "data" ||
@@ -1662,6 +2787,9 @@ export function App() {
                 <CapabilityArea
                   key={`${identityKey}:${app?.workspaceId || "none"}:${app?.applicationId || "none"}:${page}:${isWorkspaceArea(page) ? resolveWorkspaceSection(page, workFocus.section, workFocus.artifactKind) : ""}`}
                   area={page}
+                  canReadDirectoryGroups={Boolean(
+                    platformCatalog?.functions["identity.group.list"],
+                  )}
                   section={
                     isWorkspaceArea(page)
                       ? resolveWorkspaceSection(
@@ -1672,15 +2800,38 @@ export function App() {
                       : undefined
                   }
                   onNavigateSection={(section) =>
-                    navigate(page, {
-                      ...workFocus,
-                      section,
-                      artifactKind: undefined,
-                      artifactId: undefined,
-                      artifactVersion: undefined,
-                      artifactStateToken: undefined,
-                      artifactDigest: undefined,
-                    })
+                    navigate(
+                      page,
+                      {
+                        ...workFocus,
+                        section,
+                        // Deliberate section navigation leaves the exact incoming
+                        // target. Keeping its envelope would serialize the old
+                        // URL and make this transition a no-op. Preserve only its
+                        // explicit return destination in the ordinary route.
+                        referenceHandoff: undefined,
+                        returnTaskId:
+                          workFocus.referenceHandoff?.returnTo?.kind === "task"
+                            ? workFocus.referenceHandoff.returnTo.taskId
+                            : workFocus.returnTaskId,
+                        occurrenceId:
+                          workFocus.referenceHandoff?.returnTo?.kind ===
+                          "workflowActivity"
+                            ? workFocus.referenceHandoff.returnTo.occurrenceId
+                            : workFocus.occurrenceId,
+                        activityId:
+                          workFocus.referenceHandoff?.returnTo?.kind ===
+                          "workflowActivity"
+                            ? workFocus.referenceHandoff.returnTo.activityId
+                            : workFocus.activityId,
+                        artifactKind: undefined,
+                        artifactId: undefined,
+                        artifactVersion: undefined,
+                        artifactStateToken: undefined,
+                        artifactDigest: undefined,
+                      },
+                      true,
+                    )
                   }
                   onRequestTransition={requestTransition}
                   app={app}
@@ -1738,14 +2889,28 @@ export function App() {
                 />
               ) : page === "monitor" ? (
                 <Monitor
-                  key={applicationKey}
+                  key={referenceScope}
                   app={app}
                   catalog={currentCatalog}
+                  onRefreshCatalog={refreshApplicationCatalog}
                   onRequestTransition={requestTransition}
+                  targetTaskId={workFocus.taskId}
+                  onTaskContextChange={onTaskContextChange}
+                  onCloseTask={
+                    workFocus.referenceHandoff?.returnTo
+                      ? () =>
+                          openReference(
+                            retargetReferenceHandoff(
+                              workFocus.referenceHandoff!,
+                              workFocus.referenceHandoff!.returnTo!,
+                            ),
+                          )
+                      : undefined
+                  }
                 />
               ) : null}
             </Suspense>
-          )}
+          ) : null}
         </main>
         {discardPromptOpen && (
           <div className="modal-backdrop" role="presentation">
@@ -1786,8 +2951,10 @@ export function App() {
             >
               <h2 id="unsaved-work-title">Discard unsaved changes?</h2>
               <p id="unsaved-work-description">
-                These changes have not been saved. Leaving this view will
-                discard the browser draft.
+                Unsaved edits will be discarded. Unconfirmed requests may
+                already have completed; discarding local work does not cancel
+                them. Recovery records remain available during navigation in
+                this tab, but signing out or reloading clears them.
               </p>
               <ul>
                 {unsavedWork.map((item) => (
@@ -1812,7 +2979,9 @@ export function App() {
                     const transition = pendingTransition.current;
                     pendingTransition.current = null;
                     setDiscardPromptOpen(false);
-                    discardUnsavedWork();
+                    discardUnsavedWork({
+                      abandonRecovery: pendingAbandonRecovery.current,
+                    });
                     transition?.();
                   }}
                 >
@@ -1896,11 +3065,15 @@ function pageTitle(page: Page) {
   )[page];
 }
 
-function Loading() {
+function Loading({
+  message = "Loading your workspace…",
+}: {
+  message?: string;
+}) {
   return (
-    <div className="loading">
+    <div className="loading" role="status">
       <span />
-      <p>Loading your workspace…</p>
+      <p>{message}</p>
     </div>
   );
 }
@@ -1936,7 +3109,9 @@ function AccountCard({
       <dl>
         <div>
           <dt>Current role</dt>
-          <dd>{catalog?.applicationAccess.role || "Select an application"}</dd>
+          <dd>
+            {catalog ? applicationRoleLabel(catalog) : "Select an application"}
+          </dd>
         </div>
         <div>
           <dt>Accessible applications</dt>
@@ -1981,25 +3156,27 @@ function PageHeading({
 function Home({
   app,
   identity,
-  catalog,
+  availablePages,
+  serverAvailable,
   go,
 }: {
   app?: ApplicationSummary;
   identity: SessionIdentity | null;
-  catalog: ApplicationCatalog | null;
+  availablePages: readonly { id: Page }[];
+  serverAvailable: boolean;
   go: (page: Page) => void;
 }) {
   const first = (identity?.displayIdentity || "there").split(/[@. ]/)[0];
   const destinations: { page: Page; title: string; text: string }[] = [
     {
       page: "grid",
-      title: "Explore & edit data",
-      text: "Choose a view, inspect values and review your changes.",
+      title: "Explore data",
+      text: "Open Grid to browse saved views and inspect values.",
     },
     {
       page: "data",
-      title: "Import & export",
-      text: "Move data into and out of your application.",
+      title: "Data tools",
+      text: "Find import, export and supporting detail tools available to you.",
     },
     {
       page: "metadata",
@@ -2009,12 +3186,12 @@ function Home({
     {
       page: "rules",
       title: "Build calculations",
-      text: "Create reusable rules, sequences and schedules.",
+      text: "Create reusable rules with ordered steps, and schedule them.",
     },
     {
       page: "flows",
       title: "Follow a workflow",
-      text: "Complete activities with the right context and evidence.",
+      text: "Open Flows to see activities, assignments and evidence.",
     },
     {
       page: "monitor",
@@ -2022,6 +3199,9 @@ function Home({
       text: "Track running work, results and anything needing attention.",
     },
   ];
+  const visibleDestinations = destinations.filter((destination) =>
+    availablePages.some((item) => destination.page === item.id),
+  );
   return (
     <div className="page home-page">
       <PageHeading
@@ -2031,54 +3211,62 @@ function Home({
       />
       <section className="hero-card">
         <div>
-          <span className="pill">CURRENT APPLICATION</span>
-          <h2>{app?.name || "Choose your application"}</h2>
+          {app && <span className="pill">CURRENT APPLICATION</span>}
+          <h2>{app?.name || "No applications available"}</h2>
           <p>
             {app
               ? `${app.workspaceName || app.workspaceId} · ${app.applicationId}`
-              : "Open a model to begin working with its data and structure."}
+              : "Applications appear here when your account has access."}
           </p>
         </div>
         <button
           className="primary"
-          onClick={() => go(app ? "overview" : "applications")}
+          onClick={() =>
+            go(app ? "overview" : serverAvailable ? "server" : "applications")
+          }
         >
-          {app ? "Open application" : "Choose application"}
+          {app
+            ? "Open application"
+            : serverAvailable
+              ? "Open Server Administration"
+              : "View applications"}
           <UiIcon name="arrow" />
         </button>
       </section>
-      <div className="section-title">
-        <div>
-          <h2>What would you like to work on?</h2>
-          <p>Choose a task to open its workspace.</p>
-        </div>
-        <button className="secondary" onClick={() => go("work")}>
-          My work <UiIcon name="arrow" />
-        </button>
-      </div>
-      <div className="action-grid">
-        {destinations
-          .filter((item) => !app || applicationPageVisible(item.page, catalog))
-          .map((item) => (
-            <Action
-              key={item.page}
-              title={item.title}
-              text={item.text}
-              icon={item.page}
-              onClick={() => go(app ? item.page : "applications")}
-            />
-          ))}
-      </div>
-      <div className="home-orientation">
-        <UiIcon name="metadata" />
-        <div>
-          <strong>One model. Connected workspaces.</strong>
-          <p>
-            Metadata defines your structure. The grid and data tools work with
-            its values. Rules and workflows bring that work together.
-          </p>
-        </div>
-      </div>
+      {visibleDestinations.length > 0 && (
+        <>
+          <div className="section-title">
+            <div>
+              <h2>What would you like to work on?</h2>
+              <p>Choose a task to open its workspace.</p>
+            </div>
+            <button className="secondary" onClick={() => go("work")}>
+              My work <UiIcon name="arrow" />
+            </button>
+          </div>
+          <div className="action-grid">
+            {visibleDestinations.map((item) => (
+              <Action
+                key={item.page}
+                title={item.title}
+                text={item.text}
+                icon={item.page}
+                onClick={() => go(item.page)}
+              />
+            ))}
+          </div>
+          <div className="home-orientation">
+            <UiIcon name="metadata" />
+            <div>
+              <strong>One model. Connected workspaces.</strong>
+              <p>
+                Metadata defines your structure. The grid and data tools work
+                with its values. Rules and workflows bring that work together.
+              </p>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -2110,102 +3298,125 @@ function Action({
   );
 }
 
-type OverviewState = {
-  assignedWork: number;
-  worklistHasMore: boolean;
+type OverviewActivity = {
   tasksHaveMore: boolean;
+  inspectedTasks: number;
   running: number;
   attention: number;
-  recentTasks: Array<{
-    taskId: string;
-    function: string;
-    status: string;
-    initiatorKind?: string;
-  }>;
+  recentTasks: Array<TaskListRow & { initiatorKind?: string }>;
 };
+
+type OverviewScope = {
+  workspaceId: string;
+  applicationId: string;
+  catalog: ApplicationCatalog;
+};
+type OverviewRead<T> =
+  | { scope: OverviewScope; value: T; error?: undefined }
+  | { scope: OverviewScope; value?: undefined; error: string };
 
 export function Overview({
   app,
   catalog,
+  catalogueUnavailable = false,
   go,
   onRequestTransition = (action) => action(),
 }: {
   app?: ApplicationSummary;
   catalog: ApplicationCatalog | null;
+  catalogueUnavailable?: boolean;
   go: (page: Page) => void;
   onRequestTransition?: (action: () => void) => void;
 }) {
-  const [business, setBusiness] = useState<OverviewState | null>(null);
-  const [businessError, setBusinessError] = useState("");
+  const workspaceId = app?.workspaceId;
+  const applicationId = app?.applicationId;
+  const context = useMemo(
+    () =>
+      workspaceId && applicationId && catalog
+        ? { workspaceId, applicationId, catalog }
+        : null,
+    [workspaceId, applicationId, catalog],
+  );
+  const [workRead, setWorkRead] = useState<OverviewRead<{
+    count: number;
+    hasMore: boolean;
+  }> | null>(null);
+  const [activityRead, setActivityRead] =
+    useState<OverviewRead<OverviewActivity> | null>(null);
+  const currentWork = workRead?.scope === context ? workRead : null;
+  const currentActivity = activityRead?.scope === context ? activityRead : null;
+  const work = currentWork?.value;
+  const activity = currentActivity?.value;
+  const canReadWork = Boolean(
+    catalog?.functions["application.workflow.worklist"],
+  );
+  const canInspectActivity =
+    catalog?.applicationAccess.authorizationModel !== "group_assignments" &&
+    applicationPageVisible("monitor", catalog);
+  const canOpenGrid = applicationPageVisible("grid", catalog);
+
   useEffect(() => {
-    setBusiness(null);
-    setBusinessError("");
-    if (!app || !catalog) return;
+    if (!context) return;
     const controller = new AbortController();
+    const { signal } = controller;
     const scope = {
-      workspaceId: app.workspaceId,
-      applicationId: app.applicationId,
+      workspaceId: context.workspaceId,
+      applicationId: context.applicationId,
     };
-    const workflow = Object.hasOwn(
-      catalog.functions,
-      "application.workflow.worklist",
-    )
-      ? readProgram<{ items: unknown[]; nextCursor?: unknown }>(
-          scope,
-          "application.workflow.worklist",
-          { limit: 100 },
-          controller.signal,
-        )
-      : Promise.resolve({ items: [], nextCursor: null });
-    const tasks = request<{
-      hasMore?: boolean;
-      tasks: Array<{
-        taskId: string;
-        function: string;
-        status: string;
-        initiatorKind?: string;
-      }>;
-    }>(
-      "/api/tasks",
-      { ...scope, afterSequence: 0, limit: 100 },
-      controller.signal,
-    );
-    Promise.all([workflow, tasks])
-      .then(([flow, taskPage]) => {
-        if (controller.signal.aborted) return;
-        const activeStates = new Set([
-          "Accepted",
-          "Queued",
-          "Claimed",
-          "Running",
-          "Cancelling",
-        ]);
-        const attentionStates = new Set([
-          "Failed",
-          "Interrupted",
-          "Cancelled",
-          "Rejected",
-          "Stale",
-        ]);
-        setBusiness({
-          assignedWork: flow.items.length,
-          worklistHasMore: Boolean(flow.nextCursor),
-          tasksHaveMore: Boolean(taskPage.hasMore),
-          running: taskPage.tasks.filter((item) =>
-            activeStates.has(item.status),
-          ).length,
-          attention: taskPage.tasks.filter((item) =>
-            attentionStates.has(item.status),
-          ).length,
-          recentTasks: taskPage.tasks.slice(0, 4),
+    if (canReadWork)
+      void readProgram<{ items: unknown[]; nextCursor?: unknown }>(
+        scope,
+        "application.workflow.worklist",
+        { limit: 100 },
+        signal,
+      )
+        .then((flow) => {
+          if (!Array.isArray(flow.items))
+            throw new Error("Workflow worklist rows are invalid.");
+          if (!signal.aborted)
+            setWorkRead({
+              scope: context,
+              value: {
+                count: flow.items.length,
+                hasMore: Boolean(flow.nextCursor),
+              },
+            });
+        })
+        .catch((reason: Error) => {
+          if (!signal.aborted)
+            setWorkRead({ scope: context, error: reason.message });
         });
-        setBusinessError("");
-      })
-      .catch((reason: Error) => {
-        if (!controller.signal.aborted) setBusinessError(reason.message);
-      });
+
+    if (canInspectActivity)
+      void request<TaskListPage<OverviewActivity["recentTasks"][number]>>(
+        "/api/tasks",
+        taskListBody(scope),
+        signal,
+      )
+        .then((response) => {
+          if (signal.aborted) return;
+          const page = mergeTaskListPage([], response, 0, false);
+          setActivityRead({
+            scope: context,
+            value: {
+              tasksHaveMore: page.hasMore,
+              inspectedTasks: page.tasks.length,
+              running: page.tasks.filter(
+                (item) => item.progressState === "inProgress",
+              ).length,
+              attention: page.tasks.filter(
+                (item) => item.progressState === "attention",
+              ).length,
+              recentTasks: page.tasks.slice(0, 4),
+            },
+          });
+        })
+        .catch((reason: Error) => {
+          if (!signal.aborted)
+            setActivityRead({ scope: context, error: reason.message });
+        });
     return () => controller.abort();
-  }, [app?.workspaceId, app?.applicationId, catalog]);
+  }, [context, canReadWork, canInspectActivity]);
 
   if (!app)
     return (
@@ -2227,43 +3438,66 @@ export function Overview({
         title={app.name}
         description="Your work, recent activity and model context in one place."
       >
-        <button className="primary" onClick={() => go("grid")}>
-          Open Grid →
-        </button>
+        {canOpenGrid && (
+          <button className="primary" onClick={() => go("grid")}>
+            Open Grid →
+          </button>
+        )}
+        {!canOpenGrid && applicationPageVisible("security", catalog) && (
+          <button className="primary" onClick={() => go("security")}>
+            Review application access
+          </button>
+        )}
       </PageHeading>
       <div className="metric-grid">
         <Metric
-          value={
-            business
-              ? `${business.assignedWork}${business.worklistHasMore ? "+" : ""}`
-              : "—"
-          }
+          value={work ? `${work.count}${work.hasMore ? "+" : ""}` : "—"}
           label="Ready for you"
         />
-        <Metric
-          value={
-            business
-              ? `${business.running}${business.tasksHaveMore ? "+" : ""}`
-              : "—"
-          }
-          label="Work running"
-        />
-        <Metric
-          value={
-            business
-              ? `${business.attention}${business.tasksHaveMore ? "+" : ""}`
-              : "—"
-          }
-          label="Needs attention"
-        />
+        {canInspectActivity && (
+          <Metric
+            value={activity ? String(activity.running) : "—"}
+            label="In progress"
+          />
+        )}
+        {canInspectActivity && (
+          <Metric
+            value={activity ? String(activity.attention) : "—"}
+            label="Needs attention"
+          />
+        )}
       </div>
-      <p className="data-scope-note">
-        Counts reflect the loaded worklist and first 100 task records. A +
-        indicates more records are available.
-      </p>
-      {businessError && (
+      {!work ? (
+        <p className="data-scope-note" role="status">
+          {!catalog
+            ? catalogueUnavailable
+              ? "Access to assigned work could not be confirmed."
+              : "Checking access to assigned work…"
+            : !canReadWork
+              ? "The current application catalogue does not include assigned work."
+              : currentWork?.error !== undefined
+                ? "Assigned work could not be loaded."
+                : "Loading assigned work…"}
+        </p>
+      ) : (
+        work.hasMore && (
+          <p className="data-scope-note">
+            Ready for you shows + because more assigned work is available.
+          </p>
+        )
+      )}
+      {activity && (
+        <p className="data-scope-note">
+          {`In progress and Needs attention count matches in ${activity.inspectedTasks} inspected tasks.`}
+          {activity.tasksHaveMore
+            ? " More tasks are available. Their progress and attention counts are unknown."
+            : " No further tasks were reported by this read."}
+        </p>
+      )}
+      {(currentWork?.error || currentActivity?.error) && (
         <div className="alert" role="alert">
-          {businessError}
+          {currentWork?.error && <p>{currentWork.error}</p>}
+          {currentActivity?.error && <p>{currentActivity.error}</p>}
         </div>
       )}
       <div className="overview-grid">
@@ -2275,55 +3509,65 @@ export function Overview({
             </div>
           </div>
           <div className="journey-list">
-            <Action
-              title="Open cube grid"
-              text="Read, edit and compare authorized multidimensional views."
-              icon="grid"
-              onClick={() => go("grid")}
-            />
+            {canOpenGrid && (
+              <Action
+                title="Open cube grid"
+                text="Open a saved view or explore the data available to you."
+                icon="grid"
+                onClick={() => go("grid")}
+              />
+            )}
             {applicationPageVisible("rules", catalog) && (
               <Action
                 title="Build generic rules"
-                text="Compose calculations, sequences and schedules from primitives."
+                text="Build calculations as rules with ordered steps. Set a schedule for recurring work."
                 icon="rules"
                 onClick={() => go("rules")}
               />
             )}
-            <Action
-              title="Review flows"
-              text="Assignments, review steps and governed evidence."
-              icon="flows"
-              onClick={() => go("flows")}
-            />
+            {applicationPageVisible("flows", catalog) && (
+              <Action
+                title="Review flows"
+                text="Assignments, review steps and governed evidence."
+                icon="flows"
+                onClick={() => go("flows")}
+              />
+            )}
           </div>
         </section>
         <section className="panel overview-activity">
-          <div className="section-title">
-            <div>
-              <h2>Recent governed activity</h2>
-              <p>Human and agent work from the durable task record.</p>
-            </div>
-            <button onClick={() => go("monitor")}>Open Monitor</button>
-          </div>
-          {business?.recentTasks.length ? (
-            <div className="overview-task-list">
-              {business.recentTasks.map((task) => (
-                <article key={task.taskId}>
-                  <span className="status-pill">{task.status}</span>
-                  <strong>{task.function}</strong>
-                  <small>{task.initiatorKind || "Verified user"}</small>
-                </article>
-              ))}
-            </div>
-          ) : (
-            <div className="empty-state">
-              {businessError
-                ? "Activity could not be loaded. Open Monitor to retry."
-                : business
-                  ? "No recent activity is visible."
-                  : "Loading recent activity…"}
+          {canInspectActivity && (
+            <div className="section-title">
+              <div>
+                <h2>Recent governed activity</h2>
+                <p>Human and agent work from the durable task record.</p>
+              </div>
+              <button onClick={() => go("monitor")}>Open Monitor</button>
             </div>
           )}
+          {canInspectActivity &&
+            (activity?.recentTasks.length ? (
+              <div className="overview-task-list">
+                {activity.recentTasks.map((task) => (
+                  <article key={task.taskId}>
+                    <span className="status-pill">{task.status}</span>
+                    <strong>{task.function}</strong>
+                    <small>{task.initiatorKind || "Verified user"}</small>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">
+                {currentActivity?.error !== undefined ||
+                (!catalog && catalogueUnavailable)
+                  ? "Activity could not be loaded. Open Monitor to retry."
+                  : activity
+                    ? "No recent activity is visible."
+                    : catalog
+                      ? "Loading recent activity…"
+                      : "Checking access to recent activity…"}
+              </div>
+            ))}
           <details className="model-details">
             <summary>Application details</summary>
             <dl>
@@ -2333,7 +3577,7 @@ export function Overview({
               </div>
               <div>
                 <dt>Your role</dt>
-                <dd>{catalog?.applicationAccess.role || "—"}</dd>
+                <dd>{catalog ? applicationRoleLabel(catalog) : "—"}</dd>
               </div>
               <div>
                 <dt>Lifecycle state</dt>

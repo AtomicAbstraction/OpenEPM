@@ -94,7 +94,7 @@ class PostgresPythonWorkflowDispatch:
                     error_code)).fetchone()
                 return None if row is None else row[0]
 
-    def settle_failed(self,claim: dict,error_code: str) -> bool:
+    def settle_failed(self,claim: dict,error_code: str) -> str | None:
         required={'workspace_id','application_id','workflow_id',
                   'claim_generation','claimant'}
         if (type(claim) is not dict or not required<=set(claim)

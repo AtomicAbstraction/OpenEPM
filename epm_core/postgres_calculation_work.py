@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 
+from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from .calculation_work_contract import (
@@ -49,9 +50,28 @@ def _validate_actor(issuer: object, subject_id: object,
     return issuer, subject_id, idempotency_key
 
 
-def load_calculation_scope_states(db, scope: ApplicationScope
-                                  ) -> list[dict[str, object]]:
-    rows = db.execute("""SELECT state.binding_digest,state.stage,
+def load_calculation_scope_states(db, scope: ApplicationScope, *,
+        definition: tuple[str, str] | None = None, binding_digest: str | None = None,
+        after: str | None = None, limit: int | None = None) -> list[dict[str, object]]:
+    """Load only the requested definition page or binding for targeted work."""
+    filters = [sql.SQL("state.workspace_id=%s AND state.application_id=%s")]
+    parameters = [scope.workspace_id, scope.application_id]
+    if definition is not None:
+        filters.append(sql.SQL("binding.definition_id=%s AND binding.definition_state_token=%s"))
+        parameters.extend(definition)
+    if binding_digest is not None:
+        filters.append(sql.SQL("state.binding_digest=%s"))
+        parameters.append(binding_digest)
+    if after is not None:
+        # Preserve the published separator and the previous Python text
+        # ordering even for non-canonical, caller-supplied keyset boundaries.
+        filters.append(sql.SQL("""convert_to(state.binding_digest || chr(31) ||
+            state.stage || chr(31) || state.partition_key,'UTF8') > %s"""))
+        parameters.append(after.encode('utf-8', errors='surrogatepass'))
+    order = sql.SQL("""state.binding_digest COLLATE "C",
+        state.stage COLLATE "C",state.partition_key COLLATE "C" """) if definition is not None else sql.SQL(
+        "state.binding_digest,state.stage,state.partition_key")
+    rows = db.execute(sql.SQL("""SELECT state.binding_digest,state.stage,
         state.partition_key,state.required_epoch,state.published_epoch,
         state.coverage,state.presence,state.definition_digest,
         state.current_result_state_token,state.reasons,
@@ -72,9 +92,10 @@ def load_calculation_scope_states(db, scope: ApplicationScope
          AND part.application_id=manifest.application_id
          AND part.result_key=manifest.result_key
          AND part.partition_key=state.partition_key
-        WHERE state.workspace_id=%s AND state.application_id=%s
-        ORDER BY state.binding_digest,state.stage,state.partition_key""",
-        (scope.workspace_id, scope.application_id)).fetchall()
+        WHERE {filters}
+        ORDER BY {order}
+        LIMIT %s""").format(filters=sql.SQL(" AND ").join(filters), order=order),
+        (*parameters, limit)).fetchall()
     return [{
         "bindingDigest": row["binding_digest"], "stage": row["stage"],
         "partitionKey": row["partition_key"],
@@ -91,6 +112,29 @@ def load_calculation_scope_states(db, scope: ApplicationScope
     } for row in rows]
 
 
+def lock_and_read_calculation_work_request(db, scope: ApplicationScope, *,
+        issuer: str, subject_id: str, idempotency_key: str) -> dict | None:
+    """Keep immutable alias lookup and creation under the same intent fence."""
+    issuer, subject_id, idempotency_key = _validate_actor(issuer, subject_id, idempotency_key)
+    request_id = _request_id(scope, issuer, subject_id, idempotency_key)
+    # Serialize insertion of an absent key without UPDATE on the immutable
+    # alias. Acquire the intent fence before the compatible-plan fence.
+    db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
+               ("epm.calculation.request-key:" + request_id,))
+    return db.execute("""SELECT key.request_id,key.plan_digest,request.status,
+        jsonb_array_length(request.plan->'tasks') AS task_count
+        FROM epm.calculation_work_request_key AS key
+        JOIN epm.calculation_work_request AS request
+          ON request.workspace_id=key.workspace_id
+         AND request.application_id=key.application_id
+         AND request.request_id=key.request_id
+        WHERE key.workspace_id=%s AND key.application_id=%s
+        AND key.issuer=%s AND key.subject_id=%s
+        AND key.idempotency_key=%s FOR UPDATE OF request""", (
+        scope.workspace_id,
+        scope.application_id, issuer, subject_id, idempotency_key)).fetchone()
+
+
 def persist_calculation_work_request(db, scope: ApplicationScope, *,
         plan: CalculationWorkPlan, issuer: str, subject_id: str,
         idempotency_key: str) -> dict[str, object]:
@@ -100,35 +144,30 @@ def persist_calculation_work_request(db, scope: ApplicationScope, *,
     if plan.normalized["status"] == "blocked":
         raise ValueError("IMPACT_COVERAGE_PENDING")
     request_id = _request_id(scope, issuer, subject_id, idempotency_key)
-    previous = db.execute("""SELECT key.request_id,key.plan_digest,
-        request.status FROM epm.calculation_work_request_key AS key
-        JOIN epm.calculation_work_request AS request
-          ON request.workspace_id=key.workspace_id
-         AND request.application_id=key.application_id
-         AND request.request_id=key.request_id
-        WHERE key.workspace_id=%s AND key.application_id=%s
-        AND key.issuer=%s AND key.subject_id=%s
-        AND key.idempotency_key=%s FOR UPDATE OF key,request""", (
-        scope.workspace_id,
-        scope.application_id, issuer, subject_id, idempotency_key)).fetchone()
+    plan_digest = plan.digest
+    previous = lock_and_read_calculation_work_request(db, scope, issuer=issuer,
+        subject_id=subject_id, idempotency_key=idempotency_key)
     if previous is not None:
-        if previous["plan_digest"] != plan.digest:
+        if previous["plan_digest"] != plan_digest:
             raise ValueError("CALCULATION_WORK_IDEMPOTENCY_CONFLICT")
         return {"requestId": previous["request_id"],
                 "status": previous["status"], "duplicate": True,
                 "compatible": False, "taskCount": plan.task_count}
+    plan_lock = "\x1f".join(("epm.calculation.compatible-plan",
+                            scope.workspace_id, scope.application_id, plan_digest))
+    db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (plan_lock,))
     compatible = db.execute("""SELECT request_id,status FROM
         epm.calculation_work_request WHERE workspace_id=%s
         AND application_id=%s AND plan_digest=%s
         AND status IN('planned','running') ORDER BY created_at,request_id
         LIMIT 1 FOR UPDATE""", (scope.workspace_id, scope.application_id,
-                                plan.digest)).fetchone()
+                                plan_digest)).fetchone()
     if compatible is not None:
         db.execute("""INSERT INTO epm.calculation_work_request_key(
             workspace_id,application_id,issuer,subject_id,idempotency_key,
             request_id,plan_digest) VALUES(%s,%s,%s,%s,%s,%s,%s)""",
             (scope.workspace_id, scope.application_id, issuer, subject_id,
-             idempotency_key, compatible["request_id"], plan.digest))
+             idempotency_key, compatible["request_id"], plan_digest))
         return {"requestId": compatible["request_id"],
                 "status": compatible["status"], "duplicate": True,
                 "compatible": True, "taskCount": plan.task_count}
@@ -138,13 +177,13 @@ def persist_calculation_work_request(db, scope: ApplicationScope, *,
         idempotency_key,mode,plan_digest,plan,status)
         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (
         scope.workspace_id, scope.application_id, request_id, issuer,
-        subject_id, idempotency_key, plan.normalized["mode"], plan.digest,
+        subject_id, idempotency_key, plan.normalized["mode"], plan_digest,
         Jsonb(plan.normalized), status))
     db.execute("""INSERT INTO epm.calculation_work_request_key(
         workspace_id,application_id,issuer,subject_id,idempotency_key,
         request_id,plan_digest) VALUES(%s,%s,%s,%s,%s,%s,%s)""",
         (scope.workspace_id, scope.application_id, issuer, subject_id,
-         idempotency_key, request_id, plan.digest))
+         idempotency_key, request_id, plan_digest))
     for task in plan.normalized["tasks"]:
         db.execute("""INSERT INTO epm.calculation_work_task(
             workspace_id,application_id,request_id,task_ordinal,

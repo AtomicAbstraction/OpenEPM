@@ -11,7 +11,12 @@ from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .postgres_access import AccessDenied, PostgresAccessChecker, VerifiedIdentity
+from .postgres_access import PostgresAccessChecker, VerifiedIdentity
+from .application_authorization_actions import ACTION_SCOPE_KINDS
+from .current_object_contract import new_state_token
+from .dimensional_security_policy import dimensional_security_policy_digest
+from .postgres_dimensional_security_policies import assignment_policy_values, policy_from_values
+from .postgres_grants import _validate_group_id
 from .postgres_capability_contract import validate_enabled_capabilities
 from .multidimensional_roles import (
     PROGRAMMABLE_BLUEPRINT_VERSION, programmable_application_blueprint,
@@ -30,10 +35,13 @@ def compile_create_application(program: object) -> tuple[str, str]:
             or program['languageVersion'] != 2
             or program['function'] != FUNCTION
             or not isinstance(program['arguments'], dict)
-            or set(program['arguments']) not in ({'applicationId', 'name', 'kind'},
-                {'applicationId', 'name', 'kind', 'enabledCapabilities'})):
+            or not {'applicationId','name','kind'} <= set(program['arguments'])
+            or set(program['arguments']) - {'applicationId','name','kind',
+                                             'enabledCapabilities','administratorGroupId'}):
         raise ValueError('V2_FUNCTION_OR_ARGUMENTS_UNSUPPORTED')
     args = program['arguments']
+    if 'administratorGroupId' in args:
+        _validate_group_id(args['administratorGroupId'])
     if 'enabledCapabilities' in args:
         if not isinstance(args['enabledCapabilities'],list):
             raise ValueError('APPLICATION_CAPABILITIES_INVALID')
@@ -41,13 +49,53 @@ def compile_create_application(program: object) -> tuple[str, str]:
     app_id, name = args['applicationId'], args['name']
     if (not isinstance(app_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,199}', app_id)
             or not isinstance(name, str) or not 1 <= len(name) <= 200
-            or name != name.strip()
+            or name != name.strip() or '\0' in name
             or args['kind'] != PROGRAMMABLE_APPLICATION_KIND):
         raise ValueError('V2_APPLICATION_CREATE_INVALID')
     if (args['kind'] == PROGRAMMABLE_APPLICATION_KIND
             and args.get('enabledCapabilities', [])):
         raise ValueError('PROGRAMMABLE_APPLICATION_CAPABILITIES_UNSUPPORTED')
     return app_id, name
+
+
+def application_creation_contract() -> dict:
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+    from .public_program_contracts import provisioning_field_schemas
+
+    identifier, name = provisioning_field_schemas()
+    capabilities = {'type': 'array', 'items': {'type': 'string'}}
+    kind = {'const': PROGRAMMABLE_APPLICATION_KIND}
+    arguments = obj({'applicationId': identifier, 'name': name, 'kind': kind,
+                     'administratorGroupId': {'type':'string','minLength':1,'maxLength':300},
+                     'enabledCapabilities': {**capabilities, 'maxItems': 0}},
+                    ['applicationId', 'name', 'kind'])
+    dimension = obj({field: {'type': 'string'} for field in programmable_dimension_blueprint()[0]})
+    result = obj({'workspaceId': {'type': 'string'}, 'applicationId': identifier, 'name': name,
+                  'kind': kind, 'status': {'const': 'Active'}, 'enabledCapabilities': capabilities,
+                  'capabilityRevision': {'type': 'integer', 'minimum': 0},
+                  'metadataRevision': {'type': 'integer', 'minimum': 1},
+                  'blueprintVersion': {'type': 'integer', 'minimum': 1},
+                  'dimensions': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
+                  'dimensionBlueprint': {'type': 'array', 'items': dimension, 'minItems': 1}})
+    result['properties'].update({
+        'authorizationModel': {'const':'group_assignments'},
+        'administratorGroupId': {'type':'string','minLength':1,'maxLength':300},
+    })
+    contract = read_contract(FUNCTION, arguments, result, owner='PostgresWorkspaceLifecycle',
+        examples=[read_example(FUNCTION, {'applicationId': 'operating-cube', 'name': 'Operating cube',
+                                         'kind': PROGRAMMABLE_APPLICATION_KIND},
+                               name='Create a multidimensional application',
+                               binding='Use the listener for the intended workspace, an unused application ID and a new request key.')],
+        semantic_rules=['Creates the eight programmable axes without business members or domain capability bundles.',
+                        'Omit enabledCapabilities or supply an empty list.',
+                        'Select an active administratorGroupId to create a group-assigned application. The group receives access administration but no business fact permission. Omission retains the legacy creator-grant contract.',
+                        'The response describes the created foundation. Replay returns the originally recorded foundation.'],
+        result_scope='result')
+    contract['programContract']['recovery'] = (
+        'After an uncertain outcome, verify current workspace authority and retry the exact original program and key. '
+        'For a confirmed ID or name conflict, choose an unused value and review a new request.')
+    return contract
 
 
 class PostgresWorkspaceLifecycle:
@@ -64,13 +112,14 @@ class PostgresWorkspaceLifecycle:
             'mode': 'atomic_write', 'permission': 'workspace_admin',
             'arguments': {'applicationId': 'stable ID', 'name': 'display name',
                           'kind': 'multidimensional; eight mandatory axes, no seeded business members'},
-            'optionalArguments': {'enabledCapabilities': 'explicit initial known capabilities; default empty, no finance metadata seeded'},
+            'optionalArguments': {'enabledCapabilities': 'omit or supply an empty list',
+                                  'administratorGroupId': 'verified group for a group-assigned application'},
             'result': 'created application and administrator grant with the eight-axis programmable blueprint and editable semantic descriptions',
             'applicationBlueprint': programmable_application_blueprint(),
             'previewRequired': False, 'idempotencyRequired': True,
             'idempotencyScope': 'workspace lifecycle-operation namespace; use a distinct key for each intended application creation',
             'nameUniqueness': 'application display names are unique within their workspace',
-            'workClass': 'short'}}}
+            'workClass': 'short', **application_creation_contract()}}}
 
     @staticmethod
     def _set_workspace(db, workspace_id: str, application_id: str = '') -> None:
@@ -81,29 +130,8 @@ class PostgresWorkspaceLifecycle:
     @staticmethod
     def _require_administrator(db, workspace_id: str,
                                identity: VerifiedIdentity) -> None:
-        level = db.execute('SHOW transaction_isolation').fetchone()
-        if level['transaction_isolation'] != 'read committed':
-            raise ValueError('Authorization recheck requires READ COMMITTED')
-        PostgresAccessChecker.lock_workspace(db, workspace_id)
-        workspace = db.execute('''SELECT status FROM epm.workspace
-            WHERE workspace_id=%s''', (workspace_id,)).fetchone()
-        if not workspace or workspace['status'] != 'Active':
-            raise AccessDenied('WORKSPACE_UNAVAILABLE')
-        groups = PostgresAccessChecker.current_groups_in_transaction(
-            db, identity)
-        grant = db.execute('''SELECT
-            EXISTS (SELECT 1 FROM epm.workspace_access_grant
-                WHERE workspace_id=%s AND issuer=%s AND subject_id=%s
-                AND role='Administrator')
-            OR EXISTS (SELECT 1 FROM epm.workspace_group_access_grant
-                WHERE workspace_id=%s AND issuer=%s
-                AND group_id=ANY(%s::text[])
-                AND role='Administrator') AS allowed''',
-            (workspace_id, identity.issuer, identity.subject_id,
-             workspace_id, identity.issuer, list(groups))
-            ).fetchone()['allowed']
-        if not grant:
-            raise AccessDenied('WORKSPACE_ADMIN_REQUIRED')
+        PostgresAccessChecker.check_workspace_administrator_in_transaction(
+            db, identity, workspace_id)
 
     def check(self, workspace_id: str) -> None:
         if not isinstance(workspace_id, str) or not 1 <= len(workspace_id) <= 200:
@@ -119,6 +147,7 @@ class PostgresWorkspaceLifecycle:
             raise ValueError('Workspace ID is required')
         app_id, name = compile_create_application(program)
         kind = program['arguments']['kind']
+        initial_group = program['arguments'].get('administratorGroupId')
         if (not isinstance(idempotency_key, str)
                 or not 1 <= len(idempotency_key) <= 200):
             raise ValueError('Idempotency key is required')
@@ -131,6 +160,8 @@ class PostgresWorkspaceLifecycle:
             with connect_postgres(self.dsn, row_factory=dict_row) as db:
                 with db.transaction():
                     self._set_workspace(db, workspace_id, app_id)
+                    if initial_group is not None:
+                        PostgresAccessChecker.lock_directory_membership_for_assignment(db)
                     self._require_administrator(db, workspace_id, self.identity)
                     # Serializes retries of the same key without widening the
                     # workspace grant fence or relying on a preexisting row.
@@ -167,16 +198,30 @@ class PostgresWorkspaceLifecycle:
                             epm.initialize_programmable_application_blueprint(
                                 %s,%s)''',(workspace_id,app_id))
                     initial_revision = (1 if dimensions else 0)
-                    db.execute('''INSERT INTO epm.application_access_grant
-                        (issuer,subject_id,workspace_id,application_id,role)
-                        VALUES (%s,%s,%s,%s,'Administrator')''',
-                        (self.identity.issuer, self.identity.subject_id,
-                         workspace_id, app_id))
+                    if initial_group is None:
+                        db.execute('''INSERT INTO epm.application_access_grant
+                            (issuer,subject_id,workspace_id,application_id,role)
+                            VALUES (%s,%s,%s,%s,'Administrator')''',
+                            (self.identity.issuer, self.identity.subject_id,
+                             workspace_id, app_id))
+                    else:
+                        policy_values = assignment_policy_values()
+                        initial_policy = policy_from_values(policy_values)
+                        actions = sorted({'application.enter','access.manage','access.review','roles.manage'} |
+                                         {action for action in ACTION_SCOPE_KINDS if action.startswith('delegate.')})
+                        db.execute('''SELECT epm.initialize_application_group_access(
+                            %s,%s,%s,%s,%s,%s::text[],%s,%s,%s,%s,%s,%s)''',
+                            (workspace_id,app_id,self.identity.issuer,initial_group,self.identity.subject_id,
+                             list(self.identity.groups),idempotency_key,actor_digest,new_state_token(),
+                             dimensional_security_policy_digest(workspace_id,app_id,initial_policy),actions,
+                             Jsonb(policy_values)))
                     result = {'workspaceId': workspace_id,
                               'applicationId': app_id, 'name': name,
                               'kind': kind, 'status': 'Active',
                               'enabledCapabilities': sorted(program['arguments'].get('enabledCapabilities',[])),
                               'capabilityRevision': 0,
+                              **({'authorizationModel':'group_assignments','administratorGroupId':initial_group}
+                                 if initial_group is not None else {}),
                               **({'blueprintVersion': PROGRAMMABLE_BLUEPRINT_VERSION,
                                   'metadataRevision': initial_revision,
                                   'dimensions': [dimension['dimensionId']
@@ -202,3 +247,8 @@ class PostgresWorkspaceLifecycle:
                     return result
         except UniqueViolation as error:
             raise ValueError('APPLICATION_ID_OR_NAME_EXISTS') from error
+        except psycopg.Error as error:
+            if error.diag.message_primary in (
+                    'APPLICATION_GROUP_BOOTSTRAP_UNAVAILABLE','LAST_REACHABLE_APPLICATION_ADMINISTRATOR'):
+                raise ValueError(error.diag.message_primary) from error
+            raise

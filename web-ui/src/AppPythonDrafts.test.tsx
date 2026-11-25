@@ -1,3 +1,4 @@
+import { browserIdentityFixture } from "./test-setup";
 import {
   act,
   fireEvent,
@@ -8,7 +9,18 @@ import {
 import { useState } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { resetUnsavedWorkForTests, usePreservedDraft } from "./unsaved-work";
+import {
+  resetUnsavedWorkForTests,
+  usePreservedDraft,
+  unsavedWorkSnapshot,
+  type DraftRecovery,
+  type DraftRecoveryLease,
+} from "./unsaved-work";
+let currentRecovery: DraftRecovery<{ source: string }> | null = null;
+let retainedOperation: {
+  recovery: DraftRecovery<{ source: string }>;
+  lease: DraftRecoveryLease;
+} | null = null;
 import {
   resetBrowserLifecycleForTests,
   setBrowserLifecycle,
@@ -20,7 +32,7 @@ import type { ApplicationSummary } from "./types";
 vi.mock("./CapabilityArea", () => ({
   CapabilityArea: ({ app }: { app: ApplicationSummary }) => {
     const [source, setSource] = useState("");
-    usePreservedDraft(
+    const recovery = usePreservedDraft(
       app.workspaceId,
       app.applicationId,
       "python-source-v3",
@@ -29,16 +41,31 @@ vi.mock("./CapabilityArea", () => ({
       { source },
       (draft) => setSource(draft.source),
     );
+    currentRecovery = recovery;
     return (
-      <textarea
-        aria-label="Shell Python draft"
-        value={source}
-        onChange={(event) => setSource(event.target.value)}
-      />
+      <>
+        <button
+          onClick={() => {
+            // Dispatch callers capture the synchronous reservation token.
+            // The rendered lease is exposed only after hydration has settled.
+            const lease = recovery.retain({ source });
+            retainedOperation = { recovery, lease };
+          }}
+        >
+          Retain original source operation
+        </button>
+        <textarea
+          aria-label="Shell Python draft"
+          value={source}
+          onChange={(event) => setSource(event.target.value)}
+        />
+      </>
     );
   },
 }));
 afterEach(() => {
+  currentRecovery = null;
+  retainedOperation = null;
   vi.unstubAllGlobals();
   resetUnsavedWorkForTests();
   resetBrowserLifecycleForTests();
@@ -64,7 +91,8 @@ function fixture() {
           ],
           nextAfter: null,
         });
-      if (url === "/api/session-identity") return result({ issuer, subject });
+      if (url === "/api/session-identity")
+        return result(browserIdentityFixture(subject, issuer));
       if (url === "/api/runtime")
         return result({
           build: { sourceCommit: "a".repeat(40), packagedSchema: 294 },
@@ -117,6 +145,16 @@ function sourceRoute() {
     window.dispatchEvent(new HashChangeEvent("hashchange"));
   });
 }
+async function retainOriginalSource() {
+  fireEvent.click(
+    screen.getByRole("button", { name: "Retain original source operation" }),
+  );
+  expect(retainedOperation).not.toBeNull();
+  const captured = retainedOperation!;
+  expect(captured.lease).not.toBeNull();
+  await waitFor(() => expect(currentRecovery?.lease).toEqual(captured.lease));
+  return captured;
+}
 it("keeps a draft through same-tab navigation and expiry recovery while guarding logout", async () => {
   fixture();
   render(<App />);
@@ -163,17 +201,59 @@ it.each(["subject", "issuer"] as const)(
     fireEvent.change(await screen.findByLabelText("Shell Python draft"), {
       target: { value: "designer private source" },
     });
+    const { recovery: captured, lease } = await retainOriginalSource();
     if (changed === "subject") session.setSubject("other-designer");
     else session.setIssuer("https://other-identity.example");
     fireEvent(document, new Event("visibilitychange"));
     await waitFor(() =>
       expect(screen.getByText("Identity changed")).toBeInTheDocument(),
     );
+    expect(
+      screen.getByText(/Unconfirmed requests may already have completed/),
+    ).toBeVisible();
     fireEvent.click(
       screen.getByRole("button", { name: "Discard drafts and continue" }),
     );
     await waitFor(() =>
       expect(screen.getByLabelText("Shell Python draft")).toHaveValue(""),
     );
+    expect(unsavedWorkSnapshot()).toEqual([]);
+    expect(() =>
+      captured.retain({ source: "late private packet" }, lease),
+    ).toThrow("no longer current");
+    expect(() => captured.release(lease, { source: "" })).toThrow(
+      "no longer current",
+    );
   },
 );
+
+it("keeps pinned recovery through same-tab navigation and explicitly abandons it only after confirmed sign out", async () => {
+  fixture();
+  render(<App />);
+  fireEvent.change(await screen.findByLabelText("Shell Python draft"), {
+    target: { value: "original exact packet" },
+  });
+  const { recovery: captured, lease } = await retainOriginalSource();
+  fireEvent.click(screen.getByRole("button", { name: "Home" }));
+  expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  sourceRoute();
+  await waitFor(() =>
+    expect(screen.getByLabelText("Shell Python draft")).toHaveValue(
+      "original exact packet",
+    ),
+  );
+  expect(currentRecovery?.lease).toEqual(lease);
+  fireEvent.click(screen.getByRole("button", { name: "Account" }));
+  fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+  expect(screen.getByRole("alertdialog")).toHaveTextContent(
+    "Unconfirmed requests may already have completed",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+  expect(unsavedWorkSnapshot()).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+  fireEvent.click(screen.getByRole("button", { name: "Discard and continue" }));
+  expect(unsavedWorkSnapshot()).toEqual([]);
+  expect(() =>
+    captured.retain({ source: "late private packet" }, lease),
+  ).toThrow("no longer current");
+});

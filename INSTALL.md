@@ -2,7 +2,7 @@
 
 ## Supported source-build boundary
 
-This development snapshot documents the current ARM64 laptop source-build path with Docker Engine or Docker Desktop and Docker Compose v2. Portable distribution and native AMD64 qualification are deferred until the five-user laptop application is functionally accepted.
+This development snapshot documents the current ARM64 laptop source-build path with Docker Engine or Docker Desktop and Docker Compose v2. Compose may be installed as the `docker compose` plugin or the standalone `docker-compose` command. Portable distribution and native AMD64 qualification are deferred until the five-user laptop application is functionally accepted.
 
 The deployment requires an existing OpenID Connect provider. Keycloak is the reference identity provider. You must supply the exact issuer, JWKS URL, audiences, and verified subject of the first platform operator. Open EPM does not accept an authored email address as a substitute for the provider's immutable subject identifier.
 
@@ -11,7 +11,7 @@ This is not yet a one-command production installer. Use a new, disposable deploy
 ## Prerequisites
 
 - ARM64 Linux or Apple Silicon macOS
-- Docker Engine or Docker Desktop with Docker Compose v2
+- Docker Engine or Docker Desktop with Docker Compose v2 (`docker compose` or `docker-compose`)
 - At least 8 GB of memory available to Docker for a development build
 - HTTPS origins for the browser and MCP endpoints
 - A configured OIDC client with `openepm-web` and `openepm-mcp` audiences, or equivalent values reflected in your environment
@@ -39,6 +39,8 @@ EPM_PUBLIC_MCP_ORIGIN=https://mcp.example.com
 ## Build and initialize a new database
 
 From the repository root:
+
+The examples below use the `docker compose` plugin. If your installation provides the standalone Compose v2 command, replace `docker compose` with `docker-compose` in each command.
 
 ```sh
 docker compose --env-file deploy/postgres/.env -f deploy/postgres/compose.yaml build

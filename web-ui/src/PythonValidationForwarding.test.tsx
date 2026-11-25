@@ -106,7 +106,7 @@ const source = {
 };
 const binding = {
   programId: source.programId,
-  sourceToken: "c".repeat(64),
+  programSourceToken: "c".repeat(64),
   sourceDigest: source.sourceDigest,
   buildId: queued.buildId,
   active: false,
@@ -160,7 +160,9 @@ it.each(["definition", "program"] as const)(
       );
     const view = render(element());
     if (surface === "program") {
-      fireEvent.click(await screen.findByRole("button", { name: "Open" }));
+      fireEvent.click(
+        await screen.findByRole("button", { name: "View code for Rule" }),
+      );
     }
     await waitFor(() =>
       expect(contract().program.validation?.definition).toEqual(
@@ -246,7 +248,9 @@ it.each(["definition", "program"] as const)(
       ),
     );
     if (surface === "program") {
-      fireEvent.click(await screen.findByRole("button", { name: "Open" }));
+      fireEvent.click(
+        await screen.findByRole("button", { name: "View code for Rule" }),
+      );
     }
     await screen.findByText("The exact saved validation is unavailable.");
     expect(contract().program.validation?.definition).toBeUndefined();

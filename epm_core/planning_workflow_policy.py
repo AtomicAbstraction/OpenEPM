@@ -26,6 +26,60 @@ MAX_TOTAL_MEMBER_REFERENCES=10_000
 FORMAT_V2='openepm-planning-workflow-policy-v2'
 
 
+def policy_identifier_schema() -> dict:
+    return {'type': 'string', 'pattern': '^' + _ID.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+
+
+def policy_level_selector_schema(*, sealed: bool, summary: bool = False) -> dict:
+    from .postgres_numeric_catalog import obj
+
+    identifier = policy_identifier_schema()
+    fields = {'dimensionId': identifier, 'rootMemberId': identifier,
+              'depth': {'type': 'integer', 'minimum': 0, 'maximum': 1000}}
+    if sealed:
+        digest = {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}
+        revision = {'type': 'integer', 'minimum': 0}
+        fields.update(hierarchyStateToken=digest, metadataRevision=revision, schemaEpoch=revision,
+                      resolutionDigest=digest)
+        if summary:
+            fields['memberCount'] = {'type': 'integer', 'minimum': 1,
+                                     'maximum': MAX_MEMBERS_PER_SELECTOR}
+        else:
+            fields['resolvedMemberIds'] = {'type': 'array', 'minItems': 1,
+                'maxItems': MAX_MEMBERS_PER_SELECTOR, 'uniqueItems': True, 'items': identifier}
+    return obj(fields)
+
+
+def policy_definition_schema(*, sealed: bool) -> dict:
+    """Describe accepted authoring and stored shapes without resolving policy semantics."""
+    from .postgres_numeric_catalog import obj
+
+    identifier = policy_identifier_schema()
+    date_text = {'type': 'string', 'pattern': r'^[0-9]{4}-[0-9]{2}-[0-9]{2}(?![\s\S])'}
+    date_or_null = {'anyOf': [date_text, {'type': 'null'}]}
+    ids = {'type': 'array', 'minItems': 1, 'maxItems': 100, 'uniqueItems': True, 'items': identifier}
+    members = {**ids, 'maxItems': MAX_MEMBERS_PER_SELECTOR}
+    scenario = obj({'dimensionId': identifier, 'members': members})
+    period = obj({'dimensionId': identifier, 'orderedMembers': members,
+                  'startMemberId': identifier, 'endMemberId': identifier})
+    rule = {'ruleId': identifier, 'priority': {'type': 'integer', 'minimum': 0, 'maximum': 10000},
+            'effect': {'enum': sorted(_EFFECTS)}, 'actions': ids, 'workflowRoles': ids,
+            'memberSelectors': {'type': 'object', 'maxProperties': 32,
+                                'propertyNames': identifier, 'additionalProperties': members},
+            'scenarioBound': {'anyOf': [scenario, {'type': 'null'}]},
+            'periodBound': {'anyOf': [period, {'type': 'null'}]},
+            'effectiveFrom': date_or_null, 'effectiveTo': date_or_null}
+    rules = {'type': 'array', 'minItems': 1, 'maxItems': MAX_RULES}
+    common = {'workspaceId': identifier, 'applicationId': identifier, 'policyId': identifier,
+              'effectiveFrom': date_text, 'effectiveTo': date_or_null}
+    level = {'anyOf': [policy_level_selector_schema(sealed=sealed), {'type': 'null'}]}
+    v2 = {**common, 'format': {'const': FORMAT_V2},
+          'rules': {**rules, 'items': obj({**rule, 'levelSelector': level})}}
+    if sealed:
+        v2['authoredIntentDigest'] = {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}
+    return {'oneOf': [obj({**common, 'rules': {**rules, 'items': obj(rule)}}), obj(v2)]}
+
+
 def level_resolution_digest(value: dict) -> str:
     return sha256(json.dumps(value,sort_keys=True,separators=(',',':'),
                              ensure_ascii=False).encode()).hexdigest()
@@ -119,8 +173,8 @@ class PlanningPolicyRule:
         return frozenset(dimensions)
 
     def matches(self,members: Mapping[str,str],*,action: str,
-                workflow_role: str,on_date: date) -> bool:
-        if action not in self.actions or workflow_role not in self.workflow_roles:
+                workflow_roles: frozenset[str],on_date: date) -> bool:
+        if action not in self.actions or workflow_roles.isdisjoint(self.workflow_roles):
             return False
         if self.effective_from and on_date<self.effective_from:
             return False
@@ -160,6 +214,14 @@ class PlanningWorkflowPolicy:
                  action: str,workflow_role: str,on_date: date,
                  lock_state: str,
                  expected_digest: str|None=None) -> PlanningPolicyDecision:
+        _identifier(workflow_role,'WORKFLOW_ROLE')
+        return self.evaluate_for_roles(scope,coordinate,action=action,
+            workflow_roles=frozenset((workflow_role,)),on_date=on_date,
+            lock_state=lock_state,expected_digest=expected_digest)
+
+    def evaluate_for_roles(self,scope: ApplicationScope,coordinate: Coordinate,*,
+                 action: str,workflow_roles: frozenset[str],on_date: date,
+                 lock_state: str,expected_digest: str|None=None) -> PlanningPolicyDecision:
         if scope!=self.scope:
             raise ValueError('PLANNING_POLICY_SCOPE_MISMATCH')
         if (expected_digest is not None
@@ -168,7 +230,10 @@ class PlanningWorkflowPolicy:
                      or expected_digest!=self.digest)):
             raise ValueError('PLANNING_POLICY_DIGEST_STALE')
         _identifier(action,'ACTION')
-        _identifier(workflow_role,'WORKFLOW_ROLE')
+        if type(workflow_roles) is not frozenset:
+            raise ValueError('PLANNING_POLICY_WORKFLOW_ROLE_INVALID')
+        for role in workflow_roles:
+            _identifier(role,'WORKFLOW_ROLE')
         if not isinstance(on_date,date):
             raise ValueError('PLANNING_POLICY_EVALUATION_DATE_INVALID')
         if lock_state not in _LOCK_STATES:
@@ -180,7 +245,7 @@ class PlanningWorkflowPolicy:
             return self._decision(False,'PLANNING_POLICY_NOT_EFFECTIVE',())
         members=dict(coordinate.members)
         relevant=[rule for rule in self.rules
-                  if action in rule.actions and workflow_role in rule.workflow_roles
+                  if action in rule.actions and not workflow_roles.isdisjoint(rule.workflow_roles)
                   and (not rule.effective_from or on_date>=rule.effective_from)
                   and (not rule.effective_to or on_date<=rule.effective_to)]
         missing=sorted(set().union(
@@ -189,7 +254,7 @@ class PlanningWorkflowPolicy:
             return self._decision(
                 False,'PLANNING_POLICY_REQUIRED_DIMENSION_MISSING',())
         matching=[rule for rule in relevant if rule.matches(
-            members,action=action,workflow_role=workflow_role,on_date=on_date)]
+            members,action=action,workflow_roles=workflow_roles,on_date=on_date)]
         if not matching:
             return self._decision(False,'PLANNING_POLICY_NO_ALLOW_RULE',())
         priority=max(rule.priority for rule in matching)

@@ -18,24 +18,31 @@ from urllib.request import (HTTPRedirectHandler, HTTPSHandler, Request,
                             build_opener)
 
 from ._client_identity import CLIENT_NAME, CLIENT_VERSION, USER_AGENT
+from .public_diagnostics import REPAIR_CODES, repair_fields
 
 
 _TOOL = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,199}$")
-_PROTOCOL_VERSION = "2025-03-26"
+_MODERN_VERSION = "2026-07-28"
+_LEGACY_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
+_DISCOVER = "server/discover"
 _ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{2,99}\Z")
+_MAX_TEXT_DIAGNOSTIC_CHARS = 4096
 
 
 class McpTransportError(RuntimeError):
     """A bounded, credential-free public transport failure."""
 
     def __init__(self, message: str, *, code: str | None = None,
-                 http_status: int | None = None, rpc_code: int | None = None):
+                 http_status: int | None = None, rpc_code: int | None = None,
+                 request_dispatched: bool = True, details: dict[str, str] | None = None):
         # Keep existing str(error) callers compatible; machine consumers use
         # these narrowly validated fields, never arbitrary upstream text.
         super().__init__(message)
         self.code = code if isinstance(code, str) and _ERROR_CODE.fullmatch(code) else None
         self.http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
         self.rpc_code = rpc_code if type(rpc_code) is int and -(2**31) <= rpc_code < 2**31 else None
+        self.request_dispatched = request_dispatched
+        self.details = details
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -78,7 +85,7 @@ class HttpsMcpTransport:
         self._opener = build_opener(_NoRedirect(), HTTPSHandler(context=context))
         self._lock = threading.RLock()
         self._next_id = 1
-        self._initialized = False
+        self._protocol_version: str | None = None
         self._session_id: str | None = None
 
     def __repr__(self) -> str:
@@ -97,25 +104,34 @@ class HttpsMcpTransport:
         if not isinstance(canonical, dict):
             raise ValueError("MCP tool arguments must be an object")
         with self._lock:
-            self._initialize()
-            response = self._rpc("tools/call", {"name": tool,
-                                                 "arguments": canonical})
+            try:
+                self._initialize()
+            except McpTransportError as error:
+                error.request_dispatched = False
+                raise
+            response = self._rpc("tools/call", {"name": tool, "arguments": canonical},
+                                 version=self._protocol_version)
         result = response.get("result")
         if not isinstance(result, dict):
             raise McpTransportError("MCP tool returned an invalid result")
-        if result.get("isError") is True:
-            raise McpTransportError(self._error_text(result), code=self._tool_error_code(result, tool))
         structured = result.get("structuredContent")
+        text_content = self._single_text_content(result)
+        if result.get("isError") is True:
+            diagnostic = (structured if "structuredContent" in result
+                          else self._text_diagnostic(text_content))
+            code = self._tool_error_code(diagnostic, text_content, tool)
+            if code in REPAIR_CODES:
+                program = canonical.get("program")
+                function = program.get("function") if isinstance(program, dict) else None
+                details = repair_fields(diagnostic, requested_function=function)
+                raise McpTransportError(code, code=code, details=details)
+            raise McpTransportError(self._error_text(result), code=code)
         if isinstance(structured, dict):
             return structured
-        content = result.get("content")
-        if (not isinstance(content, list) or len(content) != 1
-                or not isinstance(content[0], dict)
-                or content[0].get("type") != "text"
-                or not isinstance(content[0].get("text"), str)):
+        if text_content is None:
             raise McpTransportError("MCP tool returned no structured object")
         try:
-            decoded = json.loads(content[0]["text"])
+            decoded = json.loads(text_content)
         except json.JSONDecodeError as error:
             raise McpTransportError("MCP tool returned invalid JSON text") from error
         if not isinstance(decoded, dict):
@@ -123,29 +139,82 @@ class HttpsMcpTransport:
         return decoded
 
     def _initialize(self) -> None:
-        if self._initialized:
+        if self._protocol_version is not None:
             return
-        response = self._rpc("initialize", {
-            "protocolVersion": _PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION}})
-        result = response.get("result")
-        if (not isinstance(result, dict)
-                or not isinstance(result.get("protocolVersion"), str)):
-            raise McpTransportError("MCP initialization returned an invalid result")
-        self._notify("notifications/initialized", {})
-        self._initialized = True
+        offer = self._probe_protocol()
+        if offer == _MODERN_VERSION:
+            self._protocol_version = offer
+            return
+        try:
+            # Older servers can use their default for the initialize request.
+            # The returned revision then governs every subsequent request.
+            response = self._rpc("initialize", {
+                "protocolVersion": offer, "capabilities": {},
+                "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION}},
+                version=None)
+            result = response.get("result")
+            accepted = result.get("protocolVersion") if isinstance(result, dict) else None
+            if accepted not in _LEGACY_VERSIONS:
+                raise McpTransportError("MCP initialization negotiated an unsupported protocol",
+                                        code="MCP_PROTOCOL_UNSUPPORTED")
+            self._post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+                       expect_body=False, version=accepted)
+            self._protocol_version = accepted
+        finally:
+            if self._protocol_version is None:
+                self._session_id = None
 
-    def _rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _probe_protocol(self) -> str:
+        try:
+            response = self._rpc(_DISCOVER, {}, version=_MODERN_VERSION)
+        except McpTransportError as error:
+            if error.code == "MCP_LEGACY_DISCOVERY" or error.rpc_code in (-32600, -32601):
+                return _LEGACY_VERSIONS[0]
+            raise
+        result = response.get("result")
+        if "error" in response:
+            error = response["error"]
+            data = error.get("data") if isinstance(error, dict) else None
+            if (isinstance(data, dict) and error.get("code") == -32022
+                    and data.get("requested") == _MODERN_VERSION
+                    and isinstance(data.get("supported"), list)
+                    and _MODERN_VERSION not in data["supported"]):
+                for version in _LEGACY_VERSIONS:
+                    if version in data["supported"]:
+                        return version
+            raise McpTransportError("MCP endpoint refused the preferred protocol",
+                                    code="MCP_PROTOCOL_UNSUPPORTED",
+                                    rpc_code=error.get("code") if isinstance(error, dict) else None)
+        if (isinstance(result, dict) and isinstance(result.get("supportedVersions"), list)
+                and _MODERN_VERSION in result["supportedVersions"]):
+            return _MODERN_VERSION
+        raise McpTransportError("MCP discovery did not confirm the requested protocol",
+                                code="MCP_DISCOVERY_INVALID")
+
+    def _rpc(self, method: str, params: dict[str, Any], *,
+             version: str | None) -> dict[str, Any]:
         request_id = self._next_id
         self._next_id += 1
+        if version == _MODERN_VERSION:
+            params = {**params, "_meta": {
+                "io.modelcontextprotocol/protocolVersion": version,
+                "io.modelcontextprotocol/clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }}
         response = self._post({"jsonrpc": "2.0", "id": request_id,
                                "method": method, "params": params},
-                              expect_body=True)
-        if response.get("jsonrpc") != "2.0" or response.get("id") != request_id:
+                              expect_body=True, version=version)
+        if (response.get("jsonrpc") != "2.0" or type(response.get("id")) is not int
+                or response["id"] != request_id):
             raise McpTransportError("MCP JSON-RPC response identity mismatch")
         if "error" in response:
             error = response["error"]
+            if method == _DISCOVER:
+                code = error.get("code") if isinstance(error, dict) else None
+                if code == -32022:
+                    return response
+                raise McpTransportError("MCP discovery was refused",
+                                        code="MCP_DISCOVERY_REFUSED", rpc_code=code)
             message = (error.get("message") if isinstance(error, dict) else None)
             raise McpTransportError(message if isinstance(message, str) and message
                                     else "MCP JSON-RPC request failed",
@@ -154,11 +223,8 @@ class HttpsMcpTransport:
                                     rpc_code=error.get("code") if isinstance(error, dict) else None)
         return response
 
-    def _notify(self, method: str, params: dict[str, Any]) -> None:
-        self._post({"jsonrpc": "2.0", "method": method, "params": params},
-                   expect_body=False)
-
-    def _post(self, payload: dict[str, Any], *, expect_body: bool) -> dict[str, Any]:
+    def _post(self, payload: dict[str, Any], *, expect_body: bool,
+              version: str | None) -> dict[str, Any]:
         token = self._token_provider()
         if (not isinstance(token, str) or not token or len(token) > 16384
                 or any(character in token for character in "\r\n\x00")):
@@ -166,8 +232,13 @@ class HttpsMcpTransport:
         headers = {"Authorization": "Bearer " + token,
                    "Content-Type": "application/json",
                    "Accept": "application/json, text/event-stream",
-                   "MCP-Protocol-Version": _PROTOCOL_VERSION,
                    "User-Agent": USER_AGENT}
+        if version is not None:
+            headers["MCP-Protocol-Version"] = version
+        if version == _MODERN_VERSION:
+            headers["Mcp-Method"] = payload["method"]
+            if payload["method"] == "tools/call":
+                headers["Mcp-Name"] = payload["params"]["name"]
         if self._session_id is not None:
             headers["MCP-Session-Id"] = self._session_id
         body = json.dumps(payload, sort_keys=True, separators=(",", ":"),
@@ -176,16 +247,40 @@ class HttpsMcpTransport:
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
                 session = response.headers.get("MCP-Session-Id")
-                if session is not None:
+                if payload["method"] == "initialize" and session is not None:
                     if (not session or len(session) > 1024
-                            or any(value in session for value in "\r\n\x00")):
+                            or any(not 0x21 <= ord(value) <= 0x7e for value in session)):
                         raise McpTransportError("MCP session identifier is invalid")
                     self._session_id = session
                 raw = response.read(self._max_response + 1)
         except HTTPError as error:
             # Do not echo bodies: proxies and identity providers can include
             # credential-adjacent diagnostics in an error response.
+            if payload["method"] == _DISCOVER and error.code in (400, 404, 405):
+                try:
+                    with error:
+                        raw = error.read(self._max_response + 1)
+                except OSError as failure:
+                    raise McpTransportError("MCP HTTPS discovery response could not be read") from failure
+                if len(raw) > self._max_response:
+                    raise McpTransportError("MCP HTTPS response exceeds the configured bound")
+                try:
+                    decoded = json.loads(raw)
+                except (ValueError, RecursionError):
+                    decoded = None
+                if isinstance(decoded, dict) and decoded.get("jsonrpc") == "2.0":
+                    if isinstance(decoded.get("error"), dict):
+                        return decoded
+                    raise McpTransportError("MCP discovery returned an invalid error envelope",
+                                            code="MCP_DISCOVERY_INVALID")
+                raise McpTransportError("MCP endpoint requires legacy initialization",
+                                        code="MCP_LEGACY_DISCOVERY", http_status=error.code)
             error.close()
+            if error.code == 404 and self._session_id is not None:
+                self._session_id = None
+                self._protocol_version = None
+                raise McpTransportError("MCP session expired; the next explicit call can reconnect",
+                                        code="MCP_SESSION_EXPIRED", http_status=404) from error
             raise McpTransportError(f"MCP HTTPS request failed with status {error.code}",
                 code="MCP_HTTP_ERROR", http_status=error.code) from error
         except (URLError, TimeoutError, OSError) as error:
@@ -205,18 +300,35 @@ class HttpsMcpTransport:
         return decoded
 
     @staticmethod
-    def _tool_error_code(result: dict[str, Any], tool: str) -> str | None:
-        structured = result.get("structuredContent")
-        if isinstance(structured, dict):
-            code = structured.get("code")
-            if isinstance(code, str) and _ERROR_CODE.fullmatch(code):
-                return code
+    def _single_text_content(result: dict[str, Any]) -> str | None:
         content = result.get("content")
         if (not isinstance(content, list) or len(content) != 1
-                or not isinstance(content[0], dict) or content[0].get("type") != "text"
+                or not isinstance(content[0], dict)
+                or content[0].get("type") != "text"
                 or not isinstance(content[0].get("text"), str)):
             return None
-        message = content[0]["text"]
+        return content[0]["text"]
+
+    @staticmethod
+    def _text_diagnostic(message: str | None) -> dict[str, Any] | None:
+        if (message is None or len(message) > _MAX_TEXT_DIAGNOSTIC_CHARS
+                or not message.lstrip().startswith("{")):
+            return None
+        try:
+            payload = json.loads(message)
+        except (ValueError, RecursionError):
+            return None
+        code = payload.get("code") if isinstance(payload, dict) else None
+        return payload if isinstance(code, str) and code in REPAIR_CODES else None
+
+    @staticmethod
+    def _tool_error_code(diagnostic: object, message: str | None, tool: str) -> str | None:
+        if isinstance(diagnostic, dict):
+            code = diagnostic.get("code")
+            if isinstance(code, str) and _ERROR_CODE.fullmatch(code):
+                return code
+        if message is None:
+            return None
         if _ERROR_CODE.fullmatch(message):
             return message
         # mcp 2.3.0 MCPServer Tool.run wraps deliberate ToolError messages in

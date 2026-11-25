@@ -52,7 +52,7 @@ def endpoint(value: str) -> str:
         raise ContextError("MCP endpoint is invalid") from error
     if parsed.scheme != "https" or not parsed.hostname \
             or parsed.username is not None or parsed.password is not None \
-            or parsed.fragment or port == 0:
+            or parsed.query or parsed.fragment or port == 0:
         raise ContextError("MCP endpoint must be credential-free HTTPS")
     return value
 

@@ -19,6 +19,21 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+try:
+    from openepm_release_inventory import InventoryError, parse, resolve_inventory
+    from openepm_release_upgrade import (
+        ObservationUnavailable, UpgradeObservationError, capture_restart_binding, observe_active_services)
+    from qualify_openepm_clean_linux_release import (
+        MCP_IDENTITY_TOOL, QualificationError, canonical, verify_database_versions, verify_mcp_identity_request,
+        verify_restart_continuity, verify_restart_transition)
+except ModuleNotFoundError:  # Repository imports can resolve through the package.
+    from scripts.openepm_release_inventory import InventoryError, parse, resolve_inventory
+    from scripts.openepm_release_upgrade import (
+        ObservationUnavailable, UpgradeObservationError, capture_restart_binding, observe_active_services)
+    from scripts.qualify_openepm_clean_linux_release import (
+        MCP_IDENTITY_TOOL, QualificationError, canonical, verify_database_versions, verify_mcp_identity_request,
+        verify_restart_continuity, verify_restart_transition)
+
 IMPLEMENTED = {"host-attestation", "bundle-integrity", "epmctl-doctor",
     "epmctl-install", "database-version-read", "storage-retirement",
     "native-architecture-proof", "service-restart", "populated-backup",
@@ -30,10 +45,16 @@ SHA256 = re.compile(r"^[a-f0-9]{64}$")
 DIGEST = re.compile(r"^(?:[^@\s]+@)?sha256:[a-f0-9]{64}$")
 COMMIT = re.compile(r"^[a-f0-9]{40}$")
 SCHEMA = re.compile(r"^[0-9]{4}_[A-Za-z0-9_]+\.sql$")
+RELEASE_INVENTORY = "release-inventory.json"
 
 
 class PhaseError(ValueError):
     pass
+
+
+class NoMcpRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def sha(path: Path) -> str:
@@ -61,10 +82,15 @@ def epmctl_environment(context: dict, root: Path,
             ("signingTrustPolicySignature",
              "EPM_SIGNING_TRUST_POLICY_SIGNATURE_FILE"),
             ("releaseBootstrapVerifier", "EPM_RELEASE_BOOTSTRAP_VERIFIER")):
-        path = child(root, context.get(field), field)
-        if records.get(path) != sha(path):
-            raise PhaseError(f"{field} must be bundle-manifest bound")
-        environment[variable] = str(path)
+        environment[variable] = str(bound_child(root, context.get(field), field, records))
+    for name, variable in (
+            (context.get("releaseManifest"), "EPM_RELEASE_MANIFEST_FILE"),
+            ("release-manifest.sig", "EPM_RELEASE_MANIFEST_SIGNATURE_FILE"),
+            (RELEASE_INVENTORY, "EPM_RELEASE_INVENTORY_FILE"),
+            ("compose.yaml", "EPM_RELEASE_COMPOSE_FILE"),
+            ("compose.identity.yaml", "EPM_RELEASE_IDENTITY_COMPOSE_FILE"),
+            ("openepm.env", "EPM_RELEASE_ENV_FILE")):
+        environment[variable] = str(bound_child(root, name, variable, records))
     minimum = context.get("minimumTrustPolicySequence")
     if type(minimum) is not int or minimum < 1:
         raise PhaseError("minimumTrustPolicySequence must be a positive integer")
@@ -106,6 +132,13 @@ def child(root: Path, value: object, label: str) -> Path:
     return resolved
 
 
+def bound_child(root: Path, value: object, label: str, records: dict[Path, str]) -> Path:
+    path = child(root, value, label)
+    if records.get(path) != sha(path):
+        raise PhaseError(f"{label} must be bundle-manifest bound")
+    return path
+
+
 def load(path: Path, label: str) -> dict:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -127,17 +160,19 @@ def authenticated_mcp_evidence(context: dict, root: Path,
     if (parsed_endpoint.scheme != "https" or not parsed_endpoint.hostname
             or parsed_endpoint.username is not None
             or parsed_endpoint.password is not None
-            or parsed_endpoint.fragment or port == 0):
+            or parsed_endpoint.query or parsed_endpoint.fragment or port == 0):
         raise PhaseError("mcpEndpoint must be credential-free HTTPS")
     request_path = child(root, context.get("mcpRequest"), "MCP request")
-    if records.get(request_path) != sha(request_path):
-        raise PhaseError("MCP request must be bundle-manifest bound")
     request_body = request_path.read_bytes()
+    if records.get(request_path) != hashlib.sha256(request_body).hexdigest():
+        raise PhaseError("MCP request must be bundle-manifest bound")
     if not request_body or len(request_body) > 1024 * 1024:
         raise PhaseError("MCP request is empty or oversized")
-    request_value = load(request_path, "MCP request")
-    if request_value.get("jsonrpc") != "2.0" or "id" not in request_value:
-        raise PhaseError("MCP request is not JSON-RPC 2.0")
+    try:
+        request_value = json.loads(request_body)
+        verify_mcp_identity_request(request_value)
+    except (UnicodeError, json.JSONDecodeError, QualificationError) as error:
+        raise PhaseError("MCP request must call read_v2_session_identity without arguments") from error
     token_path = Path(text_field(context, "mcpTokenFile"))
     if not token_path.is_absolute() or token_path.is_symlink() or not token_path.is_file():
         raise PhaseError("MCP token file must be absolute, regular and non-symbolic")
@@ -147,11 +182,14 @@ def authenticated_mcp_evidence(context: dict, root: Path,
     if not token or len(token) > 16384 or any(character.isspace() for character in token):
         raise PhaseError("MCP bearer token is invalid")
 
+    opener = urllib.request.build_opener(NoMcpRedirect())
+
     def invoke(headers: dict[str, str]):
         request = urllib.request.Request(endpoint, data=request_body, headers={
-            "Content-Type": "application/json", "Accept": "application/json", **headers},
+            "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": "2025-11-25", **headers},
             method="POST")
-        return urllib.request.urlopen(request, timeout=30)
+        return opener.open(request, timeout=30)
 
     try:
         with invoke({}) as response:
@@ -176,11 +214,32 @@ def authenticated_mcp_evidence(context: dict, root: Path,
     except (UnicodeError, json.JSONDecodeError) as error:
         raise PhaseError("authenticated MCP response is invalid JSON") from error
     if not isinstance(value, dict) or value.get("jsonrpc") != "2.0" \
+            or type(value.get("id")) is not type(request_value["id"]) \
             or value.get("id") != request_value["id"] \
             or not isinstance(value.get("result"), dict) or "error" in value:
         raise PhaseError("authenticated MCP response is not a successful matching result")
-    return {"verified": True, "unsignedDenied": True,
-            "responseSha256": hashlib.sha256(raw).hexdigest()}
+    result = value["result"]
+    if result.get("isError", False) is not False or result.get("resultType", "complete") != "complete":
+        raise PhaseError("authenticated result lacks a verified MCP session identity")
+    identity = result.get("structuredContent")
+    if "structuredContent" not in result:
+        content = result.get("content")
+        if (isinstance(content, list) and len(content) == 1
+                and isinstance(content[0], dict) and content[0].get("type") == "text"
+                and isinstance(content[0].get("text"), str)):
+            try:
+                identity = json.loads(content[0]["text"])
+            except json.JSONDecodeError:
+                pass
+    if (not isinstance(identity, dict)
+            or set(identity) != {"issuer", "subject", "loginIdSha256", "audience"}
+            or any(not isinstance(item, str) or not item for item in identity.values())
+            or not SHA256.fullmatch(identity["loginIdSha256"])):
+        raise PhaseError("authenticated result lacks a verified MCP session identity")
+    return {"verified": True, "unsignedDenied": True, "tool": MCP_IDENTITY_TOOL,
+            "requestSha256": hashlib.sha256(canonical({"endpoint": endpoint,
+                "request": request_value})).hexdigest(),
+            "responseSha256": hashlib.sha256(canonical(identity)).hexdigest()}
 
 
 def authenticated_mcp(context: dict, root: Path, records: dict[Path, str]) -> None:
@@ -665,6 +724,92 @@ def validate_bundle(root: Path, context: dict) -> tuple[Path, dict, dict[Path, s
     return manifest, value, records
 
 
+def release_inventory_evidence(release: Path, root: Path, records: dict[Path, str]) -> dict:
+    manifest = load(release, "release manifest")
+    artifacts = manifest.get("artifacts")
+    reference = artifacts.get("inventory") if isinstance(artifacts, dict) else None
+    inventory = child(root, RELEASE_INVENTORY, "release inventory")
+    payload = inventory.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    if not isinstance(reference, dict) or reference.get("sha256") != digest or records.get(inventory) != digest:
+        raise PhaseError("release inventory differs from the bound release manifest or bundle")
+    try:
+        profile = resolve_inventory(parse(payload.decode("utf-8")))
+    except (InventoryError, UnicodeError, TypeError) as error:
+        raise PhaseError("bound release inventory contract is invalid") from error
+    return {"releaseInventorySha256": digest, "releaseInventory": profile}
+
+
+def serving_release_evidence(epmctl: Path, environment: dict[str, str],
+                             root: Path, records: dict[Path, str]) -> dict:
+    try:
+        from qualify_openepm_clean_linux_release import QualificationError, verify_serving_release
+    except ModuleNotFoundError:
+        from scripts.qualify_openepm_clean_linux_release import QualificationError, verify_serving_release
+
+    release = Path(environment["EPM_RELEASE_MANIFEST_FILE"])
+    binding = {"releaseManifestSha256": records[release],
+               **release_inventory_evidence(release, root, records)}
+    raw = command([str(epmctl), "status", "--json"], environment=environment)
+    try:
+        observation = json.loads(raw)
+        project = verify_serving_release(observation, binding)
+    except (json.JSONDecodeError, QualificationError) as error:
+        raise PhaseError("serving release observation did not verify") from error
+    if project != (environment.get("EPM_RELEASE_PROJECT_NAME") or "openepm"):
+        raise PhaseError("serving release project differs from the configured project")
+    return observation
+
+
+def running_database_versions(context: dict, root: Path, records: dict[Path, str]) -> dict:
+    environment = epmctl_environment(context, root, records)
+    epmctl = bound_child(root, context.get("epmctl"), "epmctl", records)
+    project = environment.get("EPM_RELEASE_PROJECT_NAME") or "openepm"
+    release = Path(environment["EPM_RELEASE_MANIFEST_FILE"])
+    inventory = release_inventory_evidence(release, root, records)["releaseInventory"]
+    services = set(inventory["services"])
+
+    def database_container_id() -> str:
+        try:
+            running = observe_active_services(project, services)
+        except (ObservationUnavailable, UpgradeObservationError) as error:
+            raise PhaseError("could not observe the release database container") from error
+        if "db" not in running:
+            raise PhaseError("release database container is not running")
+        return running["db"]
+
+    container_id = database_container_id()
+    serving_release_evidence(epmctl, environment, root, records)
+    selector = text_field(context, "databaseContainer")
+    # The generated context names the default db as openepm-db. Compose
+    # generates the physical name, so use the inspected service identity.
+    if selector not in {"db", project + "-db"}:
+        selected_id = command(["docker", "container", "inspect", "--format", "{{.Id}}", selector])
+        if selected_id != container_id:
+            raise PhaseError("configured database container differs from the running release db")
+    user = text_field(context, "databaseUser")
+    database = text_field(context, "databaseName")
+    query = ("SELECT pg_catalog.json_build_array(current_database(), current_user, "
+             "pg_catalog.version(), 'pg_duckdb ' || extversion) "
+             "FROM pg_catalog.pg_extension WHERE extname = 'pg_duckdb'")
+    raw = command(["docker", "exec", container_id, "psql", "-Xw", "-h", "/var/run/postgresql",
+                   "-U", user, "-d", database, "-v", "ON_ERROR_STOP=1", "-Atqc", query])
+    try:
+        row = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise PhaseError("database version query must return one installed pg_duckdb row") from error
+    if not isinstance(row, list) or len(row) != 4 or row[:2] != [database, user]:
+        raise PhaseError("database version query returned an unexpected database or user")
+    versions = {"postgresql": row[2], "pgDuckdb": row[3], "readFromRunningDatabase": True}
+    try:
+        verify_database_versions(versions)
+    except QualificationError as error:
+        raise PhaseError(str(error)) from error
+    if database_container_id() != container_id:
+        raise PhaseError("release database container changed during version verification")
+    return versions
+
+
 def native_architecture() -> str:
     result = {"x86_64": "linux/amd64", "aarch64": "linux/arm64"}.get(platform.machine())
     if result is None:
@@ -683,7 +828,7 @@ def host_identity(path: Path = Path("/etc/machine-id")) -> str:
 
 
 def verified_source_attestation(context: dict, root: Path,
-                                records: dict[Path, str]) -> dict:
+                                records: dict[Path, str], *, check_payloads: bool = True) -> dict:
     module_path = child(root, context.get("sourceAttestationModule"),
                         "source attestation module")
     if records.get(module_path) != sha(module_path):
@@ -703,13 +848,61 @@ def verified_source_attestation(context: dict, root: Path,
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-        return module.verify(load(attestation_path, "source backup attestation"),
-            backup_root=bounded_directory(context.get("backupExportRoot"),
-                                           "backupExportRoot"),
-            key_file=Path(text_field(context, "sourceAttestationKeyFile")),
-            maximum_bytes=maximum)
+        record = load(attestation_path, "source backup attestation")
+        key_file = Path(text_field(context, "sourceAttestationKeyFile"))
+        if check_payloads:
+            source = module.verify(record,
+                backup_root=bounded_directory(context.get("backupExportRoot"), "backupExportRoot"),
+                key_file=key_file, maximum_bytes=maximum)
+        else:
+            source = module.authenticate(record, key_file=key_file)
     except Exception as error:
         raise PhaseError("source backup attestation verification failed") from error
+    public = source.get("preBackupPublicReadSignature")
+    if not isinstance(public, str) or not SHA256.fullmatch(public):
+        raise PhaseError("source backup attestation lacks a public readback signature")
+    return source
+
+
+def restore_controller_fields(output: str, expected: set[str]) -> dict[str, str]:
+    fields = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in expected:
+            if key in fields or not value:
+                raise PhaseError("restore controller emitted an ambiguous result")
+            fields[key] = value
+    if fields.keys() != expected:
+        raise PhaseError("restore controller result is incomplete")
+    return fields
+
+
+def restored_population(verifier: Path, target: str, environment: dict[str, str],
+                        expected: str, *, runtime: str | None = None) -> dict:
+    argv = [str(verifier), "--target-project", target]
+    stage = "before activation"
+    if runtime is not None:
+        argv.extend(("--serving-runtime-sha256", runtime))
+        stage = "after activation"
+    try:
+        restored = json.loads(command(argv, environment=environment))
+    except json.JSONDecodeError as error:
+        raise PhaseError(f"restored population verifier emitted invalid JSON {stage}") from error
+    if (not isinstance(restored, dict) or restored.get("status") != "passed"
+            or restored.get("populated") is not True or restored.get("signature") != expected):
+        raise PhaseError(f"restored populated signature differs from source {stage}")
+    return restored
+
+
+def verify_serving_readback(readback: object, target: str, runtime: str, expected: str) -> None:
+    try:
+        from qualify_openepm_clean_linux_release import QualificationError, verify_restored_public_readback
+    except ModuleNotFoundError:  # Repository imports can resolve through the package.
+        from scripts.qualify_openepm_clean_linux_release import QualificationError, verify_restored_public_readback
+    try:
+        verify_restored_public_readback(readback, target=target, runtime=runtime, expected=expected)
+    except QualificationError as error:
+        raise PhaseError(str(error)) from error
 
 
 def independent_host_restore(context: dict, root: Path,
@@ -728,40 +921,47 @@ def independent_host_restore(context: dict, root: Path,
         raise PhaseError("restore target project is invalid")
     environment = epmctl_environment(context, root, records)
     environment["EPM_RESTORE_TARGET_PROJECT"] = target
+    environment["EPM_RESTORE_EXPECTED_BACKUP_MANIFEST_SHA256"] = source["manifestSha256"]
     output = command([str(epmctl), "restore", source["bundle"]],
                      environment=environment)
-    result = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
-    if (result.get("restore") != "verified" or result.get("bundle") != source["bundle"]
-            or result.get("target_project") != target
-            or not result.get("source_project") or result["source_project"] == target):
+    result = restore_controller_fields(output, {"restore", "bundle", "target_project",
+        "source_project", "backup_manifest_sha256"})
+    prior = result["source_project"]
+    if result["backup_manifest_sha256"] != source["manifestSha256"]:
+        raise PhaseError("restored backup manifest differs from source attestation")
+    if (result["restore"] != "verified" or result["bundle"] != source["bundle"]
+            or result["target_project"] != target or prior == target
+            or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", prior) is None):
         raise PhaseError("epmctl did not verify a distinct fresh restore target")
-    try:
-        restored = json.loads(command([str(verifier), "--target-project", target],
-            environment=environment))
-    except json.JSONDecodeError as error:
-        raise PhaseError("restored population verifier emitted invalid JSON") from error
-    after = restored.get("signature") if isinstance(restored, dict) else None
     before = source["preBackupPopulatedSignature"]
-    if (not isinstance(restored, dict) or restored.get("status") != "passed"
-            or restored.get("populated") is not True or after != before):
-        raise PhaseError("restored populated signature differs from source")
+    imported = restored_population(verifier, target, environment, before)
     activation_output = command(
         [str(epmctl), "activate-restored", source["bundle"]],
         environment=environment)
-    activation = dict(line.split("=", 1)
-        for line in activation_output.splitlines() if "=" in line)
-    if (activation.get("activation") != "verified"
-            or activation.get("bundle") != source["bundle"]
-            or activation.get("target_project") != target
-            or activation.get("prior_project") != result["source_project"]):
+    activation = restore_controller_fields(activation_output, {"activation", "bundle",
+        "target_project", "prior_project", "activated_runtime_sha256", "backup_manifest_sha256"})
+    runtime = activation["activated_runtime_sha256"]
+    if activation["backup_manifest_sha256"] != source["manifestSha256"]:
+        raise PhaseError("activated backup manifest differs from source attestation")
+    if (activation["activation"] != "verified" or activation["bundle"] != source["bundle"]
+            or activation["target_project"] != target or activation["prior_project"] != prior
+            or SHA256.fullmatch(runtime) is None):
         raise PhaseError("epmctl did not activate the exact verified restore target")
+    after = restored_population(verifier, target, environment, before, runtime=runtime)
+    readback = after.get("publicReadback")
+    verify_serving_readback(readback, target, runtime, source["preBackupPublicReadSignature"])
     emit("independent-host-restore", restore={"populated": True,
         "independentHost": True, "encryptedTransfer": True,
         "activationVerified": True, "bundle": source["bundle"],
-        "targetProject": target, "priorProject": result["source_project"],
+        "targetProject": target, "priorProject": prior, "activatedRuntimeSha256": runtime,
+        "manifestSha256": source["manifestSha256"],
+        "restoredManifestSha256": result["backup_manifest_sha256"],
+        "activatedManifestSha256": activation["backup_manifest_sha256"],
+        "encryptedArtifactSha256": source["encryptedArtifactSha256"],
         "sourceHostIdentity": source["sourceHostIdentity"],
         "targetHostIdentity": target_identity,
-        "beforeSignature": before, "afterSignature": after})
+        "beforeSignature": before, "restoredSignatureBeforeActivation": imported["signature"],
+        "afterSignature": after["signature"], "publicReadback": readback})
 
 
 def execute(phase: str, context_path: Path) -> None:
@@ -783,11 +983,12 @@ def execute(phase: str, context_path: Path) -> None:
         raise PhaseError("context and phase harness must be bundle-manifest bound")
 
     if phase == "bundle-integrity":
-        release = child(root, context.get("releaseManifest"), "release manifest")
+        release = bound_child(root, context.get("releaseManifest"), "release manifest", records)
         emit(phase, bundle={"releaseManifestSha256": sha(release),
             "bundleManifestSha256": sha(manifest), "sourceCommit": bundle["sourceCommit"],
             "schemaMigration": bundle["schemaMigration"],
-            "sourceTreeSha256": bundle["sourceTreeSha256"]})
+            "sourceTreeSha256": bundle["sourceTreeSha256"],
+            **release_inventory_evidence(release, root, records)})
         return
     if phase == "authenticated-mcp":
         authenticated_mcp(context, root, records)
@@ -805,6 +1006,10 @@ def execute(phase: str, context_path: Path) -> None:
         independent_host_restore(context, root, records)
         return
     if phase == "host-attestation":
+        target_identity = host_identity()
+        source = verified_source_attestation(context, root, records, check_payloads=False)
+        if source["sourceHostIdentity"] == target_identity:
+            raise PhaseError("qualification target is not independent from source host")
         os_release = {}
         for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
             if "=" in line:
@@ -820,23 +1025,38 @@ def execute(phase: str, context_path: Path) -> None:
             "architecture": native_architecture(), "cleanHost": context.get("cleanHost") is True,
             "runscVersion": runsc[0], "dockerRunscRegistered": "runsc" in runtimes,
             "developmentMacPathsPresent": any(Path(item).exists() for item in ("/Users", "/Applications/Xcode.app")),
-            "hostIdentity": host_identity()})
+            "hostIdentity": target_identity, "sourceHostIdentity": source["sourceHostIdentity"]})
         return
     if phase in {"epmctl-doctor", "epmctl-install"}:
-        command([str(child(root, context.get("epmctl"), "epmctl")),
-                 phase.removeprefix("epmctl-")],
-                environment=epmctl_environment(context, root, records))
-        emit(phase, verified=True)
+        epmctl = bound_child(root, context.get("epmctl"), "epmctl", records)
+        environment = epmctl_environment(context, root, records)
+        command([str(epmctl), phase.removeprefix("epmctl-")], environment=environment)
+        if phase == "epmctl-install":
+            emit(phase, verified=True, servingRelease=serving_release_evidence(epmctl, environment, root, records))
+        else:
+            emit(phase, verified=True)
         return
     if phase == "service-restart":
-        epmctl = child(root, context.get("epmctl"), "epmctl")
+        epmctl = bound_child(root, context.get("epmctl"), "epmctl", records)
         environment = epmctl_environment(context, root, records)
-        for action in ("stop", "up", "status"):
-            command([str(epmctl), action], environment=environment)
-        readback = authenticated_mcp_evidence(context, root, records)
-        emit(phase, verified=True, authenticatedWorkflowClaimed=True,
-            unsignedDenied=readback["unsignedDenied"],
-            responseSha256=readback["responseSha256"])
+        initial = serving_release_evidence(epmctl, environment, root, records)
+        project = initial["project"]
+        services = {component["service"] for component in initial["components"]}
+        try:
+            before = capture_restart_binding(project, services)
+            for action in ("stop", "up"):
+                command([str(epmctl), action], environment=environment)
+            observation = serving_release_evidence(epmctl, environment, root, records)
+            started = capture_restart_binding(project, services)
+            verify_restart_transition(before, started)
+            readback = authenticated_mcp_evidence(context, root, records)
+            continuity = {"beforeStop": before, "afterStart": started,
+                          "afterReadback": capture_restart_binding(project, services)}
+            verify_restart_continuity(continuity)
+        except (ObservationUnavailable, UpgradeObservationError, QualificationError) as error:
+            raise PhaseError(str(error)) from error
+        emit(phase, servingRelease=observation, restartContinuity=continuity,
+             authenticatedWorkflowClaimed=True, **readback)
         return
     if phase == "populated-backup":
         if "sourceBackupAttestation" in context:
@@ -844,6 +1064,7 @@ def execute(phase: str, context_path: Path) -> None:
             emit(phase, backup={"bundle": source["bundle"],
                 "sourceHostIdentity": source["sourceHostIdentity"],
                 "preBackupPopulatedSignature": source["preBackupPopulatedSignature"],
+                "preBackupPublicReadSignature": source["preBackupPublicReadSignature"],
                 "manifestSha256": source["manifestSha256"],
                 "encryptedArtifactSha256": source["encryptedArtifactSha256"],
                 "encryptedPayloadCount": source["encryptedPayloadCount"],
@@ -949,16 +1170,7 @@ def execute(phase: str, context_path: Path) -> None:
             "proxyCertificateSha256": proxy["certificateSha256"]})
         return
     if phase == "database-version-read":
-        container = text_field(context, "databaseContainer")
-        user = text_field(context, "databaseUser")
-        database = text_field(context, "databaseName")
-        base = ["docker", "exec", container, "psql", "-U", user, "-d", database]
-        postgresql = command(base + ["--version"])
-        extension = command(base + ["-Atqc", "SELECT extversion FROM pg_extension WHERE extname='pg_duckdb'"])
-        if not extension:
-            raise PhaseError("pg_duckdb is not installed")
-        emit(phase, databaseVersions={"postgresql": postgresql,
-            "pgDuckdb": "pg_duckdb " + extension, "readFromRunningDatabase": True})
+        emit(phase, databaseVersions=running_database_versions(context, root, records))
 
 
 def main() -> int:

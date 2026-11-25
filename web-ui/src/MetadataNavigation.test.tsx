@@ -104,3 +104,26 @@ it("removes collapsed navigation children from keyboard and accessibility traver
   expect(screen.getAllByRole("button")).toHaveLength(1);
   expect(screen.getByRole("button", { name: "Metadata" })).toBeInTheDocument();
 });
+
+it("keeps every destination named and disables the entire navigation when scope is unavailable", () => {
+  const onNavigate = vi.fn();
+  render(
+    <MetadataNavigation
+      active
+      listsActive={false}
+      section="members"
+      dimensionId="Account"
+      dimensions={dimensions}
+      collapsed={false}
+      disabled
+      onNavigate={onNavigate}
+      onMemberLists={vi.fn()}
+    />,
+  );
+  for (const button of screen.getAllByRole("button")) {
+    expect(button).toHaveAccessibleName();
+    expect(button).toBeDisabled();
+  }
+  fireEvent.click(screen.getByRole("button", { name: "Relationships" }));
+  expect(onNavigate).not.toHaveBeenCalled();
+});

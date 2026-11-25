@@ -15,6 +15,8 @@
     "SECURITY.md",
     "deploy/release/public-repository.manifest.json",
     "deploy/release/public-ci.yml",
+    "deploy/postgres/compose.yaml",
+    "deploy/postgres/.env.example",
     "requirements-dev.txt",
     "requirements-postgres-dev.txt",
     "requirements-postgres.txt",

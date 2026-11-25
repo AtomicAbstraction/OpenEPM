@@ -55,6 +55,8 @@ def worker_health(worker_dsn, runtime_dsn):
                 'epm.application_schedule_worker_claim(text,integer,integer,integer,integer)','EXECUTE')
               AND has_function_privilege(current_user,
                 'epm.application_schedule_occurrence_worker_claim(text,integer,integer,integer,integer)','EXECUTE')
+              AND has_function_privilege(current_user,
+                'epm.calculation_impact_worker_scope(text,text)','EXECUTE')
               """),
             (runtime_dsn,'SELECT 1 FROM epm.application_state LIMIT 1')):
         with connect_postgres(dsn) as db:

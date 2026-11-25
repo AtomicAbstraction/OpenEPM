@@ -9,6 +9,8 @@ from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 import psycopg
 from epm_core.postgres_processing_limits import BUSY_CODE
+from epm_core.mcp_diagnostics import DiagnosticToolError
+from epm_core.public_program_diagnostics import ProgramValidationError
 
 from epm_core.postgres_auth import AuthError, access_token
 from epm_core.deployment_secrets import configured_hex_bytes, configured_text
@@ -65,6 +67,8 @@ def _assertion(ctx: Context) -> str:
 def _call(operation):
     try:
         return operation()
+    except ProgramValidationError as error:
+        raise DiagnosticToolError(error.diagnostics) from None
     except (AuthError, ValueError) as error:
         raise ToolError(str(error)) from error
     except psycopg.errors.LockNotAvailable as error:
@@ -106,14 +110,14 @@ def execute_v2_workspace_program(program: dict, idempotency_key: str,
 @bounded_tool(server)
 def set_v2_workspace_access(program: dict, idempotency_key: str,
                             ctx: Context) -> dict:
-    """Grant or revoke one user or group Administrator through fixed core."""
+    """Apply a discovered workspace security effect through the fixed core."""
     return _call(lambda: application().access(
         _assertion(ctx), program, idempotency_key=idempotency_key))
 
 
 @bounded_tool(server)
 def read_v2_workspace_access(program: dict, ctx: Context) -> dict:
-    """Read bounded workspace group grants through the fixed security store."""
+    """Inspect discovered workspace access, assignment origins and migration reviews."""
     return _call(lambda: application().read_access(_assertion(ctx), program))
 
 

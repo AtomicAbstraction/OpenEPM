@@ -8,49 +8,15 @@ import sys
 from urllib.request import Request, urlopen
 
 from .model import Application, BuildContext, Program
-from .diagnostics import Diagnostic, SourceValidationError, diagnostic_payload
+from .diagnostics import (Diagnostic, SourceValidationError, diagnostic_payload,
+                          metadata_failure as _metadata_failure)
 from .source_validation import validate_python_source
 from .source_mapping import capture_source, program_source_map, FILENAME
-from .authoring import MetadataAuthoringError
 from .metadata_references import BOOTSTRAP_CONTRACT_DIGEST
 
 MAX_INPUT = 8192
 MAX_RESPONSE = 2 * 1024 * 1024
 MAX_LOG = 1024 * 1024
-
-
-def _metadata_failure(error: Exception):
-    """Only fixed SDK classifications may specialize a build diagnostic.
-
-    Caller names, candidate matches and arbitrary exception messages never
-    cross this boundary. A missing name and a denied name have one response.
-    """
-    if type(error) is not MetadataAuthoringError:
-        return None
-    if type(error.code) is not str or type(error.kind) is not str:
-        return None
-    if error.kind in ("dimension", "member"):
-        kind = error.kind
-        options = {
-            "METADATA_NAME_REQUIRED": (
-                f"A nonempty {kind} name or ID is required.",
-                f"Supply the {kind}'s exact name or stable ID from the application metadata."),
-            "METADATA_NAME_UNAVAILABLE": (
-                f"The {kind} is unavailable in the authorized metadata snapshot.",
-                f"Check the {kind} name or ID and your access, then refresh metadata and save again."),
-            "METADATA_NAME_AMBIGUOUS": (
-                f"The {kind} name matches more than one authorized object.",
-                f"Use the intended {kind}'s unique stable ID from the application metadata."),
-        }
-        if error.code in options:
-            return error.code, *options[error.code]
-    if (error.code, error.kind) == ("METADATA_HIERARCHY_UNAVAILABLE", "hierarchy"):
-        return (error.code, "A hierarchy built for the current metadata revision is unavailable.",
-                "Build the dimension hierarchy at the current metadata revision, then save again.")
-    if (error.code, error.kind) == ("AUTHORING_METADATA_CONTEXT_UNAVAILABLE", "context"):
-        return (error.code, "The authorized application metadata snapshot is unavailable or stale.",
-                "Refresh the application metadata and start a new validation build.")
-    return None
 
 
 def _source_failure(error: Exception, source_digest: str) -> SourceValidationError:

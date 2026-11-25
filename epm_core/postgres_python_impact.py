@@ -341,6 +341,10 @@ class PostgresPythonImpactEvaluator:
                 if definition is not None and definition['kind']=='ApplicationRule':
                     from .postgres_application_rules import PostgresApplicationRules,bind_definition
                     rule=plan.canonical_plan['units'][0]['operations'][0]['arguments']['definition']
+                    if access.authorization_model=='group_assignments':
+                        from .postgres_group_rule_source import require_numeric_rule_declaration
+                        operation=plan.canonical_plan['units'][0]['operations'][0]
+                        require_numeric_rule_declaration(definition['definitionId'],operation['function'],operation['arguments'],impact=True)
                     resolved_bindings,member_list_pins=PostgresApplicationRules(
                         self.dsn,identity=self.identity)._resolve_member_list_bindings(
                             scope,rule,parameters,metadata_revision=metadata_revision)
@@ -361,9 +365,16 @@ class PostgresPythonImpactEvaluator:
                         definition_result=evaluated['definitionResult']
                         rows=[]
                     else:
-                        current_access = PostgresAccessChecker.check_in_transaction(db,
-                            self.identity, scope, 'write', function=operation['function'],
-                            arguments=operation['arguments'])
+                        if access.authorization_model=='group_assignments':
+                            from .postgres_group_rule_source import NUMERIC_RULE_OPERATIONS
+                            if definition is None or definition['kind']!='ApplicationRule' or operation['function'] not in NUMERIC_RULE_OPERATIONS:
+                                raise ValueError('RULE_SOURCE_VALIDATION_OPERATION_UNAVAILABLE')
+                            current_access = PostgresAccessChecker.check_in_transaction(db,self.identity,scope,'write',action='facts.write')
+                            PostgresAccessChecker.require_capability_in_transaction(db,scope,operation['function'],operation['arguments'])
+                        else:
+                            current_access = PostgresAccessChecker.check_in_transaction(db,
+                                self.identity, scope, 'write', function=operation['function'],
+                                arguments=operation['arguments'])
                         rows=self._evaluate_unit(db,scope,operation,private,current_access.role,
                             unit=index,revision=state['commit_revision']+index)
                     steps.append({'unit': index, 'name': unit['name'],
@@ -465,7 +476,7 @@ class PostgresPythonImpactEvaluator:
             rows=prepare(db,scope,values,fact_state=private)
             normalized={'function':'facts.text.batch','statements':rows}
             enforce_sequence_dimensional_security(db,self.identity,scope,normalized)
-            enforce_sequence_target_policy(db,scope,normalized,role)
+            enforce_sequence_target_policy(db,scope,normalized,role,identity=self.identity)
             return normalized,rows
         if operation['function']=='facts.line-detail.replace':
             from .postgres_line_detail_job import compile_program as compile_detail
@@ -479,14 +490,16 @@ class PostgresPythonImpactEvaluator:
             from .postgres_language_v2 import compile_numeric_program
             from .postgres_numeric_batch import prepare
             mutations = compile_numeric_program(operation)
+            declared = {'function':'facts.numeric.batch','statements':[
+                {'members':dict(m.coordinate.members),'series_key':m.coordinate.series_key} for m in mutations]}
+            enforce_sequence_dimensional_security(db,self.identity,scope,declared)
             rows = prepare(db, scope, mutations, fact_state=private)
             normalized = {'function': 'facts.numeric.sequence', 'statements': rows}
-            enforce_sequence_dimensional_security(db, self.identity, scope, normalized)
-            enforce_sequence_target_policy(db, scope, normalized, role)
+            enforce_sequence_target_policy(db, scope, normalized, role, identity=self.identity)
             # Batch publication uses the same preparation rows directly.
             return normalized, rows
         normalized = compile_program(operation)
         enforce_sequence_dimensional_security(db, self.identity, scope, normalized)
         initial = initial_state(db, scope, normalized, fact_state=private)
-        enforce_sequence_target_policy(db, scope, normalized, role)
+        enforce_sequence_target_policy(db, scope, normalized, role, identity=self.identity)
         return normalized, evaluate_from_initial(db, normalized, initial)

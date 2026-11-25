@@ -348,22 +348,34 @@ export function ParameterFields({
             0,
           ),
         )
+      ) : properties ? (
+        <div>
+          <p role="alert">
+            These saved parameter values cannot be matched to the current named
+            fields.
+          </p>
+          <button type="button" onClick={() => onChange("{}")}>
+            Reset parameters
+          </button>
+        </div>
       ) : (
         <p>No named parameter fields are declared.</p>
       )}
-      {properties && Object.keys(properties).length === 0 && (
+      {properties && values && Object.keys(properties).length === 0 && (
         <p>No parameters are required.</p>
       )}
-      <details>
-        <summary>Advanced parameter object</summary>
-        <textarea
-          aria-label={advancedLabel}
-          value={value}
-          disabled={disabled}
-          onChange={(event) => onChange(event.target.value)}
-          rows={3}
-        />
-      </details>
+      {!properties && (
+        <label>
+          {advancedLabel}
+          <textarea
+            aria-label={advancedLabel}
+            value={value}
+            disabled={disabled}
+            onChange={(event) => onChange(event.target.value)}
+            rows={3}
+          />
+        </label>
+      )}
     </fieldset>
   );
 }

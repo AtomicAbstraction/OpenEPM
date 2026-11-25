@@ -24,10 +24,20 @@
         "function": "facts.numeric.batch",
         "resourceClass": "write",
         "status": "Succeeded",
+        "progressState": "succeeded",
+        "recoveryState": null,
         "interruptible": false,
         "rerunSupported": true,
         "createdAt": "2026-11-02T00:00:00+00:00",
-        "updatedAt": "2026-11-02T00:00:01+00:00"
+        "updatedAt": "2026-11-02T00:00:01+00:00",
+        "latestEvent": {
+          "event": 2,
+          "status": "Succeeded",
+          "claimGeneration": 1,
+          "receiptRevision": 3,
+          "errorCode": null,
+          "occurredAt": "2026-11-02T00:00:01+00:00"
+        }
       }
     ],
     "nextSequence": 7,
@@ -42,6 +52,8 @@
     "function": "facts.numeric.batch",
     "resourceClass": "write",
     "status": "Succeeded",
+    "progressState": "succeeded",
+    "recoveryState": null,
     "interruptible": false,
     "rerunSupported": true,
     "createdAt": "2026-11-02T00:00:00+00:00",
@@ -57,7 +69,15 @@
       }
     ],
     "nextEvent": 2,
-    "hasMoreEvents": false
+    "hasMoreEvents": false,
+    "latestEvent": {
+      "event": 2,
+      "status": "Succeeded",
+      "claimGeneration": 1,
+      "receiptRevision": 3,
+      "errorCode": null,
+      "occurredAt": "2026-11-02T00:00:01+00:00"
+    }
   },
   "taskLogs": {
     "taskId": "c:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

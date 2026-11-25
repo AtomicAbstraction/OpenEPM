@@ -13,11 +13,12 @@ import re
 # Updated only after a migration's workspace deletion implications are
 # reviewed. An unreviewed table or FK leaves reset apply blocked.
 EXPECTED_SCHEMA_FINGERPRINT = (
-    '090c87c423ce39f0233ea03dc9db290f2305fae43668f413ad657929c4b94fa1')
+    '01851985aa4a2f60dbfdc32444e0abfc6ce072082203abaa9fd6056fd495b98b')
 
 _PROJECTION_VIEWS = frozenset((
     'numeric_cell_current', 'text_cell_current', 'line_detail_current',
-    'generic_fact_current', 'coordinate_member', 'coordinate_projection'))
+    'generic_fact_current', 'coordinate_member', 'coordinate_projection',
+    'application_authorization_privilege'))
 
 
 def _normalize_view_definition(definition: str) -> str:

@@ -34,6 +34,7 @@ TESTS = (
     "tests.test_postgres_numeric_store.PostgresNumericStoreTests."
     "test_resolved_read_applies_typed_suppression_to_authorized_snapshot",
 )
+BROWSER_TESTS = ("src/Analyze.test.tsx",)
 SOURCES = (
     ROOT / "epm_core/postgres_cube_query.py",
     ROOT / "epm_core/postgres_calculation_scan.py",
@@ -91,7 +92,7 @@ def qualify(*, image: str, output: Path) -> dict:
                 "cube-view suppression/paging qualification failed: "
                 + (completed.stdout + completed.stderr)[-4000:])
         browser = subprocess.run(
-            ["npm", "test", "--", "--run", "src/Analyze.test.tsx"],
+            ["npm", "test", "--", "--run", *BROWSER_TESTS],
             cwd=ROOT / "web-ui", env=environment, text=True,
             capture_output=True, check=False)
         if browser.returncode != 0:

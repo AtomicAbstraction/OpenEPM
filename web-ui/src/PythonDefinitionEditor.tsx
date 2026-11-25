@@ -4,6 +4,7 @@ import { collectAllContinuations } from "./continuation";
 import { useStableMutationIntentKey } from "./mutation-intent";
 import { usePreservedDraft } from "./unsaved-work";
 import { PythonProgramTest } from "./PythonProgramTest";
+import { PythonSourceValidation } from "./PythonSourceValidation";
 import type { SealedPythonTest } from "./PythonProgramTest";
 import { PythonRuleEditor } from "./PythonRuleEditor";
 import type {
@@ -17,39 +18,59 @@ import {
 } from "./python-authoring";
 import type { PythonBuildStatus } from "./python-authoring";
 import {
+  pythonEnvironmentSelection,
   pythonProgramActionBody,
   pythonProgramSaveBody,
+  newAssignedRuleOutput,
+  pythonSaveEnvironment,
+  pythonSourceSaveError,
+  STALE_PYTHON_SOURCE_DRAFT,
 } from "./python-source-contract";
 import { usePythonBuildObserver } from "./usePythonBuildObserver";
 import type { PythonBuildObservation } from "./usePythonBuildObserver";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
+import {
+  DEFINITION_VALIDATION_EXPLANATION,
+  definitionAvailabilityLabel,
+  isDefinitionLifecycle,
+  type DefinitionLifecycle,
+  type DefinitionSourceBinding,
+} from "./definition-lifecycle";
 
-export type PythonSourceBinding = {
-  programId: string;
-  sourceToken: string;
-  sourceDigest: string;
-  buildId: string;
-  active: boolean;
-};
+export type PythonSourceBinding = DefinitionSourceBinding;
 export type PythonDefinitionKind =
   | "ApplicationRule"
   | "MemberList"
   | "CalculatedMember";
-type Source = {
+type Source = Partial<DefinitionLifecycle> & {
   defined: boolean;
   programId: string;
   stateToken: string;
   sourceToken: string;
-  status: "Inactive" | "Active";
+  status: "Inactive" | "Active" | "Unavailable";
   sourceDigest: string;
   sourceText: string;
   entryPoint: string;
   environmentId: string;
   environmentStateToken: string;
   parameterSchema: Record<string, unknown>;
+  declaredOutput?: Record<string, unknown> | null;
   validation?: PythonBuildStatus | null;
   latestImpactTest?: PythonBuildStatus | null;
 };
+type SourceReference = Pick<Source, "sourceToken" | "sourceDigest">;
+
+function assertExactSource(source: Source, expected: SourceReference) {
+  if (source.sourceToken !== expected.sourceToken)
+    throw new Error(
+      "The saved source no longer matches this definition. Refresh the definition before continuing.",
+    );
+  if (source.sourceDigest !== expected.sourceDigest)
+    throw new Error(
+      "The definition source digest does not match its immutable binding.",
+    );
+}
+
 type Environment = {
   environment_id: string;
   state_token: string;
@@ -94,6 +115,7 @@ export function PythonDefinitionEditor({
   const [value, setValue] = useState(template);
   const [editing, setEditing] = useState(!binding);
   const [dirty, setDirty] = useState(false);
+  const [draftStateToken, setDraftStateToken] = useState<string | null>(null);
   const [environment, setEnvironment] = useState("");
   const [environments, setEnvironments] = useState<Environment[]>([]);
   const [entry, setEntry] = useState("build");
@@ -117,23 +139,40 @@ export function PythonDefinitionEditor({
   const generation = useRef(0);
   const mutationKey = useStableMutationIntentKey("python-definition");
   const contextKey = authoringContextKey(app, catalog);
+  const groupDesign =
+    catalog.applicationAccess.authorizationModel === "group_assignments";
   const observer = usePythonBuildObserver(
     app,
     contextKey,
     validation,
     "Validation",
     setValidation,
+    groupDesign
+      ? catalog.functions["python.program.read"] && programId
+        ? programId
+        : null
+      : undefined,
+  );
+  const canChooseEnvironment = Boolean(
+    catalog.functions["python.environment.list"],
   );
   const canWrite = Boolean(
-    catalog.functions["python.program.save"] &&
-      catalog.functions["python.environment.list"],
+    (!groupDesign ||
+      (kind === "ApplicationRule" && source?.status !== "Active")) &&
+      catalog.functions["python.program.save"] &&
+      (source || canChooseEnvironment || draftStateToken),
   );
-  const approvedEnvironment = environments.find(
-    (item) =>
-      JSON.stringify([item.environment_id, item.state_token]) === environment,
+  const approvedEnvironment = pythonSaveEnvironment(
+    environment,
+    canChooseEnvironment ? environments : null,
+    source,
   );
+  const draftMatchesSource = draftStateToken
+    ? sourceContextKey === contextKey && draftStateToken === source?.stateToken
+    : !binding && !source;
   const exactValidation =
     source &&
+    source.validation?.ownedByCaller !== false &&
     validation &&
     observer.current &&
     validation.build.buildId === source.validation?.buildId
@@ -141,6 +180,7 @@ export function PythonDefinitionEditor({
       : null;
   const definition = exactValidation?.definition;
   const validationReady =
+    !groupDesign &&
     exactValidation?.status === "sealed" &&
     definition?.kind === kind &&
     (!definitionId || definition.definitionId === definitionId);
@@ -169,12 +209,12 @@ export function PythonDefinitionEditor({
     kind,
     definitionId ?? null,
     binding?.programId ?? null,
-    binding?.sourceToken ?? null,
+    binding?.programSourceToken ?? null,
     binding?.sourceDigest ?? null,
   ]);
   const restoredTarget = useRef<string | null>(null);
   const openedTarget = useRef<string | null>(null);
-  const acceptedSource = useRef<{ target: string; digest: string } | null>(
+  const acceptedSource = useRef<(SourceReference & { target: string }) | null>(
     null,
   );
   usePreservedDraft(
@@ -183,7 +223,7 @@ export function PythonDefinitionEditor({
     `python-definition-${draftTarget}`,
     `Unsaved ${kind} Python source`,
     dirty,
-    { programId, value, environment, entry, schema },
+    { programId, value, environment, entry, schema, draftStateToken },
     (draft) => {
       restoredTarget.current = draftTarget;
       setProgramId(draft.programId);
@@ -191,6 +231,7 @@ export function PythonDefinitionEditor({
       setEnvironment(draft.environment);
       setEntry(draft.entry);
       setSchema(draft.schema);
+      setDraftStateToken(draft.draftStateToken ?? null);
       setEditing(true);
       setDirty(true);
       setValidation(null);
@@ -201,7 +242,6 @@ export function PythonDefinitionEditor({
 
   function load(next: Source, key: string) {
     restoredTarget.current = null;
-    acceptedSource.current = { target: draftTarget, digest: next.sourceDigest };
     setSource(next);
     setSourceContextKey(key);
     setProgramId(next.programId);
@@ -213,10 +253,12 @@ export function PythonDefinitionEditor({
     );
     setEditing(false);
     setDirty(false);
+    setDraftStateToken(null);
     setDiagnostics(null);
     setSealedTest(null);
     setValidation(
-      next.validation?.purpose === "Validation"
+      next.validation?.purpose === "Validation" &&
+        next.validation.ownedByCaller !== false
         ? { build: next.validation, contextKey: key }
         : null,
     );
@@ -243,7 +285,8 @@ export function PythonDefinitionEditor({
       !/^[a-f0-9]{64}$/.test(response.result.stateToken) ||
       !/^[a-f0-9]{64}$/.test(response.result.sourceToken) ||
       typeof response.result.sourceText !== "string" ||
-      !/^[a-f0-9]{64}$/.test(response.result.sourceDigest)
+      !/^[a-f0-9]{64}$/.test(response.result.sourceDigest) ||
+      !isDefinitionLifecycle(response.result)
     )
       throw new Error("The bound Python source is unavailable.");
     return response.result;
@@ -259,8 +302,6 @@ export function PythonDefinitionEditor({
     openedTarget.current = draftTarget;
     if (acceptedSource.current?.target !== draftTarget)
       acceptedSource.current = null;
-    const expectedDigest =
-      acceptedSource.current?.digest ?? binding?.sourceDigest;
     setBusy(Boolean(binding));
     setError("");
     setSource(null);
@@ -273,25 +314,37 @@ export function PythonDefinitionEditor({
       setProgramId("");
       setValue(template);
       setEnvironment("");
+      setDraftStateToken(null);
       setEntry("build");
       setSchema('{"type":"object"}');
       setEditing(!binding);
       setDirty(false);
     }
     if (binding) {
+      const expectedSource = acceptedSource.current ?? {
+        sourceToken: binding.programSourceToken,
+        sourceDigest: binding.sourceDigest,
+      };
       void readSource(binding.programId, controller.signal)
         .then((next) => {
           if (revision !== generation.current || controller.signal.aborted)
             return;
-          if (next.sourceDigest !== expectedDigest)
-            throw new Error(
-              "The definition source digest does not match its immutable binding.",
-            );
-          if (preserveDraft || restoredTarget.current === draftTarget) {
+          // The read settled under current authority. An older local draft can
+          // be copied if the saved binding changed, but cannot be submitted.
+          setSourceContextKey(contextKey);
+          assertExactSource(next, expectedSource);
+          const retainingDraft =
+            preserveDraft || restoredTarget.current === draftTarget;
+          if (retainingDraft) {
             setSource(next);
-            setSourceContextKey(contextKey);
           } else load(next, contextKey);
-          onSourceCurrentness?.("current");
+          onSourceCurrentness?.(
+            next.sourceToken === binding.programSourceToken &&
+              next.sourceDigest === binding.sourceDigest &&
+              next.active === binding.active
+              ? "current"
+              : "unavailable",
+          );
         })
         .catch((reason) => {
           if (!controller.signal.aborted && revision === generation.current) {
@@ -336,7 +389,7 @@ export function PythonDefinitionEditor({
   }, [contextKey, Boolean(catalog.functions["metadata.authoring.context"])]);
   useEffect(() => {
     setEnvironments([]);
-    if (!canWrite || !editing) return;
+    if (!canWrite || !editing || !canChooseEnvironment) return;
     const controller = new AbortController();
     void collectAllContinuations<EnvironmentPage, Environment>({
       label: "Python environments",
@@ -385,11 +438,12 @@ export function PythonDefinitionEditor({
           );
       });
     return () => controller.abort();
-  }, [contextKey, editing, canWrite]);
+  }, [contextKey, editing, canWrite, canChooseEnvironment]);
   useEffect(() => {
     if (
       !source ||
       editing ||
+      groupDesign ||
       !observer.current ||
       validation?.build.status !== "sealed" ||
       definition
@@ -399,11 +453,11 @@ export function PythonDefinitionEditor({
     void readSource(source.programId, controller.signal)
       .then((next) => {
         if (controller.signal.aborted) return;
-        if (next.sourceDigest !== source.sourceDigest)
-          throw new Error("The saved source digest changed.");
+        assertExactSource(next, source);
         if (
           next.validation?.buildId !== validation.build.buildId ||
           next.validation.purpose !== "Validation" ||
+          next.validation.ownedByCaller === false ||
           next.validation.status !== "sealed" ||
           next.validation.current !== true
         )
@@ -416,7 +470,7 @@ export function PythonDefinitionEditor({
           current?.programId === next.programId &&
           current.sourceToken === next.sourceToken &&
           current.sourceDigest === next.sourceDigest
-            ? { ...current, validation: next.validation }
+            ? next
             : current,
         );
         setSourceContextKey(contextKey);
@@ -449,7 +503,11 @@ export function PythonDefinitionEditor({
     try {
       const latest = await readSource(source.programId);
       if (revision !== generation.current) return;
+      assertExactSource(latest, source);
+      if (binding && latest.active !== binding.active)
+        onSourceCurrentness?.("unavailable");
       load(latest, contextKey);
+      setDraftStateToken(latest.stateToken);
       setEditing(true);
       setDirty(true);
       setValidation(null);
@@ -458,18 +516,23 @@ export function PythonDefinitionEditor({
         "Edit the current Python source, then save and validate the replacement.",
       );
     } catch (reason) {
-      if (revision === generation.current)
+      if (revision === generation.current) {
+        setSource(null);
+        setSourceContextKey("");
+        onSourceCurrentness?.("unavailable");
         setError(
           reason instanceof Error
             ? reason.message
             : "Unable to prepare the current source.",
         );
+      }
     } finally {
       if (revision === generation.current) setBusy(false);
     }
   }
   function draft() {
     const selected = approvedEnvironment;
+    if (!draftMatchesSource) throw new Error(STALE_PYTHON_SOURCE_DRAFT);
     if (
       !selected ||
       !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(programId) ||
@@ -488,18 +551,21 @@ export function PythonDefinitionEditor({
       typeof parameterSchema !== "object"
     )
       throw new Error("Parameter schema must be a JSON object.");
+    const declaredOutput =
+      source?.declaredOutput ??
+      (groupDesign ? newAssignedRuleOutput(programId) : undefined);
     return {
       programId,
       entryPoint: entry,
       sourceText: value,
       parameterSchema,
-      environmentId: selected.environment_id,
-      environmentStateToken: selected.state_token,
-      ...(source?.stateToken ? { expectedStateToken: source.stateToken } : {}),
+      ...selected,
+      ...(declaredOutput ? { declaredOutput } : {}),
+      ...(draftStateToken ? { expectedStateToken: draftStateToken } : {}),
     };
   }
   async function save() {
-    if (busy || !editing || !canWrite) return;
+    if (busy || !editing || !canWrite || !draftMatchesSource) return;
     const revision = generation.current;
     setBusy(true);
     setError("");
@@ -525,6 +591,8 @@ export function PythonDefinitionEditor({
       );
       if (revision !== generation.current) return;
       if (
+        !/^[a-f0-9]{64}$/.test(response.result.sourceToken) ||
+        !/^[a-f0-9]{64}$/.test(response.result.stateToken) ||
         !/^[a-f0-9]{64}$/.test(response.result.sourceDigest) ||
         response.result.validation?.purpose !== "Validation"
       )
@@ -532,8 +600,10 @@ export function PythonDefinitionEditor({
       restoredTarget.current = null;
       acceptedSource.current = {
         target: draftTarget,
-        digest: response.result.sourceDigest,
+        sourceToken: response.result.sourceToken,
+        sourceDigest: response.result.sourceDigest,
       };
+      onSourceCurrentness?.("unavailable");
       setSource({
         defined: true,
         ...sourceDraft,
@@ -547,6 +617,7 @@ export function PythonDefinitionEditor({
       setValidation({ build: response.result.validation, contextKey });
       setEditing(false);
       setDirty(false);
+      setDraftStateToken(null);
       setNotice(`Saved ${programId}; validating its typed definition.`);
     } catch (reason) {
       if (revision !== generation.current) return;
@@ -555,11 +626,7 @@ export function PythonDefinitionEditor({
           ? pythonDiagnostics(reason.details)
           : undefined;
       if (payload) setDiagnostics({ contextKey, value: payload });
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to save Python source.",
-      );
+      setError(pythonSourceSaveError(reason));
     } finally {
       if (revision === generation.current) setBusy(false);
     }
@@ -597,6 +664,7 @@ export function PythonDefinitionEditor({
         ),
       );
       if (revision !== generation.current) return;
+      onSourceCurrentness?.("unavailable");
       // Notify the owning view of the committed change before a catalog
       // refresh invalidates this request's old authority context.
       onChanged?.(activationDefinition ?? definition);
@@ -604,6 +672,7 @@ export function PythonDefinitionEditor({
       if (revision !== generation.current) return;
       const next = await readSource(source.programId);
       if (revision !== generation.current) return;
+      assertExactSource(next, source);
       load(next, refreshed ? authoringContextKey(app, refreshed) : contextKey);
       setNotice(
         action === "activate"
@@ -632,16 +701,30 @@ export function PythonDefinitionEditor({
           Retry bound source
         </button>
       )}
-      {(source || !binding) && (
+      {(source ||
+        !binding ||
+        (editing &&
+          dirty &&
+          draftStateToken &&
+          sourceContextKey === contextKey)) && (
         <>
           <p>
             {programId || "New source"}
             {source?.status === "Active" ? " · Active" : ""}
           </p>
-          {editing && (
+          {source && (
+            <p aria-label="Current definition availability">
+              {isDefinitionLifecycle(source)
+                ? definitionAvailabilityLabel(source)
+                : "Current definition acceptance has not been read yet."}
+            </p>
+          )}
+          {editing && canWrite && (
             <fieldset disabled={busy}>
               <label>
-                Source ID
+                {groupDesign && !binding
+                  ? "Source and application rule ID"
+                  : "Source ID"}
                 <input
                   aria-label={`${kind} source ID`}
                   value={programId}
@@ -652,30 +735,34 @@ export function PythonDefinitionEditor({
                   }}
                 />
               </label>
-              <label>
-                Approved environment
-                <select
-                  aria-label={`${kind} source environment`}
-                  value={environment}
-                  onChange={(event) => {
-                    setEnvironment(event.target.value);
-                    setDirty(true);
-                  }}
-                >
-                  <option value="">Select an environment</option>
-                  {environments.map((item) => (
-                    <option
-                      key={`${item.environment_id}:${item.state_token}`}
-                      value={JSON.stringify([
-                        item.environment_id,
-                        item.state_token,
-                      ])}
-                    >
-                      {item.environment_id}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              {groupDesign && !binding && (
+                <p>Return an ApplicationRule with this ID from your source.</p>
+              )}
+              {canChooseEnvironment ? (
+                <label>
+                  Approved environment
+                  <select
+                    aria-label={`${kind} source environment`}
+                    value={environment}
+                    onChange={(event) => {
+                      setEnvironment(event.target.value);
+                      setDirty(true);
+                    }}
+                  >
+                    <option value="">Select an environment</option>
+                    {environments.map((item) => (
+                      <option
+                        key={`${item.environment_id}:${item.state_token}`}
+                        value={pythonEnvironmentSelection(item)}
+                      >
+                        {item.environment_id}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : (
+                source && <p>Approved environment: {source.environmentId}</p>
+              )}
               <details>
                 <summary>Source settings</summary>
                 <label>
@@ -709,7 +796,7 @@ export function PythonDefinitionEditor({
               setDirty(true);
               setDiagnostics(null);
             }}
-            readOnly={!editing || busy}
+            readOnly={!editing || busy || !canWrite}
             diagnostics={
               diagnostics?.contextKey === contextKey
                 ? diagnostics.value
@@ -721,14 +808,20 @@ export function PythonDefinitionEditor({
               metadata?.contextKey === contextKey ? metadata.values : []
             }
           />
-          {editing ? (
+          {editing && !draftMatchesSource && (
+            <p role="status">{STALE_PYTHON_SOURCE_DRAFT}</p>
+          )}
+          {editing && canWrite ? (
             <button
-              disabled={busy || !dirty || !approvedEnvironment || !canWrite}
+              disabled={
+                busy || !dirty || !approvedEnvironment || !draftMatchesSource
+              }
               onClick={() => void save()}
             >
               Save and validate source
             </button>
           ) : (
+            !editing &&
             canWrite && (
               <button disabled={busy} onClick={() => void edit()}>
                 Edit current source
@@ -736,10 +829,13 @@ export function PythonDefinitionEditor({
             )
           )}
           {validation && (
-            <p role="status">
-              Validation: {validation.build.status}
-              {!observer.current ? " · stale context" : ""}
-            </p>
+            <>
+              <p role="status">
+                Validation: {validation.build.status}
+                {!observer.current ? " · stale context" : ""}
+              </p>
+              <p className="muted-copy">{DEFINITION_VALIDATION_EXPLANATION}</p>
+            </>
           )}
           {definition && <p>Validated as {definition.kind}.</p>}
           {observer.error && (
@@ -750,14 +846,39 @@ export function PythonDefinitionEditor({
               </button>
             </p>
           )}
-          {validation?.build.status === "sealed" && !definition && (
-            <button onClick={() => setDefinitionRefresh((value) => value + 1)}>
-              Refresh compiled definition
-            </button>
+          {!groupDesign &&
+            validation?.build.status === "sealed" &&
+            !definition && (
+              <button
+                onClick={() => setDefinitionRefresh((value) => value + 1)}
+              >
+                Refresh compiled definition
+              </button>
+            )}
+          {source && !editing && (
+            <PythonSourceValidation
+              key={source.sourceToken}
+              app={app}
+              catalog={catalog}
+              source={source}
+              contextKey={contextKey}
+              suspended={busy || sourceContextKey !== contextKey}
+              onAccepted={(build) => {
+                setSource((current) =>
+                  current?.sourceToken === source.sourceToken
+                    ? { ...current, validation: build }
+                    : current,
+                );
+                setValidation({ build, contextKey });
+              }}
+            />
           )}
           {source &&
             !editing &&
-            Boolean(catalog.functions["python.program.test"]) && (
+            Boolean(
+              catalog.functions["python.program.test"] ||
+                catalog.functions["python.program.read"],
+            ) && (
               <PythonProgramTest
                 key={`${source.programId}:${source.sourceToken}:${source.latestImpactTest?.buildId}:${source.latestImpactTest?.status}`}
                 app={app}

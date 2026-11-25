@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import gzip
 import json
 import hashlib
 from pathlib import Path
 import re
 import sys
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,16 +87,7 @@ def _read_bound_evidence(name: str, value: object) -> dict:
             or any(character not in "0123456789abcdef" for character in digest)
             or not isinstance(evidence_format, str) or not evidence_format):
         raise ValueError(f"RELEASE_GATE_EVIDENCE_INVALID:{name}")
-    candidate = ROOT / relative
-    try:
-        resolved = candidate.resolve(strict=True)
-        qualifications = (ROOT / "docs" / "qualifications").resolve(strict=True)
-    except OSError as error:
-        raise ValueError(f"RELEASE_GATE_EVIDENCE_UNAVAILABLE:{name}") from error
-    if (Path(relative).is_absolute() or candidate.is_symlink() or not resolved.is_file()
-            or resolved == qualifications or qualifications not in resolved.parents):
-        raise ValueError(f"RELEASE_GATE_EVIDENCE_PATH_INVALID:{name}")
-    payload = resolved.read_bytes()
+    payload = _qualification_file(name, relative).read_bytes()
     if hashlib.sha256(payload).hexdigest() != digest:
         raise ValueError(f"RELEASE_GATE_EVIDENCE_DIGEST_MISMATCH:{name}")
     try:
@@ -108,11 +101,82 @@ def _read_bound_evidence(name: str, value: object) -> dict:
     return evidence
 
 
+def _qualification_file(name: str, relative: str) -> Path:
+    candidate = ROOT / relative
+    try:
+        resolved = candidate.resolve(strict=True)
+        qualifications = (ROOT / "docs" / "qualifications").resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"RELEASE_GATE_EVIDENCE_UNAVAILABLE:{name}") from error
+    if (Path(relative).is_absolute() or candidate.is_symlink() or not resolved.is_file()
+            or resolved == qualifications or qualifications not in resolved.parents):
+        raise ValueError(f"RELEASE_GATE_EVIDENCE_PATH_INVALID:{name}")
+    return resolved
+
+
 def verify_gate_evidence(name: str, value: object) -> dict:
     evidence = _read_bound_evidence(name, value)
     if evidence.get("releaseGate") != name:
         raise ValueError(f"RELEASE_GATE_EVIDENCE_ASSERTION_INVALID:{name}")
-    return _verify_qualification_binding(name, evidence.get("qualificationBinding"))
+    binding = _verify_qualification_binding(name, evidence.get("qualificationBinding"))
+    if name == "sustained300Sessions":
+        _verify_sustained_session_measurement(evidence.get("measurementEvidence"), binding)
+    return binding
+
+
+def _verify_sustained_session_measurement(reference: object, binding: dict) -> None:
+    if reference is None:
+        raise ValueError("SUSTAINED_SESSION_MEASUREMENT_REQUIRED")
+    evidence = _read_bound_evidence("sustained300Sessions.measurement", reference)
+    if (evidence.get("format") != "openepm-sustained-session-measurement-v1"
+            or evidence.get("qualificationBinding") != binding):
+        raise ValueError("SUSTAINED_SESSION_MEASUREMENT_BINDING_MISMATCH")
+
+    observation = evidence.get("observation")
+    if not isinstance(observation, dict):
+        raise ValueError("SUSTAINED_SESSION_OBSERVATION_INVALID")
+    window = [observation.get(field) for field in ("startedAt", "finishedAt")]
+    if not all(isinstance(value, str) and EXECUTED_AT.fullmatch(value)
+               for value in window):
+        raise ValueError("SUSTAINED_SESSION_WINDOW_INVALID")
+    try:
+        start, finish = (datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+                         for value in window)
+    except ValueError as error:
+        raise ValueError("SUSTAINED_SESSION_WINDOW_INVALID") from error
+    if (window[0] < binding["executedAt"]
+            or (finish - start).total_seconds() < 30 * 60):
+        raise ValueError("SUSTAINED_SESSION_WINDOW_TOO_SHORT_OR_OUTSIDE_RUN")
+    minimum = observation.get("minimumConcurrentSessions")
+    if type(minimum) is not int or minimum < 300:
+        raise ValueError("SUSTAINED_SESSION_MINIMUM_NOT_MET")
+
+    applications = observation.get("applications")
+    if (not isinstance(applications, list) or len(applications) < 3
+            or any(not isinstance(item, dict)
+                   or set(item) != {"workspaceId", "applicationId"}
+                   or not all(isinstance(value, str) and value.strip() == value and value
+                              for value in item.values())
+                   for item in applications)
+            or len({(item["workspaceId"], item["applicationId"])
+                    for item in applications}) != len(applications)):
+        raise ValueError("SUSTAINED_SESSION_APPLICATION_COVERAGE_INCOMPLETE")
+    workloads = observation.get("workloads")
+    if (not isinstance(workloads, list) or len(workloads) < 8
+            or any(not isinstance(item, dict)
+                   or set(item) != {"scenarioId", "completedOperations"}
+                   or not isinstance(item["scenarioId"], str)
+                   or item["scenarioId"] not in binding["executedScenarios"]
+                   or type(item["completedOperations"]) is not int
+                   or item["completedOperations"] <= 0
+                   for item in workloads)
+            or len({item["scenarioId"] for item in workloads}) != len(workloads)):
+        raise ValueError("SUSTAINED_SESSION_WORKLOAD_COVERAGE_INCOMPLETE")
+    approval = evidence.get("approval")
+    if (not isinstance(approval, dict) or approval.get("accepted") is not True
+            or not isinstance(approval.get("reviewer"), str)
+            or not approval["reviewer"].strip()):
+        raise ValueError("SUSTAINED_SESSION_MEASUREMENT_APPROVAL_REQUIRED")
 
 
 def verify_work_package_evidence(package: str, values: object,
@@ -441,10 +505,301 @@ def evaluate_laptop(value: object) -> dict:
             "deferredCampaigns": LAPTOP_DEFERRED_CAMPAIGNS}
 
 
+def _evaluate_improvement(value: object) -> tuple[dict, dict]:
+    """Track the accepted improvement scope in the existing readiness authority.
+
+    Documentary assessment and focused passing tests cannot satisfy a complete
+    acceptance criterion. Verified criteria require a bound qualification with
+    named scenarios and an independent review of that exact criterion.
+    """
+    fields = {'format', 'authority', 'authoritySha256', 'workPackages'}
+    authority = 'docs/product-improvement-strategy/improvement-plan.json'
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get('format') != 'openepm-product-improvement-acceptance-v1'
+            or value.get('authority') != authority):
+        raise ValueError('IMPROVEMENT_GROUP_INVALID')
+    payload = (ROOT / authority).read_bytes()
+    if hashlib.sha256(payload).hexdigest() != value['authoritySha256']:
+        raise ValueError('IMPROVEMENT_AUTHORITY_CHANGED_RECONCILE_ACCEPTANCE')
+    planned = json.loads(payload)['packages']
+    expected_criteria = {
+        row['id']: [f"{row['id']}-AC-{index:02d}"
+                    for index in range(1, len(row['acceptance_criteria']) + 1)]
+        for row in planned
+    }
+    known_criteria = {key for group in expected_criteria.values() for key in group}
+    rows = value['workPackages']
+    if (not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
+            or [row.get('id') for row in rows] != [row['id'] for row in planned]):
+        raise ValueError('IMPROVEMENT_PACKAGE_INVENTORY_INVALID')
+    unresolved, outstanding = [], []
+    retained_reviews = {}
+    for row, plan in zip(rows, planned):
+        subject = row['id']
+        if (set(row) != {'id', 'title', 'status', 'acceptanceCriteria'}
+                or row['title'] != plan['title'] or row['status'] not in LAPTOP_STATUSES):
+            raise ValueError('IMPROVEMENT_PACKAGE_INVALID:' + subject)
+        criteria = row['acceptanceCriteria']
+        if (not isinstance(criteria, list)
+                or any(not isinstance(item, dict) for item in criteria)
+                or [item.get('id') for item in criteria] != expected_criteria[subject]):
+            raise ValueError('IMPROVEMENT_CRITERIA_INVENTORY_INVALID:' + subject)
+        for criterion, text in zip(criteria, plan['acceptance_criteria']):
+            key = criterion['id']
+            if (set(criterion) != {'id', 'requirement', 'status', 'evidence'}
+                    or criterion['requirement'] != text
+                    or criterion['status'] not in LAPTOP_STATUSES
+                    or not isinstance(criterion['evidence'], list)):
+                raise ValueError('IMPROVEMENT_CRITERION_INVALID:' + key)
+            if criterion['status'] == 'verified':
+                if len(criterion['evidence']) != 1:
+                    raise ValueError('IMPROVEMENT_CURRENT_PROOF_REQUIRED:' + key)
+                evidence = _read_bound_evidence(key, criterion['evidence'][0])
+                review = evidence.get('independentReview')
+                reviewer = review.get('reviewer') if isinstance(review, dict) else None
+                author = review.get('author') if isinstance(review, dict) else None
+                if (evidence.get('format') != 'openepm-improvement-acceptance-evidence-v1'
+                        or evidence.get('criterion') != key
+                        or evidence.get('authoritySha256') != value['authoritySha256']
+                        or not isinstance(reviewer, str) or not reviewer.strip()
+                        or review.get('accepted') is not True
+                        or ('reviewedPackets' in review and author is None)
+                        or (author is not None and (not isinstance(author, str)
+                            or not author.strip() or author.strip() == reviewer.strip()))
+                        or not _nonempty_strings(evidence.get('verifiedOutcomes'))):
+                    raise ValueError('IMPROVEMENT_ACCEPTANCE_UNSUPPORTED:' + key)
+                _verify_qualification_binding(key, evidence.get('qualificationBinding'))
+                retained_reviews[key] = _verify_improvement_reviewed_packets(
+                    value, key, review, known_criteria)
+            else:
+                outstanding.append(key)
+                # Partial evidence is explicitly scoped and cannot imply acceptance.
+                for item in criterion['evidence']:
+                    _read_bound_evidence(key, item)
+        verified = all(item['status'] == 'verified' for item in criteria)
+        if (row['status'] == 'verified') != verified:
+            raise ValueError('IMPROVEMENT_PACKAGE_STATUS_CONTRADICTED:' + subject)
+        if not verified:
+            unresolved.append(subject)
+    return ({'complete': not unresolved, 'unresolvedWorkPackages': unresolved,
+             'unresolvedAcceptanceCriteria': outstanding}, retained_reviews)
+
+
+def evaluate_improvement(value: object) -> dict:
+    result, _ = _evaluate_improvement(value)
+    return result
+
+
+def _grouped_review_references(value):
+    """Read artifact references from historical groups containing run metadata."""
+    if isinstance(value, dict):
+        if value.keys() & {'artifactPath', 'path', 'artifactSha256', 'sha256', 'uncompressedSha256'}:
+            yield value
+            return
+        for child in value.values():
+            yield from _grouped_review_references(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _grouped_review_references(child)
+
+
+def _review_artifacts(packet: dict, *, supporting: bool = False) -> dict[str, Path]:
+    checked = {}
+    for name in ('artifacts', 'relatedEvidence'):
+        records = packet.get(name, [] if supporting or name == 'relatedEvidence' else None)
+        if supporting and isinstance(records, dict):
+            records = _grouped_review_references(records)
+        elif not isinstance(records, list):
+            raise ValueError('IMPROVEMENT_REVIEW_ARTIFACTS_INVALID')
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError('IMPROVEMENT_REVIEW_ARTIFACTS_INVALID')
+            path = record.get('artifactPath', record.get('path'))
+            sha = record.get('artifactSha256', record.get('sha256'))
+            if not (isinstance(path, str) and path and isinstance(sha, str) and HEX_DIGEST.fullmatch(sha)):
+                raise ValueError('IMPROVEMENT_REVIEW_ARTIFACTS_INVALID')
+            file = _qualification_file(path, path)
+            with file.open('rb') as stream:
+                if hashlib.file_digest(stream, 'sha256').hexdigest() != sha:
+                    raise ValueError('IMPROVEMENT_REVIEW_ARTIFACT_DIGEST_MISMATCH:' + path)
+                if 'uncompressedSha256' in record:
+                    uncompressed_sha = sha
+                    stream.seek(0)
+                    if file.suffix == '.gz' or stream.peek(2).startswith(b'\x1f\x8b'):
+                        with gzip.GzipFile(fileobj=stream) as decoded:
+                            uncompressed_sha = hashlib.file_digest(decoded, 'sha256').hexdigest()
+                    if uncompressed_sha != record['uncompressedSha256']:
+                        raise ValueError('IMPROVEMENT_REVIEW_UNCOMPRESSED_DIGEST_MISMATCH:' + path)
+            checked[path] = file
+    return checked
+
+
+def _recorded_reproduction(packet: dict) -> object:
+    review = packet.get('independentReview')
+    return packet.get('reproduction', review.get('reproduction') if isinstance(review, dict) else None)
+
+
+def _review_supporting_components(root: str, direct: dict[str, Path]) -> tuple[dict[str, Path], list[dict]]:
+    expanded = dict(direct)
+    components = []
+    pending = list(direct.items())
+    seen = {_qualification_file(root, root)}
+    while pending:
+        path, file = pending.pop()
+        if file.suffix != '.json' or file in seen:
+            continue
+        seen.add(file)
+        try:
+            value = json.loads(file.read_bytes())
+        except (UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict) or value.get('format') != 'openepm-improvement-component-evidence-v1':
+            continue
+        artifacts = _review_artifacts(value, supporting=True)
+        expanded.update(artifacts)
+        pending.extend(artifacts.items())
+        components.append({'packet': path, 'scope': value.get('scope'),
+                           'qualificationLimits': value.get('qualificationLimits'),
+                           'recordedReproduction': _recorded_reproduction(value),
+                           'sourceBindings': value.get('sourceBindings', {})})
+    return expanded, sorted(components, key=lambda component: component['packet'])
+
+
+def _review_source_bindings(bindings: object) -> dict:
+    if isinstance(bindings, list):
+        # Historical reports record the post-change digest in a list of references.
+        by_path = {}
+        for item in bindings:
+            if not isinstance(item, dict):
+                raise ValueError('IMPROVEMENT_REVIEW_SOURCE_BINDINGS_INVALID')
+            name = item.get('artifactPath', item.get('path'))
+            if not isinstance(name, str) or not name or name in by_path:
+                raise ValueError('IMPROVEMENT_REVIEW_SOURCE_BINDINGS_INVALID')
+            by_path[name] = item.get('artifactSha256', item.get('sha256'))
+        bindings = by_path
+    if not isinstance(bindings, dict):
+        raise ValueError('IMPROVEMENT_REVIEW_SOURCE_BINDINGS_INVALID')
+    changed, missing = [], []
+    for name, expected in sorted(bindings.items()):
+        relative = Path(name)
+        path = ROOT / relative
+        if (relative.is_absolute() or '..' in relative.parts or '.git' in relative.parts
+                or path.resolve() != path or not isinstance(expected, str) or not HEX_DIGEST.fullmatch(expected)):
+            raise ValueError('IMPROVEMENT_REVIEW_SOURCE_BINDING_INVALID:' + name)
+        if not path.is_file():
+            missing.append(name)
+            continue
+        with path.open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != expected:
+                changed.append(name)
+    state = 'drift' if changed or missing else 'matches' if bindings else 'no_explicit_file_bindings'
+    return {'state': state, 'recordedCount': len(bindings), 'changed': changed, 'missing': missing}
+
+
+def _improvement_review_packet_has_scope(group: dict, packet: dict) -> bool:
+    subjects = packet.get('criteriaContext')
+    review = packet.get('independentReview')
+    return (packet['format'] == 'openepm-improvement-component-evidence-v1'
+            and packet.get('authority') == group['authority']
+            and packet.get('authoritySha256') == group['authoritySha256']
+            and _nonempty_strings(subjects)
+            and packet.get('acceptedCriteria') == []
+            and _nonempty_strings(packet.get('qualificationLimits'))
+            and isinstance(review, dict)
+            and (review.get('accepted') is None or review['accepted'] is False))
+
+
+def _read_improvement_review_packet(group: dict, label: str, reference: object) -> dict:
+    packet = _read_bound_evidence(label, reference)
+    if not _improvement_review_packet_has_scope(group, packet):
+        raise ValueError('IMPROVEMENT_REVIEW_PACKET_SCOPE_INVALID:' + label)
+    return packet
+
+
+def _verify_improvement_reviewed_packets(group: dict, criterion: str, review: dict,
+                                         known_criteria: set[str]) -> list[dict]:
+    references = review.get('reviewedPackets', [])
+    if not isinstance(references, list):
+        raise ValueError('IMPROVEMENT_REVIEWED_PACKETS_INVALID:' + criterion)
+    seen = set()
+    for reference in references:
+        packet = _read_improvement_review_packet(group, criterion, reference)
+        if reference['artifactPath'] in seen:
+            raise ValueError('IMPROVEMENT_REVIEWED_PACKETS_INVALID:' + criterion)
+        seen.add(reference['artifactPath'])
+        subjects = set(packet['criteriaContext'])
+        if criterion not in subjects or not subjects <= known_criteria:
+            raise ValueError('IMPROVEMENT_REVIEWED_PACKET_OUTSIDE_CRITERION:' + criterion)
+        _review_supporting_components(reference['artifactPath'], _review_artifacts(packet))
+    return references
+
+
+def evaluate_improvement_review(value: dict, paths: list[str], *,
+                                criterion_ids: list[str] | None = None) -> dict:
+    """Check retained evidence without claiming reproduction or accepting criteria."""
+    _, retained_reviews = _evaluate_improvement(value)
+    criteria = {c['id']: c for package in value['workPackages'] for c in package['acceptanceCriteria']}
+    evidence = {key: retained_reviews.get(key, criterion['evidence']) for key, criterion in criteria.items()}
+    registrations = {path: {} for path in paths}
+    selection = []
+    for key in dict.fromkeys(criterion_ids or ()):
+        if key not in criteria:
+            raise ValueError('IMPROVEMENT_REVIEW_CRITERION_UNKNOWN:' + key)
+        selected, context = [], []
+        for reference in evidence[key]:
+            path = reference['artifactPath']
+            packet = _read_bound_evidence(key, reference)
+            if _improvement_review_packet_has_scope(value, packet):
+                selected.append(path)
+                registrations.setdefault(path, {})
+            else:
+                context.append(path)
+        selection.append({'criterion': key, 'status': criteria[key]['status'],
+                          'packetPaths': selected, 'contextOnlyEvidencePaths': context})
+    for key, references in evidence.items():
+        for reference in references:
+            path = reference['artifactPath']
+            if path in registrations:
+                registrations[path][key] = reference
+    results, checked = [], set()
+    for path, references in registrations.items():
+        if not references:
+            raise ValueError('IMPROVEMENT_REVIEW_PACKET_NOT_REGISTERED:' + path)
+        reference = next(iter(references.values()))
+        packet = _read_improvement_review_packet(value, path, reference)
+        subjects = packet['criteriaContext']
+        subject_set = set(subjects)
+        if (subject_set - criteria.keys() or references.keys() - subject_set
+                or any(criteria[key]['status'] != 'verified' for key in subject_set - references.keys())):
+            raise ValueError('IMPROVEMENT_REVIEW_PACKET_SCOPE_INVALID:' + path)
+        artifacts = _review_artifacts(packet)
+        expanded, supporting = _review_supporting_components(path, artifacts)
+        for component in supporting:
+            component['sourceBindings'] = _review_source_bindings(component['sourceBindings'])
+        checked.update([path, *expanded])
+        results.append({'packet': path, 'packetSha256': reference['artifactSha256'], 'criteria': subjects,
+                        'requirements': {key: criteria[key]['requirement'] for key in subjects},
+                        'criterionStatuses': {key: criteria[key]['status'] for key in subjects},
+                        'criteriaWithRetainedDecisions': [key for key in subjects
+                                                          if key in references and key in retained_reviews],
+                        'scope': packet.get('scope'), 'qualificationLimits': packet['qualificationLimits'],
+                        'recordedReproduction': _recorded_reproduction(packet),
+                        'sourceBindings': _review_source_bindings(packet.get('sourceBindings', {})),
+                        'artifactCount': len(artifacts), 'totalArtifactCount': len(expanded),
+                        'supportingComponents': supporting})
+    report = {'format': 'openepm-improvement-review-preflight-v1', 'artifactIntegrityVerified': True,
+              'reproductionExecuted': False, 'acceptanceDecisionsRecorded': False,
+              'distinctFilesVerified': len(checked), 'packets': results}
+    if selection:
+        report['criterionSelection'] = selection
+    return report
+
+
 def evaluate(value: object) -> dict:
     if not isinstance(value, dict) or value.get("format") != "openepm-enterprise-readiness-v1":
         raise ValueError("REGISTER_FORMAT_UNSUPPORTED")
     laptop = evaluate_laptop(value.get("laptopFunctionalAcceptance"))
+    improvement = evaluate_improvement(value.get('productImprovementAcceptance'))
     packages = value.get("workPackages")
     if not isinstance(packages, list) or [row.get("id") for row in packages if isinstance(row, dict)] != EXPECTED_PACKAGES:
         raise ValueError("WORK_PACKAGE_INVENTORY_INVALID")
@@ -494,21 +849,40 @@ def evaluate(value: object) -> dict:
     return {"format": "openepm-enterprise-readiness-check-v1", "complete": complete,
         "unresolvedWorkPackages": unresolved, "unmetReleaseGates": unmet,
         "deferredRequirements": [row["requirement"] for row in deferred],
-        "laptopFunctionalAcceptance": laptop}
+        "laptopFunctionalAcceptance": laptop,
+        "productImprovementAcceptance": improvement}
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scope", choices=("enterprise", "laptop", "laptop-plan"),
+    parser.add_argument("--scope", choices=("enterprise", "laptop", "laptop-plan", "improvement"),
                         default="enterprise")
+    parser.add_argument('--review-packet', action='append', metavar='REPO_PATH',
+                        help='Preflight a registered improvement review packet without making an acceptance decision')
+    parser.add_argument('--review-criterion', action='append', metavar='CRITERION_ID',
+                        help='Find and preflight registered packets for an improvement criterion')
     args = parser.parse_args(argv)
+    review_requested = args.review_packet or args.review_criterion
     try:
-        result = evaluate(json.loads(REGISTER.read_text(encoding="utf-8")))
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
-        print(json.dumps({"format": "openepm-enterprise-readiness-check-v1", "complete": False, "error": str(error)}, sort_keys=True))
+        register = json.loads(REGISTER.read_text(encoding="utf-8"))
+        if review_requested:
+            result = evaluate_improvement_review(register.get('productImprovementAcceptance'),
+                                                 args.review_packet or [], criterion_ids=args.review_criterion)
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        result = evaluate(register)
+    except (OSError, ValueError, EOFError, zlib.error) as error:
+        if review_requested:
+            failure = {'format': 'openepm-improvement-review-preflight-v1',
+                       'artifactIntegrityVerified': False, 'error': str(error)}
+        else:
+            failure = {'format': 'openepm-enterprise-readiness-check-v1', 'complete': False, 'error': str(error)}
+        print(json.dumps(failure, sort_keys=True))
         return 2
     result["evaluatedScope"] = args.scope
-    scoped_complete = (result["complete"] if args.scope == "enterprise" else
+    scoped_complete = (result['productImprovementAcceptance']['complete']
+                       if args.scope == 'improvement' else
+                       result["complete"] if args.scope == "enterprise" else
                        result["laptopFunctionalAcceptance"][
                            "laptopFunctionalComplete" if args.scope == "laptop" else "planComplete"])
     result["scopeComplete"] = scoped_complete

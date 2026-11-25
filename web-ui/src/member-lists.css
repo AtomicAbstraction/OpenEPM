@@ -1,6 +1,12 @@
 .member-lists-workspace {
   min-width: 0;
 }
+.member-list-outcome code {
+  overflow-wrap: anywhere;
+}
+.member-list-dependencies li {
+  overflow-wrap: anywhere;
+}
 .member-list-page-heading,
 .member-list-editor-header {
   display: flex;

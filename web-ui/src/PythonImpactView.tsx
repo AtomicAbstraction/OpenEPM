@@ -15,6 +15,31 @@ function object(value: unknown): Record<string, unknown> | undefined {
     ? (value as Record<string, unknown>)
     : undefined;
 }
+function bindingValue(value: unknown): string {
+  if (value === undefined || value === null || value === "")
+    return "Not provided";
+  if (typeof value === "boolean") return value ? "True" : "False";
+  if (typeof value === "string" || typeof value === "number")
+    return String(value);
+  if (Array.isArray(value))
+    return value.length
+      ? value.every(
+          (item) => typeof item === "string" || typeof item === "number",
+        )
+        ? value.join(", ")
+        : `${value.length} selected values`
+      : "No selected values";
+  const structured = object(value);
+  if (!structured) return "Structured value";
+  if (typeof structured.listId === "string" && structured.listId)
+    return `Saved selection: ${structured.listId}`;
+  if (
+    typeof structured.dimensionId === "string" &&
+    typeof structured.memberId === "string"
+  )
+    return `${structured.dimensionId}: ${structured.memberId}`;
+  return "Structured value";
+}
 function ImpactCell({ value }: { value: unknown }) {
   const [open, setOpen] = useState(false);
   const [page, setPage] = useState(0);
@@ -220,14 +245,40 @@ function DefinitionImpact({ value }: { value: unknown }) {
       </>
     );
   }
+  const bindings = object(result.bindings) ?? {};
+  const kindLabel =
+    kind === "ApplicationRule"
+      ? "Calculation rule"
+      : kind === "MemberList"
+        ? "Saved selection"
+        : "Calculated member";
   return (
-    <section aria-label="Tested definition result">
-      <h5>{String(kind)} test result</h5>
+    <section aria-label="Test result">
+      <h5>{kindLabel} test result</h5>
       {content}
-      <details>
-        <summary>Tested rule parameters</summary>
-        <pre>{JSON.stringify(result.bindings ?? {}, null, 2)}</pre>
-      </details>
+      <section aria-label="Tested rule parameters">
+        <h6>Tested rule parameters</h6>
+        {Object.keys(bindings).length ? (
+          <table className="react-cube-grid">
+            <thead>
+              <tr>
+                <th>Parameter</th>
+                <th>Value</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(bindings).map(([name, binding]) => (
+                <tr key={name}>
+                  <th>{name}</th>
+                  <td>{bindingValue(binding)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p>No rule parameters were supplied.</p>
+        )}
+      </section>
     </section>
   );
 }
@@ -242,7 +293,6 @@ export function PythonImpactView({
   sourceDigest: string;
 }) {
   const [page, setPage] = useState(0);
-  const [rawOpen, setRawOpen] = useState(false);
   const impact = useMemo(() => {
     if (!complete) return undefined;
     try {
@@ -296,8 +346,8 @@ export function PythonImpactView({
       )}
       {complete && !impact && (
         <p role="alert">
-          The impact cannot be rendered as a complete result for this source.
-          Inspect its technical artifact.
+          This test result is incomplete or no longer matches the current
+          source. Run the private test again before relying on it.
         </p>
       )}
       {impact && (
@@ -317,7 +367,7 @@ export function PythonImpactView({
             aria-label="Before and after effects scroll area"
             tabIndex={0}
           >
-            <table className="react-cube-grid">
+            <table className="react-cube-grid python-impact-grid">
               <caption>Before and after effects</caption>
               <thead>
                 <tr>
@@ -387,17 +437,6 @@ export function PythonImpactView({
           </button>
         </>
       )}
-      <details
-        open={rawOpen}
-        onToggle={(event) => setRawOpen(event.currentTarget.open)}
-      >
-        <summary>Technical impact artifact</summary>
-        {rawOpen && (
-          <pre role="region" aria-label="Python impact artifact" tabIndex={0}>
-            {text}
-          </pre>
-        )}
-      </details>
     </section>
   );
 }

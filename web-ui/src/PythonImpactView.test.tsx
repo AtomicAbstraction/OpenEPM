@@ -77,7 +77,9 @@ it("pages complete cell effects and never presents a partial or foreign-source a
   rerender(
     <PythonImpactView complete sourceDigest={"b".repeat(64)} text={text} />,
   );
-  expect(screen.getByRole("alert")).toHaveTextContent("cannot be rendered");
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "incomplete or no longer matches",
+  );
   rerender(<PythonImpactView complete sourceDigest={digest} text={text} />);
   expect(screen.getAllByRole("row")).toHaveLength(51);
   expect(
@@ -202,7 +204,8 @@ it("distinguishes calculation generations from raw cells at the same coordinate 
   }
 });
 
-it("renders an application-rule result without exposing its backend identity", () => {
+it("renders business-readable rule parameters without exposing backend identities or raw artifacts", () => {
+  const token = "c".repeat(64);
   render(
     <PythonImpactView
       complete
@@ -212,15 +215,38 @@ it("renders an application-rule result without exposing its backend identity", (
         definitionResult: {
           kind: "ApplicationRule",
           definitionId: "margin",
-          bindings: {},
+          bindings: {
+            Tolerance: "0.00000001",
+            Enabled: false,
+            Regions: {
+              listId: "operating-regions",
+              stateToken: token,
+              parameters: {},
+            },
+            Entity: { dimensionId: "Entity", memberId: "Zurich" },
+          },
         },
       })}
     />,
   );
   expect(
-    screen.getByRole("heading", { name: "ApplicationRule test result" }),
+    screen.getByRole("heading", { name: "Calculation rule test result" }),
   ).toBeInTheDocument();
   expect(screen.queryByText("margin")).not.toBeInTheDocument();
+  expect(screen.getByText("Tolerance")).toBeInTheDocument();
+  expect(screen.getByText("0.00000001")).toBeInTheDocument();
+  expect(screen.getByText("False")).toBeInTheDocument();
+  expect(
+    screen.getByText("Saved selection: operating-regions"),
+  ).toBeInTheDocument();
+  expect(screen.getByText("Entity: Zurich")).toBeInTheDocument();
+  expect(screen.queryByText(token)).not.toBeInTheDocument();
+  expect(
+    screen.queryByText("Technical impact artifact"),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("region", { name: "Python impact artifact" }),
+  ).not.toBeInTheDocument();
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 

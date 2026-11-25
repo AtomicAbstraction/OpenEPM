@@ -117,8 +117,10 @@ that the directory contains no private key or unrelated file.
 `epmctl` requires the independently supplied offline-root public key, signed
 policy, policy signature and minimum sequence. It verifies the policy and exact
 operations-image identity on the host before executing the image verifier. The
-highest authenticated sequence is atomically persisted; a lower release-channel
-or stored sequence cannot be used to roll back trust.
+controller compares the authenticated sequence with the current stored floor
+and publishes an increase under the same lock. When another command advances
+the floor during verification, the earlier command stops before Compose
+dispatch. Component diagnosis checks the latest floor without publishing it.
 
 Recovery must restore the offline root public key and the highest accepted
 sequence from accepted operational records. Never restore an older policy as a

@@ -83,7 +83,8 @@ class ResolvedCubeReadPlan:
 
 
 def compile_resolved_cube_read(value: object, *,
-        active_dimensions: Iterable[str]) -> ResolvedCubeReadPlan:
+        active_dimensions: Iterable[str],
+        expected_metadata_revision: int | None = None) -> ResolvedCubeReadPlan:
     """Validate one bounded, complete mixed-read intent.
 
     A caller chooses own input or a current effective binding explicitly.
@@ -102,7 +103,8 @@ def compile_resolved_cube_read(value: object, *,
             or any(not isinstance(item, str) or not item for item in active)):
         raise ValueError("RESOLVED_READ_DIMENSIONS_INVALID")
     selection = canonical_selection(value["selection"],
-                                    active_dimensions=active)
+        active_dimensions=active,
+        expected_metadata_revision=expected_metadata_revision)
     grain = _axes(value["outputGrain"], active)
     if value["freshness"] not in FRESHNESS:
         raise ValueError("RESOLVED_READ_FRESHNESS_INVALID")

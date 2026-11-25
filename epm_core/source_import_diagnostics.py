@@ -108,6 +108,44 @@ _WARNINGS = frozenset((DiagnosticCode.REPLACE_SCOPE_EMPTY_INPUT,
                        DiagnosticCode.DIAGNOSTICS_TRUNCATED))
 
 
+def diagnostic_summary_properties() -> dict:
+    from .postgres_numeric_catalog import obj
+
+    digest = {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}
+    count = {'type': 'integer', 'minimum': 0}
+    return {
+        'sourceIdentity': obj({field: digest for field in (
+            'manifestDigest', 'contentDigest', 'schemaDigest')}),
+        **{field: count for field in ('diagnosticCount', 'observedCount',
+                                     'errorCount', 'warningCount')},
+        'accepted': {'type': 'boolean'},
+        'truncated': {'type': 'boolean'},
+    }
+
+
+def diagnostics_artifact_schema() -> dict:
+    from .postgres_numeric_catalog import obj
+
+    identifier = {'type': 'string', 'pattern': '^' + _ID.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    diagnostic = obj({
+        'code': {'enum': [code.value for code in DiagnosticCode]},
+        'severity': {'enum': [severity.value for severity in DiagnosticSeverity]},
+        'message': {'enum': list(_MESSAGES.values())},
+        'rowIndex': {'type': 'integer', 'minimum': 1, 'maximum': 100000},
+        'field': identifier,
+        'coordinate': {'type': 'object', 'minProperties': 1, 'maxProperties': 32,
+                       'propertyNames': identifier, 'additionalProperties': identifier},
+    }, ['code', 'severity', 'message'])
+    return obj({
+        'contractVersion': {'const': CONTRACT_VERSION},
+        **diagnostic_summary_properties(),
+        'diagnostics': {'type': 'array', 'items': diagnostic},
+        'omittedCount': {'type': 'integer', 'minimum': 0},
+        'diagnosticsPayloadBytes': {'type': 'integer', 'minimum': 2},
+        'diagnosticsDigest': {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'},
+    })
+
+
 def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(',', ':'),
                       ensure_ascii=False, allow_nan=False).encode('utf-8')

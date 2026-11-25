@@ -17,7 +17,7 @@ from .postgres_access import (PostgresAccessChecker, VerifiedIdentity,
                               assert_nonowner_role)
 from .authorization_principal import principals_for_identity
 from .postgres_mcp_application import PostgresMCPApplication
-from .postgres_capacity_metrics import PostgresCapacityMetrics
+from .postgres_capacity_metrics import CapacityView, PostgresCapacityMetrics
 from .postgres_python_environments import ApprovedPythonEnvironment
 
 
@@ -82,6 +82,14 @@ class PostgresMCPRouter:
         return self.list_applications_for_identity(
             self._identity(assertion),after=after,limit=limit)
 
+    def managed_workspaces(self, assertion, *, after=None, limit=100):
+        return self.managed_workspaces_for_identity(self._identity(assertion), after=after, limit=limit)
+
+    def managed_workspaces_for_identity(self, identity, *, after=None, limit=100):
+        from .postgres_managed_workspaces import list_managed_workspaces
+        principals_for_identity(identity)
+        return list_managed_workspaces(self.access_dsn, identity, after=after, limit=limit, secret=self.preview_secret)
+
     @staticmethod
     def session_identity(assertion: str) -> dict:
         """Return only this verified caller's enrollment-safe identity fields."""
@@ -116,7 +124,8 @@ class PostgresMCPRouter:
                 ON w.workspace_id=a.workspace_id
                 WHERE a.status<>'Deleting' AND w.status<>'Deleting'
                 AND (a.workspace_id,a.application_id)>(%s,%s)
-                AND (EXISTS (SELECT 1 FROM epm.workspace_access_grant wg
+                AND ((a.authorization_model='legacy' AND (
+                     EXISTS (SELECT 1 FROM epm.workspace_access_grant wg
                     WHERE wg.workspace_id=a.workspace_id AND wg.issuer=%s
                     AND wg.subject_id=%s AND wg.role='Administrator')
                  OR EXISTS (SELECT 1 FROM epm.workspace_group_access_grant wgg
@@ -130,11 +139,18 @@ class PostgresMCPRouter:
                  OR EXISTS (SELECT 1 FROM epm.application_group_access_grant agg
                     WHERE agg.workspace_id=a.workspace_id
                     AND agg.application_id=a.application_id
-                    AND agg.issuer=%s AND agg.group_id=ANY(%s::text[])))
+                    AND agg.issuer=%s AND agg.group_id=ANY(%s::text[]))))
+                 OR (a.authorization_model='group_assignments' AND EXISTS (
+                    SELECT 1 FROM epm.application_authorization_privilege p
+                    WHERE p.workspace_id=a.workspace_id AND p.application_id=a.application_id
+                    AND p.issuer=%s AND p.group_id=ANY(%s::text[])
+                    AND p.action='application.enter' AND p.scope_kind='entire_application')))
                 ORDER BY a.workspace_id,a.application_id LIMIT %s''',
                 (after_workspace,after_app,identity.issuer,identity.subject_id,
                  identity.issuer,groups,identity.issuer,identity.subject_id,
-                 identity.issuer,groups,limit+1)).fetchall()
+                 identity.issuer,groups,identity.issuer,groups,limit+1)).fetchall()
+            if tuple(groups) != PostgresAccessChecker.current_groups_in_transaction(db, identity):
+                raise ValueError('APPLICATION_DISCOVERY_AUTHORIZATION_STALE')
         visible=rows[:limit]
         applications=[{'workspaceId':row['workspace_id'],
                        'workspaceName':row['workspace_name'],
@@ -159,8 +175,9 @@ class PostgresMCPRouter:
             approved_python_profiles=self.approved_python_profiles)
 
     def catalog(self,assertion: str,workspace_id: str,
-                application_id: str) -> dict:
-        result=self._application(workspace_id,application_id).catalog(assertion)
+                application_id: str, *, discovery: dict | None = None) -> dict:
+        result=self._application(workspace_id,application_id).catalog(
+            assertion, discovery=discovery)
         result['listener']['scope']='routed_application'
         return result
 
@@ -170,14 +187,15 @@ class PostgresMCPRouter:
             assertion,program)
 
     def capacity_metrics_for_identity(self,identity: VerifiedIdentity,
-                                      workspace_id: str,application_id: str) -> dict:
+                                      workspace_id: str,application_id: str,*,
+                                      view: CapacityView = 'full') -> dict:
         return PostgresCapacityMetrics(self.runtime_dsn).read(
-            identity,ApplicationScope(workspace_id,application_id))
+            identity,ApplicationScope(workspace_id,application_id),view=view)
 
     def capacity_metrics(self,assertion: str,workspace_id: str,
-                         application_id: str) -> dict:
+                         application_id: str,*,view: CapacityView = 'full') -> dict:
         return self.capacity_metrics_for_identity(
-            self._identity(assertion),workspace_id,application_id)
+            self._identity(assertion),workspace_id,application_id,view=view)
 
     def preview(self,assertion: str,workspace_id: str,application_id: str,
                 program: dict) -> dict:
@@ -234,9 +252,10 @@ class PostgresMCPRouter:
             assertion,program,idempotency_key=idempotency_key)
 
     def python_build_read(self,assertion: str,workspace_id: str,
-                          application_id: str,build_id: str) -> dict:
+                          application_id: str,build_id: str | None = None, *,
+                          original_request: dict | None = None) -> dict:
         return self._application(workspace_id,application_id).python_build_read(
-            assertion,build_id)
+            assertion,build_id,original_request=original_request)
 
     def python_build_artifact_read(self, assertion: str, workspace_id: str,
                                    application_id: str, *, build_id: str,
@@ -258,9 +277,10 @@ class PostgresMCPRouter:
             assertion,program,idempotency_key=idempotency_key)
 
     def python_workflow_read(self,assertion: str,workspace_id: str,
-                             application_id: str,workflow_id: str) -> dict:
+                             application_id: str,workflow_id: str | None = None, *,
+                             original_request: dict | None = None) -> dict:
         return self._application(workspace_id,application_id).python_workflow_read(
-            assertion,workflow_id)
+            assertion,workflow_id,original_request=original_request)
 
     def python_workflow_cancel(self,assertion: str,workspace_id: str,
                                application_id: str,workflow_id: str) -> dict:
@@ -429,9 +449,9 @@ class PostgresMCPRouter:
             idempotency_key=idempotency_key)
 
     def job(self,assertion: str,workspace_id: str,application_id: str,
-            job_id: str) -> dict:
+            job_id: str | None = None, *, operation_id: str | None = None) -> dict:
         return self._application(workspace_id,application_id).job(
-            assertion,job_id)
+            assertion,job_id,operation_id=operation_id)
 
     def events(self,assertion: str,workspace_id: str,application_id: str,*,
                after_sequence: int=0,limit: int=100) -> dict:
@@ -444,9 +464,10 @@ class PostgresMCPRouter:
             assertion,job_id)
 
     def tasks(self,assertion: str,workspace_id: str,application_id: str,*,
-              after_sequence: int=0,limit: int=100) -> dict:
+              after_sequence: int=0,limit: int=100,attention_only: bool=False) -> dict:
         return self._application(workspace_id,application_id).tasks(
-            assertion,after_sequence=after_sequence,limit=limit)
+            assertion,after_sequence=after_sequence,limit=limit,
+            attention_only=attention_only)
 
     def task(self,assertion: str,workspace_id: str,application_id: str,
              task_id: str,*,after_event: int=0,event_limit: int=100) -> dict:

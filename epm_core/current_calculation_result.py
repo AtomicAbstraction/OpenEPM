@@ -19,13 +19,43 @@ from .current_object_contract import require_state_token
 from .persistence_contract import ApplicationScope
 
 
-_RESULT_KEY = re.compile(r"[A-Za-z0-9._-]{8,128}\Z")
+RESULT_KEY_PATTERN = re.compile(r"[A-Za-z0-9._-]{8,128}\Z")
 _AFTER = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_CURSOR_BYTES = 16_384
 
 
+def calculation_output_kind(function: str, compiler: str, program: object) -> str:
+    """Route published values to the storage profile owned by their producer."""
+    if function == "facts.expression.calculate" and (
+            (isinstance(program, dict) and program.get("resultUnit") == {"type": "Ratio", "scale": 12})
+            or compiler == "typed-numeric-expression-v24"):
+        # A compiler version can serve several result types. Selected-domain
+        # and wrapped calculations keep their exact unit in the stored plan.
+        return "ratio"
+    if not isinstance(program, dict):
+        return "amount"
+    expression = program.get("expression")
+    if (function in (
+            "consolidation.equity.contribution.publish",
+            "consolidation.proportional.contribution.publish",
+            "consolidation.full.typed.contribute",
+            "consolidation.method.total.publish",
+            "consolidation.inventory.unrealized_profit.request")
+            or function == "currency.amount.translate.publish" and program.get("version") == 3
+            or function == "consolidation.nci.period.publish" and compiler in (
+                "period-nci-attribution-v7-typed-unit",
+                "period-nci-attribution-v8-ic-adjusted-typed-unit")
+            or function == "facts.expression.calculate" and (
+                compiler in ("typed-numeric-expression-v19", "typed-numeric-expression-v22",
+                             "typed-numeric-expression-v23", "typed-numeric-expression-v29",
+                             "typed-numeric-expression-v32")
+                or isinstance(expression, dict) and expression.get("op") == "CurrencyConvert")):
+        return "currency"
+    return "amount"
+
+
 def require_result_key(value: object) -> str:
-    if not isinstance(value, str) or _RESULT_KEY.fullmatch(value) is None:
+    if not isinstance(value, str) or RESULT_KEY_PATTERN.fullmatch(value) is None:
         raise ValueError("CALCULATION_RESULT_KEY_INVALID")
     return value
 

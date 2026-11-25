@@ -18,6 +18,7 @@ from psycopg.types.json import Jsonb
 from .persistence_contract import ApplicationScope, Coordinate, NumericCell
 from .dimensional_security_policy import AccessKind
 from .postgres_access import PostgresAccessChecker, VerifiedIdentity
+from .postgres_dimensional_security import CUBE_READ_AUTHORIZATION_STALE
 from .postgres_dimensional_security_enforcement import authorize_coordinates
 from .postgres_fact_batch import validate_coordinates
 from .postgres_jobs import _canonical_digest
@@ -583,9 +584,9 @@ class PostgresManualJournal:
                 db.execute('SET TRANSACTION READ ONLY')
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
+                access = PostgresAccessChecker.check_in_transaction(
                     db, self.identity, scope, 'read')
-                state = db.execute('''SELECT metadata_revision,commit_revision
+                state = db.execute('''SELECT metadata_revision,security_revision,commit_revision
                     FROM epm.application_state WHERE workspace_id=%s
                     AND application_id=%s''',
                     (scope.workspace_id,scope.application_id)).fetchone()
@@ -615,7 +616,7 @@ class PostgresManualJournal:
                          axis,member)).fetchone():
                         raise ValueError('COORDINATE_MEMBER_UNAVAILABLE')
                 authorize_coordinates(db, self.identity, scope, (coordinate,),
-                                      kind=AccessKind.READ)
+                                      kind=AccessKind.READ, expected_access=access)
                 point = db.execute('''SELECT coordinate_id,members
                     FROM epm.coordinate WHERE workspace_id=%s
                     AND application_id=%s AND series_key=%s''',
@@ -657,15 +658,19 @@ class PostgresManualJournal:
                             LIMIT 1''',
                             (scope.workspace_id,scope.application_id,
                              point['coordinate_id'],revision)).fetchone()
-                        if text_row and text_row['present']:
-                            raise ValueError('ADJUSTED_BALANCE_TEXT_COORDINATE')
-                after_state = db.execute('''SELECT metadata_revision
+                after_state = db.execute('''SELECT metadata_revision,security_revision
                     FROM epm.application_state WHERE workspace_id=%s
                     AND application_id=%s''',
                     (scope.workspace_id,scope.application_id)).fetchone()
                 if (not after_state or after_state['metadata_revision'] !=
                         state['metadata_revision']):
                     raise ValueError('STALE_METADATA_REVISION')
+                if after_state['security_revision'] != state['security_revision']:
+                    raise ValueError('STALE_SECURITY_REVISION')
+                if PostgresAccessChecker.check_in_transaction(db, self.identity, scope, 'read') != access:
+                    raise ValueError(CUBE_READ_AUTHORIZATION_STALE)
+                if text_row and text_row['present']:
+                    raise ValueError('ADJUSTED_BALANCE_TEXT_COORDINATE')
                 adjustment = (summary['adjustment_amount'] if summary else
                               Decimal('0.00000000'))
                 result = {'members':dict(coordinate.members),

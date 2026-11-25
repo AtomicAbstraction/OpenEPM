@@ -20,12 +20,110 @@ export type MetadataMember = {
   custom_values?: Record<string, unknown>;
 };
 
+type AttributeDefinitionPage<Row> = {
+  rows: Row[];
+  nextAfterAttributeId: string | null;
+  nextPageToken?: string | null;
+  metadataRevision: number;
+  hasMore?: boolean;
+};
+
+export function attributeDefinitionContinuation(
+  afterAttributeId: string | null,
+  previous?: { metadataRevision: number; nextPageToken?: string | null },
+) {
+  return afterAttributeId
+    ? {
+        afterAttributeId,
+        ...(previous?.nextPageToken
+          ? {
+              expectedMetadataRevision: previous.metadataRevision,
+              expectedPageToken: previous.nextPageToken,
+            }
+          : {}),
+      }
+    : {};
+}
+
+export function collectCapabilityAttributeDefinitions<
+  Row extends { attribute_id: string },
+>(
+  readPage: (
+    continuation: ReturnType<typeof attributeDefinitionContinuation>,
+  ) => Promise<AttributeDefinitionPage<Row>>,
+  {
+    expectedMetadataRevision,
+    maximumRows,
+  }: {
+    expectedMetadataRevision?: number;
+    maximumRows?: number;
+  } = {},
+) {
+  let previous: AttributeDefinitionPage<Row> | undefined;
+  let count = 0;
+  return collectAllContinuations<AttributeDefinitionPage<Row>, Row>({
+    label: "Attribute definitions",
+    readPage: async (after) => {
+      const page = await readPage(
+        attributeDefinitionContinuation(after, previous),
+      );
+      previous = page;
+      return page;
+    },
+    rows: (page) => {
+      if (
+        page.hasMore !== undefined &&
+        page.hasMore !== (page.nextAfterAttributeId !== null)
+      )
+        throw new Error("Invalid attribute continuation.");
+      if (maximumRows !== undefined && Array.isArray(page.rows)) {
+        count += page.rows.length;
+        if (count > maximumRows)
+          throw new Error(
+            `The attribute catalogue exceeds its governed ${maximumRows}-column bound.`,
+          );
+      }
+      return page.rows;
+    },
+    nextCursor: (page) => page.nextAfterAttributeId,
+    rowIdentity: (row) => row.attribute_id,
+    consistencyIdentity: (page) => {
+      if (
+        expectedMetadataRevision !== undefined &&
+        page.metadataRevision !== expectedMetadataRevision
+      )
+        throw new Error(
+          "Metadata changed while reading attribute definitions.",
+        );
+      return page.metadataRevision;
+    },
+  });
+}
+
+export function activeFactDimensions(dimensions: MetadataDimension[]) {
+  return dimensions.filter(
+    (dimension) =>
+      dimension.status === "Active" && dimension.model_role !== "Currency",
+  );
+}
+
 export function dimensionListArguments(
   afterDimensionId?: string | null,
   expectedMetadataRevision?: number,
-) {
+  expectedPageToken?: string | null,
+): {
+  limit: number;
+  afterDimensionId?: string;
+  expectedMetadataRevision?: number;
+  expectedPageToken?: string;
+} {
   return afterDimensionId
-    ? { limit: 100, afterDimensionId, expectedMetadataRevision }
+    ? {
+        limit: 100,
+        afterDimensionId,
+        expectedMetadataRevision,
+        ...(expectedPageToken ? { expectedPageToken } : {}),
+      }
     : { limit: 100 };
 }
 
@@ -33,9 +131,16 @@ export function memberListArguments(
   dimension: string,
   afterMemberId?: string | null,
   expectedMetadataRevision?: number,
+  expectedPageToken?: string | null,
 ) {
   return afterMemberId
-    ? { dimension, limit: 100, afterMemberId, expectedMetadataRevision }
+    ? {
+        dimension,
+        limit: 100,
+        afterMemberId,
+        expectedMetadataRevision,
+        ...(expectedPageToken ? { expectedPageToken } : {}),
+      }
     : {
         dimension,
         limit: 100,
@@ -49,12 +154,14 @@ type DimensionPage = {
   rows: MetadataDimension[];
   nextAfterDimensionId: string | null;
   metadataRevision: number;
+  nextPageToken?: string | null;
 };
 
 type MemberPage = {
   rows: MetadataMember[];
   nextAfterMemberId: string | null;
   metadataRevision: number;
+  nextPageToken?: string | null;
 };
 
 export function collectCapabilityDimensions(
@@ -63,11 +170,15 @@ export function collectCapabilityDimensions(
   ) => Promise<DimensionPage>,
 ) {
   let revision: number | undefined;
+  let token: string | null | undefined;
   return collectAllContinuations<DimensionPage, MetadataDimension>({
     label: "Metadata dimensions",
     readPage: async (cursor) => {
-      const page = await readPage(dimensionListArguments(cursor, revision));
+      const page = await readPage(
+        dimensionListArguments(cursor, revision, token),
+      );
       revision = page.metadataRevision;
+      token = page.nextPageToken;
       return page;
     },
     rows: (page) => page.rows,
@@ -85,13 +196,15 @@ export function collectCapabilityMembers(
   expectedMetadataRevision?: number,
 ) {
   let revision: number | undefined = expectedMetadataRevision;
+  let token: string | null | undefined;
   return collectAllContinuations<MemberPage, MetadataMember>({
     label: "Metadata members",
     readPage: async (cursor) => {
       const page = await readPage(
-        memberListArguments(dimension, cursor, revision),
+        memberListArguments(dimension, cursor, revision, token),
       );
       revision = page.metadataRevision;
+      token = page.nextPageToken;
       return page;
     },
     rows: (page) => page.rows,

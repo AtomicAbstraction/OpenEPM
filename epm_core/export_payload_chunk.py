@@ -13,7 +13,7 @@ import re
 from .export_artifact_manifest import export_artifact_manifest_matches
 from .persistence_contract import ApplicationScope
 from .postgres_fact_export import (
-    PostgresFactExport, _EXPORT_SCHEMA, _content_digest, _valid_export_row)
+    PostgresFactExport, _EXPORT_SCHEMA, _content_digest, _valid_export_row, export_row_schema)
 
 
 CONTRACT_VERSION = 'openepm-export-payload-v2'
@@ -22,6 +22,27 @@ MAX_CHUNK_BYTES = 8 * 1024 * 1024
 _DIGEST = re.compile(r'[0-9a-f]{64}\Z')
 _OPAQUE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z')
 _SOURCE = re.compile(r'export:([0-9a-f]{64})\Z')
+
+
+def payload_chunk_schema() -> dict:
+    from .export_artifact_manifest import export_type_counts_schema
+    from .postgres_numeric_catalog import obj
+
+    count = {'type': 'integer', 'minimum': 0}
+    digest = {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}
+    nullable_digest = {**digest, 'type': ['string', 'null']}
+    opaque = {'type': 'string', 'pattern': '^' + _OPAQUE.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    return obj({'contractVersion': {'const': CONTRACT_VERSION},
+        'artifactId': {'type': 'string', 'pattern': r'^[0-9a-f]{32}(?![\s\S])'},
+        'manifestDigest': digest, 'pageIndex': count, 'chunkIndex': count,
+        'pageEntryDigest': digest, 'pageContentDigest': digest,
+        'rows': {'type': 'array', 'maxItems': MAX_CHUNK_ROWS, 'items': export_row_schema()},
+        'rowCount': {**count, 'maximum': MAX_CHUNK_ROWS},
+        'rowBytes': {'type': 'integer', 'minimum': 2, 'maximum': MAX_CHUNK_BYTES},
+        'typeCounts': export_type_counts_schema(), 'firstKey': nullable_digest, 'lastKey': nullable_digest,
+        'finalChunkForPage': {'type': 'boolean'}, 'ciphertextRef': {
+            'oneOf': [obj({'keyId': opaque, 'objectId': opaque}), {'type': 'null'}]},
+        'chunkDigest': digest})
 
 
 def _canonical(value: object) -> bytes:

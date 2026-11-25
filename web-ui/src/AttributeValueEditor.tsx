@@ -4,6 +4,7 @@ import type { ApplicationCatalog, ApplicationSummary } from "./types";
 import { useUnsavedWork } from "./unsaved-work";
 import { useStableMutationIntentKey } from "./mutation-intent";
 import { collectAllContinuations } from "./continuation";
+import { memberListArguments } from "./metadata-data";
 
 type AttributeScope = "Dimension" | "Member" | "Relationship";
 type ObjectOption = { id: string; name: string };
@@ -23,6 +24,7 @@ type AttributeDefinition = {
 type MemberObjectPage = {
   rows: Array<{ member_id: string; name: string }>;
   nextAfterMemberId: string | null;
+  nextPageToken?: string | null;
   metadataRevision: number;
 };
 
@@ -37,22 +39,24 @@ export function collectAttributeMemberObjects(
   expectedRevision: number,
   readPage: (arguments_: Record<string, unknown>) => Promise<MemberObjectPage>,
 ) {
+  let token: string | null | undefined;
   return collectAllContinuations<
     MemberObjectPage,
     MemberObjectPage["rows"][number]
   >({
     label: "Attribute member objects",
-    readPage: (cursor) =>
-      readPage(
-        cursor
-          ? {
-              dimension: dimensionId,
-              limit: 100,
-              afterMemberId: cursor,
-              expectedMetadataRevision: expectedRevision,
-            }
-          : { dimension: dimensionId, limit: 100 },
-      ),
+    readPage: async (cursor) => {
+      const page = await readPage(
+        memberListArguments(
+          dimensionId,
+          cursor,
+          cursor ? expectedRevision : undefined,
+          token,
+        ),
+      );
+      token = page.nextPageToken;
+      return page;
+    },
     rows: (page) => page.rows,
     nextCursor: (page) => page.nextAfterMemberId,
     rowIdentity: (row) => row.member_id,
@@ -292,6 +296,8 @@ export function AttributeValueEditor({
       setReviewed(false);
     } catch (reason) {
       setReadback(null);
+      if (!draftTouched) setDraft("");
+      setReviewed(false);
       setError(
         reason instanceof Error
           ? reason.message

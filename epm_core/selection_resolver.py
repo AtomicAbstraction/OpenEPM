@@ -13,6 +13,7 @@ from .selection_contract import canonical_selection
 
 
 MAX_RESOLVED_MEMBERS = 100_000
+RESOLVED_FORMAT = "openepm-resolved-selection-v1"
 
 
 def _digest(value: object) -> str:
@@ -113,6 +114,14 @@ def selection_semantic_references(selection, *, member_lists=None):
                     references.add((dimension, 'hierarchy', node['hierarchyId']))
                     references.add((dimension, 'member', node['memberId']))
                     references.add((dimension, 'member-domain', dimension))
+                elif kind == 'navigation':
+                    # Watch syntax, not today's output: an empty native set can
+                    # acquire members after membership/status/topology changes.
+                    references.add((dimension, 'member-domain', dimension))
+                    if node['hierarchyId'] is not None:
+                        references.add((dimension, 'hierarchy', node['hierarchyId']))
+                    if node['anchor'] is not None:
+                        references.add((dimension, 'member', node['anchor']['memberId']))
                 elif kind == 'attribute':
                     references.add((dimension, 'attribute', node['attributeId']))
                     references.add((dimension, 'member-domain', dimension))
@@ -146,16 +155,17 @@ def resolve_selection(
 
     if type(metadata_revision) is not int or metadata_revision < 1:
         raise ValueError("CUBE_SELECTION_METADATA_REVISION_INVALID")
-    canonical = canonical_selection(selection, active_dimensions=active_dimensions)
-    if canonical["metadataRevision"] != metadata_revision:
-        raise ValueError("CUBE_SELECTION_METADATA_STALE")
+    canonical = canonical_selection(selection, active_dimensions=active_dimensions,
+        expected_metadata_revision=metadata_revision)
     dimensions = set(active_dimensions)
     if (set(members) != dimensions or set(relationships) != dimensions
             or set(placement_relationships) != dimensions
             or set(attributes) != dimensions or set(attribute_types) != dimensions):
         raise ValueError("CUBE_SELECTION_METADATA_SNAPSHOT_INCOMPLETE")
 
+    from .member_list_contract import iter_member_list_nodes
     pins: list[dict] = []
+    placement_unavailable = set()
 
     def resolve(dimension: str, selector: Mapping[str, object]) -> tuple[list[str],list[dict]]:
         kind = selector["kind"]
@@ -179,13 +189,20 @@ def resolve_selection(
                 attribute_types=attribute_types[dimension],
                 parameters=parameters,
                 hierarchy_graphs=hierarchy_graphs.get(dimension,{}) if hierarchy_graphs is not None else None)
-            placements = evaluate_member_list_placements(
-                definition, members=members[dimension],
-                relationships=placement_relationships[dimension],
-                attributes=attributes[dimension],
-                attribute_types=attribute_types[dimension],
-                parameters=parameters,
-                hierarchy_graphs=hierarchy_graphs.get(dimension,{}) if hierarchy_graphs is not None else None)
+            if any(node["kind"] == "navigation" for node in iter_member_list_nodes(definition["expression"])):
+                # Native browsing paths are not certified contribution paths.
+                # Seal that distinction; a placement reduction must not interpret
+                # these selections as paths with a default contribution sign.
+                placement_unavailable.add(dimension)
+                placements = []
+            else:
+                placements = evaluate_member_list_placements(
+                    definition, members=members[dimension],
+                    relationships=placement_relationships[dimension],
+                    attributes=attributes[dimension],
+                    attribute_types=attribute_types[dimension],
+                    parameters=parameters,
+                    hierarchy_graphs=hierarchy_graphs.get(dimension,{}) if hierarchy_graphs is not None else None)
         unavailable = set(result) - set(members[dimension])
         if unavailable:
             raise ValueError("CUBE_SELECTION_MEMBER_UNAVAILABLE")
@@ -213,11 +230,14 @@ def resolve_selection(
         if total > MAX_RESOLVED_MEMBERS:
             raise ValueError("CUBE_SELECTION_RESOLUTION_LIMIT_EXCEEDED")
         resolved[dimension_id] = selected
-        resolved_placements[dimension_id] = selected_placements
+        resolved_placements[dimension_id] = (
+            [] if dimension_id in placement_unavailable else selected_placements)
     pins.sort(key=lambda item: (item["listId"],
                                 _digest(item["parameters"])))
-    sealed = {"format": "openepm-resolved-selection-v1",
+    sealed = {"format": RESOLVED_FORMAT,
               "metadataRevision": metadata_revision,
               "members": resolved, "placements": resolved_placements,
               "memberListPins": pins}
+    if placement_unavailable:
+        sealed["placementUnavailableDimensions"] = sorted(placement_unavailable)
     return {**sealed, "resolutionDigest": _digest(sealed)}

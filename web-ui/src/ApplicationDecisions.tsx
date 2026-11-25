@@ -1,5 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { readProgram, readSecurityProgram, requestAdmittedEffect } from "./api";
+import {
+  ApiError,
+  readProgram,
+  readSecurityProgram,
+  type AdmittedEffectPacket,
+} from "./api";
+import { canonicalProgramDigest } from "./canonical-program-digest";
+import { useGovernedEffectRecovery } from "./governed-effect-recovery";
+import { receiptForActorAfterRevision } from "./ReceiptInspector";
 import type { ApplicationCatalog, Scope } from "./types";
 import { usePreservedDraft } from "./unsaved-work";
 import {
@@ -30,11 +38,6 @@ type DecisionPage = {
   collectionToken: string;
   nextAfterDecisionId: string | null;
 };
-type Program = {
-  languageVersion: number;
-  function: string;
-  arguments: Record<string, unknown>;
-};
 type Draft = {
   decisionId: string;
   expectedStateToken?: string;
@@ -43,7 +46,99 @@ type Draft = {
   rationale: string;
   sourceReference: string;
   provenance: ApplicationDecision["provenance"];
-  intent?: { program: Program; key: string };
+};
+
+const decisionOutcomes = {
+  "application.decision.create": "Active",
+  "application.decision.replace": "Active",
+  "application.decision.withdraw": "Withdrawn",
+} as const;
+type DecisionEffect = keyof typeof decisionOutcomes;
+type DecisionAttempt = {
+  decisionId: string;
+  functionName: DecisionEffect;
+  issuer: string;
+  actorId: string;
+  previousCommit: number;
+};
+type OriginalDecision = {
+  packet: AdmittedEffectPacket;
+  details: DecisionAttempt;
+};
+const token = /^[0-9a-f]{64}(?![\s\S])/;
+
+function decisionResult(value: unknown, { packet, details }: OriginalDecision) {
+  const reply = value as
+    | (Partial<ApplicationDecision> & {
+        languageVersion?: unknown;
+        function?: unknown;
+      })
+    | null;
+  const status = decisionOutcomes[details.functionName];
+  if (
+    reply?.languageVersion !== 2 ||
+    reply.function !== details.functionName ||
+    reply.operationId !== packet.body.idempotencyKey ||
+    reply.decisionId !== details.decisionId ||
+    reply.status !== status ||
+    typeof reply.stateToken !== "string" ||
+    !token.test(reply.stateToken) ||
+    typeof reply.contentDigest !== "string" ||
+    !token.test(reply.contentDigest)
+  )
+    return null;
+  return status;
+}
+
+async function decisionReceipt(
+  value: unknown,
+  { packet, details }: OriginalDecision,
+) {
+  const body = packet.body;
+  const receipt = receiptForActorAfterRevision(
+    value,
+    body.idempotencyKey,
+    details.actorId,
+    details.previousCommit,
+  );
+  const status = decisionOutcomes[details.functionName];
+  if (
+    receipt?.outcome.function !== details.functionName ||
+    receipt.outcome.status !== status ||
+    receipt.commandDigest !==
+      (await canonicalProgramDigest({
+        scope: [body.workspaceId, body.applicationId],
+        identity: [details.issuer, details.actorId],
+        program: body.program,
+      }))
+  )
+    return null;
+  return status;
+}
+
+const recoveryProtocol = {
+  path: "/api/application-decision",
+  tool: "execute_v2_application_decision",
+  editor: "application-decision-change",
+  pendingLabel: "Decision change with an unconfirmed outcome",
+  functions: Object.keys(decisionOutcomes),
+  subject: "decision change",
+  closePrompt:
+    "Close the unconfirmed decision request? Review the current decision before trying a new change.",
+  initialRefusal: (reason: unknown) =>
+    reason instanceof ApiError &&
+    [400, 403, 404, 409, 422].includes(reason.status) &&
+    (reason.code.startsWith("APPLICATION_DECISION_") ||
+      [
+        "APPLICATION_GRANT_REQUIRED",
+        "APPLICATION_NOT_ACTIVE",
+        "APPLICATION_UNAVAILABLE",
+        "OPERATION_ADMISSION_EXPIRED",
+        "OPERATION_ADMISSION_MISMATCH",
+        "PROGRAM_VALIDATION_FAILED",
+      ].includes(reason.code)),
+  result: decisionResult,
+  receiptResult: decisionReceipt,
 };
 function content(record: ApplicationDecision): Draft {
   return {
@@ -134,6 +229,35 @@ export function ApplicationDecisions({
     draft,
     setDraft,
   );
+  const recovery = useGovernedEffectRecovery(
+    scope,
+    catalog,
+    "application-decisions",
+    recoveryProtocol,
+    ({ decisionId }, status) => {
+      void run(async () => {
+        setDraft(null);
+        setComparison(null);
+        setNotice(
+          status === "Withdrawn"
+            ? "Original decision withdrawal recorded."
+            : "Original decision save recorded.",
+        );
+        await show(decisionId);
+        await loadPage();
+      });
+    },
+  );
+  const reviewedProgram = recovery.reviewedProgram;
+  const pendingDraft =
+    reviewedProgram?.function === "application.decision.create" ||
+    reviewedProgram?.function === "application.decision.replace"
+      ? (reviewedProgram.arguments as Draft)
+      : null;
+  const shownDraft = pendingDraft ?? draft;
+  const editingBlocked = busy || recovery.busy || recovery.pending;
+  const { issuer, subjectId: actorId } = catalog.applicationAccess;
+  const canAuthor = Boolean(issuer && actorId);
   async function loadPage(after?: string, pin?: string) {
     const result = await readProgram<DecisionPage>(
       scope,
@@ -242,63 +366,45 @@ export function ApplicationDecisions({
       setComparison(null);
     }
   }
-  async function save() {
-    if (!draft) return;
-    const { intent: oldIntent, expectedStateToken, ...fields } = draft;
-    const program: Program = {
-      languageVersion: 2,
-      function: `application.decision.${expectedStateToken === undefined ? "create" : "replace"}`,
-      arguments: {
-        ...fields,
-        ...(expectedStateToken === undefined ? {} : { expectedStateToken }),
+  async function submitDecision(
+    functionName: DecisionEffect,
+    arguments_:
+      | Draft
+      | {
+          decisionId: string;
+          expectedStateToken: string;
+        },
+  ) {
+    if (!issuer || !actorId || editingBlocked) return;
+    setError("");
+    setNotice("");
+    await recovery.submit(
+      {
+        ...scope,
+        program: {
+          languageVersion: 2,
+          function: functionName,
+          arguments: arguments_,
+        },
+        idempotencyKey: `decision-ui-${crypto.randomUUID()}`,
       },
-    };
-    const intent =
-      oldIntent && JSON.stringify(oldIntent.program) === JSON.stringify(program)
-        ? oldIntent
-        : { program, key: `decision-ui-${crypto.randomUUID()}` };
-    setDraft({ ...draft, intent });
-    await requestAdmittedEffect("/api/application-decision", {
-      ...scope,
-      program,
-      idempotencyKey: intent.key,
-    });
-    if (!alive.current) return;
-    setDraft(null);
-    setComparison(null);
-    setNotice("Decision saved.");
-    await show(draft.decisionId);
-    await loadPage();
+      {
+        functionName,
+        decisionId: arguments_.decisionId,
+        issuer,
+        actorId,
+        previousCommit: catalog.revisions.commit,
+      },
+    );
   }
-  const withdrawIntent = useRef<{ program: Program; key: string } | null>(null);
-  async function withdraw() {
-    if (!selected) return;
-    const program: Program = {
-      languageVersion: 2,
-      function: "application.decision.withdraw",
-      arguments: {
-        decisionId: selected.decisionId,
-        expectedStateToken: selected.stateToken,
-      },
-    };
-    if (
-      JSON.stringify(withdrawIntent.current?.program) !==
-      JSON.stringify(program)
-    ) {
-      withdrawIntent.current = {
-        program,
-        key: `decision-ui-${crypto.randomUUID()}`,
-      };
-    }
-    await requestAdmittedEffect("/api/application-decision", {
-      ...scope,
-      program,
-      idempotencyKey: withdrawIntent.current!.key,
-    });
-    if (!alive.current) return;
-    setNotice("Decision withdrawn.");
-    await show(selected.decisionId);
-    await loadPage();
+
+  function save() {
+    if (!draft) return;
+    const functionName =
+      draft.expectedStateToken === undefined
+        ? "application.decision.create"
+        : "application.decision.replace";
+    void submitDecision(functionName, draft);
   }
   function change(field: keyof Draft, value: string) {
     setDraft((current) => (current ? { ...current, [field]: value } : null));
@@ -313,9 +419,9 @@ export function ApplicationDecisions({
             Shared context for application administrators and their MCP clients.
           </p>
         </div>
-        {allowed("create") && (
+        {canAuthor && allowed("create") && (
           <button
-            disabled={busy}
+            disabled={editingBlocked}
             onClick={() =>
               onRequestTransition(() => {
                 setDraft({
@@ -338,14 +444,62 @@ export function ApplicationDecisions({
       {error && (
         <div role="alert" className="alert">
           {error}
-          {draft && (
-            <p>
-              Your draft is preserved. Retry the same request after a connection
-              failure. For a state conflict, compare the current decision before
-              saving again.
-            </p>
-          )}
         </div>
+      )}
+      {recovery.message && (
+        <div role="alert" className="alert">
+          {recovery.message}
+        </div>
+      )}
+      {recovery.pending && (
+        <section aria-label="Unconfirmed decision request">
+          <h3>Unconfirmed decision request</h3>
+          <p>Check the original receipt before reviewing another change.</p>
+          <div className="button-row">
+            {recovery.canCheckReceipt && (
+              <>
+                <button
+                  disabled={recovery.busy}
+                  onClick={() => void recovery.checkReceipt()}
+                >
+                  Check original decision receipt
+                </button>
+                <button
+                  disabled={recovery.busy}
+                  onClick={() => void recovery.copyReceiptCheck()}
+                >
+                  Copy receipt check for MCP
+                </button>
+              </>
+            )}
+            {recovery.retryReady && (
+              <button
+                disabled={recovery.busy}
+                onClick={() => void recovery.retry()}
+              >
+                Retry original decision request
+              </button>
+            )}
+            {recovery.canCloseRecovery && (
+              <button
+                disabled={recovery.busy}
+                onClick={() => {
+                  const original = recovery.closeRecovery();
+                  if (!original) return;
+                  if (pendingDraft) setDraft(pendingDraft);
+                  setComparison(null);
+                  void run(async () => {
+                    if (original.functionName !== "application.decision.create")
+                      await show(original.decisionId);
+                    await loadPage();
+                  });
+                }}
+              >
+                Close unconfirmed decision request
+              </button>
+            )}
+          </div>
+        </section>
       )}
       {notice && <p role="status">{notice}</p>}
       {!page ? (
@@ -357,7 +511,7 @@ export function ApplicationDecisions({
           {page.items.map((row) => (
             <li key={row.decisionId}>
               <button
-                disabled={busy}
+                disabled={editingBlocked}
                 onClick={() =>
                   onRequestTransition(() => {
                     setDraft(null);
@@ -396,9 +550,9 @@ export function ApplicationDecisions({
         <div>
           <DecisionText decision={selected} actorName={actorName(selected)} />
           <div className="button-row">
-            {allowed("replace") && (
+            {canAuthor && allowed("replace") && (
               <button
-                disabled={busy}
+                disabled={editingBlocked}
                 onClick={() =>
                   onRequestTransition(() => {
                     setDraft(content(selected));
@@ -409,34 +563,41 @@ export function ApplicationDecisions({
                 Edit decision
               </button>
             )}
-            {allowed("withdraw") && selected.status === "Active" && (
-              <button
-                disabled={busy || draft !== null}
-                onClick={() => void run(withdraw)}
-              >
-                Withdraw decision
-              </button>
-            )}
+            {canAuthor &&
+              allowed("withdraw") &&
+              selected.status === "Active" && (
+                <button
+                  disabled={editingBlocked || draft !== null}
+                  onClick={() =>
+                    void submitDecision("application.decision.withdraw", {
+                      decisionId: selected.decisionId,
+                      expectedStateToken: selected.stateToken,
+                    })
+                  }
+                >
+                  Withdraw decision
+                </button>
+              )}
           </div>
         </div>
       )}
-      {draft && (
+      {shownDraft && (
         <form
           onSubmit={(event) => {
             event.preventDefault();
-            void run(save);
+            save();
           }}
         >
           <h3>
-            {draft.expectedStateToken === undefined
+            {shownDraft.expectedStateToken === undefined
               ? "New decision"
               : "Edit current decision"}
           </h3>
-          <fieldset disabled={busy}>
+          <fieldset disabled={editingBlocked || !canAuthor}>
             <label>
               Title
               <input
-                value={draft.title}
+                value={shownDraft.title}
                 maxLength={200}
                 required
                 onChange={(event) => change("title", event.target.value)}
@@ -445,7 +606,7 @@ export function ApplicationDecisions({
             <label>
               Provenance
               <select
-                value={draft.provenance}
+                value={shownDraft.provenance}
                 onChange={(event) => change("provenance", event.target.value)}
               >
                 <option value="UserDecision">User decision</option>
@@ -457,7 +618,7 @@ export function ApplicationDecisions({
             <label>
               Decision
               <textarea
-                value={draft.text}
+                value={shownDraft.text}
                 maxLength={8000}
                 required
                 rows={6}
@@ -467,7 +628,7 @@ export function ApplicationDecisions({
             <label>
               Rationale (optional)
               <textarea
-                value={draft.rationale}
+                value={shownDraft.rationale}
                 maxLength={2000}
                 rows={3}
                 onChange={(event) => change("rationale", event.target.value)}
@@ -476,7 +637,7 @@ export function ApplicationDecisions({
             <label>
               Source reference (optional)
               <input
-                value={draft.sourceReference}
+                value={shownDraft.sourceReference}
                 maxLength={1000}
                 onChange={(event) =>
                   change("sourceReference", event.target.value)
@@ -502,7 +663,7 @@ export function ApplicationDecisions({
               >
                 Discard draft
               </button>
-              {draft.expectedStateToken !== undefined && (
+              {shownDraft.expectedStateToken !== undefined && (
                 <button
                   type="button"
                   onClick={() =>
@@ -510,7 +671,7 @@ export function ApplicationDecisions({
                       const value = await readProgram<ApplicationDecision>(
                         scope,
                         "application.decision.read",
-                        { decisionId: draft.decisionId },
+                        { decisionId: shownDraft.decisionId },
                       );
                       if (alive.current) setComparison(value);
                     })
@@ -530,12 +691,11 @@ export function ApplicationDecisions({
               />
               <button
                 type="button"
-                disabled={busy}
+                disabled={editingBlocked}
                 onClick={() => {
                   setDraft({
-                    ...draft,
+                    ...shownDraft,
                     expectedStateToken: comparison.stateToken,
-                    intent: undefined,
                   });
                   setError("");
                 }}

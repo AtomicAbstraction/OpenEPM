@@ -1,6 +1,15 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { ApplicationPurge } from "./ApplicationPurge";
+import {
+  ApplicationPurge,
+  applicationPurgeRecoveryKey,
+} from "./ApplicationPurge";
 import { ApiError, request } from "./api";
 vi.mock("./api", async (original) => ({
   ...(await original<typeof import("./api")>()),
@@ -17,12 +26,15 @@ const manifest = {
   rowCounts: { numeric_cell_projection: 42 },
 };
 const prepared = { manifest, manifestDigest: "d".repeat(64) };
+const issuer = "https://identity.example/realm";
+const storageKey = applicationPurgeRecoveryKey(issuer, "owner", "w")!;
 const deleted = vi.fn().mockResolvedValue(undefined);
 function display() {
   return render(
     <ApplicationPurge
       workspaceId="w"
       applicationId="a"
+      issuer={issuer}
       subject="owner"
       deleted={deleted}
     />,
@@ -59,16 +71,14 @@ it("shows the exact target and inventory and requires distinct stop and delete a
   );
   await waitFor(() => expect(request).toHaveBeenCalledTimes(3));
   expect(deleted).not.toHaveBeenCalled();
-  const stored = JSON.parse(
-    localStorage.getItem("openepm:application-purge:owner:w")!,
-  );
+  const stored = JSON.parse(localStorage.getItem(storageKey)!);
   expect(stored.program.function).toBe("workspace.application.purge.apply");
   expect(JSON.stringify(stored)).not.toContain("rowCounts");
   expect(JSON.stringify(stored)).not.toContain("Forecast");
   fireEvent.click(screen.getByRole("button", { name: "Delete a permanently" }));
   await waitFor(() => expect(deleted).toHaveBeenCalledWith("w", "a"));
   expect(vi.mocked(request).mock.calls[3][1]).toEqual(stored);
-  expect(localStorage.getItem("openepm:application-purge:owner:w")).toBeNull();
+  expect(localStorage.getItem(storageKey)).toBeNull();
   expect(screen.queryByRole("checkbox")).toBeNull();
 });
 
@@ -148,10 +158,7 @@ it("reconciles a lost deletion response with the exact persisted request without
       arguments: { applicationId: "a", createdAt: manifest.createdAt },
     },
   };
-  localStorage.setItem(
-    "openepm:application-purge:owner:w",
-    JSON.stringify(exact),
-  );
+  localStorage.setItem(storageKey, JSON.stringify(exact));
   vi.mocked(request).mockResolvedValueOnce({ status: "Deleted" });
   display();
   fireEvent.click(screen.getByRole("button", { name: "Delete a permanently" }));
@@ -179,7 +186,7 @@ it("clears a provably rejected stale manifest so the owner can inspect again", a
   expect(
     screen.getByRole("button", { name: "Inspect application" }),
   ).toBeEnabled();
-  expect(localStorage.getItem("openepm:application-purge:owner:w")).toBeNull();
+  expect(localStorage.getItem(storageKey)).toBeNull();
 });
 it.each([
   { extra: { inventory: { facts: [1] } } },
@@ -190,7 +197,7 @@ it.each([
   { argumentsExtra: { createdAt: "not-a-date" } },
 ])("rejects malformed or foreign persisted retry metadata: %j", (value) => {
   localStorage.setItem(
-    "openepm:application-purge:owner:w",
+    storageKey,
     JSON.stringify({
       workspaceId: "w",
       idempotencyKey: "purge-key",
@@ -212,4 +219,216 @@ it.each([
   expect(screen.getByLabelText("Application ID to delete")).toBeEnabled();
   expect(screen.getByLabelText("Application ID to delete")).toHaveValue("a");
   expect(request).not.toHaveBeenCalled();
+});
+
+function savedIntent(target: string, key = "purge-original-request") {
+  return JSON.stringify({
+    workspaceId: "w",
+    idempotencyKey: key,
+    program: {
+      languageVersion: 2,
+      function: "workspace.application.purge.apply",
+      arguments: { applicationId: target, createdAt: manifest.createdAt },
+    },
+  });
+}
+
+it.each([
+  { issuer: "https://other.example/realm", subject: "owner", workspaceId: "w" },
+  { issuer, subject: "another-owner", workspaceId: "w" },
+  { issuer, subject: "owner", workspaceId: "another-workspace" },
+])(
+  "never restores another authority, account or workspace intent: %j",
+  (identity) => {
+    const original = savedIntent("original-secret-target");
+    localStorage.setItem(storageKey, original);
+    const view = display();
+    expect(screen.getByLabelText("Application ID to delete")).toHaveValue(
+      "original-secret-target",
+    );
+    view.rerender(
+      <ApplicationPurge
+        {...identity}
+        applicationId="current"
+        deleted={deleted}
+      />,
+    );
+    expect(screen.getByLabelText("Application ID to delete")).toHaveValue(
+      "current",
+    );
+    expect(screen.getByLabelText("Application ID to delete")).toBeEnabled();
+    expect(
+      screen.queryByText(/original-secret-target/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /permanently/ }),
+    ).not.toBeInTheDocument();
+    expect(localStorage.getItem(storageKey)).toBe(original);
+    expect(request).not.toHaveBeenCalled();
+  },
+);
+
+it("keeps each issuer's same-subject retry exact when switching back", () => {
+  const otherIssuer = "https://other.example/realm";
+  const otherKey = applicationPurgeRecoveryKey(otherIssuer, "owner", "w")!;
+  const original = savedIntent("first-authority-target");
+  const other = savedIntent("second-authority-target", "second-operation");
+  localStorage.setItem(storageKey, original);
+  localStorage.setItem(otherKey, other);
+  const view = display();
+  view.rerender(
+    <ApplicationPurge
+      workspaceId="w"
+      applicationId="a"
+      issuer={otherIssuer}
+      subject="owner"
+      deleted={deleted}
+    />,
+  );
+  expect(screen.getByLabelText("Application ID to delete")).toHaveValue(
+    "second-authority-target",
+  );
+  view.rerender(
+    <ApplicationPurge
+      workspaceId="w"
+      applicationId="a"
+      issuer={issuer}
+      subject="owner"
+      deleted={deleted}
+    />,
+  );
+  expect(screen.getByLabelText("Application ID to delete")).toHaveValue(
+    "first-authority-target",
+  );
+  expect(localStorage.getItem(storageKey)).toBe(original);
+  expect(localStorage.getItem(otherKey)).toBe(other);
+  expect(request).not.toHaveBeenCalled();
+});
+
+it("preserves an unbound legacy witness without disclosing or adopting its contents", () => {
+  const key = "openepm:application-purge:owner:w";
+  const legacy = savedIntent("legacy-secret-target", "legacy-secret-operation");
+  localStorage.setItem(key, legacy);
+  display();
+  open();
+  expect(screen.getByRole("status")).toHaveTextContent(
+    "preserved but cannot be restored",
+  );
+  expect(screen.getByRole("status")).toHaveTextContent(
+    "current-authorized application status inspection",
+  );
+  expect(document.body.textContent).not.toContain("legacy-secret");
+  expect(screen.getByLabelText("Application ID to delete")).toHaveValue("a");
+  expect(screen.getByLabelText("Application ID to delete")).toBeEnabled();
+  expect(localStorage.getItem(key)).toBe(legacy);
+  expect(localStorage.getItem(storageKey)).toBeNull();
+  expect(request).not.toHaveBeenCalled();
+});
+
+it("requires a verified issuer and account before reading recovery or offering deletion", () => {
+  localStorage.setItem(storageKey, savedIntent("secret-target"));
+  const read = vi.spyOn(Storage.prototype, "getItem");
+  const view = render(
+    <ApplicationPurge
+      workspaceId="w"
+      applicationId="a"
+      issuer=""
+      subject="owner"
+      deleted={deleted}
+    />,
+  );
+  expect(
+    screen.getByText(/requires a verified sign-in authority and account/),
+  ).toBeVisible();
+  expect(
+    screen.queryByLabelText("Application ID to delete"),
+  ).not.toBeInTheDocument();
+  view.rerender(
+    <ApplicationPurge
+      workspaceId="w"
+      applicationId="a"
+      issuer={issuer}
+      subject=""
+      deleted={deleted}
+    />,
+  );
+  expect(read).not.toHaveBeenCalled();
+  expect(request).not.toHaveBeenCalled();
+  read.mockRestore();
+});
+
+it("discloses reload/sign-out persistence and the definite reconciliation lifetime", () => {
+  display();
+  open();
+  expect(
+    screen.getByText(/This browser stores the exact deletion retry request/),
+  ).toHaveTextContent(
+    "survives reload and sign-out until the request is reconciled as deleted or definitively rejected",
+  );
+});
+
+it("ignores a late previous-identity reply without clearing its witness or reading as the new identity", async () => {
+  const original = savedIntent("original-target");
+  localStorage.setItem(storageKey, original);
+  let finish!: (value: { status: string }) => void;
+  vi.mocked(request).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const view = display();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Delete original-target permanently" }),
+  );
+  expect(request).toHaveBeenCalledOnce();
+  view.rerender(
+    <ApplicationPurge
+      workspaceId="w"
+      applicationId="a"
+      issuer="https://other.example"
+      subject="owner"
+      deleted={deleted}
+    />,
+  );
+  await act(async () => finish({ status: "Deleting" }));
+  expect(request).toHaveBeenCalledOnce();
+  expect(deleted).not.toHaveBeenCalled();
+  expect(localStorage.getItem(storageKey)).toBe(original);
+  expect(screen.getByLabelText("Application ID to delete")).toHaveValue("a");
+});
+
+it("cannot let an unmounted reply delete a newer same-identity retry witness", async () => {
+  localStorage.setItem(storageKey, savedIntent("original-target"));
+  let finish!: (value: { status: string }) => void;
+  vi.mocked(request).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const first = display();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Delete original-target permanently" }),
+  );
+  first.unmount();
+  const newer = savedIntent("newer-target", "newer-operation");
+  localStorage.setItem(storageKey, newer);
+  display();
+  await act(async () => finish({ status: "Deleted" }));
+  expect(localStorage.getItem(storageKey)).toBe(newer);
+  expect(screen.getByLabelText("Application ID to delete")).toHaveValue(
+    "newer-target",
+  );
+  expect(deleted).not.toHaveBeenCalled();
+  expect(request).toHaveBeenCalledOnce();
+});
+
+it("encodes tuple boundaries without colon or percent aliases", () => {
+  expect(applicationPurgeRecoveryKey("issuer:a", "b", "w")).not.toBe(
+    applicationPurgeRecoveryKey("issuer", "a:b", "w"),
+  );
+  expect(applicationPurgeRecoveryKey("issuer%3Aa", "b", "w")).not.toBe(
+    applicationPurgeRecoveryKey("issuer:a", "b", "w"),
+  );
 });

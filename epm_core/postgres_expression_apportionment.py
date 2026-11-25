@@ -252,15 +252,10 @@ def materialize_relation_requests(db, scope, request):
     if len(measures) != 1:
         raise ValueError('EXPRESSION_APPORTIONMENT_MEASURE_UNAVAILABLE')
     from .postgres_applicability_relations import resolve_apportionment_domain
-    resolved = resolve_apportionment_domain(
+    resolved, rows = resolve_apportionment_domain(
         db, scope, request['apportionmentDomain'],
         active_dimensions=active)
     domain = resolved['domain']
-    rows = db.execute('''SELECT row_id,values
-        FROM epm.applicability_relation_row
-        WHERE workspace_id=%s AND application_id=%s AND relation_id=%s
-        ORDER BY row_id''', (scope.workspace_id, scope.application_id,
-        domain['relationId'])).fetchall()
     formulas = {item['formulaId']: item['expression']
                 for item in request['formulas']}
     anchor_columns = {item['dimensionId']: item['columnId']
@@ -497,7 +492,7 @@ def replay(dsn, identity, scope, program, *, idempotency_key, dependencies, exec
             state = _current_state(db, scope)
             if state['schema_epoch'] != normalized['schemaEpoch']:
                 raise ValueError('STALE_JOB_INPUT_REVISION')
-            _require_python_job_authority(db, scope, prior)
+            _require_python_job_authority(db, scope, prior, replay_only=True)
     # The ordinary queue owns exact authority/dependency/scope replay comparison.
     return PostgresJobQueue(dsn, identity=identity).submit(scope,
         idempotency_key=idempotency_key, function_name=FUNCTION, normalized_program=normalized,

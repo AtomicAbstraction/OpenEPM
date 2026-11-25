@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
-import { readProgram, requestAdmittedEffect } from "./api";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ApiError, readProgram, requestAdmittedEffect } from "./api";
 import { AttributeValueEditor } from "./AttributeValueEditor";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
 import { useUnsavedWork } from "./unsaved-work";
 import { useStableMutationIntentKey } from "./mutation-intent";
-import { collectAllContinuations } from "./continuation";
+import { collectCapabilityAttributeDefinitions } from "./metadata-data";
 
 type AttributeScope = "Dimension" | "Member" | "Relationship";
 type AttributeStatus = "Active" | "Inactive";
@@ -74,7 +74,6 @@ export function attributeListArguments(
   dimensionId: string,
   query: string,
   status: "All" | AttributeStatus,
-  afterAttributeId?: string | null,
 ) {
   return {
     scope,
@@ -82,7 +81,6 @@ export function attributeListArguments(
     ...(query.trim() ? { query: query.trim() } : {}),
     ...(status === "All" ? {} : { status }),
     limit: 100,
-    ...(afterAttributeId ? { afterAttributeId } : {}),
   };
 }
 
@@ -126,17 +124,7 @@ function validDraft(draft: AttributeDraft) {
   );
 }
 
-export function AttributeCatalog({
-  app,
-  catalog,
-  dimensions,
-  dimensionId,
-  metadataRevision,
-  onChanged,
-  contextLocked = false,
-  initialScope = "Dimension",
-  onRequestTransition = (action) => action(),
-}: {
+type AttributeCatalogProps = {
   app?: ApplicationSummary;
   catalog: ApplicationCatalog | null;
   dimensions: { dimension_id: string; name: string; status: string }[];
@@ -146,7 +134,58 @@ export function AttributeCatalog({
   contextLocked?: boolean;
   initialScope?: AttributeScope;
   onRequestTransition?: (action: () => void) => void;
-}) {
+};
+
+export function AttributeCatalog(props: AttributeCatalogProps) {
+  const { app, catalog } = props;
+  const access = catalog?.applicationAccess;
+  const revisions = catalog?.revisions;
+  const key = JSON.stringify([
+    app?.workspaceId,
+    app?.applicationId,
+    catalog?.accessContext,
+    access?.issuer,
+    access?.subjectId,
+    access?.role,
+    access?.workspaceAdministrator,
+    revisions?.security,
+    revisions?.policy,
+    revisions?.schemaEpoch,
+    revisions?.capability,
+    Boolean(catalog?.functions["metadata.attribute-definition.list"]),
+  ]);
+  return <AttributeCatalogWorkspace key={key} {...props} />;
+}
+
+function invalidatesAttributeDefinitionRead(reason: unknown) {
+  return (
+    reason instanceof ApiError &&
+    (reason.kind === "authorization" ||
+      reason.kind === "authentication" ||
+      [
+        "APPLICATION_UNAVAILABLE",
+        "WORKSPACE_UNAVAILABLE",
+        "ATTRIBUTE_DEFINITION_UNAVAILABLE",
+        "METADATA_ATTRIBUTE_READ_AUTHORIZATION_STALE",
+        "METADATA_CHANGED_DURING_READ",
+        "METADATA_DIRECTORY_CURSOR_REQUIRED",
+        "METADATA_DIRECTORY_CURSOR_STALE",
+        "STALE_METADATA_REVISION",
+      ].includes(reason.code))
+  );
+}
+
+function AttributeCatalogWorkspace({
+  app,
+  catalog,
+  dimensions,
+  dimensionId,
+  metadataRevision,
+  onChanged,
+  contextLocked = false,
+  initialScope = "Dimension",
+  onRequestTransition = (action) => action(),
+}: AttributeCatalogProps) {
   const mutationIntentKey = useStableMutationIntentKey("attribute-ui");
   const [scope, setScope] = useState<AttributeScope>(initialScope);
   const [contextDimension, setContextDimension] = useState(dimensionId);
@@ -161,9 +200,13 @@ export function AttributeCatalog({
   const [createDraft, setCreateDraft] = useState(emptyDraft);
   const [reviewedAction, setReviewedAction] = useState<ReviewedAction>(null);
   const [usage, setUsage] = useState<Usage | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [reading, setReading] = useState(false);
+  const [mutating, setMutating] = useState(false);
+  const busy = reading || mutating;
+  const [recheckRequired, setRecheckRequired] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState("");
+  const currentRead = useRef<AbortController | null>(null);
 
   const canRead = Boolean(
     catalog?.functions["metadata.attribute-definition.list"],
@@ -182,6 +225,10 @@ export function AttributeCatalog({
   );
   const effectiveDimension =
     scope === "Dimension" ? "" : contextLocked ? dimensionId : contextDimension;
+  const visit = useMemo(
+    () => ({ active: false }),
+    [scope, effectiveDimension, query, status, canRead],
+  );
   const rowById = useMemo(
     () => new Map(rows.map((row) => [row.attribute_id, row])),
     [rows],
@@ -208,40 +255,62 @@ export function AttributeCatalog({
     );
   }, [dimensionId, dimensions]);
 
-  async function readDefinitions() {
-    if (!app || !canRead || (scope !== "Dimension" && !effectiveDimension))
-      return;
-    setBusy(true);
+  function beginRead() {
+    currentRead.current?.abort();
+    const read = new AbortController();
+    currentRead.current = read;
+    setReading(true);
     setError("");
     setUsage(null);
+    return read;
+  }
+
+  function finishRead(read: AbortController) {
+    if (currentRead.current !== read) return;
+    currentRead.current = null;
+    setReading(false);
+  }
+
+  function clearDefinitionProjection() {
+    setRows([]);
+    setDrafts({});
+    setReadRevision(null);
+    setReviewedAction(null);
+    setUsage(null);
+  }
+
+  async function readDefinitions() {
+    if (
+      !visit.active ||
+      !app ||
+      !canRead ||
+      (scope !== "Dimension" && !effectiveDimension)
+    )
+      return;
+    const read = beginRead();
     try {
-      type AttributePage = {
-        rows: AttributeDefinition[];
-        nextAfterAttributeId: string | null;
-        metadataRevision: number;
-      };
-      const collected = await collectAllContinuations<
-        AttributePage,
-        AttributeDefinition
-      >({
-        label: "Attribute Catalog",
-        readPage: (after) =>
-          readProgram(
-            { workspaceId: app.workspaceId, applicationId: app.applicationId },
-            "metadata.attribute-definition.list",
-            attributeListArguments(
-              scope,
-              effectiveDimension,
-              query,
-              status,
-              after,
+      const collected =
+        await collectCapabilityAttributeDefinitions<AttributeDefinition>(
+          (continuation) =>
+            readProgram(
+              {
+                workspaceId: app.workspaceId,
+                applicationId: app.applicationId,
+              },
+              "metadata.attribute-definition.list",
+              {
+                ...attributeListArguments(
+                  scope,
+                  effectiveDimension,
+                  query,
+                  status,
+                ),
+                ...continuation,
+              },
+              read.signal,
             ),
-          ),
-        rows: (page) => page.rows,
-        nextCursor: (page) => page.nextAfterAttributeId,
-        rowIdentity: (row) => row.attribute_id,
-        consistencyIdentity: (page) => page.metadataRevision,
-      });
+        );
+      if (read.signal.aborted) return;
       const found = collected.rows;
       const revision = collected.finalPage.metadataRevision;
       setRows(found);
@@ -252,40 +321,37 @@ export function AttributeCatalog({
       );
       setReadRevision(revision);
       setReviewedAction(null);
+      setRecheckRequired(false);
     } catch (reason) {
-      setRows([]);
-      setDrafts({});
-      setReadRevision(null);
+      if (read.signal.aborted) return;
+      clearDefinitionProjection();
+      setRecheckRequired(true);
       setError(
         reason instanceof Error ? reason.message : "Unable to read attributes",
       );
     } finally {
-      setBusy(false);
+      finishRead(read);
     }
   }
 
-  useEffect(() => {
-    setRows([]);
-    setDrafts({});
-    setReadRevision(null);
+  useLayoutEffect(() => {
+    visit.active = true;
+    clearDefinitionProjection();
     setAttributeId("");
     setDefaultName("");
     setCreateDraft(emptyDraft());
-    setReviewedAction(null);
-    setUsage(null);
+    setReading(false);
+    setMutating(false);
+    setRecheckRequired(false);
     setError("");
     setResult("");
-    if (app && canRead && (scope === "Dimension" || effectiveDimension))
-      void readDefinitions();
-  }, [
-    app?.workspaceId,
-    app?.applicationId,
-    scope,
-    effectiveDimension,
-    query,
-    status,
-    canRead,
-  ]);
+    void readDefinitions();
+    return () => {
+      visit.active = false;
+      currentRead.current?.abort();
+      currentRead.current = null;
+    };
+  }, [visit]);
 
   useEffect(() => {
     if (
@@ -314,6 +380,7 @@ export function AttributeCatalog({
     confirmation: string,
   ) {
     if (
+      !visit.active ||
       !app ||
       readRevision === null ||
       busy ||
@@ -321,7 +388,7 @@ export function AttributeCatalog({
       !window.confirm(confirmation)
     )
       return;
-    setBusy(true);
+    setMutating(true);
     setError("");
     setResult("");
     try {
@@ -342,6 +409,7 @@ export function AttributeCatalog({
           }),
         ),
       );
+      if (!visit.active) return;
       setResult("The reviewed attribute change was applied.");
       setReviewedAction(null);
       setAttributeId("");
@@ -350,20 +418,20 @@ export function AttributeCatalog({
       await onChanged();
       await readDefinitions();
     } catch (reason) {
+      if (!visit.active) return;
       setError(
         reason instanceof Error
           ? reason.message
           : "Unable to apply the Attribute Catalog change",
       );
     } finally {
-      setBusy(false);
+      if (visit.active) setMutating(false);
     }
   }
 
   async function readUsage(row: AttributeDefinition) {
-    if (!app || !canReadUsage) return;
-    setBusy(true);
-    setError("");
+    if (!visit.active || !app || !canReadUsage) return;
+    const read = beginRead();
     try {
       const value = await readProgram<{
         valueCount: number;
@@ -373,14 +441,21 @@ export function AttributeCatalog({
         { workspaceId: app.workspaceId, applicationId: app.applicationId },
         "metadata.attribute-definition.usage.read",
         { ...contextArguments(), attributeId: row.attribute_id },
+        read.signal,
       );
+      if (read.signal.aborted) return;
       setUsage({ attributeId: row.attribute_id, ...value });
     } catch (reason) {
+      if (read.signal.aborted) return;
+      if (invalidatesAttributeDefinitionRead(reason)) {
+        clearDefinitionProjection();
+        setRecheckRequired(true);
+      }
       setError(
         reason instanceof Error ? reason.message : "Unable to read usage",
       );
     } finally {
-      setBusy(false);
+      finishRead(read);
     }
   }
 
@@ -410,7 +485,7 @@ export function AttributeCatalog({
             immutable; display labels and semantic guidance can evolve.
           </p>
         </div>
-        <span>{rows.length} current rows</span>
+        {readRevision !== null && <span>{rows.length} current rows</span>}
       </div>
       <div className="metadata-workbook-toolbar attribute-catalog-toolbar">
         <label>
@@ -487,13 +562,23 @@ export function AttributeCatalog({
       {error && (
         <div className="inline-error" role="alert">
           {error}
+          {recheckRequired && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => onRequestTransition(() => void readDefinitions())}
+            >
+              Recheck attribute definitions
+            </button>
+          )}
         </div>
       )}
       {result && <p role="status">{result}</p>}
       {usage && (
         <aside className="attribute-usage" aria-label="Attribute usage">
           <strong>{usage.attributeId}</strong> is populated on{" "}
-          {usage.valueCount} object{usage.valueCount === 1 ? "" : "s"}.
+          {usage.valueCount} object{usage.valueCount === 1 ? "" : "s"} visible
+          under current access.
           {usage.sampleObjectIds.length > 0 && (
             <span>
               {" "}
@@ -877,19 +962,30 @@ export function AttributeCatalog({
           </tbody>
         </table>
       </div>
-      <AttributeValueEditor
-        app={app}
-        catalog={catalog}
-        scope={scope}
-        dimensionId={effectiveDimension}
-        definitions={rows}
-        dimensions={dimensions}
-        definitionRevision={readRevision}
-        onChanged={async () => {
-          await onChanged();
-          await readDefinitions();
-        }}
-      />
+      {scope === "Dimension" ? (
+        readRevision !== null && (
+          <AttributeValueEditor
+            app={app}
+            catalog={catalog}
+            scope={scope}
+            dimensionId={effectiveDimension}
+            definitions={rows}
+            dimensions={dimensions}
+            definitionRevision={readRevision}
+            onChanged={async () => {
+              if (!visit.active) return;
+              await onChanged();
+              await readDefinitions();
+            }}
+          />
+        )
+      ) : (
+        <p className="authority-note" role="status">
+          {scope} attribute values are edited in the inline{" "}
+          {scope.toLowerCase()} grid, where the target object and current value
+          remain visible.
+        </p>
+      )}
       <p className="authority-note">
         The browser stores no definition authority. Every accepted edit is
         revalidated by the fixed core and recorded as a governed change.

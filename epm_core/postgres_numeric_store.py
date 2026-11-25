@@ -45,7 +45,7 @@ class PostgresNumericFactStore:
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             self._set_scope(db, scope)
             PostgresAccessChecker.check_in_transaction(
-                db, self.identity, scope, 'read')
+                db, self.identity, scope, 'read', action='facts.read')
             authorize_coordinate(
                 db, self.identity, scope, coordinate, kind=AccessKind.READ)
             state = db.execute('''SELECT commit_revision FROM epm.application_state
@@ -86,6 +86,7 @@ class PostgresNumericFactStore:
               expected_data_revision: int | None = None) -> MutationReceipt:
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
+                PostgresAccessChecker.lock_directory_membership_for_assignment(db)
                 return self.apply_in_transaction(
                     db, scope, mutations, operation_id=operation_id,
                     command_digest=command_digest, actor_id=actor_id,
@@ -124,7 +125,7 @@ class PostgresNumericFactStore:
             expected_data_revision)
         self._set_scope(db, scope)
         PostgresAccessChecker.check_in_transaction(
-            db, self.identity, scope, 'write')
+            db, self.identity, scope, 'write', action='facts.write')
         # Keep the application publication row unlocked while the fixed core
         # validates and calculates this bounded POV.  A scoped advisory lock
         # serializes an overlapping numeric target; disjoint POVs can prepare
@@ -169,7 +170,7 @@ class PostgresNumericFactStore:
         # short publication fence so a revoked writer cannot publish using an
         # earlier decision, and use the current role for planning policy.
         current_access=PostgresAccessChecker.check_in_transaction(
-            db,self.identity,scope,'write')
+            db,self.identity,scope,'write',action='facts.write')
         authorize_coordinates(
             db, self.identity, scope,
             (item.coordinate for item in mutations), kind=AccessKind.WRITE)
@@ -181,7 +182,7 @@ class PostgresNumericFactStore:
         policy_evidence=enforce_active_planning_policy(
             db,scope,writes=tuple((item.coordinate,actions[item.kind])
                                   for item in mutations),
-            workflow_role=current_access.role)
+            workflow_role=current_access.role, identity=self.identity)
         from .postgres_numeric_batch import (
             publish_prepared,recheck_prepared_inputs,
         )

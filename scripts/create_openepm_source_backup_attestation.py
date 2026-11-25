@@ -14,12 +14,13 @@ import stat
 
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 BUNDLE = re.compile(r"openepm-base-[0-9]{8}T[0-9]{6}Z-[0-9]+\Z")
-FORMAT = "openepm-source-backup-attestation-v3"
-BASE_FIELDS = {"format", "sourceHostIdentity", "bundle",
+FORMAT = "openepm-source-backup-attestation-v4"
+LEGACY_FORMAT = "openepm-source-backup-attestation-v3"
+LEGACY_FIELDS = {"format", "sourceHostIdentity", "bundle",
     "preBackupPopulatedSignature", "manifestSha256", "payloads",
     "encryptedArtifactSha256", "encryptedPayloadCount", "totalBytes",
     "attestationHmac"}
-FIELDS = BASE_FIELDS
+FIELDS = LEGACY_FIELDS | {"preBackupPublicReadSignature"}
 CHUNK = 1024 * 1024
 MAX_TREE_FILES = 100_000
 MAX_TREE_BYTES = 100 * 1024 * 1024 * 1024
@@ -105,29 +106,35 @@ def _bundle(root: Path, name: str, maximum_bytes: int) -> tuple[Path, dict, list
 
 def create(*, backup_root: Path, bundle: str, key_file: Path,
            population_signature: str, maximum_bytes: int,
-           machine_id: Path = Path("/etc/machine-id")) -> dict:
+           machine_id: Path = Path("/etc/machine-id"),
+           public_read_signature: str | None = None) -> dict:
     if not isinstance(population_signature, str) or not SHA256.fullmatch(
             population_signature):
         raise AttestationError("population signature is invalid")
+    if public_read_signature is not None and (not isinstance(public_read_signature, str)
+                                             or not SHA256.fullmatch(public_read_signature)):
+        raise AttestationError("public readback signature is invalid")
     manifest_path, manifest, payloads = _bundle(
         backup_root, bundle, maximum_bytes)
-    value = {"format": FORMAT,
+    value = {"format": FORMAT if public_read_signature is not None else LEGACY_FORMAT,
         "sourceHostIdentity": host_identity(machine_id),
         "bundle": bundle, "preBackupPopulatedSignature": population_signature,
         "manifestSha256": digest(manifest_path), "payloads": payloads,
         "encryptedArtifactSha256": hashlib.sha256(canonical(payloads)).hexdigest(),
         "encryptedPayloadCount": len(payloads),
         "totalBytes": sum(item["sizeBytes"] for item in payloads)}
+    if public_read_signature is not None:
+        value["preBackupPublicReadSignature"] = public_read_signature
     value["attestationHmac"] = hmac.new(
         protected_key(key_file), canonical(value), hashlib.sha256).hexdigest()
     return value
 
 
-def verify(value: object, *, backup_root: Path, key_file: Path,
-           maximum_bytes: int) -> dict:
-    if (not isinstance(value, dict)
-            or value.get("format") != FORMAT
-            or set(value) != FIELDS):
+def authenticate(value: object, *, key_file: Path) -> dict:
+    """Authenticate the source metadata before any backup payload is opened."""
+    if not isinstance(value, dict) or not (
+            value.get("format") == FORMAT and set(value) == FIELDS
+            or value.get("format") == LEGACY_FORMAT and set(value) == LEGACY_FIELDS):
         raise AttestationError("source backup attestation is invalid")
     signature = value.get("attestationHmac")
     unsigned = {key: item for key, item in value.items()
@@ -142,6 +149,16 @@ def verify(value: object, *, backup_root: Path, key_file: Path,
     if (not isinstance(identity, str) or not SHA256.fullmatch(identity)
             or not isinstance(population, str) or not SHA256.fullmatch(population)):
         raise AttestationError("source backup identities are invalid")
+    if value["format"] == FORMAT:
+        public = value["preBackupPublicReadSignature"]
+        if not isinstance(public, str) or not SHA256.fullmatch(public):
+            raise AttestationError("public readback signature is invalid")
+    return value
+
+
+def verify(value: object, *, backup_root: Path, key_file: Path,
+           maximum_bytes: int) -> dict:
+    value = authenticate(value, key_file=key_file)
     manifest_path, manifest, payloads = _bundle(
         backup_root, value.get("bundle"), maximum_bytes)
     expected = {"manifestSha256": digest(manifest_path), "payloads": payloads,
@@ -159,6 +176,7 @@ def main() -> int:
     parser.add_argument("--bundle", required=True)
     parser.add_argument("--key-file", type=Path, required=True)
     parser.add_argument("--population-signature", required=True)
+    parser.add_argument("--public-read-signature")
     parser.add_argument("--maximum-bytes", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
@@ -168,6 +186,7 @@ def main() -> int:
         value = create(backup_root=arguments.backup_root.resolve(),
             bundle=arguments.bundle, key_file=arguments.key_file,
             population_signature=arguments.population_signature,
+            public_read_signature=arguments.public_read_signature,
             maximum_bytes=arguments.maximum_bytes)
     except AttestationError as error:
         parser.error(str(error))

@@ -18,7 +18,8 @@ from .persistence_contract import ApplicationScope
 from .postgres_capability_contract import (assert_source_operation_purpose,
                                           assert_source_plan_purpose)
 from openepm.diagnostics import (Diagnostic, SourceValidationError,
-                                 diagnostic_payload, validate_diagnostic_payload)
+                                 diagnostic_payload, validate_diagnostic_payload,
+                                 metadata_failure)
 from openepm.source_mapping import FORMAT as SOURCE_MAP_FORMAT, validate_source_map
 
 
@@ -146,11 +147,13 @@ def validate_proposed_plan(scope: ApplicationScope, proposed: object, *,
                 message = ('Operation rejected: ' + code + '.'
                     if re.fullmatch(r'[A-Z][A-Z0-9_]{2,127}', code)
                     else 'The operation has invalid arguments or references.')
-                diagnostics.append(Diagnostic('PYTHON_PLAN_OPERATION_INVALID',
-                    message, 'semantic',
+                diagnostic_code, message, hint = metadata_failure(error) or (
+                    'PYTHON_PLAN_OPERATION_INVALID', message,
+                    'Correct this operation using the published primitive contract.')
+                diagnostics.append(Diagnostic(diagnostic_code, message, 'semantic',
                     tuple(span[key] for key in ('startLine', 'startColumn', 'endLine', 'endColumn'))
                     if span else None, path=path,
-                    hint='Correct this operation using the published primitive contract.'))
+                    hint=hint))
                 if len(diagnostics) == 100:
                     raise SourceValidationError(diagnostic_payload(source['sourceDigest'],
                         tuple(diagnostics), truncated=True)) from None
@@ -415,6 +418,28 @@ class WorkflowRecord:
         status = (WorkflowStatus.PARTIALLY_PUBLISHED if self.committed_units
                   else WorkflowStatus.CANCELLED)
         return replace(self, status=status)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowCancellationResult:
+    """Ephemeral evidence retained by the locked native control transaction.
+
+    None means the result cannot establish whether an unconfirmed tail has
+    effects. It is never serialized as a new public workflow result field.
+    """
+    workflow: WorkflowRecord
+    committed_effects_remain: bool | None
+
+    @classmethod
+    def from_control(cls, before: WorkflowRecord,
+                     after: WorkflowRecord) -> WorkflowCancellationResult:
+        if after != before.request_cancel():
+            raise ValueError("PYTHON_WORKFLOW_CONTROL_RESULT_INVALID")
+        certainty = (True if after.committed_units else
+            False if before.status == WorkflowStatus.ACCEPTED
+                and not before.checkpoints
+                and after.status == WorkflowStatus.CANCELLED else None)
+        return cls(after, certainty)
 
 
 class BuildRepository(Protocol):

@@ -15,6 +15,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .cube_aggregate_lifecycle import (
+    AMOUNT_MEASURE_REQUIRED, STALE_CONTEXT,
     AggregateQueryBudgets, AggregateQueryRecord, AggregateQueryStatus,
     AggregateSourcePins, AggregateTechnicalCertificate,
     POSTGRES_EXACT_DIMENSIONAL_BACKEND)
@@ -23,9 +24,11 @@ from .postgres_access import (
     AccessDenied,PostgresAccessChecker,VerifiedIdentity,assert_nonowner_role,
     durable_authority_fields)
 from .postgres_connection import connect_postgres
+from .postgres_aggregate_privileges import authorize_aggregate_selection
 from .postgres_dimensional_scope import resolve_effective_dimensional_scope
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_processing_limits import configure_statement_timeout
+from .selection_contract import SELECTION_METADATA_STALE
 
 
 _AMOUNT = re.compile(r'-?(?:0|[1-9][0-9]{0,29})(?:\.[0-9]{1,8})?\Z')
@@ -33,6 +36,7 @@ _COUNT = re.compile(r'(?:0|[1-9][0-9]*)\Z', re.ASCII)
 _MAX_COUNT = 9223372036854775807
 _HEX32 = re.compile(r'^[0-9a-f]{32}$')
 _HEX64 = re.compile(r'^[0-9a-f]{64}$')
+_VISIBILITY_PINS = ('metadata_revision', 'policy_revision', 'security_revision', 'schema_epoch')
 _KEY = re.compile(r'^[A-Za-z0-9._-]{8,128}$')
 
 
@@ -190,12 +194,11 @@ class PostgresCubeAggregateRepository:
                 or record.subject != self.identity.subject_id):
             raise ValueError('CUBE_AGGREGATE_QUERY_UNAVAILABLE')
 
-    def _authorization_scope_digest(self, db, scope, *,
-                                    request_family='aggregate'):
+    def _authorization_scope(self, db, scope, *, request_family='aggregate'):
         return resolve_effective_dimensional_scope(
             db, self.identity, scope,
             function=('facts.cube.aggregate.request'
-                      if request_family == 'aggregate' else None)).scope_digest
+                      if request_family == 'aggregate' else None))
 
     def _require_current_authorization_scope(self, db, scope, query_id):
         row = db.execute('''SELECT authorization_scope_digest,request_family
@@ -206,9 +209,28 @@ class PostgresCubeAggregateRepository:
             raise ValueError('CUBE_AGGREGATE_QUERY_UNAVAILABLE')
         expected = row['authorization_scope_digest']
         if (expected is None or
-                self._authorization_scope_digest(db, scope,
-                    request_family=row['request_family']) != expected):
+                self._authorization_scope(db, scope,
+                    request_family=row['request_family']).scope_digest != expected):
             raise AccessDenied('CUBE_AGGREGATE_AUTHORIZATION_SCOPE_CHANGED')
+
+    def _require_current_selection(self, db, scope, normalized_request, authorization):
+        if normalized_request.get('source') == 'raw_numeric':
+            authorize_aggregate_selection(db, scope, authorization, normalized_request)
+        pins = normalized_request.get('genericPins')
+        if pins is None:
+            return
+        artifact = db.execute('''SELECT 1 FROM epm.sealed_cube_selection s
+            JOIN epm.application_state a USING (workspace_id,application_id)
+            WHERE s.workspace_id=%s AND s.application_id=%s AND s.selection_id=%s
+              AND s.issuer=%s AND s.subject_id=%s AND s.resolution_digest=%s
+              AND s.metadata_revision=%s AND s.policy_revision=%s
+              AND s.metadata_revision=a.metadata_revision AND s.policy_revision=a.policy_revision
+              AND s.authorization_scope_digest=%s AND s.expires_at>clock_timestamp()''', (
+                scope.workspace_id, scope.application_id, pins['selectionId'],
+                self.identity.issuer, self.identity.subject_id, pins['resolutionDigest'],
+                pins['metadataRevision'], pins['policyRevision'], authorization.scope_digest)).fetchone()
+        if artifact is None:
+            raise ValueError('CUBE_AGGREGATE_SEALED_SELECTION_STALE')
 
     def rerun_as_task_controller(self, scope, query_id, *, idempotency_key):
         """Create a fresh owner query attempt from a terminal source query."""
@@ -226,8 +248,7 @@ class PostgresCubeAggregateRepository:
             sort_keys=True,separators=(',',':'),ensure_ascii=True).encode('ascii')
         new_query_id = sha256(raw).hexdigest()[:32]
         with self._authorized(scope, write=True) as db:
-            authorization_scope_digest = self._authorization_scope_digest(
-                db, scope)
+            authorization = self._authorization_scope(db, scope)
             replay = db.execute('''SELECT query_id,status,rerun_of_query_id
                 FROM epm.cube_aggregate_query WHERE workspace_id=%s
                 AND application_id=%s AND issuer=%s AND subject_id=%s
@@ -249,6 +270,10 @@ class PostgresCubeAggregateRepository:
             if source is None or source['status'] not in (
                     'sealed','expired','failed','cancelled'):
                 raise ValueError('CUBE_AGGREGATE_RERUN_NOT_SUPPORTED')
+            if (source['placement_lineage'] is not None and
+                    source['authorization_scope_digest'] != authorization.scope_digest):
+                raise AccessDenied('CUBE_AGGREGATE_AUTHORIZATION_SCOPE_CHANGED')
+            self._require_current_selection(db, scope, source['normalized_request'], authorization)
             generation = db.execute('''SELECT coalesce(max(rerun_generation),0)+1
                 AS generation FROM epm.cube_aggregate_query
                 WHERE workspace_id=%s AND application_id=%s AND issuer=%s
@@ -277,8 +302,8 @@ class PostgresCubeAggregateRepository:
                  source['ttl_seconds'], source['ttl_seconds'], generation,
                  query_id, idempotency_key, Jsonb(source['placement_lineage'])
                  if source['placement_lineage'] is not None else None,
-                 source['placement_lineage_digest'], list(self.identity.groups),
-                 authorization_scope_digest,token_issued_at,
+                 source['placement_lineage_digest'], list(authorization.access.groups),
+                 authorization.scope_digest,token_issued_at,
                  authority_kind)).fetchone()
             return {'queryId':inserted['query_id'],
                     'status':inserted['status']}
@@ -342,16 +367,18 @@ class PostgresCubeAggregateRepository:
     @contextmanager
     def _authorized(self, scope, *, pins=None, write=False,
                     require_dimensional_safe=False, backend_profile=None,
-                    request_family='aggregate'):
+                    request_family='aggregate', read_function=None):
         if not isinstance(scope, ApplicationScope):
             raise ValueError('CUBE_AGGREGATE_SCOPE_INVALID')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
+                if read_function is not None:
+                    db.execute('SET TRANSACTION READ ONLY')
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
                 PostgresAccessChecker.check_in_transaction(
                     db, self.identity, scope, 'read',
-                    function=('facts.cube.aggregate.request'
+                    function=read_function or ('facts.cube.aggregate.request'
                               if request_family == 'aggregate' else None))
                 state = db.execute('''SELECT s.metadata_revision,s.policy_revision,
                     s.security_revision,s.schema_epoch,EXISTS(SELECT 1 FROM
@@ -368,9 +395,8 @@ class PostgresCubeAggregateRepository:
                     raise AccessDenied(
                         'CUBE_AGGREGATE_DIMENSIONAL_SECURITY_FILTER_REQUIRED')
                 if pins is not None and any(state[key] != getattr(pins, key)
-                        for key in ('metadata_revision', 'policy_revision',
-                                    'security_revision', 'schema_epoch')):
-                    raise ValueError('CUBE_AGGREGATE_STALE_CONTEXT')
+                        for key in _VISIBILITY_PINS):
+                    raise ValueError(STALE_CONTEXT)
                 yield db
 
     @staticmethod
@@ -403,8 +429,9 @@ class PostgresCubeAggregateRepository:
         self._require_owner(record)
         with self._authorized(record.scope, write=True,
                               request_family=record.request_family) as db:
-            authorization_scope_digest = self._authorization_scope_digest(
+            authorization = self._authorization_scope(
                 db, record.scope, request_family=record.request_family)
+            self._require_current_selection(db, record.scope, normalized_request, authorization)
             token_issued_at,authority_kind=durable_authority_fields(self.identity)
             db.execute('''INSERT INTO epm.cube_aggregate_query(
                 workspace_id,application_id,query_id,issuer,subject_id,request_digest,
@@ -418,9 +445,9 @@ class PostgresCubeAggregateRepository:
                  Jsonb(normalized_request), record.status.value, record.budgets.max_groups,
                  record.budgets.max_result_bytes, record.budgets.page_size,
                  record.budgets.ttl_seconds, _timestamp(record.accepted_at),
-                 _timestamp(record.expires_at), list(self.identity.groups),
+                 _timestamp(record.expires_at), list(authorization.access.groups),
                  record.request_family,
-                 authorization_scope_digest,token_issued_at,authority_kind))
+                 authorization.scope_digest,token_issued_at,authority_kind))
 
     def insert_ready(self, record, *, normalized_request,
                      technical_lineage=None):
@@ -435,8 +462,9 @@ class PostgresCubeAggregateRepository:
         ready = record.transition(AggregateQueryStatus.READY)
         with self._authorized(record.scope, write=True,
                               request_family=record.request_family) as db:
-            authorization_scope_digest = self._authorization_scope_digest(
+            authorization = self._authorization_scope(
                 db, record.scope, request_family=record.request_family)
+            self._require_current_selection(db, record.scope, normalized_request, authorization)
             token_issued_at,authority_kind=durable_authority_fields(self.identity)
             db.execute('''INSERT INTO epm.cube_aggregate_query(
                 workspace_id,application_id,query_id,issuer,subject_id,request_digest,
@@ -451,8 +479,8 @@ class PostgresCubeAggregateRepository:
                  record.budgets.max_result_bytes, record.budgets.page_size,
                  record.budgets.ttl_seconds, _timestamp(record.accepted_at),
                  _timestamp(record.expires_at),lineage,lineage_digest,
-                 list(self.identity.groups),record.request_family,
-                 authorization_scope_digest,
+                 list(authorization.access.groups),record.request_family,
+                 authorization.scope_digest,
                  token_issued_at,authority_kind))
         return ready
 
@@ -657,6 +685,15 @@ class PostgresCubeAggregateRepository:
 
     def settle_cancelled_claim(self, claim):
         """Terminally settle only the still-live generation-owned claim."""
+        return self._settle_claim(claim, 'cancel_requested', 'cancelled', None)
+
+    def settle_amount_failure_claim(self, claim):
+        return self._settle_claim(claim, 'running', 'failed', AMOUNT_MEASURE_REQUIRED)
+
+    def settle_resolved_stale_selection(self, claim):
+        return self._settle_claim(claim, 'running', 'failed', SELECTION_METADATA_STALE)
+
+    def _settle_claim(self, claim, current_status, status, error_code):
         if (type(claim) is not dict or not isinstance(
                 claim.get('record'), AggregateQueryRecord)
                 or type(claim.get('claimant')) is not str
@@ -666,13 +703,15 @@ class PostgresCubeAggregateRepository:
         with self._authorized(record.scope,write=True,
                               request_family=record.request_family) as db:
             changed=db.execute('''UPDATE epm.cube_aggregate_query SET
-                status='cancelled',claimant=NULL,lease_until=NULL,
+                status=%s,error_code=%s,claimant=NULL,lease_until=NULL,
                 updated_at=transaction_timestamp()
                 WHERE workspace_id=%s AND application_id=%s AND query_id=%s
-                  AND status='cancel_requested' AND claim_generation=%s
+                  AND issuer=%s AND subject_id=%s AND request_family=%s
+                  AND status=%s AND claim_generation=%s
                   AND claimant=%s AND lease_until>clock_timestamp()''',(
-                record.scope.workspace_id,record.scope.application_id,
-                record.query_id,claim['claimGeneration'],
+                status,error_code,record.scope.workspace_id,record.scope.application_id,
+                record.query_id,record.issuer,record.subject,record.request_family,
+                current_status,claim['claimGeneration'],
                 claim['claimant'])).rowcount
             return changed==1
 
@@ -886,23 +925,47 @@ class PostgresCubeAggregateRepository:
         self._require_owner(current)
         if current.status != AggregateQueryStatus.COMPUTED or current.certificate is None:
             raise ValueError('CUBE_AGGREGATE_COMPUTED_RECORD_REQUIRED')
-        # This separate transaction is the post-compute authorization fence.
-        with self._authorized(current.scope, pins=current.certificate.source_pins,
-                              write=True, require_dimensional_safe=True,
-                              backend_profile=
-                                  current.certificate.backend_profile,
+        # Keep the application revision fence until the computed result has a
+        # durable visibility outcome. The query lock then serializes seal and
+        # cancellation without re-running the private computation.
+        scope = (current.scope.workspace_id, current.scope.application_id)
+        owner = (*scope, current.query_id, current.issuer, current.subject, current.request_family)
+        pins = current.certificate.source_pins
+        with self._authorized(current.scope, write=True, require_dimensional_safe=True,
+                              backend_profile=current.certificate.backend_profile,
                               request_family=current.request_family) as db:
+            state = db.execute('''SELECT metadata_revision,policy_revision,security_revision,schema_epoch
+                FROM epm.application_state WHERE workspace_id=%s AND application_id=%s FOR SHARE''',
+                scope).fetchone()
+            if state is None:
+                raise ValueError('APPLICATION_UNAVAILABLE')
             self._require_current_authorization_scope(
                 db, current.scope, current.query_id)
-            result = db.execute('''UPDATE epm.cube_aggregate_query SET status='sealed',
-                updated_at=transaction_timestamp() WHERE workspace_id=%s
-                AND application_id=%s AND query_id=%s AND status='computed'
-                AND result_digest=%s''', (current.scope.workspace_id,
-                    current.scope.application_id, current.query_id,
-                    current.certificate.result_digest))
-            if result.rowcount != 1:
+            observed = self._record(db.execute('''SELECT * FROM epm.cube_aggregate_query
+                WHERE workspace_id=%s AND application_id=%s AND query_id=%s AND issuer=%s
+                  AND subject_id=%s AND request_family=%s FOR UPDATE''', owner).fetchone())
+            if (observed is None or observed.request_digest != current.request_digest
+                    or observed.certificate != current.certificate):
                 raise ValueError('CUBE_AGGREGATE_STALE_CONTROL_STATE')
-        return current.transition(AggregateQueryStatus.SEALED)
+            if observed.status is not AggregateQueryStatus.COMPUTED:
+                return observed
+            stale = any(state[key] != getattr(pins, key) for key in _VISIBILITY_PINS)
+            outcome = db.execute('''UPDATE epm.cube_aggregate_query
+                SET status=CASE WHEN expires_at<=statement_timestamp() THEN 'expired' ELSE %s END,
+                    error_code=CASE WHEN expires_at<=statement_timestamp()
+                        THEN NULL ELSE %s END,
+                    updated_at=transaction_timestamp()
+                WHERE workspace_id=%s AND application_id=%s AND query_id=%s
+                RETURNING status,error_code''', (
+                    'failed' if stale else 'sealed', STALE_CONTEXT if stale else None,
+                    *scope, current.query_id)).fetchone()
+            status = AggregateQueryStatus(outcome['status'])
+            if status in (AggregateQueryStatus.FAILED, AggregateQueryStatus.EXPIRED):
+                db.execute('''DELETE FROM epm.cube_aggregate_result
+                    WHERE workspace_id=%s AND application_id=%s AND query_id=%s''',
+                    (*scope, current.query_id))
+            return observed.transition(status, certificate=observed.certificate,
+                                       error_code=outcome['error_code'])
 
     def page(self, record, *, after_ordinal, limit):
         self._require_owner(record)
@@ -945,6 +1008,27 @@ class PostgresCubeAggregateRepository:
                  **({'minAmount': row['min_amount']} if 'MinAmount' in kinds else {}),
                  **({'maxAmount': row['max_amount']} if 'MaxAmount' in kinds else {})}
                 for row in rows], has_more
+
+    def read_placement_lineage(self, scope, query_id):
+        with self._authorized(scope, read_function='cube.aggregate.lineage.read') as db:
+            row = db.execute('''SELECT q.status,q.placement_lineage,q.placement_lineage_digest,
+                q.normalized_request,a.metadata_revision,a.policy_revision
+                FROM epm.cube_aggregate_query q JOIN epm.application_state a
+                  USING (workspace_id,application_id)
+                WHERE q.workspace_id=%s AND q.application_id=%s AND q.query_id=%s
+                  AND q.issuer=%s AND q.subject_id=%s AND q.request_family='aggregate' ''', (
+                    scope.workspace_id, scope.application_id, query_id,
+                    self.identity.issuer, self.identity.subject_id)).fetchone()
+            if row is None or row['placement_lineage'] is None:
+                raise ValueError('CUBE_AGGREGATE_PLACEMENT_LINEAGE_UNAVAILABLE')
+            self._require_current_authorization_scope(db, scope, query_id)
+            request = row['normalized_request']
+            pins = request.get('genericPins') or request.get('hierarchyPins')
+            if (pins is None or pins['metadataRevision'] != row['metadata_revision'] or
+                    pins['policyRevision'] != row['policy_revision']):
+                raise ValueError('CUBE_AGGREGATE_STALE_CONTEXT')
+            return {'queryId': query_id, 'status': row['status'],
+                    'lineageDigest': row['placement_lineage_digest'], 'lineage': row['placement_lineage']}
 
     def page_resolved(self,record,*,after_ordinal,limit):
         self._require_owner(record)

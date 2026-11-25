@@ -1,3 +1,4 @@
+import { browserIdentityFixture } from "./test-setup";
 import {
   act,
   fireEvent,
@@ -28,21 +29,94 @@ import {
 import { resolveWorkflowDestination } from "./workflow-destination";
 import type {
   MetadataDestination,
+  MetadataNavigationDimension,
   MetadataSection,
 } from "./metadata-navigation";
-import type { ApplicationSummary } from "./types";
+import type { ApplicationCatalog, ApplicationSummary } from "./types";
+
+it("keeps inspected tasks available while assigned work is pending and after its read fails", async () => {
+  let finishWork: (value: Response) => void = () => undefined;
+  const work = new Promise<Response>((resolve) => {
+    finishWork = resolve;
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url) => {
+      if (String(url) === "/api/tasks")
+        return new Response(
+          JSON.stringify({
+            tasks: [
+              {
+                taskId: "one",
+                sequence: 1,
+                function: "facts.numeric.batch",
+                status: "Running",
+                progressState: "inProgress",
+              },
+            ],
+            hasMore: false,
+            nextSequence: 1,
+          }),
+        );
+      return work;
+    }),
+  );
+  render(
+    <Overview
+      app={{
+        workspaceId: "ws",
+        applicationId: "app",
+        name: "Plan",
+        status: "Active",
+      }}
+      catalog={{
+        applicationAccess: { role: "Reader", workspaceAdministrator: false },
+        enabledCapabilities: [],
+        functions: { "application.workflow.worklist": {} },
+        revisions: { metadata: 1, data: 2, policy: 3, security: 4, commit: 5 },
+      }}
+      go={vi.fn()}
+    />,
+  );
+  await screen.findByText("facts.numeric.batch");
+  expect(screen.getByText("Loading assigned work…")).toBeVisible();
+  expect(
+    screen.getByText("Ready for you").parentElement?.querySelector("strong"),
+  ).toHaveTextContent(/^—$/);
+  await act(async () =>
+    finishWork(
+      new Response(JSON.stringify({ error: "WORK_READ_FAILED" }), {
+        status: 400,
+      }),
+    ),
+  );
+  expect(
+    await screen.findByText("Assigned work could not be loaded."),
+  ).toBeVisible();
+  expect(screen.getByText("facts.numeric.batch")).toBeVisible();
+  expect(
+    screen.getByText("In progress").parentElement?.querySelector("strong"),
+  ).toHaveTextContent(/^1$/);
+});
 
 vi.mock("./MetadataWorkspace", () => ({
   MetadataWorkspace: ({
     app,
+    catalog,
     section,
     dimensionId,
     onNavigate,
+    onDimensionsChange,
   }: {
     app?: ApplicationSummary;
+    catalog: ApplicationCatalog | null;
     section: MetadataSection;
     dimensionId?: string;
     onNavigate: (destination: MetadataDestination) => void;
+    onDimensionsChange: (
+      dimensions: MetadataNavigationDimension[],
+      metadataRevision: number,
+    ) => void;
   }) => (
     <section aria-label="Metadata navigation fixture">
       <p>Metadata application: {app?.applicationId || "none"}</p>
@@ -61,6 +135,23 @@ vi.mock("./MetadataWorkspace", () => ({
         }
       >
         Open account relationships
+      </button>
+      <button
+        onClick={() =>
+          onDimensionsChange(
+            [
+              {
+                dimension_id: "Account",
+                name: "Current catalogue dimension",
+                model_role: "Account",
+                status: "Active",
+              },
+            ],
+            catalog?.revisions.metadata ?? 0,
+          )
+        }
+      >
+        Publish metadata navigation
       </button>
     </section>
   ),
@@ -207,6 +298,26 @@ it("keeps generic authoring and administration navigation role aware", () => {
   expect(applicationPageVisible("rules", reader)).toBe(false);
   expect(applicationPageVisible("administration", reader)).toBe(false);
   expect(applicationPageVisible("monitor", reader)).toBe(true);
+  expect(applicationPageVisible("security", reader)).toBe(false);
+  const reviewer = {
+    ...reader,
+    applicationAccess: {
+      role: "Assigned",
+      authorizationModel: "group_assignments" as const,
+      roles: ["Access Reviewer"],
+      workspaceAdministrator: false,
+    },
+    functions: { "security.application.effective-access.list": {} },
+  };
+  expect(applicationPageVisible("security", reviewer)).toBe(true);
+  for (const page of [
+    "metadata",
+    "rules",
+    "grid",
+    "administration",
+    "monitor",
+  ] as const)
+    expect(applicationPageVisible(page, reviewer)).toBe(false);
   expect(
     applicationPageVisible("rules", {
       ...reader,
@@ -298,12 +409,22 @@ it("resolves only exact authorized workflow destinations", () => {
     },
   });
   for (const [artifactKind, readFunction] of [
-    ["ApplicationSequence", "rules.numeric_sequence.read"],
     ["ApplicationSchedule", "schedule.read"],
   ] as const) {
     const artifactCatalog = {
       ...catalog,
-      functions: { ...catalog.functions, [readFunction]: {} },
+      functions: {
+        ...catalog.functions,
+        [readFunction]: {
+          availability: {
+            version: 1,
+            kind: "current-definition-owner",
+            ownerFunction: "rules.numeric_sequence.template",
+            status: "available",
+            code: null,
+          },
+        },
+      },
     };
     expect(
       resolveWorkflowDestination(
@@ -327,6 +448,18 @@ it("resolves only exact authorized workflow destinations", () => {
       },
     });
   }
+  expect(
+    resolveWorkflowDestination(
+      {
+        kind: "Artifact",
+        artifactKind: "ApplicationSequence",
+        artifactId: "old-sequence",
+        stateToken: "c".repeat(64),
+        digest: "b".repeat(64),
+      },
+      { ...catalog, functions: { "rules.numeric_sequence.read": {} } },
+    ),
+  ).toMatchObject({ supported: false, code: "APPLICATION_FUNCTION_RETIRED" });
   const calculatedMemberCatalog = {
     ...catalog,
     functions: {
@@ -381,7 +514,7 @@ it("resolves only exact authorized workflow destinations", () => {
     ),
   ).toMatchObject({
     supported: false,
-    code: "WORKFLOW_ARTIFACT_DESTINATION_UNAUTHORIZED",
+    code: "WORKFLOW_ARTIFACT_DESTINATION_UNAVAILABLE",
   });
   const applicationRuleCatalog = {
     ...catalog,
@@ -464,6 +597,8 @@ it("opens each My Work item at its exact generic flow identity", async () => {
                 status: "Waiting",
               },
             ],
+            hasMore: false,
+            nextSequence: 0,
           }),
         );
       if (body.program.function === "application.workflow.worklist")
@@ -506,17 +641,18 @@ it("opens each My Work item at its exact generic flow identity", async () => {
   );
 
   await screen.findByText("Approve forecast");
-  const continueButtons = screen.getAllByRole("button", {
-    name: "Open activity →",
-  });
-  fireEvent.click(continueButtons[0]);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Open activity Approve forecast" }),
+  );
   expect(open).toHaveBeenCalledWith("flows", {
     workspaceId: "ws",
     applicationId: "app",
     occurrenceId: "occ-7",
     activityId: "approve",
   });
-  fireEvent.click(continueButtons[1]);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Open activity Workflow activity" }),
+  );
   expect(open).toHaveBeenCalledWith("flows", {
     workspaceId: "ws",
     applicationId: "app",
@@ -556,6 +692,8 @@ it("prefers generic programmable workflow work over retained planning flows", as
                 status: "Waiting",
               },
             ],
+            hasMore: false,
+            nextSequence: 0,
           }),
         );
       functions.push(body.program.function);
@@ -607,7 +745,9 @@ it("prefers generic programmable workflow work over retained planning flows", as
   expect(screen.queryByText("review")).not.toBeInTheDocument();
   expect(screen.queryByText(/planning assignment/i)).not.toBeInTheDocument();
   fireEvent.click(
-    screen.getAllByRole("button", { name: "Open activity →" })[0],
+    screen.getByRole("button", {
+      name: "Open activity Prepare selected cube slice",
+    }),
   );
   expect(open).toHaveBeenCalledWith("flows", {
     workspaceId: "ws",
@@ -635,17 +775,23 @@ it("keeps business work prominent and technical revisions in details", async () 
             tasks: [
               {
                 taskId: "task-1",
+                sequence: 2,
                 function: "facts.cube.aggregate.request",
                 status: "Running",
+                progressState: "inProgress",
                 initiatorKind: "MCP agent",
               },
               {
                 taskId: "task-2",
+                sequence: 1,
                 function: "facts.source.begin",
                 status: "Failed",
+                progressState: "attention",
                 initiatorKind: "Human",
               },
             ],
+            nextSequence: 1,
+            hasMore: false,
           }),
         );
       const body = JSON.parse(String(init?.body));
@@ -686,12 +832,17 @@ it("keeps business work prominent and technical revisions in details", async () 
     expect(screen.getByText("Ready for you")).toBeInTheDocument(),
   );
   expect(screen.queryByText("Reviews waiting")).not.toBeInTheDocument();
+  expect(await screen.findByText("facts.cube.aggregate.request")).toBeVisible();
   expect(
-    screen.getByText(/Counts reflect the loaded worklist/),
-  ).toBeInTheDocument();
-  expect(screen.getByText("Work running")).toBeInTheDocument();
+    screen.getByText(
+      "The current application catalogue does not include assigned work.",
+    ),
+  ).toBeVisible();
+  expect(
+    screen.getByText("Ready for you").parentElement?.querySelector("strong"),
+  ).toHaveTextContent(/^—$/);
+  expect(screen.getByText("In progress")).toBeInTheDocument();
   expect(screen.getByText("Needs attention")).toBeInTheDocument();
-  expect(screen.getByText("facts.cube.aggregate.request")).toBeInTheDocument();
   expect(screen.getByText("Application details")).toBeInTheDocument();
   expect(screen.queryByText("Authorized functions")).not.toBeInTheDocument();
   expect(screen.queryByText("Current revision")).not.toBeInTheDocument();
@@ -727,7 +878,7 @@ it("renders the agent-first shell from existing read contracts", async () => {
       if (url === "/api/session-identity")
         return new Response(
           JSON.stringify({
-            subject: sessionSubject,
+            ...browserIdentityFixture(sessionSubject),
             displayIdentity: `${sessionSubject}@example.com`,
             applicationMcpEndpoint: "https://mcp.example/epu_personal",
           }),
@@ -878,7 +1029,11 @@ it("renders the agent-first shell from existing read contracts", async () => {
     );
     await Promise.resolve();
   });
-  expect(screen.getByText("Link copied")).toBeInTheDocument();
+  expect(
+    screen.getByText(
+      "Page link copied. Unsaved or unresolved grid context is not included.",
+    ),
+  ).toBeInTheDocument();
   expect(writeText).toHaveBeenCalledWith(
     `${window.location.origin}/#/grid/0?workspace=ws-pilot&application=pilot-fpna`,
   );
@@ -929,23 +1084,26 @@ it("renders the agent-first shell from existing read contracts", async () => {
     "#/work/0?workspace=ws-pilot&application=pilot-fpna",
   );
   await waitFor(() =>
-    expect(screen.getByText("No work is currently ready")).toBeInTheDocument(),
+    expect(
+      screen.getByText(
+        "The current application catalogue does not include assigned work.",
+      ),
+    ).toBeInTheDocument(),
   );
   expect(
     screen.getByRole("group", { name: "Filter work by state" }),
   ).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "All 0" })).toHaveAttribute(
+  expect(screen.getByRole("button", { name: "All —" })).toHaveAttribute(
     "aria-pressed",
     "true",
   );
-  fireEvent.click(screen.getByRole("button", { name: "Waiting 0" }));
-  expect(screen.getByRole("button", { name: "Waiting 0" })).toHaveAttribute(
-    "aria-pressed",
-    "true",
-  );
+  const unavailableWaiting = screen.getByRole("button", { name: "Waiting —" });
+  expect(unavailableWaiting).toBeDisabled();
+  fireEvent.click(unavailableWaiting);
+  expect(unavailableWaiting).toHaveAttribute("aria-pressed", "false");
   expect(
-    screen.getByText("No work waiting on dependencies"),
-  ).toBeInTheDocument();
+    screen.queryByText("No work waiting on dependencies"),
+  ).not.toBeInTheDocument();
   expect(
     screen.queryByText("No work is currently ready"),
   ).not.toBeInTheDocument();
@@ -954,10 +1112,13 @@ it("renders the agent-first shell from existing read contracts", async () => {
   fireEvent(document, new Event("visibilitychange"));
   expect(await screen.findByText("Identity changed")).toBeInTheDocument();
   expect(
-    screen.getByRole("list", { name: "Unpublished browser work" }),
-  ).toHaveTextContent("Unsaved grid value");
+    screen.queryByRole("list", { name: "Unpublished browser work" }),
+  ).not.toBeInTheDocument();
   fireEvent.click(
     screen.getByRole("button", { name: "Discard drafts and continue" }),
+  );
+  await waitFor(() =>
+    expect(document.querySelector(".shell")).not.toHaveAttribute("inert"),
   );
   expect(
     screen.queryByRole("list", { name: "Unpublished browser work" }),
@@ -979,6 +1140,16 @@ it("renders the agent-first shell from existing read contracts", async () => {
   expect(
     screen.getByRole("button", { name: "Retry connection" }),
   ).toBeInTheDocument();
+  act(() => setBrowserLifecycle("offline", "NETWORK_UNAVAILABLE"));
+  expect(await screen.findByText("You are offline")).toBeInTheDocument();
+  expect(
+    screen.getByText(
+      /Unconfirmed operations may have completed; reconnect and reconcile their original status/,
+    ),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByText(/nothing has been published/),
+  ).not.toBeInTheDocument();
 });
 
 it("round-trips metadata pages with exact application, dimension and member identity", () => {
@@ -1042,7 +1213,7 @@ function metadataNavigationFixture(
       if (url === "/api/session-identity")
         return new Response(
           JSON.stringify({
-            subject: "designer",
+            ...browserIdentityFixture("designer"),
             displayIdentity: "designer@example.com",
           }),
         );
@@ -1066,6 +1237,7 @@ function metadataNavigationFixture(
             },
             enabledCapabilities: [],
             functions: {
+              "security.application.access.list": {},
               "metadata.dimension.list": {},
               "metadata.member.list": {},
             },
@@ -1084,6 +1256,162 @@ function metadataNavigationFixture(
     }),
   );
 }
+
+it.each([650, 651, 684, 950, 951])(
+  "keeps sidebar state and metadata destinations coherent at %ipx",
+  async (width) => {
+    metadataNavigationFixture();
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: width <= Number(/max-width: (\d+)px/.exec(query)?.[1]),
+      media: query,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    }));
+    window.history.replaceState(
+      null,
+      "",
+      "#/metadata/0?workspace=ws&application=alpha&metadataSection=members&dimension=Account",
+    );
+    render(<App />);
+    await screen.findByText("Metadata application: alpha");
+    const compact = width <= 950;
+    const toggle = screen.getByRole("button", {
+      name: compact ? "Expand sidebar" : "Collapse sidebar",
+    });
+    expect(toggle).toHaveAttribute("aria-expanded", String(!compact));
+    if (compact) {
+      expect(screen.queryByRole("button", { name: "Dimensions" })).toBeNull();
+      fireEvent.click(toggle);
+    }
+    expect(
+      await screen.findByRole("button", { name: "Dimensions" }),
+    ).toBeVisible();
+    if (width === 650) {
+      const close = screen.getByRole("button", { name: "Close sidebar" });
+      close.focus();
+      fireEvent.click(close);
+      expect(
+        screen.getByRole("button", { name: "Expand sidebar" }),
+      ).toHaveFocus();
+      expect(screen.queryByRole("button", { name: "Dimensions" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    }
+    const reference = screen.getByRole("button", {
+      name: "Function reference",
+    });
+    reference.focus();
+    fireEvent.click(reference);
+    await screen.findByText("Metadata section: reference");
+    expect(window.location.hash).toContain("application=alpha");
+    expect(
+      screen.getByRole("button", {
+        name: compact ? "Expand sidebar" : "Collapse sidebar",
+      }),
+    ).toHaveAttribute("aria-expanded", String(!compact));
+    if (compact)
+      expect(
+        screen.getByRole("button", { name: "Expand sidebar" }),
+      ).toHaveFocus();
+  },
+);
+
+it.each([
+  {
+    statuses: ["Cancelled", "Completed"],
+    states: ["other", "other"],
+    hasMore: true,
+    running: "0",
+    attention: "0",
+  },
+  {
+    statuses: ["Running", "Failed"],
+    states: ["inProgress", "attention"],
+    hasMore: true,
+    running: "1",
+    attention: "1",
+  },
+  {
+    statuses: ["InterruptRequested", "NeedsInspection"],
+    states: ["attention", "attention"],
+    hasMore: false,
+    running: "0",
+    attention: "2",
+  },
+])(
+  "reports only inspected status counts for $statuses with hasMore=$hasMore",
+  async ({ statuses, states, hasMore, running, attention }) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async (input: RequestInfo | URL) =>
+          new Response(
+            JSON.stringify(
+              String(input) === "/api/tasks"
+                ? {
+                    hasMore,
+                    nextSequence: 1,
+                    tasks: statuses.map((status, index) => ({
+                      taskId: `task-${index}`,
+                      sequence: statuses.length - index,
+                      function: "example.read",
+                      status,
+                      progressState: states[index],
+                    })),
+                  }
+                : {
+                    result: {
+                      items: [{ activityId: "assigned" }],
+                      nextCursor: "next-work-page",
+                    },
+                  },
+            ),
+          ),
+      ),
+    );
+    render(
+      <Overview
+        app={{
+          workspaceId: "ws",
+          applicationId: "app",
+          name: "Plan",
+          status: "Active",
+        }}
+        catalog={{
+          applicationAccess: { role: "Planner", workspaceAdministrator: false },
+          enabledCapabilities: [],
+          functions: { "application.workflow.worklist": {} },
+          revisions: {
+            metadata: 1,
+            data: 1,
+            policy: 1,
+            security: 1,
+            commit: 1,
+          },
+        }}
+        go={vi.fn()}
+      />,
+    );
+    await screen.findByText(/count matches in 2 inspected tasks/);
+    expect(
+      screen.getByText("In progress").parentElement?.querySelector("strong"),
+    ).toHaveTextContent(new RegExp(`^${running}$`));
+    expect(
+      screen
+        .getByText("Needs attention")
+        .parentElement?.querySelector("strong"),
+    ).toHaveTextContent(new RegExp(`^${attention}$`));
+    expect(
+      screen.getByText("Ready for you").parentElement?.querySelector("strong"),
+    ).toHaveTextContent(/^1\+$/);
+    expect(
+      screen.getByText(
+        hasMore
+          ? /Their progress and attention counts are unknown/
+          : /No further tasks were reported/,
+      ),
+    ).toBeInTheDocument();
+  },
+);
 
 it("resolves metadata application identity rather than a stale positional index", async () => {
   metadataNavigationFixture();
@@ -1118,7 +1446,97 @@ it("does not render fallback metadata for an unknown explicit application", asyn
   ).not.toBeInTheDocument();
 });
 
-it.each(["overview", "grid", "data", "rules", "flows", "monitor"])(
+it("keeps an unavailable metadata destination at its exact application and restores it after revalidation", async () => {
+  let role = "Reader";
+  metadataNavigationFixture(async () => {
+    const value = await catalogResponse().json();
+    value.applicationAccess.role = role;
+    value.functions["metadata.dimension.list"] = {};
+    return Response.json(value);
+  });
+  const destination =
+    "#/metadata/1?workspace=ws&application=beta&metadataSection=members&dimension=Account";
+  window.history.replaceState(null, "", destination);
+  render(<App />);
+  expect(
+    await screen.findByRole("heading", { name: "Metadata unavailable" }),
+  ).toBeVisible();
+  expect(window.location.hash).toBe(destination);
+  expect(
+    screen.getByRole("button", { name: "Open application overview" }),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("region", { name: "Metadata navigation fixture" }),
+  ).toBeNull();
+
+  role = "Administrator";
+  act(() => window.dispatchEvent(new Event("online")));
+  expect(await screen.findByText("Metadata application: beta")).toBeVisible();
+  expect(screen.getByText("Metadata dimension: Account")).toBeVisible();
+  expect(window.location.hash).toBe(destination);
+});
+
+it.each(["security revision", "current access context"] as const)(
+  "withdraws previous dimension names when the %s changes",
+  async (change) => {
+    let refreshed = false;
+    metadataNavigationFixture(async () => {
+      const value = await catalogResponse().json();
+      value.functions["metadata.dimension.list"] = {};
+      value.revisions.security =
+        refreshed && change === "security revision" ? 2 : 1;
+      value.accessContext =
+        refreshed && change === "current access context"
+          ? "b".repeat(64)
+          : "a".repeat(64);
+      return Response.json(value);
+    });
+    const destination =
+      "#/metadata/0?workspace=ws&application=alpha&metadataSection=members&dimension=Account";
+    window.history.replaceState(null, "", destination);
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Publish metadata navigation",
+      }),
+    );
+    const breadcrumb = within(
+      screen.getByRole("navigation", { name: "Breadcrumb" }),
+    );
+    expect(
+      breadcrumb.getByRole("link", { name: "Current catalogue dimension" }),
+    ).toBeVisible();
+
+    refreshed = true;
+    act(() => window.dispatchEvent(new Event("online")));
+    await waitFor(() => expect(breadcrumb.getByText("Account")).toBeVisible());
+    expect(breadcrumb.queryByText("Current catalogue dimension")).toBeNull();
+    expect(breadcrumb.getByRole("link", { name: "Account" })).toBeVisible();
+    expect(
+      screen.queryByRole("button", {
+        name: "Collapse Current catalogue dimension metadata",
+      }),
+    ).toBeNull();
+    expect(window.location.hash).toBe(destination);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Publish metadata navigation" }),
+    );
+    expect(
+      breadcrumb.getByRole("link", { name: "Current catalogue dimension" }),
+    ).toBeVisible();
+  },
+);
+
+it.each([
+  "overview",
+  "grid",
+  "data",
+  "rules",
+  "flows",
+  "monitor",
+  "security",
+  "administration",
+])(
   "rejects an unknown explicit application on %s instead of reading the selected fallback",
   async (page) => {
     metadataNavigationFixture();
@@ -1138,6 +1556,112 @@ it.each(["overview", "grid", "data", "rules", "flows", "monitor"])(
     ).toHaveLength(0);
   },
 );
+
+it("rechecks the same Monitor reference when application authority changes", async () => {
+  let downgraded = false;
+  let holdPrevious = false;
+  metadataNavigationFixture(async () => {
+    const value = await catalogResponse().json();
+    value.applicationAccess.role = downgraded ? "Reader" : "Administrator";
+    value.revisions.security = downgraded ? 2 : 1;
+    return new Response(JSON.stringify(value));
+  });
+  const fixture = vi.mocked(fetch).getMockImplementation()!;
+  const task = {
+    taskId: "exact-monitor-origin",
+    sequence: 1,
+    sourceFamily: "Job",
+    function: "previously.visible.task",
+    status: "Running",
+    progressState: "inProgress",
+    latestEvent: null,
+  };
+  const held: Array<{ signal?: AbortSignal | null; settle: () => void }> = [];
+  const currentReads: string[] = [];
+  vi.mocked(fetch).mockImplementation(async (input, init) => {
+    const path = String(input);
+    if (path === "/api/events")
+      return new Promise<Response>((resolve) => {
+        held.push({
+          signal: init?.signal,
+          settle: () =>
+            resolve(
+              new Response(
+                JSON.stringify({
+                  events: [
+                    {
+                      sequence: 1,
+                      job_id: "a".repeat(32),
+                      status: "private-job-state",
+                    },
+                  ],
+                  nextSequence: 1,
+                  hasMore: false,
+                }),
+              ),
+            ),
+        });
+      });
+    if (path !== "/api/tasks" && path !== "/api/task")
+      return fixture(input, init);
+    const body = JSON.parse(String(init?.body));
+    expect(body.applicationId).toBe("alpha");
+    const result = () =>
+      new Response(
+        JSON.stringify(
+          path === "/api/tasks"
+            ? {
+                tasks: [task],
+                nextSequence: 1,
+                hasMore: false,
+              }
+            : task,
+        ),
+      );
+    if (!downgraded && holdPrevious)
+      return new Promise<Response>((resolve) => {
+        held.push({ signal: init?.signal, settle: () => resolve(result()) });
+      });
+    if (!downgraded) return result();
+    currentReads.push(path);
+    return path === "/api/tasks"
+      ? new Response(
+          JSON.stringify({ tasks: [], nextSequence: 0, hasMore: false }),
+        )
+      : new Response(JSON.stringify({ code: "TASK_UNAVAILABLE" }), {
+          status: 403,
+        });
+  });
+  window.history.replaceState(
+    null,
+    "",
+    "#/monitor/0?workspace=ws&application=alpha&task=exact-monitor-origin",
+  );
+  render(<App />);
+  await screen.findByRole("region", { name: "Client handoff" });
+  holdPrevious = true;
+  fireEvent.click(screen.getByRole("button", { name: "Show jobs" }));
+  const refresh = screen.getByRole("button", { name: "Refresh" });
+  refresh.focus();
+  fireEvent.click(refresh);
+  await waitFor(() => expect(held).toHaveLength(3));
+  downgraded = true;
+  act(() => window.dispatchEvent(new Event("online")));
+  await waitFor(() =>
+    expect(currentReads).toEqual(["/api/tasks", "/api/task"]),
+  );
+  expect(window.location.hash).toContain("task=exact-monitor-origin");
+  expect(screen.queryByRole("region", { name: "Client handoff" })).toBeNull();
+  expect(held.every(({ signal }) => signal?.aborted)).toBe(true);
+  await act(async () => held.forEach(({ settle }) => settle()));
+  expect(await screen.findByText("TASK_UNAVAILABLE")).toBeVisible();
+  expect(screen.queryByText(task.function)).toBeNull();
+  expect(screen.queryByText("private-job-state")).toBeNull();
+  expect(
+    screen.queryByRole("complementary", { name: "Selected task detail" }),
+  ).toBeNull();
+  expect(document.getElementById("main-content")).toHaveFocus();
+});
 
 it("guards leaving a non-metadata workspace and preserves the route on cancel", async () => {
   metadataNavigationFixture();
@@ -1160,6 +1684,111 @@ it("guards leaving a non-metadata workspace and preserves the route on cancel", 
   await waitFor(() => expect(window.location.hash).toContain("#/home/"));
 });
 
+it.each([
+  { surface: "search", removed: false },
+  { surface: "search", removed: true },
+  { surface: "workspace selector", removed: false },
+  { surface: "workspace selector", removed: true },
+])(
+  "preserves the application chosen in $surface before inventory revalidation (target removed: $removed)",
+  async ({ surface, removed }) => {
+    metadataNavigationFixture();
+    const original = vi.mocked(fetch).getMockImplementation()!;
+    const current = {
+      workspaceId: "a",
+      applicationId: "plan",
+      name: "Current model",
+      status: "Active",
+    };
+    const target = { ...current, workspaceId: "c", name: "Requested model" };
+    const alternative = { ...current, workspaceId: "b", name: "Another model" };
+    let holdListing = false;
+    let releaseListing: (() => void) | undefined;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (String(input) !== "/api/applications") return original(input, init);
+      const result = (applications: (typeof current)[]) =>
+        new Response(JSON.stringify({ applications, nextAfter: null }));
+      if (!holdListing) return result([current, target]);
+      return new Promise<Response>((resolve) => {
+        releaseListing = () =>
+          resolve(
+            result(
+              removed ? [current, alternative] : [current, alternative, target],
+            ),
+          );
+      });
+    });
+    window.history.replaceState(
+      null,
+      "",
+      "#/overview/0?workspace=a&application=plan",
+    );
+    render(<App />);
+    await screen.findByRole("heading", { name: current.name });
+    if (surface === "workspace selector")
+      fireEvent.click(screen.getByRole("button", { name: "Applications" }));
+    act(() => setUnsavedWork("exact-switch", "Unsubmitted calculation", true));
+    if (surface === "search") {
+      fireEvent.click(screen.getByRole("button", { name: "Search" }));
+      const search = screen.getByRole("dialog", { name: "Search Open EPM" });
+      fireEvent.change(within(search).getByRole("textbox"), {
+        target: { value: target.name },
+      });
+      fireEvent.click(
+        within(search).getByRole("button", { name: /Requested model/ }),
+      );
+    } else {
+      fireEvent.change(await screen.findByLabelText("Workspace selector"), {
+        target: { value: target.workspaceId },
+      });
+    }
+    const confirm = await screen.findByRole("button", {
+      name: "Discard and continue",
+    });
+    holdListing = true;
+    act(() => window.dispatchEvent(new Event("online")));
+    await waitFor(() => expect(releaseListing).toBeDefined());
+    await act(async () => releaseListing!());
+
+    const previousRequests = vi.mocked(fetch).mock.calls.length;
+    fireEvent.click(confirm);
+    expect(
+      await screen.findByRole("heading", {
+        name: removed
+          ? "Application unavailable"
+          : surface === "search"
+            ? target.name
+            : target.workspaceId,
+      }),
+    ).toBeVisible();
+    expect(readPresentationRoute().focus).toMatchObject({
+      workspaceId: target.workspaceId,
+      applicationId: target.applicationId,
+    });
+    if (!removed) expect(readPresentationRoute().applicationIndex).toBe(2);
+    expect(
+      screen.queryByRole("heading", { name: alternative.name }),
+    ).toBeNull();
+    const catalogCalls = vi
+      .mocked(fetch)
+      .mock.calls.slice(previousRequests)
+      .filter(([url]) => String(url) === "/api/catalog")
+      .map(([, init]) => JSON.parse(String(init?.body)).workspaceId);
+    expect(catalogCalls).toEqual(removed ? [] : [target.workspaceId]);
+    if (surface === "search")
+      expect(document.getElementById("main-content")).toHaveFocus();
+    if (removed) {
+      fireEvent.click(
+        within(screen.getByRole("main")).getByRole("button", {
+          name: "Choose application",
+        }),
+      );
+      expect(await screen.findByLabelText("Workspace selector")).toBeVisible();
+      expect(readPresentationRoute().focus.workspaceId).toBeUndefined();
+    }
+  },
+);
+
 it("opens the exact newly created application rather than the previous model", async () => {
   metadataNavigationFixture(async () => {
     const value = await catalogResponse().json();
@@ -1172,6 +1801,7 @@ it("opens the exact newly created application rather than the previous model", a
     applicationId: "scenario",
     name: "New scenario",
     status: "Active",
+    kind: "multidimensional",
     enabledCapabilities: [],
     capabilityRevision: 0,
   };
@@ -1403,15 +2033,46 @@ it("shows a current catalogue error and removes its scope when another applicati
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
-it("ignores an initial platform catalogue cancellation during StrictMode remount", async () => {
+it.each([
+  ["an invalid successful response", () => new Response("{}")],
+  [
+    "a gateway refusal",
+    () =>
+      new Response(JSON.stringify({ code: "WEB_ORIGIN_REQUIRED" }), {
+        status: 403,
+      }),
+  ],
+] as const)("offers an exact context retry after %s", async (_, failure) => {
+  const reads = deferredCatalogFixture();
+  openMetadataHash("alpha");
+  render(<App />);
+  await waitFor(() => expect(reads).toHaveLength(1));
+  expect(screen.getByText("Checking the application context…")).toBeVisible();
+  expect(screen.queryByText("Metadata application: alpha")).toBeNull();
+  await act(async () => reads[0].resolve(failure()));
+  expect(
+    await screen.findByRole("heading", {
+      name: "Application context unavailable",
+    }),
+  ).toBeVisible();
+  expect(screen.queryByText("Checking the application context…")).toBeNull();
+  expect(screen.queryByText(/linked application is unavailable/)).toBeNull();
+  expect(window.location.hash).toContain("application=alpha");
+  fireEvent.click(screen.getByRole("button", { name: "Retry context check" }));
+  await waitFor(() => expect(reads).toHaveLength(2));
+  expect(reads[1].applicationId).toBe("alpha");
+  expect(screen.getByText("Checking the application context…")).toBeVisible();
+  await act(async () => reads[1].resolve(catalogResponse()));
+  expect(await screen.findByText("Metadata application: alpha")).toBeVisible();
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+it("ignores an initial session identity cancellation during StrictMode remount", async () => {
   metadataNavigationFixture();
   const original = vi.mocked(fetch).getMockImplementation()!;
-  let platformReads = 0;
+  let sessionReads = 0;
   vi.mocked(fetch).mockImplementation((input, init) => {
-    if (
-      String(input) === "/api/platform/browser/catalog" &&
-      ++platformReads === 1
-    ) {
+    if (String(input) === "/api/session-identity" && ++sessionReads === 1) {
       return new Promise<Response>((_resolve, reject) => {
         init?.signal?.addEventListener(
           "abort",
@@ -1436,7 +2097,7 @@ it("ignores an initial platform catalogue cancellation during StrictMode remount
   expect(
     await screen.findByRole("button", { name: "Metadata" }),
   ).toBeInTheDocument();
-  expect(platformReads).toBe(2);
+  expect(sessionReads).toBe(2);
   expect(
     screen.queryByText("signal is aborted without reason"),
   ).not.toBeInTheDocument();
@@ -1466,6 +2127,115 @@ it("hides server administration for an explicit unauthorized catalogue", async (
   expect(
     screen.queryByRole("button", { name: "Server Administration" }),
   ).not.toBeInTheDocument();
+});
+
+it("offers only server and global destinations to a directory operator with no application grants", async () => {
+  metadataNavigationFixture();
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation((input, init) => {
+    if (String(input) === "/api/applications")
+      return Promise.resolve(
+        Response.json({ applications: [], nextAfter: null }),
+      );
+    if (String(input) === "/api/platform/browser/catalog")
+      return Promise.resolve(
+        Response.json({
+          languageVersion: 2,
+          authorized: true,
+          functions: { "identity.native-user.list": {} },
+        }),
+      );
+    return original(input, init);
+  });
+  render(<App />);
+  expect(
+    await screen.findByRole("heading", { name: "No applications available" }),
+  ).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: "Open Server Administration" }),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("navigation", { name: "Application navigation" }),
+  ).toBeNull();
+  expect(screen.queryByRole("button", { name: "Notifications" })).toBeNull();
+  expect(screen.queryByRole("button", { name: /Explore data/ })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Search" }));
+  const query = screen.getByRole("textbox", {
+    name: "Search applications, pages or authorized functions",
+  });
+  const dialog = screen.getByRole("dialog", { name: "Search Open EPM" });
+  const status = within(dialog).getByRole("status");
+  fireEvent.change(query, { target: { value: "Grid" } });
+  expect(status).toHaveTextContent("No accessible result matches your search.");
+  fireEvent.change(query, { target: { value: "Server Administration" } });
+  expect(status).toBeEmptyDOMElement();
+  fireEvent.click(
+    within(screen.getByRole("dialog", { name: "Search Open EPM" })).getByRole(
+      "button",
+      { name: /Server Administration/ },
+    ),
+  );
+  expect(
+    await screen.findByRole("heading", { name: "Identity directory" }),
+  ).toBeVisible();
+  expect(document.querySelector("#main-content")).toHaveFocus();
+  expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).not.toContain(
+    "/api/tasks",
+  );
+  expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).not.toContain(
+    "/api/catalog",
+  );
+});
+
+it("restarts open notifications on a same-application change in authority", async () => {
+  let downgraded = false;
+  metadataNavigationFixture(async () => {
+    const value = await catalogResponse(
+      downgraded ? "Reader" : "Administrator",
+    ).json();
+    value.revisions.security = downgraded ? 2 : 1;
+    return Response.json(value);
+  });
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  let finish!: (response: Response) => void;
+  vi.mocked(fetch).mockImplementation(async (input, init) => {
+    if (String(input) !== "/api/tasks") return original(input, init);
+    if (downgraded)
+      return new Promise<Response>((resolve) => {
+        finish = resolve;
+      });
+    return Response.json({
+      tasks: [
+        {
+          taskId: "old-admin-notice",
+          function: "admin-only notice",
+          sourceFamily: "Job",
+          status: "Failed",
+          progressState: "attention",
+          sequence: 9,
+        },
+      ],
+      nextSequence: 9,
+      hasMore: false,
+    });
+  });
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Notifications" }));
+  expect(await screen.findByText("admin-only notice")).toBeVisible();
+  downgraded = true;
+  act(() => window.dispatchEvent(new Event("online")));
+  await waitFor(() => expect(finish).toBeDefined());
+  const panel = await screen.findByRole("dialog", { name: "Notifications" });
+  expect(within(panel).queryByText("admin-only notice")).toBeNull();
+  expect(within(panel).getByRole("status")).toHaveTextContent(
+    "Reading task status",
+  );
+  await act(async () =>
+    finish(Response.json({ tasks: [], nextSequence: 0, hasMore: false })),
+  );
+  expect(
+    await screen.findByText("No task currently needs attention"),
+  ).toBeVisible();
 });
 
 it("retains named hierarchy identity through refresh and same-dimension breadcrumbs", async () => {
@@ -1500,4 +2270,262 @@ it("retains named hierarchy identity through refresh and same-dimension breadcru
   );
   fireEvent.click(trail.getByRole("link", { name: "Metadata" }));
   await waitFor(() => expect(window.location.hash).not.toContain("hierarchy="));
+});
+
+it("keeps a visible application cue in the compact rail and names every shell destination", async () => {
+  metadataNavigationFixture();
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches: query === "(max-width: 950px)",
+    media: query,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+  }));
+  window.history.replaceState(
+    null,
+    "",
+    "#/metadata/0?workspace=ws&application=alpha&metadataSection=members&dimension=Account",
+  );
+  const { container } = render(<App />);
+  await screen.findByText("Metadata application: alpha");
+  expect(
+    container.querySelector(".application-switcher-compact-label"),
+  ).toHaveTextContent("Choose application");
+  expect(container.querySelector(".sidebar-toggle-label")).toHaveTextContent(
+    "Menu",
+  );
+  for (const control of container.querySelectorAll(
+    ".sidebar button, .topbar button, .topbar nav a",
+  )) {
+    expect(control).toHaveAccessibleName();
+  }
+});
+
+it("returns compact-rail focus before crossing into the off-canvas sidebar", async () => {
+  metadataNavigationFixture();
+  const listeners = new Map<string, (event: { matches: boolean }) => void>();
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches: query === "(max-width: 950px)",
+    media: query,
+    addEventListener: (
+      _event: string,
+      listener: (event: { matches: boolean }) => void,
+    ) => listeners.set(query, listener),
+    removeEventListener: vi.fn(),
+  }));
+  window.history.replaceState(
+    null,
+    "",
+    "#/metadata/0?workspace=ws&application=alpha&metadataSection=members&dimension=Account",
+  );
+  render(<App />);
+  await screen.findByText("Metadata application: alpha");
+  const destination = within(
+    screen.getByRole("navigation", { name: "Global navigation" }),
+  ).getByRole("button", { name: "Applications" });
+  destination.focus();
+  expect(destination).toHaveFocus();
+  act(() => listeners.get("(max-width: 650px)")?.({ matches: true }));
+  expect(screen.getByRole("button", { name: "Expand sidebar" })).toHaveFocus();
+  expect(window.location.hash).toContain("#/metadata/");
+});
+
+function mobileNavigationFixture() {
+  metadataNavigationFixture();
+  const listeners = new Map<string, (event: { matches: boolean }) => void>();
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches: true,
+    media: query,
+    addEventListener: (
+      _event: string,
+      listener: (event: { matches: boolean }) => void,
+    ) => listeners.set(query, listener),
+    removeEventListener: vi.fn(),
+  }));
+  window.history.replaceState(
+    null,
+    "",
+    "#/metadata/0?workspace=ws&application=alpha&metadataSection=members&dimension=Account",
+  );
+  return listeners;
+}
+
+it("mobile navigation moves focus inside, isolates background and contains keyboard focus", async () => {
+  mobileNavigationFixture();
+  const { container } = render(<App />);
+  await screen.findByText("Metadata application: alpha");
+  const menu = screen.getByRole("button", { name: "Expand sidebar" });
+  menu.focus();
+  fireEvent.click(menu);
+  const modal = screen.getByRole("dialog", { name: "Application navigation" });
+  expect(modal).toHaveAttribute("aria-modal", "true");
+  const close = within(modal).getByRole("button", { name: "Close sidebar" });
+  expect(close).toHaveFocus();
+  for (const node of container.querySelectorAll(".topbar, main, .skip-link"))
+    expect(node).toHaveAttribute("inert");
+  const controls = within(modal).getAllByRole("button");
+  const last = controls.at(-1)!;
+  fireEvent.keyDown(close, { key: "Tab", shiftKey: true });
+  expect(last).toHaveFocus();
+  fireEvent.keyDown(last, { key: "Tab" });
+  expect(close).toHaveFocus();
+  fireEvent.keyDown(close, { key: "k", ctrlKey: true });
+  expect(
+    screen.queryByRole("dialog", { name: "Search Open EPM" }),
+  ).not.toBeInTheDocument();
+  fireEvent.keyDown(close, { key: "Escape" });
+  expect(menu).toHaveFocus();
+  expect(
+    screen.queryByRole("dialog", { name: "Application navigation" }),
+  ).not.toBeInTheDocument();
+  for (const node of container.querySelectorAll(".topbar, main, .skip-link"))
+    expect(node).not.toHaveAttribute("inert");
+});
+
+it("mobile navigation closes on resize with focus restored and desktop rail unchanged", async () => {
+  const listeners = mobileNavigationFixture();
+  const { container } = render(<App />);
+  await screen.findByText("Metadata application: alpha");
+  const menu = screen.getByRole("button", { name: "Expand sidebar" });
+  fireEvent.click(menu);
+  expect(screen.getByRole("button", { name: "Close sidebar" })).toHaveFocus();
+  act(() => listeners.get("(max-width: 650px)")?.({ matches: false }));
+  expect(menu).toHaveFocus();
+  expect(
+    screen.queryByRole("dialog", { name: "Application navigation" }),
+  ).not.toBeInTheDocument();
+  fireEvent.click(menu);
+  expect(container.querySelector(".shell")).not.toHaveClass("collapsed");
+  expect(container.querySelector(".sidebar")).not.toHaveAttribute("aria-modal");
+  expect(container.querySelector("main")).not.toHaveAttribute("inert");
+});
+
+it("mobile navigation gives discard confirmation priority and restores a valid trigger", async () => {
+  const listeners = mobileNavigationFixture();
+  const { container } = render(<App />);
+  await screen.findByText("Metadata application: alpha");
+  const menu = screen.getByRole("button", { name: "Expand sidebar" });
+  fireEvent.click(menu);
+  act(() => setUnsavedWork("mobile-guard", "Unsaved navigation fixture", true));
+  const target = within(
+    screen.getByRole("navigation", { name: "Global navigation" }),
+  ).getByRole("button", { name: "Applications" });
+  target.focus();
+  fireEvent.click(target);
+  const dialog = await screen.findByRole("alertdialog");
+  const keep = within(dialog).getByRole("button", { name: "Keep editing" });
+  expect(keep).toHaveFocus();
+  expect(container.querySelector(".sidebar")).toHaveAttribute("inert");
+  expect(container.querySelector(".sidebar")).not.toHaveAttribute("aria-modal");
+  fireEvent.keyDown(keep, { key: "Tab", shiftKey: true });
+  expect(
+    within(dialog).getByRole("button", { name: "Discard and continue" }),
+  ).toHaveFocus();
+  fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+  expect(target).toHaveFocus();
+  expect(container.querySelector(".sidebar")).not.toHaveAttribute("inert");
+  expect(container.querySelector(".sidebar")).toHaveAttribute(
+    "aria-modal",
+    "true",
+  );
+  fireEvent.click(target);
+  act(() => listeners.get("(max-width: 650px)")?.({ matches: false }));
+  expect(screen.getByRole("button", { name: "Keep editing" })).toHaveFocus();
+  fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+  expect(menu).toHaveFocus();
+  act(() => listeners.get("(max-width: 650px)")?.({ matches: true }));
+  fireEvent.click(menu);
+  target.focus();
+  fireEvent.click(target);
+  fireEvent.click(screen.getByRole("button", { name: "Discard and continue" }));
+  await waitFor(() =>
+    expect(window.location.hash).toContain("#/applications/"),
+  );
+  expect(menu).toHaveFocus();
+  expect(container.querySelector("main")).not.toHaveAttribute("inert");
+  expect(container.querySelector(".shell")).toHaveClass("collapsed");
+});
+
+it("preserves the exact placement in a scoped metadata route and clears it in unrelated navigation", () => {
+  for (const metadataSection of ["relationships", "tree"] as const) {
+    const focus = {
+      workspaceId: "ws north",
+      applicationId: "forecast-2027",
+      metadataSection,
+      dimensionId: "Account",
+      memberId: "Cash",
+      hierarchyId: "Reporting & legal",
+      relationshipId: "Cash / Flow",
+    };
+    window.history.replaceState(
+      null,
+      "",
+      presentationRouteHash("metadata", 0, focus),
+    );
+    expect(readPresentationRoute().focus).toMatchObject(focus);
+    window.history.replaceState(
+      null,
+      "",
+      presentationRouteHash("metadata", 1, {
+        workspaceId: "ws south",
+        applicationId: "other",
+        metadataSection: "relationships",
+        dimensionId: "Entity",
+      }),
+    );
+    expect(readPresentationRoute().focus.relationshipId).toBeUndefined();
+    expect(window.location.hash).not.toContain("relationship=");
+  }
+});
+
+it("opens an administered workspace route when the identity has zero admitted applications", async () => {
+  metadataNavigationFixture();
+  const original = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation((input, init) => {
+    const url = String(input);
+    if (url === "/api/applications")
+      return Promise.resolve(
+        Response.json({ applications: [], nextAfter: null }),
+      );
+    if (url === "/api/applications?view=managedWorkspaces")
+      return Promise.resolve(
+        Response.json({
+          workspaces: [
+            { workspaceId: "empty", workspaceName: "Empty workspace" },
+          ],
+          nextAfter: null,
+        }),
+      );
+    if (url === "/api/workspace-catalog")
+      return Promise.resolve(
+        Response.json({
+          workspaceId: "empty",
+          functions: [
+            "security.workspace.people.list",
+            "security.workspace.person-applications.list",
+            "security.workspace.bootstrap-groups.list",
+            "workspace.application.create",
+          ],
+        }),
+      );
+    return original(input, init);
+  });
+  window.history.replaceState({}, "", "#/applications/0?workspace=empty");
+  render(<App />);
+  expect(
+    await screen.findByRole("heading", { name: "Empty workspace" }),
+  ).toBeInTheDocument();
+  expect(
+    await screen.findByRole("button", {
+      name: "Review people and administrators",
+    }),
+  ).toBeEnabled();
+  expect(
+    screen.queryByRole("heading", { name: "Application unavailable" }),
+  ).toBeNull();
+  expect(
+    screen.getByRole("button", { name: "Create application" }),
+  ).toBeEnabled();
+  expect(
+    vi.mocked(fetch).mock.calls.map((call) => String(call[0])),
+  ).not.toContain("/api/catalog");
 });

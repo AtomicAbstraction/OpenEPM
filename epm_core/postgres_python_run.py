@@ -9,22 +9,11 @@ from .postgres_jobs import PostgresJobQueue
 from .postgres_python_workflow import (PostgresPythonWorkflowStore,
                                        python_workflow_id)
 from .python_plan_runner import ChildOutcome, SealedPlanRunner
-from .python_program_execution import WorkflowRecord
+from .python_execution_contract import (
+    RUN as RUN, workflow_result as _wire, parse_run_program)
 
 
-RUN = 'python.program.run'
 _HEX32 = re.compile(r'^[0-9a-f]{32}$')
-_KEY = re.compile(r'^[A-Za-z0-9._-]{8,128}$')
-
-
-def _wire(record: WorkflowRecord) -> dict:
-    return {'workflowId': record.workflow_id, 'buildId': record.build_id,
-        'planDigest': record.plan_digest, 'status': record.status.value,
-        'unitCount': record.unit_count, 'committedUnits': record.committed_units,
-        'remainingUnits': record.remaining_units,
-        'checkpoints': [{'ordinal': item.ordinal, 'jobId': item.job_id,
-            'committed': item.committed, 'receiptId': item.receipt_id}
-            for item in record.checkpoints]}
 
 
 class _JobInspector:
@@ -41,14 +30,15 @@ class _JobInspector:
 
 class PostgresPythonRun:
     def __init__(self, dsn: str, *, identity: VerifiedIdentity, admission,
-                 worker_claim: dict | None = None):
+                 worker_claim: dict | None = None, _occurrence_admission=None):
         if (type(dsn) is not str or not dsn
                 or not isinstance(identity, VerifiedIdentity)
                 or not hasattr(admission, 'preview') or not hasattr(admission, 'submit')):
             raise ValueError('PYTHON_RUN_CONFIGURATION_INVALID')
         self.identity = identity
         self.store = PostgresPythonWorkflowStore(dsn, identity=identity,
-                                                  worker_claim=worker_claim)
+                                                  worker_claim=worker_claim,
+                                                  _occurrence_admission=_occurrence_admission)
         queue = PostgresJobQueue(dsn, identity=identity)
         self.runner = SealedPlanRunner(admission, self.store,
                                        _JobInspector(queue))
@@ -57,20 +47,19 @@ class PostgresPythonRun:
     def _workflow_id(scope, identity, idempotency_key,*,build_id):
         return python_workflow_id(scope, identity, idempotency_key,build_id=build_id)
 
+    @staticmethod
+    def _build_id(program: object, idempotency_key: str) -> str:
+        return parse_run_program(program, idempotency_key)
+
+    def replay(self, scope: ApplicationScope, program: object, *,
+               idempotency_key: str) -> dict | None:
+        build_id=self._build_id(program,idempotency_key)
+        record=self.store.replay(scope,build_id=build_id,idempotency_key=idempotency_key)
+        return None if record is None else _wire(record)
+
     def run(self, scope: ApplicationScope, program: object, *,
             idempotency_key: str) -> dict:
-        if (type(program) is not dict
-                or set(program) != {'languageVersion','function','arguments'}
-                or program.get('languageVersion') != 2
-                or program.get('function') != RUN
-                or type(program.get('arguments')) is not dict
-                or set(program['arguments']) != {'buildId'}
-                or type(program['arguments']['buildId']) is not str
-                or _HEX32.fullmatch(program['arguments']['buildId']) is None
-                or type(idempotency_key) is not str
-                or _KEY.fullmatch(idempotency_key) is None):
-            raise ValueError('PYTHON_RUN_ARGUMENTS_INVALID')
-        build_id = program['arguments']['buildId']
+        build_id = self._build_id(program,idempotency_key)
         plan = self.store.sealed_plan(scope, build_id)
         from .postgres_python_definitions import descriptor
         if descriptor(plan.canonical_plan) is not None:
@@ -99,7 +88,8 @@ class PostgresPythonRun:
         if type(workflow_id) is not str or _HEX32.fullmatch(workflow_id) is None:
             raise ValueError('PYTHON_WORKFLOW_ID_INVALID')
         workflow=self.store.read(scope,workflow_id)
-        plan=self.store.sealed_plan(scope,workflow.build_id)
+        plan=self.store.sealed_plan(scope,workflow.build_id,
+            _cancellation=workflow) if workflow.status.value=='cancel_requested' else self.store.sealed_plan(scope,workflow.build_id)
         return _wire(self.runner.advance(workflow,plan))
 
     def read(self, scope: ApplicationScope, workflow_id: str) -> dict:
@@ -107,9 +97,20 @@ class PostgresPythonRun:
             raise ValueError('PYTHON_WORKFLOW_ID_INVALID')
         return _wire(self.store.read(scope, workflow_id))
 
+    def read_original(self, scope: ApplicationScope, program: dict, *,
+                      idempotency_key: str) -> dict:
+        """Historical inspection uses READ, never the execution replay path."""
+        build_id = self._build_id(program, idempotency_key)
+        workflow_id = self._workflow_id(scope, self.identity, idempotency_key, build_id=build_id)
+        return _wire(self.store.read(scope, workflow_id, original_build_id=build_id,
+            original_idempotency_key=idempotency_key))
+
     def cancel(self, scope: ApplicationScope, workflow_id: str) -> dict:
         if type(workflow_id) is not str or _HEX32.fullmatch(workflow_id) is None:
             raise ValueError('PYTHON_WORKFLOW_ID_INVALID')
         self.store.authorize_run(scope)
-        return _wire(self.runner.request_cancel(
-            self.store.read(scope, workflow_id)))
+        # Retain current owner/read scope before the shared control owner;
+        # unlike execution CAS, control may interrupt an active worker claim.
+        self.store.read(scope, workflow_id)
+        current = self.store.request_cancel_as_task_controller(scope, workflow_id)
+        return _wire(self.runner.request_cancel(current))

@@ -2,8 +2,10 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { MetadataSecurityStringEditor } from "./MetadataSecurityStringEditor";
 import { operationAdmissionResponse } from "./test-setup";
+import { discardUnsavedWork } from "./unsaved-work";
 
 afterEach(() => {
+  discardUnsavedWork({ abandonRecovery: true });
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -20,6 +22,8 @@ function catalog(functions: string[]) {
     applicationAccess: {
       role: "Administrator" as const,
       workspaceAdministrator: false,
+      issuer: "https://issuer",
+      subjectId: "admin",
     },
     enabledCapabilities: [],
     functions: Object.fromEntries(functions.map((name) => [name, {}])),
@@ -27,11 +31,29 @@ function catalog(functions: string[]) {
   };
 }
 
+function mutationReply(body: {
+  program: { function: string };
+  idempotencyKey: string;
+}) {
+  return new Response(
+    JSON.stringify({
+      languageVersion: 2,
+      function: body.program.function,
+      result: {
+        operationId: body.idempotencyKey,
+        committedRevision: 8,
+        changedCount: 1,
+      },
+    }),
+  );
+}
+
 it("reads and writes a dimension Security String through governed contracts", async () => {
   const calls: Array<{
     path: string;
     body: { program: { function: string; arguments: Record<string, unknown> } };
   }> = [];
+  let saved = false;
   vi.stubGlobal(
     "confirm",
     vi.fn(() => true),
@@ -53,13 +75,16 @@ it("reads and writes a dimension Security String through governed contracts", as
               status: "Active",
               readTags: ["North"],
               writeTags: ["NorthWrite"],
-              securityString: "read=North;write=NorthWrite",
-              metadataRevision: 7,
-              securityRevision: 3,
+              securityString: saved
+                ? "read=North;write="
+                : "read=North;write=NorthWrite",
+              metadataRevision: saved ? 8 : 7,
+              securityRevision: saved ? 4 : 3,
             },
           }),
         );
-      return new Response(JSON.stringify({ result: { receiptId: "r-1" } }));
+      saved = true;
+      return mutationReply(body);
     }),
   );
   const changed = vi.fn(async () => undefined);
@@ -111,7 +136,10 @@ it("reads and writes a dimension Security String through governed contracts", as
       ),
     ).toBe(true),
   );
-  expect(changed).toHaveBeenCalledOnce();
+  await waitFor(() => expect(changed).toHaveBeenCalledOnce());
+  expect(await screen.findByLabelText("Dimension Security String")).toHaveValue(
+    "read=North;write=",
+  );
 });
 
 it("uses the relationship identity and hides itself without read authority", async () => {
@@ -140,12 +168,14 @@ it("uses the relationship identity and hides itself without read authority", asy
   ).toBeNull();
 });
 
-it("restores a member draft with fresh review required and retains the exact key after an uncertain write", async () => {
+it("checks the original member receipt before retrying the exact packet after remount", async () => {
   const calls: Array<{ path: string; body: Record<string, any> }> = [];
   const memberCatalog = catalog([
     "security.application.member-tags.read",
     "metadata.member.security-string.set",
+    "application.operation.receipt.read",
   ]);
+  let saved = false;
   vi.stubGlobal(
     "confirm",
     vi.fn(() => true),
@@ -158,6 +188,11 @@ it("restores a member draft with fresh review required and retains the exact key
       calls.push({ path, body });
       if (path === "/api/operation-admission")
         return operationAdmissionResponse("8");
+      if (path === "/api/read")
+        return new Response(
+          JSON.stringify({ code: "OPERATION_RECEIPT_NOT_FOUND" }),
+          { status: 400 },
+        );
       if (path === "/api/security")
         return new Response(
           JSON.stringify({
@@ -167,9 +202,11 @@ it("restores a member draft with fresh review required and retains the exact key
               status: "Active",
               readTags: ["North"],
               writeTags: ["NorthWrite"],
-              securityString: "read=North;write=NorthWrite",
-              metadataRevision: 7,
-              securityRevision: 3,
+              securityString: saved
+                ? "read=North;write="
+                : "read=North;write=NorthWrite",
+              metadataRevision: saved ? 8 : 7,
+              securityRevision: saved ? 4 : 3,
             },
           }),
         );
@@ -178,9 +215,8 @@ it("restores a member draft with fresh review required and retains the exact key
         1
       )
         throw new Error("Response interrupted");
-      return new Response(
-        JSON.stringify({ result: { receiptId: "same-receipt" } }),
-      );
+      saved = true;
+      return mutationReply(body);
     }),
   );
   const props = {
@@ -203,38 +239,49 @@ it("restores a member draft with fresh review required and retains the exact key
   fireEvent.click(
     screen.getByRole("button", { name: "Compile and save Security String" }),
   );
-  expect(await screen.findByRole("alert")).toHaveTextContent(
-    "Response interrupted",
-  );
+  await screen.findByRole("heading", {
+    name: "Security string change awaiting confirmation",
+  });
   first.unmount();
 
   render(<MetadataSecurityStringEditor {...props} />);
-  await waitFor(() =>
-    expect(screen.getByLabelText("Member Security String")).toHaveValue(
-      "read=North;write=",
-    ),
+  const check = await screen.findByRole("button", {
+    name: "Check original security string receipt",
+  });
+  await waitFor(() => expect(check).toBeEnabled());
+  expect(screen.getByLabelText("Member Security String")).toHaveValue(
+    "read=North;write=",
   );
   const review = screen.getByLabelText(
     "I reviewed this exact member and canonical Security String.",
   );
   expect(review).not.toBeChecked();
   expect(review).toBeDisabled();
-  fireEvent.click(
+  expect(
     screen.getByRole("button", { name: "Refresh current security" }),
-  );
-  await waitFor(() => expect(review).toBeEnabled());
-  expect(screen.getByLabelText("Member Security String")).toHaveValue(
-    "read=North;write=",
-  );
-  fireEvent.click(review);
+  ).toBeDisabled();
+  expect(
+    screen.queryByRole("button", {
+      name: "Retry original security string change",
+    }),
+  ).toBeNull();
+  fireEvent.click(check);
   fireEvent.click(
-    screen.getByRole("button", { name: "Compile and save Security String" }),
+    await screen.findByRole("button", {
+      name: "Retry original security string change",
+    }),
+  );
+  await screen.findByText(
+    "The fixed metadata service compiled and applied the reviewed Security String.",
   );
   await waitFor(() =>
-    expect(
-      calls.filter((call) => call.path === "/api/metadata-action"),
-    ).toHaveLength(2),
+    expect(screen.getByLabelText("Member Security String")).toHaveValue(
+      "read=North;write=",
+    ),
   );
+  expect(
+    calls.filter((call) => call.path === "/api/operation-admission"),
+  ).toHaveLength(1);
   const writes = calls.filter((call) => call.path === "/api/metadata-action");
   expect(writes[1].body).toEqual(writes[0].body);
   expect(writes[1].body.program).toEqual({
@@ -374,3 +421,175 @@ it("rejects a security read for a different target and requires a member dimensi
   );
   expect(screen.queryByLabelText("Member Security String")).toBeNull();
 });
+
+it.each([
+  {
+    kind: "Dimension",
+    targetId: "Axis",
+    key: "dimensionId",
+    read: "dimension-metadata-tags",
+  },
+  { kind: "Member", targetId: "Member", key: "memberId", read: "member-tags" },
+  {
+    kind: "Relationship",
+    targetId: "placement",
+    key: "relationshipId",
+    read: "relationship-tags",
+  },
+] as const)(
+  "recovers a committed $kind security string after remount under receipt-read authority",
+  async ({ kind, targetId, key, read }) => {
+    const readFunction = `security.application.${read}.read`;
+    const writeFunction = `metadata.${kind.toLowerCase()}.security-string.set`;
+    const receiptFunction = "application.operation.receipt.read";
+    const props = {
+      app,
+      catalog: catalog([readFunction, writeFunction, receiptFunction]),
+      targetKind: kind,
+      targetId,
+      dimensionId: "Axis",
+      onChanged: vi.fn(async () => {}),
+    };
+    const packets: Array<{ path: string; body: any }> = [];
+    let receiptActor = "different-actor";
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        const body = JSON.parse(String(init?.body));
+        packets.push({ path, body });
+        if (path === "/api/operation-admission")
+          return operationAdmissionResponse("a");
+        if (path === "/api/security")
+          return new Response(
+            JSON.stringify({
+              result: {
+                dimensionId: "Axis",
+                [key]: targetId,
+                status: "Active",
+                readTags: ["Before"],
+                writeTags: [],
+                securityString: "read=Before;write=",
+                metadataRevision: 7,
+                securityRevision: 3,
+              },
+            }),
+          );
+        if (path === "/api/metadata-action")
+          throw new TypeError("Response interrupted");
+        return new Response(
+          JSON.stringify({
+            result: {
+              operationId: packets.find(
+                (packet) => packet.path === "/api/metadata-action",
+              )!.body.idempotencyKey,
+              actorId: receiptActor,
+              committedRevision: 8,
+              committedAt: "2026-11-20T15:00:00Z",
+              commandDigest: "a".repeat(64),
+              outcome: { changedCount: 1 },
+            },
+          }),
+        );
+      }),
+    );
+    const first = render(<MetadataSecurityStringEditor {...props} />);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Edit Security String" }),
+    );
+    fireEvent.change(await screen.findByLabelText(`${kind} Security String`), {
+      target: { value: "read=After;write=" },
+    });
+    fireEvent.click(
+      screen.getByLabelText(
+        `I reviewed this exact ${kind.toLowerCase()} and canonical Security String.`,
+      ),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Compile and save Security String" }),
+    );
+    const pending = await screen.findByRole("heading", {
+      name: "Security string change awaiting confirmation",
+    });
+    await waitFor(() => expect(pending).toHaveFocus());
+    first.unmount();
+
+    const other = render(
+      <MetadataSecurityStringEditor {...props} targetId="different-target" />,
+    );
+    expect(
+      screen.queryByRole("button", {
+        name: "Check original security string receipt",
+      }),
+    ).toBeNull();
+    other.unmount();
+    const reader = catalog([receiptFunction]);
+    render(
+      <MetadataSecurityStringEditor
+        {...props}
+        catalog={{
+          ...reader,
+          applicationAccess: { ...reader.applicationAccess, role: "Reader" },
+        }}
+        showEditor={false}
+      />,
+    );
+    const check = await screen.findByRole("button", {
+      name: "Check original security string receipt",
+    });
+    await waitFor(() => expect(check).toBeEnabled());
+    expect(screen.queryByLabelText(`${kind} Security String`)).toBeNull();
+    fireEvent.click(check);
+    await screen.findByText(
+      "The receipt could not confirm the original security string change.",
+    );
+    expect(props.onChanged).not.toHaveBeenCalled();
+
+    receiptActor = "admin";
+    fireEvent.click(check);
+    await screen.findByText(
+      "The original Security String change was recorded.",
+    );
+    await waitFor(() => expect(props.onChanged).toHaveBeenCalledTimes(1));
+    expect(packets.filter(({ path }) => path === "/api/security")).toHaveLength(
+      1,
+    );
+    expect(
+      packets.filter(({ path }) => path === "/api/operation-admission"),
+    ).toHaveLength(1);
+    const mutations = packets.filter(
+      ({ path }) => path === "/api/metadata-action",
+    );
+    expect(mutations).toHaveLength(1);
+    const { idempotencyKey, program: applied } = mutations[0].body;
+    expect(applied).toEqual({
+      languageVersion: 2,
+      function: writeFunction,
+      arguments: {
+        ...(kind === "Member" ? { dimensionId: "Axis" } : {}),
+        [key]: targetId,
+        securityString: "read=After;write=",
+        expectedMetadataRevision: 7,
+      },
+    });
+    expect(
+      packets
+        .filter(({ path }) => path === "/api/read")
+        .map(({ body }) => body),
+    ).toEqual(
+      Array.from({ length: 2 }, () => ({
+        workspaceId: "ws",
+        applicationId: "app",
+        program: {
+          languageVersion: 2,
+          function: receiptFunction,
+          arguments: { operationId: idempotencyKey },
+        },
+      })),
+    );
+  },
+);

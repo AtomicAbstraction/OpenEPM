@@ -234,23 +234,80 @@ class PostgresProjectionCleanupPublisher:
 
 
 def catalog():
+    outputs = output_schemas()
     schema={'$schema':'https://json-schema.org/draft/2020-12/schema','type':'object','additionalProperties':False,
-        'required':['languageVersion','function','arguments'],'properties':{'languageVersion':{'const':2},
+        'required':['languageVersion','function','arguments'],'properties':{'languageVersion':{'type':'integer','const':2},
         'function':{'const':FUNCTION},'arguments':{'type':'object','additionalProperties':False,
             'required':['rebuildJobId','generationKind','reason'],'properties':{
-                'rebuildJobId':{'type':'string','pattern':'^[0-9a-f]{32}$'},
+                'rebuildJobId':{'type':'string','pattern':r'^[0-9a-f]{32}(?![\s\S])'},
                 'generationKind':{'enum':['abandoned','retired']},
-                'reason':{'type':'string','minLength':1,'maxLength':500}}}}}
+                'reason':{'type':'string','minLength':1,
+                    'description':'The fixed owner trims whitespace, then requires 1–500 characters; NUL is forbidden. Raw length is not the trimmed length.'}}}}}
     return {FUNCTION:{'mode':'durable_write','permission':'admin','previewRequired':True,'idempotencyRequired':True,
         'workClass':'long','arguments':{'rebuildJobId':'Existing V2 recovery job ID',
             'generationKind':'abandoned target of a failed/cancelled build or retired source of a published build',
             'reason':'1–500 nonblank characters'},'result':'jobId then bounded hidden-row deletion checkpoints and receipt',
-        'programContract':{'programSchema':schema,'examples':[{'program':{'languageVersion':2,'function':FUNCTION,
-            'arguments':{'rebuildJobId':'a'*32,'generationKind':'retired','reason':'Reclaim an obsolete derived generation'}}}],
+        'programContract':{'programSchema':schema,
+            'resultSchema':outputs['submission']['schema'],'resultSchemaScope':'envelope',
+            'outputSchemas':outputs,
+            'examples':[{'name':'Reclaim a retired source generation',
+                'program':{'languageVersion':2,'function':FUNCTION,'arguments':{
+                    'rebuildJobId':'a'*32,'generationKind':'retired','reason':'Reclaim an obsolete derived generation'}},
+                'prerequisites':'Replace the synthetic rebuildJobId with an existing published V2 rebuild in this authorized disposable application. Its native recovery manifest must identify an original generation that is no longer active. Current Administrator permission and unchanged schema are required; a published receipt alone does not authorize an active target.'},
+                {'name':'Reclaim an abandoned incomplete generation',
+                'program':{'languageVersion':2,'function':FUNCTION,'arguments':{
+                    'rebuildJobId':'b'*32,'generationKind':'abandoned','reason':'Reclaim an abandoned incomplete derived generation'}},
+                'prerequisites':'Replace the synthetic rebuildJobId with an existing failed or cancelled V2 rebuild that created a native recovery manifest but never published. Its incomplete target must remain inactive; a never-started job without a target is insufficient. Current Administrator permission and unchanged schema are required. Use existing failed/cancelled work, not direct SQL or an intentional corruption of business history.'}],
+            'exampleWorkflow':'Discover the original owned rebuild job and bind its exact ID. Preview lets the native owner resolve the inactive generation and pins; submit the unchanged program with original preview and operation admission, then inspect that owned cleanup job until publication or failure. Do not send a target generation or private manifest.',
             'semanticRules':['Administrator permission is required at preview, admission, replay and each worker quantum.',
                 'Native recovery metadata selects the target; arbitrary generation numbers or rows are forbidden.',
                 'Active generations, canonical events, receipts and source history are never cleanup targets.',
                 'Admission pins the usual revision vector; after admission business writes may advance while the exact hidden target and schema stay valid.',
                 'Each quantum has a 20-second budget preserving shorter configured limits; successful checkpoints do not consume failure attempts.',
-                'No active pointer or data/metadata/policy/schema revision changes; only the final technical receipt advances commit revision.'],
+                'No active pointer or data/metadata/policy/schema revision changes; only the final technical receipt advances commit revision.',
+                'A checkpoint result is the last durable deletion quantum, not the outer job current status. It can remain after a later claim, failure or cancellation; counters describe completed deletion only.',
+                'Exact accepted-job replay authenticates the original preview even after preview expiry, current authority and unchanged target/intent/dependencies. This function has no expired outer-operation-admission replay profile; read a known owned job before considering any new intent.',
+                'Output schemas describe current compiler results, not whole job records or worker wrappers. A published cleanup result does not delete source events, business receipts or the active generation.'],
             'execution':{'scope':'one authorized application; one fixed hidden generation','compiler':COMPILER,'planDigest':PLAN_DIGEST}}}}
+
+
+def output_schemas():
+    """Describe preview and native migration 0082's bounded cleanup results."""
+    from .postgres_jobs import job_submission_schema
+    from .postgres_numeric_catalog import obj
+    dialect = 'https://json-schema.org/draft/2020-12/schema'
+    count = {'type': 'integer', 'minimum': 0}
+    positive = {'type': 'integer', 'minimum': 1}
+    digest = {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}
+    preview_schema = {'$schema': dialect, **obj({
+        'languageVersion': {'type': 'integer', 'const': 2}, 'function': {'const': FUNCTION},
+        'previewToken': {'type': 'string', 'minLength': 1}, 'programDigest': digest,
+        'revisionVector': obj({name: count for name in (
+            'metadata_revision', 'data_revision', 'policy_revision')}),
+        'workClass': {'const': 'long'}, 'targetGeneration': count,
+        'recoveryProgramDigest': digest, 'schemaEpoch': count})}
+    phases = ('numeric', 'text', 'detail', 'generic', 'members', 'projection')
+    checkpoint = {'$schema': dialect, **obj({
+        'status': {'const': 'ready'}, 'checkpoint': {'type': 'boolean', 'const': True},
+        'phase': {'enum': [*phases, 'publish']},
+        'deletedRows': {'type': 'integer', 'minimum': 0, 'maximum': 128},
+        'serializedBytes': count, 'targetGeneration': count, 'quantumCount': positive}),
+        'anyOf': [{'properties': {'serializedBytes': {'maximum': 1048576}}},
+                  {'properties': {'deletedRows': {'const': 1}}}]}
+    published = {'$schema': dialect, **obj({
+        'committedRevision': positive,
+        'rebuildJobId': {'type': 'string', 'pattern': r'^[0-9a-f]{32}(?![\s\S])'},
+        'generationKind': {'enum': ['abandoned', 'retired']}, 'targetGeneration': count,
+        'reason': {'type': 'string', 'minLength': 1, 'maxLength': 500},
+        'projections': obj({name: count for name in phases}),
+        'historyPreserved': {'type': 'boolean', 'const': True},
+        'activeGenerationRetained': {'type': 'boolean', 'const': True}})}
+    return {
+        'preview': {'schema': preview_schema, 'scope': 'envelope',
+            'surface': 'preview_v2_program / POST /api/preview; complete read-only response with native-resolved hidden-generation pins.'},
+        'submission': {'schema': job_submission_schema(), 'scope': 'envelope',
+            'surface': 'submit_v2_program / POST /api/submit; complete admission or exact accepted-job replay response, not publication.'},
+        'checkpointResult': {'schema': checkpoint, 'scope': 'result',
+            'surface': 'read_v2_job / POST /api/job result field when checkpoint is true. Last durable deletion checkpoint; inspect outer job status separately. A single oversized row may exceed the 1048576-byte quantum bound.'},
+        'publishedResult': {'schema': published, 'scope': 'result',
+            'surface': 'read_v2_job / POST /api/job result field when cleanup is published; also its operation receipt result. Not the whole job or worker wrapper.'}}

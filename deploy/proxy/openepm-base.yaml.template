@@ -24,28 +24,53 @@ http:
         stsIncludeSubdomains: true
   routers:
     platform:
-      rule: "Host(`__EPM_PUBLIC_HOST__`) && PathPrefix(`/api/platform`)"
+      rule: "Host(`__EPM_PUBLIC_HOST__`) && (Path(`/api/platform`) || PathPrefix(`/api/platform/`))"
+      priority: 20
       entryPoints: [websecure]
       middlewares: [platform-prefix, security-headers]
       service: platform
       tls: {}
+    platform-mcp:
+      rule: "Host(`__EPM_PUBLIC_HOST__`) && Path(`/api/platform/mcp`)"
+      priority: 200
+      entryPoints: [websecure]
+      middlewares: [security-headers]
+      service: platform
+      tls: {}
     browser-platform:
-      rule: "Host(`__EPM_PUBLIC_HOST__`) && PathPrefix(`/api/platform/browser`)"
+      rule: "Host(`__EPM_PUBLIC_HOST__`) && (Path(`/api/platform/browser`) || PathPrefix(`/api/platform/browser/`))"
       priority: 200
       entryPoints: [websecure]
       middlewares: [security-headers]
       service: browser-gateway
       tls: {}
     workspace:
-      rule: "Host(`__EPM_PUBLIC_HOST__`) && PathPrefix(`/api/workspace`)"
+      rule: "Host(`__EPM_PUBLIC_HOST__`) && (Path(`/api/workspace`) || PathPrefix(`/api/workspace/`))"
+      priority: 20
       entryPoints: [websecure]
       middlewares: [workspace-prefix, security-headers]
       service: workspace
       tls: {}
+    workspace-mcp:
+      rule: "Host(`__EPM_PUBLIC_HOST__`) && Path(`/api/workspace/mcp`)"
+      priority: 200
+      entryPoints: [websecure]
+      middlewares: [security-headers]
+      service: workspace
+      tls: {}
     application:
-      rule: "Host(`__EPM_PUBLIC_HOST__`) && PathPrefix(`/api/application`)"
+      rule: "Host(`__EPM_PUBLIC_HOST__`) && (Path(`/api/application`) || PathPrefix(`/api/application/`))"
+      priority: 20
       entryPoints: [websecure]
       middlewares: [application-prefix, security-headers]
+      service: application
+      tls: {}
+    application-mcp:
+      # The listener emits the resource-specific challenge before aliasing to /mcp.
+      rule: "Host(`__EPM_PUBLIC_HOST__`) && Path(`/api/application/mcp`)"
+      priority: 200
+      entryPoints: [websecure]
+      middlewares: [security-headers]
       service: application
       tls: {}
     application-personal:
@@ -56,8 +81,17 @@ http:
       middlewares: [security-headers]
       service: application
       tls: {}
+    mcp-resource-metadata:
+      # The application router owns discovery for all supported resources.
+      rule: "Host(`__EPM_PUBLIC_HOST__`) && (Path(`/.well-known/oauth-protected-resource`) || PathPrefix(`/.well-known/oauth-protected-resource/`))"
+      priority: 200
+      entryPoints: [websecure]
+      middlewares: [security-headers]
+      service: application
+      tls: {}
     web:
       rule: "Host(`__EPM_PUBLIC_HOST__`)"
+      priority: 1
       entryPoints: [websecure]
       middlewares: [security-headers]
       service: browser-gateway

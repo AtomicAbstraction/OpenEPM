@@ -180,8 +180,20 @@ async function openRule(page) {
   );
   await page.getByRole("heading", { name: "Python programs" }).waitFor();
   await page.getByText("AIC Apportion Policy", { exact: true }).waitFor();
-  await page.getByRole("button", { name: "Open", exact: true }).click();
+  await page
+    .getByRole("button", {
+      name: "View code for AIC Apportion Policy",
+      exact: true,
+    })
+    .click();
   await page.getByText("This program does not require parameters.").waitFor();
+  const detail = page.getByLabel("Python program detail", { exact: true });
+  await detail.waitFor();
+  await page.waitForFunction(
+    () =>
+      document.activeElement?.getAttribute("aria-label") ===
+      "Python program detail",
+  );
 }
 
 async function renderedEditorSource(textbox) {
@@ -241,22 +253,16 @@ async function qualifyNormal(browser) {
   );
   await installApi(page, audit);
   await openRule(page);
-  const viewer = page.getByRole("textbox", {
+  const viewer = page.getByRole("region", {
     name: "Authorized Python source",
     exact: true,
   });
   await viewer.waitFor();
-  await page.waitForFunction(() =>
-    Array.from(document.querySelectorAll(".monaco-editor")).some((element) => {
-      const rectangle = element.getBoundingClientRect();
-      return rectangle.width > 0 && rectangle.height > 0;
-    }),
-  );
   assert.equal(
     await page.getByRole("button", { name: "Retry editor" }).count(),
     0,
   );
-  assert.equal(await renderedEditorSource(viewer), source);
+  assert.equal(await viewer.textContent(), source);
   const body = await page.locator("body").innerText();
   for (const token of [
     "a".repeat(64),
@@ -286,22 +292,48 @@ async function qualifyNormal(browser) {
 }
 
 async function qualifyEditorFailure(browser) {
-  const page = await browser.newPage();
+  // Use a separate context so the successful case cannot satisfy the dynamic
+  // editor import from Chromium's HTTP cache.
+  const context = await browser.newContext();
+  const page = await context.newPage();
   const audit = { apiRequests: [], unhandledApi: [], externalRequests: [] };
+  let blockedRuntimeRequests = 0;
   await installApi(page, audit);
-  await page.route("**/ui/assets/python-editor-runtime-*.js", (route) =>
-    route.abort("failed"),
+  await page.route(
+    /\/ui\/assets\/python-editor-runtime-[^/]+\.js(?:\?.*)?$/,
+    (route) => {
+      blockedRuntimeRequests += 1;
+      return route.abort("failed");
+    },
   );
   await openRule(page);
-  const fallback = page.getByRole("textbox", {
+  const viewer = page.getByRole("region", {
     name: "Authorized Python source",
+    exact: true,
+  });
+  await viewer.waitFor();
+  assert.equal(await viewer.textContent(), source);
+  assert.equal(
+    await page.getByRole("button", { name: "Retry editor" }).count(),
+    0,
+  );
+  await page.getByRole("button", { name: "Edit current source" }).click();
+  const fallback = page.getByRole("textbox", {
+    name: "Python program source",
     exact: true,
   });
   await fallback.waitFor();
   assert.equal(await fallback.inputValue(), source);
-  await page.getByRole("button", { name: "Retry editor" }).waitFor();
+  await page
+    .locator("button")
+    .filter({ hasText: /^Retry editor$/ })
+    .waitFor();
+  assert(
+    blockedRuntimeRequests > 0,
+    "editor runtime failure was not exercised",
+  );
   assert.deepEqual(audit.unhandledApi, []);
-  await page.close();
+  await context.close();
   return { sourceVisible: true, retryVisible: true };
 }
 

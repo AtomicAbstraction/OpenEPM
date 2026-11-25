@@ -24,6 +24,13 @@ _PARAMETER_TYPES = frozenset({"Member", "String", "Decimal", "Boolean", "Date"})
 _HIERARCHY_KINDS = frozenset(
     {"children", "parents", "descendants", "ancestors", "siblings", "leaves", "base"}
 )
+NAVIGATION_OPERATIONS = (
+    "top", "all", "roots", "unplaced", "leaves", "self", "is_base", "children",
+    "descendants", "leaf_descendants", "parents", "ancestors", "siblings",
+    "same_level", "same_generation",
+)
+NAVIGATION_FIELDS = {"kind", "operation", "scope", "hierarchyId", "anchor",
+                     "includeSelf", "allParents"}
 _ATTRIBUTE_OPERATORS = frozenset(
     {"eq", "ne", "lt", "lte", "gt", "gte", "contains", "starts_with", "in", "exists"}
 )
@@ -71,6 +78,50 @@ def _expression(
     if budget.nodes > MAX_NODES:
         raise ValueError("MEMBER_LIST_EXPRESSION_NODE_LIMIT_EXCEEDED")
     kind = value["kind"]
+
+    if kind == "navigation":
+        item = _exact_keys(value, NAVIGATION_FIELDS, "MEMBER_LIST_NAVIGATION_INVALID")
+        operation, scope = item["operation"], item["scope"]
+        anchor, hierarchy = item["anchor"], item["hierarchyId"]
+        if (operation not in NAVIGATION_OPERATIONS or scope not in {"dimension", "hierarchy"}
+                or type(item["includeSelf"]) is not bool
+                or type(item["allParents"]) is not bool):
+            raise ValueError("MEMBER_LIST_NAVIGATION_INVALID")
+        if hierarchy is not None:
+            hierarchy = _identifier(hierarchy, "HIERARCHY_ID")
+        if hierarchy is None and (scope == "hierarchy" or operation not in {"top", "all"}):
+            raise ValueError("MEMBER_LIST_NAVIGATION_HIERARCHY_REQUIRED")
+        if scope == "dimension" and operation not in {"top", "all", "leaves", "unplaced"}:
+            raise ValueError("MEMBER_LIST_NAVIGATION_SCOPE_INVALID")
+        if anchor is not None:
+            anchor = _exact_keys(anchor, {"memberId", "pathRelationshipIds"},
+                                 "MEMBER_LIST_NAVIGATION_ANCHOR_INVALID")
+            path = anchor["pathRelationshipIds"]
+            if path is not None:
+                if type(path) is not list or len(path) > 32:
+                    raise ValueError("MEMBER_LIST_NAVIGATION_PATH_INVALID")
+                path = [_identifier(edge, "RELATIONSHIP_ID") for edge in path]
+                if len(path) != len(set(path)):
+                    raise ValueError("MEMBER_LIST_NAVIGATION_PATH_INVALID")
+            anchor = {"memberId": _identifier(anchor["memberId"], "MEMBER_ID"),
+                      "pathRelationshipIds": path}
+            budget.member_references += 1
+            if budget.member_references > MAX_MEMBER_REFERENCES:
+                raise ValueError("MEMBER_LIST_MEMBER_REFERENCE_LIMIT_EXCEEDED")
+        if (anchor is not None and operation in {"top", "all", "roots", "unplaced", "leaves"}
+                or anchor is None and operation in {"self", "is_base", "parents", "ancestors", "siblings", "same_level"}
+                or scope == "dimension" and anchor is not None):
+            raise ValueError("MEMBER_LIST_NAVIGATION_ANCHOR_INVALID")
+        if item["includeSelf"] and (anchor is None or operation not in {
+                "children", "descendants", "leaf_descendants", "parents", "ancestors",
+                "siblings", "same_level", "same_generation"}):
+            raise ValueError("MEMBER_LIST_NAVIGATION_INCLUDE_SELF_INVALID")
+        if item["allParents"] and (operation not in {"parents", "ancestors", "siblings"}
+                or anchor is not None and anchor["pathRelationshipIds"] is not None):
+            raise ValueError("MEMBER_LIST_NAVIGATION_ALL_PARENTS_INVALID")
+        return {"kind": kind, "operation": operation, "scope": scope,
+                "hierarchyId": hierarchy, "anchor": anchor,
+                "includeSelf": item["includeSelf"], "allParents": item["allParents"]}
 
     if kind == "explicit":
         item = _exact_keys(value, {"kind", "memberIds"}, "MEMBER_LIST_EXPLICIT_INVALID")
@@ -278,3 +329,71 @@ def member_list_digest(value: object) -> str:
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
     ).encode("ascii")
     return sha256(encoded).hexdigest()
+
+
+def structural_schema_definitions(*, parameters=True):
+    """Structural projection of this module's canonical IR, not an evaluator."""
+    from .postgres_numeric_catalog import obj
+    identifier = {'type': 'string', 'pattern': '^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$'}
+    scalar = {'type': ['string', 'boolean', 'integer', 'null']}
+    node = {'$ref': '#/$defs/memberListExpression'}
+    path = {'anyOf': [{'type': 'array', 'maxItems': 32, 'uniqueItems': True,
+        'items': identifier}, {'type': 'null'}]}
+    anchor = {'anyOf': [obj({'memberId': identifier, 'pathRelationshipIds': path}),
+        {'type': 'null'}]}
+    navigation = obj({'kind': {'const': 'navigation'},
+        'operation': {'enum': list(NAVIGATION_OPERATIONS)},
+        'scope': {'enum': ['dimension', 'hierarchy']},
+        'hierarchyId': {'anyOf': [identifier, {'type': 'null'}]},
+        'anchor': anchor, 'includeSelf': {'type': 'boolean'},
+        'allParents': {'type': 'boolean'}})
+    navigation['allOf'] = [
+        {'if': {'properties': {'scope': {'const': 'dimension'}}},
+         'then': {'properties': {'operation': {'enum': ['top', 'all', 'leaves', 'unplaced']}, 'anchor': {'type': 'null'}}}},
+        {'if': {'properties': {'hierarchyId': {'type': 'null'}}},
+         'then': {'properties': {'scope': {'const': 'dimension'}, 'operation': {'enum': ['top', 'all']}}}},
+        {'if': {'properties': {'operation': {'enum': ['top', 'all', 'roots', 'unplaced', 'leaves']}}},
+         'then': {'properties': {'anchor': {'type': 'null'}}}},
+        {'if': {'properties': {'operation': {'enum': ['self', 'is_base', 'parents', 'ancestors', 'siblings', 'same_level']}}},
+         'then': {'properties': {'anchor': {'type': 'object'}}}},
+        {'if': {'properties': {'includeSelf': {'const': True}}},
+         'then': {'properties': {'anchor': {'type': 'object'},
+             'operation': {'enum': ['children', 'descendants', 'leaf_descendants', 'parents', 'ancestors', 'siblings', 'same_level', 'same_generation']}}}},
+        {'if': {'properties': {'allParents': {'const': True}}},
+         'then': {'properties': {'operation': {'enum': ['parents', 'ancestors', 'siblings']},
+             'anchor': {'anyOf': [{'type': 'null'}, {'type': 'object',
+                 'properties': {'pathRelationshipIds': {'type': 'null'}}}]}}}}]
+    hierarchy = obj({'kind': {'enum': sorted(_HIERARCHY_KINDS)},
+        'hierarchyId': identifier, 'memberId': identifier, 'includeSelf': {'type': 'boolean'}})
+    hierarchy['allOf'] = [{'if': {'properties': {'kind': {'const': 'base'}}},
+        'then': {'properties': {'includeSelf': {'const': False}}}}]
+    attribute = obj({'kind': {'const': 'attribute'}, 'attributeId': identifier,
+        'operator': {'enum': sorted(_ATTRIBUTE_OPERATORS)},
+        'value': {'anyOf': [scalar, {'type': 'array', 'minItems': 1, 'maxItems': 100, 'items': scalar}]}})
+    attribute['allOf'] = [
+        {'if': {'properties': {'operator': {'const': 'exists'}}}, 'then': {'properties': {'value': {'type': 'boolean'}}}},
+        {'if': {'properties': {'operator': {'const': 'in'}}}, 'then': {'properties': {'value': {'type': 'array'}}}},
+        {'if': {'properties': {'operator': {'not': {'enum': ['exists', 'in']}}}}, 'then': {'properties': {'value': scalar}}}]
+    order = obj({'kind': {'const': 'order'}, 'source': node,
+        'by': {'enum': ['member_id', 'name', 'attribute']},
+        'direction': {'enum': ['ascending', 'descending']},
+        'attributeId': {'anyOf': [identifier, {'type': 'null'}]}})
+    order['allOf'] = [{'if': {'properties': {'by': {'const': 'attribute'}}},
+        'then': {'properties': {'attributeId': identifier}},
+        'else': {'properties': {'attributeId': {'type': 'null'}}}}]
+    variants = [navigation, hierarchy, attribute, order,
+        obj({'kind': {'const': 'explicit'}, 'memberIds': {'type': 'array',
+            'minItems': 1, 'maxItems': MAX_MEMBER_REFERENCES, 'uniqueItems': True, 'items': identifier}}),
+        obj({'kind': {'enum': ['union', 'intersection']}, 'items': {'type': 'array',
+            'minItems': 2, 'maxItems': MAX_SET_ITEMS, 'items': node}}),
+        obj({'kind': {'const': 'difference'}, 'source': node, 'subtract': node})]
+    if parameters:
+        variants.append(obj({'kind': {'const': 'parameter'}, 'name': identifier}))
+    definition = obj({'format': {'const': FORMAT}, 'listId': identifier,
+        'dimensionId': identifier, 'name': {'type': 'string', 'minLength': 1, 'maxLength': 200},
+        'parameters': {'type': 'array', 'maxItems': 100, 'items': obj({
+            'name': identifier, 'type': {'enum': sorted(_PARAMETER_TYPES)}, 'required': {'type': 'boolean'}})},
+        'expression': node, 'limits': obj({
+            'nodeCount': {'type': 'integer', 'minimum': 1, 'maximum': MAX_NODES},
+            'memberReferenceCount': {'type': 'integer', 'minimum': 0, 'maximum': MAX_MEMBER_REFERENCES}})})
+    return {'memberListExpression': {'oneOf': variants}, 'memberListDefinition': definition}

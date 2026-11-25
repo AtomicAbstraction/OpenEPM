@@ -12,6 +12,31 @@ export type WorkspaceSection = {
   prefixes: string[];
 };
 
+export const securitySectionReads = {
+  security: "security.application.access.list",
+  "effective-access": "security.application.effective-access.list",
+  assignments: "security.application.authorization.read",
+  groups: "security.application.group-access.list",
+  policy: "security.application.dimension-policy.read",
+  "planning-policies": "cube.write.policy.list",
+  audit: "security.application.audit.list",
+} as const;
+
+export function firstSecuritySection(functions: Record<string, unknown>) {
+  return Object.entries(securitySectionReads).find(([, name]) =>
+    Object.hasOwn(functions, name),
+  )?.[0];
+}
+
+export function ruleSectionsFor(functions: Record<string, unknown>) {
+  const names = Object.keys(functions);
+  return workspaceSections.rules.filter((section) =>
+    section.prefixes.some((prefix) =>
+      names.some((name) => name.startsWith(prefix)),
+    ),
+  );
+}
+
 export const workspaceSections: Record<WorkspaceArea, WorkspaceSection[]> = {
   data: [
     {
@@ -43,7 +68,8 @@ export const workspaceSections: Record<WorkspaceArea, WorkspaceSection[]> = {
     {
       id: "reference",
       label: "Function reference",
-      description: "Inspect the data functions available to your current role.",
+      description:
+        "Inspect data functions in the current application catalogue.",
       prefixes: ["facts.transfer.", "facts.source.", "facts.line-detail."],
     },
   ],
@@ -74,13 +100,6 @@ export const workspaceSections: Record<WorkspaceArea, WorkspaceSection[]> = {
       prefixes: ["calculated.member."],
     },
     {
-      id: "sequences",
-      label: "Sequences",
-      description:
-        "Inspect ordered calculation statements and run a published sequence.",
-      prefixes: ["application.sequence.", "rules.numeric_sequence."],
-    },
-    {
       id: "schedules",
       label: "Schedules",
       description: "Inspect and maintain scheduled application work.",
@@ -103,11 +122,9 @@ export const workspaceSections: Record<WorkspaceArea, WorkspaceSection[]> = {
       id: "reference",
       label: "Function reference",
       description:
-        "Inspect the calculation and execution functions available to your current role.",
+        "Inspect calculation and execution functions in the current application catalogue.",
       prefixes: [
         "application.rule.",
-        "application.sequence.",
-        "rules.numeric_sequence.",
         "application.schedule.",
         "schedule.",
         "calculated.member.",
@@ -131,7 +148,7 @@ export const workspaceSections: Record<WorkspaceArea, WorkspaceSection[]> = {
       id: "reference",
       label: "Function reference",
       description:
-        "Inspect the member-list functions available to your current role.",
+        "Inspect member-list functions in the current application catalogue.",
       prefixes: ["metadata.member_list."],
     },
   ],
@@ -144,11 +161,39 @@ export const workspaceSections: Record<WorkspaceArea, WorkspaceSection[]> = {
       prefixes: ["security.", "application.dimension.access"],
     },
     {
+      id: "effective-access",
+      label: "Effective access",
+      description:
+        "Find a person and inspect how they receive access to this application.",
+      prefixes: [securitySectionReads["effective-access"]],
+    },
+    {
+      id: "assignments",
+      label: "Role assignments",
+      description:
+        "Manage the groups, roles and resource scopes assigned to this application.",
+      prefixes: ["security.application.authorization."],
+    },
+    {
+      id: "groups",
+      label: "Groups & access",
+      description:
+        "Inspect group grants and review application access changes.",
+      prefixes: ["security.application.group-access.list"],
+    },
+    {
       id: "policy",
       label: "Dimensional policy",
       description:
         "Inspect the active access policy and review an exact policy change.",
       prefixes: ["security.application.dimension-policy."],
+    },
+    {
+      id: "planning-policies",
+      label: "Planning policies",
+      description:
+        "Review the rules that govern cube writes, prepare drafts and manage activation.",
+      prefixes: ["cube.write.policy."],
     },
     {
       id: "audit",
@@ -163,8 +208,12 @@ export const workspaceSections: Record<WorkspaceArea, WorkspaceSection[]> = {
       id: "reference",
       label: "Function reference",
       description:
-        "Inspect the security functions available to your current role.",
-      prefixes: ["security.", "application.dimension.access"],
+        "Inspect security functions in the current application catalogue.",
+      prefixes: [
+        "security.",
+        "application.dimension.access",
+        "cube.write.policy.",
+      ],
     },
   ],
   administration: [
@@ -183,8 +232,9 @@ export const workspaceSections: Record<WorkspaceArea, WorkspaceSection[]> = {
       id: "reference",
       label: "Function reference",
       description:
-        "Inspect the administration functions available to your current role.",
+        "Inspect administration functions in the current application catalogue.",
       prefixes: [
+        "application.state.read",
         "application.lifecycle",
         "application.maintenance",
         "application.reset",
@@ -199,7 +249,7 @@ export function workspaceSectionForArtifact(kind?: string) {
     : kind === "CalculatedMember"
       ? "calculations"
       : kind === "ApplicationSequence"
-        ? "sequences"
+        ? "rules"
         : kind === "ApplicationSchedule"
           ? "schedules"
           : undefined;
