@@ -120,7 +120,7 @@ class HttpsMcpTransport:
             diagnostic = (structured if "structuredContent" in result
                           else self._text_diagnostic(text_content))
             code = self._tool_error_code(diagnostic, text_content, tool)
-            if code in REPAIR_CODES:
+            if code is not None and code in REPAIR_CODES:
                 program = canonical.get("program")
                 function = program.get("function") if isinstance(program, dict) else None
                 details = repair_fields(diagnostic, requested_function=function)
@@ -167,8 +167,8 @@ class HttpsMcpTransport:
     def _probe_protocol(self) -> str:
         try:
             response = self._rpc(_DISCOVER, {}, version=_MODERN_VERSION)
-        except McpTransportError as error:
-            if error.code == "MCP_LEGACY_DISCOVERY" or error.rpc_code in (-32600, -32601):
+        except McpTransportError as probe_error:
+            if probe_error.code == "MCP_LEGACY_DISCOVERY" or probe_error.rpc_code in (-32600, -32601):
                 return _LEGACY_VERSIONS[0]
             raise
         result = response.get("result")
