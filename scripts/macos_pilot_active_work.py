@@ -36,8 +36,10 @@ SOURCES = {
  "schedules": (
   ("epm.python_program_occurrence", "status", {"ready","running","building","running_program","cancel_requested","needs_inspection"}, {"published","failed","cancelled"}),
   ("epm.python_program_schedule_state", "CASE WHEN dispatch_claimant IS NOT NULL AND dispatch_lease_until > clock_timestamp() THEN 'claimed' ELSE 'idle' END", {"claimed"}, {"idle"}),
+  ("epm.python_program_schedule_definition", "CASE WHEN dispatch_claimant IS NOT NULL AND dispatch_lease_until > clock_timestamp() THEN 'claimed' ELSE 'idle' END", {"claimed"}, {"idle"}),
   ("epm.application_schedule_occurrence", "status", {"ready","running","submitted","cancel_requested","needs_inspection"}, {"published","partially_published","failed","cancelled"}),
-  ("epm.application_schedule_state", "CASE WHEN dispatch_claimant IS NOT NULL AND dispatch_lease_until > clock_timestamp() THEN 'claimed' ELSE 'idle' END", {"claimed"}, {"idle"})),
+  ("epm.application_schedule_state", "CASE WHEN dispatch_claimant IS NOT NULL AND dispatch_lease_until > clock_timestamp() THEN 'claimed' ELSE 'idle' END", {"claimed"}, {"idle"}),
+  ("epm.application_schedule_definition", "CASE WHEN dispatch_claimant IS NOT NULL AND dispatch_lease_until > clock_timestamp() THEN 'claimed' ELSE 'idle' END", {"claimed"}, {"idle"})),
  "imports": (
   ("epm.source_batch", "status", {"staging","ready"},
    {"published","failed","cancelled"}),
@@ -53,8 +55,48 @@ SOURCES = {
   ("epm.application", "status", {"Deleting"}, {"Active","Maintenance"})),
 }
 
+# The active-work contract spans retained historical generations as well as the
+# current schema. A relation is queried only while it exists, but its current
+# replacement is part of the same canonical inventory from the migration that
+# creates it. Unexpected absence within that bounded lifetime still fails
+# closed as an ordinary SQL error.
+SOURCE_INTRODUCED_SCHEMA = {
+ "epm.workspace":1,"epm.application":1,"epm.job":12,"epm.source_batch":15,
+ "epm.expression_rule_sequence":44,"epm.full_aggregate_sequence":54,
+ "epm.cube_aggregate_query":88,"epm.python_program_build":89,
+ "epm.python_program_workflow":89,"epm.layout_replacement_request":107,
+ "epm.layout_replacement_activation":110,"epm.fact_export_producer_request":113,
+ "epm.transfer_cleanup_request":115,"epm.python_program_occurrence":132,
+ "epm.python_program_schedule_state":132,"epm.source_import_execution":151,
+ "epm.application_rule_workflow":217,"epm.application_schedule_occurrence":220,
+ "epm.application_schedule_state":220,
+ "epm.application_schedule_definition":312,
+ "epm.python_program_schedule_definition":315,
+}
+SOURCE_RETIRED_SCHEMA = {
+ "epm.application_schedule_state":312,
+ "epm.python_program_schedule_state":315,
+}
+
 
 class ActiveWorkError(RuntimeError): pass
+
+
+def sources_for_schema(schema:int)->dict[str,tuple]:
+    canonical={table for family in FAMILIES
+               for table,_,_,_ in SOURCES[family]}
+    if not isinstance(schema,int) or isinstance(schema,bool) or schema<1 \
+            or set(SOURCE_INTRODUCED_SCHEMA)!=canonical \
+            or not set(SOURCE_RETIRED_SCHEMA).issubset(canonical) \
+            or any(SOURCE_RETIRED_SCHEMA[table]
+                   <=SOURCE_INTRODUCED_SCHEMA[table]
+                   for table in SOURCE_RETIRED_SCHEMA):
+        raise ActiveWorkError("active-work schema inventory differs")
+    return {family:tuple(source for source in SOURCES[family]
+                         if SOURCE_INTRODUCED_SCHEMA[source[0]]<=schema
+                         and schema<SOURCE_RETIRED_SCHEMA.get(
+                             source[0],schema+1))
+            for family in FAMILIES}
 
 
 def canonical(value: object) -> bytes:
@@ -120,8 +162,13 @@ class ActiveWorkObserver:
                 db.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 db.execute("SELECT set_config('statement_timeout',%s,true)",
                            (str(self.timeout),))
+                identity=db.execute(
+                    "SELECT max(version)::bigint maximum FROM epm.schema_migration"
+                ).fetchone()
+                schema=identity.get("maximum") if isinstance(identity,dict) else None
+                applicable=sources_for_schema(schema)
                 for family in FAMILIES:
-                    for table,column,_,_ in SOURCES[family]:
+                    for table,column,_,_ in applicable[family]:
                         query=f"SELECT %s table_name,{column} status,count(*)::bigint count FROM {table} GROUP BY {column}"
                         for row in db.execute(query,(table,)).fetchall():
                             item=dict(row);item["count"]=int(item["count"])

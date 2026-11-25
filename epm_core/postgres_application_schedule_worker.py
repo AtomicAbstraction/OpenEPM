@@ -106,11 +106,12 @@ class PostgresApplicationScheduleWorker:
                 s.execution_issuer,s.execution_subject,s.execution_groups,
                 s.authorization_scope_digest,s.execution_token_issued_at,
                 s.execution_authority_kind,s.delegation_id,
-                s.delegation_state_token FROM epm.application_schedule_occurrence o
+                s.delegation_state_token,s.status AS schedule_status
+                FROM epm.application_schedule_occurrence o
                 JOIN epm.application_state incarnation ON
                   incarnation.workspace_id=o.workspace_id
                   AND incarnation.application_id=o.application_id
-                JOIN epm.application_schedule_definition s ON
+                LEFT JOIN epm.application_schedule_definition s ON
                   (s.workspace_id,s.application_id,s.schedule_id,s.state_token)=
                   (o.workspace_id,o.application_id,o.schedule_id,
                    o.schedule_state_token)
@@ -119,6 +120,26 @@ class PostgresApplicationScheduleWorker:
                   AND incarnation.processing_mode='Active' ''',(scope.workspace_id,
                 scope.application_id,occurrence_id,schema_epoch)).fetchone()
             if row is None:
+                raise ValueError("APPLICATION_SCHEDULE_OCCURRENCE_UNAVAILABLE")
+            parent=None
+            if row["application_rule_workflow_id"] is not None:
+                from .postgres_job_origin import schedule_control_parent
+                # Ordinary receipt polling needs the same exact retained link
+                # as cancellation. A similarly shaped key never adopts a run.
+                parent=schedule_control_parent(db,scope,row)
+            if row["status"]=="cancel_requested":
+                if parent is None:
+                    raise ValueError("APPLICATION_RULE_EXECUTION_ORIGIN_UNRESOLVED")
+                # The original parent/task identifies cancellation authority;
+                # a rotated current definition never supplies a new actor.
+                row={**row,"_control_parent":parent,
+                    "execution_issuer":parent["issuer"],
+                    "execution_subject":parent["subject_id"],
+                    "execution_groups":parent["verified_groups"],
+                    "authorization_scope_digest":parent["authorization_scope_digest"],
+                    "execution_token_issued_at":parent["token_issued_at"],
+                    "execution_authority_kind":parent["authority_kind"]}
+            elif row["schedule_status"]!="Active":
                 raise ValueError("APPLICATION_SCHEDULE_OCCURRENCE_UNAVAILABLE")
             return row
 
@@ -132,7 +153,8 @@ class PostgresApplicationScheduleWorker:
                     application_rule_workflow_id=COALESCE(
                       %s,application_rule_workflow_id),
                     error_code=%s,result=%s,
-                    inspection_origin_status=NULL,
+                    inspection_origin_status=CASE WHEN %s='needs_inspection'
+                      THEN %s ELSE NULL END,
                     next_attempt_at=CASE WHEN %s THEN
                       clock_timestamp()+interval '5 seconds' ELSE NULL END,
                     claimant=NULL,lease_until=NULL,
@@ -140,12 +162,14 @@ class PostgresApplicationScheduleWorker:
                 WHERE workspace_id=%s AND application_id=%s
                   AND occurrence_id=%s AND claim_generation=%s
                   AND claimant=%s AND lease_until>clock_timestamp()
+                  AND (%s::text IS NULL OR application_rule_workflow_id=%s)
                   AND EXISTS(SELECT 1 FROM epm.application_state incarnation
                     WHERE incarnation.workspace_id=%s AND incarnation.application_id=%s
                      AND incarnation.schema_epoch=%s AND incarnation.processing_mode='Active')''',(
-                status,workflow_id,error_code,Jsonb(result or {}),next_poll,
+                status,workflow_id,error_code,Jsonb(result or {}),status,
+                "cancel_requested" if claim["status"]=="cancel_requested" else claim["status"],next_poll,
                 scope.workspace_id,scope.application_id,claim["occurrence_id"],
-                claim["claim_generation"],claim["claimant"],scope.workspace_id,
+                claim["claim_generation"],claim["claimant"],workflow_id,workflow_id,scope.workspace_id,
                 scope.application_id,claim["schema_epoch"])).rowcount
             if changed!=1:
                 raise ValueError("APPLICATION_SCHEDULE_OCCURRENCE_STALE_CLAIM")
@@ -166,31 +190,10 @@ class PostgresApplicationScheduleWorker:
             capacity_limits=self.capacity_limits)
         if claim is None:return None
         scope=ApplicationScope(claim["workspace_id"],claim["application_id"])
-        fence=None
         try:
-            # The occurrence's owning schedule is immutable.  Resolve that
-            # stable identifier first, then acquire its admission fence and
-            # re-read the full exact-current occurrence under the fence.
-            with connect_postgres(self.runtime_dsn,row_factory=dict_row) as lookup:
-              with lookup.transaction():
-                self._scope(lookup,scope)
-                owner=lookup.execute('''SELECT schedule_id FROM
-                    epm.application_schedule_occurrence WHERE workspace_id=%s
-                    AND application_id=%s AND occurrence_id=%s''',(
-                    scope.workspace_id,scope.application_id,
-                    claim["occurrence_id"])).fetchone()
-            if owner is None:
-                raise ValueError("APPLICATION_SCHEDULE_OCCURRENCE_UNAVAILABLE")
-            schedule_id=owner["schedule_id"]
-            # Hold the same schedule-scoped advisory fence used by Save,
-            # Activate and Deactivate until the exact child workflow has been
-            # admitted and linked.  This closes the read→admit race without
-            # sharing a database transaction across service boundaries.
-            fence=connect_postgres(self.runtime_dsn,autocommit=True)
-            configure_statement_timeout(fence,5000);configure_lock_wait(fence)
-            fence.execute('''SELECT pg_advisory_lock(hashtextextended(
-                'epm.application.schedule:'||%s||':'||%s||':'||%s,0))''',(
-                scope.workspace_id,scope.application_id,schedule_id))
+            # Parent insertion validates the exact claim and links this
+            # occurrence under the application-state fence. Never hold a
+            # session schedule lock across sealing or another transaction.
             row=self._occurrence_row(scope,claim["occurrence_id"],claim["schema_epoch"])
             identity=PostgresApplicationSchedules._execution_identity(row)
             language=PostgresLanguageV2(self.runtime_dsn,identity=identity,
@@ -198,20 +201,46 @@ class PostgresApplicationScheduleWorker:
             service=PostgresApplicationRuleRun(
                 self.runtime_dsn,identity=identity,language=language)
             if row["status"]=="cancel_requested":
-                if row["application_rule_workflow_id"] is not None:
-                    service.advance_existing(
-                        scope,row["application_rule_workflow_id"])
+                parent=row["_control_parent"]
+                if parent["status"]=="needs_inspection":
+                    return self._update(scope,claim,status="needs_inspection",
+                        workflow_id=parent["workflow_id"],
+                        error_code="WORKFLOW_CANCELLATION_CHILD_UNRESOLVED")
+                if (parent["status"]=="cancel_requested" and parent["worker_failures"]>=3
+                        and parent["claimant"] is None and parent["lease_until"] is None):
+                    return self._update(scope,claim,status="needs_inspection",
+                        workflow_id=parent["workflow_id"],
+                        error_code="WORKFLOW_CANCELLATION_RECOVERY_PARKED")
+                if parent["status"] in ("accepted","running"):
+                    controlled=service.cancel(scope,parent["workflow_id"])
+                    parent_status=controlled["status"]
+                else:
+                    parent_status=parent["status"]
+                if parent_status=="cancel_requested":
+                    service.advance_existing(scope,parent["workflow_id"])
+                else:
+                    # Receipt/status accounting must not rebuild a sealed plan
+                    # or demand the withdrawn execution delegation.
+                    service.read(scope,parent["workflow_id"])
                 workflow=PostgresApplicationSchedules(
                     self.runtime_dsn,identity=identity
                 ).reconcile_cancel_requested(scope,claim["occurrence_id"])
             elif row["application_rule_workflow_id"] is None:
+                from .postgres_job_origin import ScheduledRuleAdmission
                 definition=validate_definition(row["definition"])
                 target=definition["target"]
                 workflow=service.run(scope,target["ruleId"],
                     bindings=execution_bindings(definition),
                     expected_state_token=target["stateToken"],
                     expected_program_digest=target["programDigest"],
-                    idempotency_key="schedule-rule-"+claim["occurrence_id"])
+                    idempotency_key="schedule-rule-"+claim["occurrence_id"],
+                    _schedule_admission=ScheduledRuleAdmission(
+                        occurrence_id=claim["occurrence_id"],schedule_id=row["schedule_id"],
+                        schedule_state_token=row["schedule_state_token"],
+                        delegation_id=row["delegation_id"],
+                        delegation_state_token=row["delegation_state_token"],
+                        claim_generation=claim["claim_generation"],claimant=claim["claimant"],
+                        schema_epoch=claim["schema_epoch"]))
             else:
                 workflow=service.advance_existing(
                     scope,row["application_rule_workflow_id"])
@@ -222,9 +251,15 @@ class PostgresApplicationScheduleWorker:
                 workflow_id=workflow["workflowId"],result=workflow,
                 next_poll=mapped in ("submitted","cancel_requested"))
         except AccessDenied:
+            if claim["status"]=="cancel_requested":
+                return self._settle_occurrence_unexpected(claim)
             return self._update(scope,claim,status="failed",
                 error_code="APPLICATION_SCHEDULE_AUTHORIZATION_REVOKED")
         except ValueError as error:
+            if str(error) in ("APPLICATION_RULE_EXECUTION_ORIGIN_UNRESOLVED",
+                              "APPLICATION_RULE_EXECUTION_ORIGIN_INVALID"):
+                return self._update(scope,claim,status="needs_inspection",
+                    error_code=str(error))
             if str(error) in ("TOKEN_ISSUE_TIME_UNAVAILABLE",
                               "TECHNICAL_AUTHORITY_INVALID"):
                 return self._update(scope,claim,status="needs_inspection",
@@ -240,14 +275,6 @@ class PostgresApplicationScheduleWorker:
             return self._settle_occurrence_unexpected(claim)
         except Exception:
             return self._settle_occurrence_unexpected(claim)
-        finally:
-            if fence is not None:
-                try:
-                    fence.execute('''SELECT pg_advisory_unlock(hashtextextended(
-                        'epm.application.schedule:'||%s||':'||%s||':'||%s,0))''',(
-                        scope.workspace_id,scope.application_id,schedule_id))
-                finally:
-                    fence.close()
 
     def _settle_occurrence_unexpected(self,claim):
         outcome=self.dispatch.settle_occurrence_unexpected(claim)

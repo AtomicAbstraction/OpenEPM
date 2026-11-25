@@ -7,12 +7,17 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Annotated
+from pydantic import StrictBool, WithJsonSchema
+from epm_core.python_execution_contract import historical_read_contract
 from mcp.server import MCPServer
 from epm_core.postgres_mcp_execution import bounded_tool
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from epm_core.mcp_diagnostics import DiagnosticToolError
 from openepm.diagnostics import SourceValidationError
+from epm_core.public_program_diagnostics import ProgramValidationError
+from epm_core.application_catalog_projection import CatalogDiscoveryError
 
 import psycopg
 from epm_core.postgres_processing_limits import BUSY_CODE
@@ -68,7 +73,7 @@ def _assertion(ctx: Context) -> str:
 def _call(operation):
     try:
         return operation()
-    except SourceValidationError as error:
+    except (SourceValidationError, ProgramValidationError, CatalogDiscoveryError) as error:
         raise DiagnosticToolError(error.diagnostics) from None
     except (AuthError,ValueError) as error:
         raise ToolError(str(error)) from error
@@ -94,14 +99,24 @@ def read_v2_session_identity(ctx: Context) -> dict:
 
 
 @bounded_tool(server)
-def list_v2_functions(ctx: Context) -> dict:
-    """Discover the granted functions on this exact application listener."""
-    return _call(lambda:application().catalog(_assertion(ctx)))
+def list_v2_functions(ctx: Context, discovery: dict | None = None) -> dict:
+    """Discover current grants; omit discovery for all contracts.
+
+    Use {"view":"summary"} for families and a first read, then
+    {"view":"functions","family":family,"limit":20} or an exact "function".
+    Pass discovery.next as "after" with the same query to continue.
+    """
+    return _call(lambda:application().catalog(_assertion(ctx),discovery=discovery))
 
 
 @bounded_tool(server)
 def read_v2_program(program: dict,ctx: Context) -> dict:
-    """Run a catalogued bounded read program."""
+    """Dispatch a catalogued program using its declared function mode.
+
+    This route supports bounded reads, technical query/control and retained
+    layout compatibility calls. Use the catalogued signed metadata tool for
+    current layout request workflows.
+    """
     return _call(lambda:application().read(_assertion(ctx),program))
 
 
@@ -139,7 +154,7 @@ def execute_v2_source_program(program: dict,ctx: Context) -> dict:
 @bounded_tool(server)
 def execute_v2_metadata_program(program: dict,idempotency_key: str,
                                 ctx: Context) -> dict:
-    """Apply typed metadata or unreviewed currency-settings programs."""
+    """Apply typed metadata, signed layout requests, or unreviewed currency settings."""
     return _call(lambda:application().metadata(
         _assertion(ctx),program,idempotency_key=idempotency_key))
 
@@ -177,9 +192,15 @@ def execute_v2_python_program_build(program: dict,idempotency_key: str,
 
 
 @bounded_tool(server)
-def read_v2_python_program_build(build_id: str,ctx: Context) -> dict:
-    """Read one caller-owned technical build and sealed-plan digest."""
-    return _call(lambda:application().python_build_read(_assertion(ctx),build_id))
+def read_v2_python_program_build(ctx: Context, build_id: str | None = None,
+        original_request: Annotated[dict, WithJsonSchema(historical_read_contract(build=True)['originalRequestSchema'])] | None = None) -> dict:
+    """Read by build_id OR exact original_request (program and idempotencyKey).
+
+    Current READ/owner/scope is required; expired original references are
+    authenticated but never admit, rebuild or resume work.
+    """
+    return _call(lambda:application().python_build_read(_assertion(ctx),build_id,
+        original_request=original_request))
 
 
 @bounded_tool(server)
@@ -206,10 +227,14 @@ def execute_v2_python_program_run(program: dict,idempotency_key: str,
 
 
 @bounded_tool(server)
-def read_v2_python_program_workflow(workflow_id: str,ctx: Context) -> dict:
-    """Read durable child jobs and committed unit receipts."""
+def read_v2_python_program_workflow(ctx: Context, workflow_id: str | None = None,
+        original_request: Annotated[dict, WithJsonSchema(historical_read_contract()['originalRequestSchema'])] | None = None) -> dict:
+    """Read by workflow_id OR exact original_request (program and idempotencyKey).
+
+    Historical READ never reloads source, resumes a plan or grants execution.
+    """
     return _call(lambda:application().python_workflow_read(
-        _assertion(ctx),workflow_id))
+        _assertion(ctx),workflow_id,original_request=original_request))
 
 
 @bounded_tool(server)
@@ -456,9 +481,11 @@ def apply_v2_cube_write_scope_transition(program: dict,preview_token: str,
 
 
 @bounded_tool(server)
-def read_v2_job(job_id: str,ctx: Context) -> dict:
-    """Read your authoritative durable job status and receipt revision."""
-    return _call(lambda:application().job(_assertion(ctx),job_id))
+def read_v2_job(ctx: Context, job_id: str | None = None,
+                operation_id: str | None = None) -> dict:
+    """Read your durable status by exactly one of job_id or the original operation_id."""
+    return _call(lambda:application().job(
+        _assertion(ctx),job_id,operation_id=operation_id))
 
 
 @bounded_tool(server)
@@ -477,10 +504,11 @@ def cancel_v2_job(job_id: str,ctx: Context) -> dict:
 
 @bounded_tool(server)
 def list_v2_tasks(ctx: Context,after_sequence: int=0,
-                  limit: int=100) -> dict:
-    """Page your durable tasks, or application tasks as an administrator."""
+                  limit: int=100,attention_only: StrictBool=False) -> dict:
+    """Page authorized durable tasks. Set attention_only to true for tasks needing attention."""
     return _call(lambda:application().tasks(
-        _assertion(ctx),after_sequence=after_sequence,limit=limit))
+        _assertion(ctx),after_sequence=after_sequence,limit=limit,
+        attention_only=attention_only))
 
 
 @bounded_tool(server)

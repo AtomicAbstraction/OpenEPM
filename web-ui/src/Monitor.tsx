@@ -1,28 +1,50 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { request } from "./api";
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Ref,
+} from "react";
+import { ApiError, isDefiniteEffectRefusal, request } from "./api";
 import type { ApplicationCatalog, ApplicationSummary, Scope } from "./types";
 import { useUnsavedWork } from "./unsaved-work";
-import { ReceiptInspector } from "./ReceiptInspector";
+import { ReceiptInspector, outcomeAuthorityKey } from "./ReceiptInspector";
+import { ApplicationQueue } from "./ApplicationQueue";
+import { LayoutActivation } from "./LayoutActivation";
+import { focusWhenInteractive } from "./MetadataReceiptRecovery";
+import { workflowCountBasis } from "./workflow-outcome";
+import {
+  isTaskProgressState,
+  mergeTaskListPage,
+  taskListBody,
+} from "./task-list";
+import type { TaskListPage, TaskListRow } from "./task-list";
 
-type TaskSummary = {
-  taskId: string;
+type TaskSummary = TaskListRow & {
   sourceFamily: string;
-  function: string;
-  status: string;
+  sourceId?: string;
   interruptible: boolean;
   rerunSupported: boolean;
   createdAt?: string;
   updatedAt?: string;
   initiatorKind?: string;
   initiatedBy?: string;
+  latestEvent: TaskEvent | null;
+  recoveryState?:
+    | "workflowCancellationPaused"
+    | "scheduleCancellationUnresolved"
+    | null;
 };
 
 type TaskEvent = {
   event?: number;
   status: string;
   occurredAt?: string;
-  claimGeneration?: number;
-  errorCode?: string;
+  claimGeneration?: number | null;
+  receiptRevision?: number | null;
+  errorCode?: string | null;
 };
 
 type TaskDetail = TaskSummary & {
@@ -45,40 +67,6 @@ type TaskLogPage = {
   lifecycle: { events: TaskEvent[]; nextEvent: number; hasMore: boolean };
   sourceLog: TaskSourceLog | null;
 };
-
-type TaskListPage = {
-  tasks: TaskSummary[];
-  nextSequence?: number | null;
-  hasMore: boolean;
-};
-
-export function mergeTaskListPage(
-  current: TaskSummary[],
-  page: TaskListPage,
-  previousCursor: number,
-  append: boolean,
-): { tasks: TaskSummary[]; nextSequence: number | null; hasMore: boolean } {
-  if (!Array.isArray(page.tasks) || typeof page.hasMore !== "boolean")
-    throw new Error("Task continuation response is invalid.");
-  const next = page.nextSequence ?? null;
-  if (
-    typeof next !== "number" ||
-    !Number.isSafeInteger(next) ||
-    next < 0 ||
-    (page.hasMore && next <= previousCursor)
-  )
-    throw new Error("Task continuation cursor is invalid.");
-  const combined = append ? [...current, ...page.tasks] : [...page.tasks];
-  const identifiers = new Set<string>();
-  for (const task of combined) {
-    if (!task || typeof task.taskId !== "string" || !task.taskId)
-      throw new Error("Task continuation contains an invalid task.");
-    if (identifiers.has(task.taskId))
-      throw new Error("Task continuation repeated a task.");
-    identifiers.add(task.taskId);
-  }
-  return { tasks: combined, nextSequence: next, hasMore: page.hasMore };
-}
 
 export function mergeTaskLogPage(
   current: TaskLogPage,
@@ -177,17 +165,6 @@ export type TaskProgressRow = {
   total: number;
 };
 
-export const taskListBody = (
-  scope: Scope,
-  afterSequence = 0,
-  attentionOnly = false,
-) => ({
-  ...scope,
-  afterSequence,
-  limit: 100,
-  attentionOnly,
-});
-
 export const jobReadBody = (scope: Scope, jobId: string) => ({
   ...scope,
   jobId,
@@ -207,17 +184,34 @@ function initiator(task: TaskSummary) {
   return task.initiatedBy ? `Human · ${task.initiatedBy}` : "Verified user";
 }
 
-function stateClass(status: string) {
-  if (
-    ["Failed", "Interrupted", "Cancelled", "Rejected", "Stale"].includes(status)
-  )
-    return "attention";
-  if (
-    ["Accepted", "Queued", "Claimed", "Running", "Cancelling"].includes(status)
-  )
-    return "running";
-  if (status === "Succeeded") return "succeeded";
-  return "neutral";
+async function readTaskDetail(
+  scope: Scope,
+  taskId: string,
+  signal: AbortSignal,
+) {
+  const detail = await request<TaskDetail>(
+    "/api/task",
+    {
+      ...scope,
+      taskId,
+      afterEvent: 0,
+      eventLimit: 100,
+    },
+    signal,
+  );
+  if (detail.taskId !== taskId)
+    throw new Error(
+      "The task response does not match the requested reference.",
+    );
+  if (!isTaskProgressState(detail.progressState))
+    throw new Error("Task progress is unavailable.");
+  return detail;
+}
+
+function taskStateClass(task: TaskSummary) {
+  if (task.progressState === "inProgress") return "running";
+  if (task.progressState === "other") return "neutral";
+  return task.progressState;
 }
 
 export function taskProgressRows(tasks: TaskSummary[]): TaskProgressRow[] {
@@ -232,7 +226,7 @@ export function taskProgressRows(tasks: TaskSummary[]): TaskProgressRow[] {
       other: 0,
       total: 0,
     };
-    const state = stateClass(task.status);
+    const state = taskStateClass(task);
     const group: ProgressState =
       state === "attention" || state === "running" || state === "succeeded"
         ? state
@@ -255,19 +249,56 @@ function time(value?: string) {
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
 }
 
-export function Monitor({
-  app,
-  catalog,
-  onRequestTransition = (action) => action(),
-}: {
+type MonitorProps = {
   app?: ApplicationSummary;
   catalog: ApplicationCatalog | null;
-  onRequestTransition?: (action: () => void) => void;
-}) {
+  onRefreshCatalog?: (signal?: AbortSignal) => Promise<ApplicationCatalog>;
+  onRequestTransition?: (action: () => void, preserveDrafts?: boolean) => void;
+  targetTaskId?: string;
+  onTaskContextChange?: (taskId: string | null) => void;
+  // Origin navigation owns its guard; local closes use onRequestTransition.
+  onCloseTask?: () => void;
+};
+
+export function Monitor(props: MonitorProps) {
+  const { app, catalog, onRefreshCatalog } = props;
+  if (catalog?.applicationAccess.authorizationModel === "group_assignments") {
+    if (!app || !catalog.ownedJobOperations?.includes("events")) return null;
+    const scope = {
+      workspaceId: app.workspaceId,
+      applicationId: app.applicationId,
+    };
+    return (
+      <div className="monitor-page">
+        <JobConsole
+          key={outcomeAuthorityKey(scope, catalog)}
+          scope={scope}
+          catalog={catalog}
+          onRefreshCatalog={onRefreshCatalog}
+        />
+      </div>
+    );
+  }
+  return <TaskMonitor {...props} />;
+}
+
+function TaskMonitor({
+  app,
+  catalog,
+  onRefreshCatalog,
+  onRequestTransition = (action) => action(),
+  targetTaskId,
+  onTaskContextChange,
+  onCloseTask,
+}: MonitorProps) {
   const scope = app
     ? { workspaceId: app.workspaceId, applicationId: app.applicationId }
     : null;
+  const taskResultsStatusId = useId();
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
+  const [taskListState, setTaskListState] = useState<
+    "loading" | "ready" | "unavailable"
+  >("loading");
   const [nextSequence, setNextSequence] = useState<number | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [attentionOnly, setAttentionOnly] = useState(false);
@@ -276,97 +307,167 @@ export function Monitor({
   const [selectedState, setSelectedState] = useState<ProgressState | "all">(
     "all",
   );
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const [readingTaskId, setReadingTaskId] = useState<string | null>(null);
+  const [listError, setListError] = useState("");
+  const [detailError, setDetailError] = useState("");
+  const busy = taskListState === "loading" || readingTaskId !== null;
+  const error = detailError || listError;
   const [query, setQuery] = useState("");
-  const requestVersion = useRef(0);
+  const taskListRead = useRef<AbortController | null>(null);
+  const taskDetailRead = useRef<AbortController | null>(null);
+  const taskOpener = useRef<{
+    element: HTMLButtonElement;
+    entering: boolean;
+  } | null>(null);
+  const closeTaskButton = useRef<HTMLButtonElement>(null);
+  const taskSearch = useRef<HTMLInputElement>(null);
+  const returnTaskFocus = useRef<HTMLElement | null>(null);
+
+  useLayoutEffect(() => {
+    if (selected) {
+      const opener = taskOpener.current;
+      if (!opener?.entering) return;
+      opener.entering = false;
+      // Keep the user's new position if they moved elsewhere while reading.
+      if (opener.element.ownerDocument.activeElement === opener.element)
+        return focusWhenInteractive(closeTaskButton.current);
+    } else if (returnTaskFocus.current) {
+      const opener = returnTaskFocus.current;
+      returnTaskFocus.current = null;
+      return focusWhenInteractive(
+        opener.isConnected ? opener : taskSearch.current,
+      );
+    }
+  }, [selected]);
 
   function changeTaskContext(action?: () => void) {
     onRequestTransition(() => {
-      ++requestVersion.current;
-      setBusy(false);
+      taskDetailRead.current?.abort();
+      taskOpener.current = null;
+      setReadingTaskId(null);
+      setDetailError("");
       setSelected(null);
+      onTaskContextChange?.(null);
       action?.();
+    }, true);
+  }
+
+  function closeTaskDetail() {
+    // Search stays mounted even when the refreshed list removes the prior row.
+    const opener =
+      taskListState === "loading" ? null : taskOpener.current?.element;
+    changeTaskContext(() => {
+      returnTaskFocus.current = opener ?? taskSearch.current;
     });
   }
 
   async function load(append = false) {
     if (!scope) return;
-    const version = ++requestVersion.current;
-    setBusy(true);
-    setError("");
+    taskListRead.current?.abort();
+    const controller = new AbortController();
+    taskListRead.current = controller;
+    const { signal } = controller;
+    setTaskListState("loading");
+    setListError("");
     try {
-      const page = await request<TaskListPage>(
+      const cursor = append ? nextSequence || 0 : 0;
+      const page = await request<TaskListPage<TaskSummary>>(
         "/api/tasks",
-        taskListBody(scope, append ? nextSequence || 0 : 0, attentionOnly),
+        taskListBody(scope, cursor, attentionOnly),
+        signal,
       );
-      if (version !== requestVersion.current) return;
-      const merged = mergeTaskListPage(
-        tasks,
-        page,
-        append ? nextSequence || 0 : 0,
-        append,
-      );
-      setTasks(merged.tasks);
-      setNextSequence(merged.nextSequence);
-      setHasMore(merged.hasMore);
+      if (signal.aborted) return;
+      const list = mergeTaskListPage(tasks, page, cursor, append);
+      setTasks(list.tasks);
+      setNextSequence(list.nextSequence);
+      setHasMore(list.hasMore);
+      setTaskListState("ready");
     } catch (reason) {
-      if (version !== requestVersion.current) return;
-      setError(
+      if (signal.aborted) return;
+      setTasks([]);
+      setNextSequence(null);
+      setHasMore(false);
+      setTaskListState("unavailable");
+      setListError(
         reason instanceof Error ? reason.message : "Unable to read tasks",
       );
-    } finally {
-      if (version === requestVersion.current) setBusy(false);
     }
   }
 
-  async function open(task: Pick<TaskSummary, "taskId">) {
+  async function open(
+    task: Pick<TaskSummary, "taskId">,
+    {
+      opener,
+      refresh = false,
+    }: { opener?: HTMLButtonElement; refresh?: boolean } = {},
+  ) {
     if (!scope) return;
-    const version = ++requestVersion.current;
-    setBusy(true);
-    setError("");
+    taskDetailRead.current?.abort();
+    const controller = new AbortController();
+    taskDetailRead.current = controller;
+    const { signal } = controller;
+    setReadingTaskId(task.taskId);
+    setDetailError("");
+    if (!refresh) {
+      taskOpener.current = opener ? { element: opener, entering: true } : null;
+      setSelected(null);
+      onTaskContextChange?.(null);
+    }
     try {
-      const detail = await request<TaskDetail>("/api/task", {
-        ...scope,
-        taskId: task.taskId,
-        afterEvent: 0,
-        eventLimit: 100,
-      });
-      if (version !== requestVersion.current) return;
+      const detail = await readTaskDetail(scope, task.taskId, signal);
+      if (signal.aborted) return;
       setSelected(detail);
+      if (!refresh) onTaskContextChange?.(detail.taskId);
     } catch (reason) {
-      if (version !== requestVersion.current) return;
-      setError(
+      if (signal.aborted) return;
+      if (refresh) {
+        setSelected(null);
+        onTaskContextChange?.(null);
+      }
+      setDetailError(
         reason instanceof Error ? reason.message : "Unable to read task",
       );
     } finally {
-      if (version === requestVersion.current) setBusy(false);
+      if (!signal.aborted) setReadingTaskId(null);
     }
   }
 
   useEffect(() => {
+    if (!scope) return;
+    taskOpener.current = null;
     setTasks([]);
     setSelected(null);
+    setReadingTaskId(null);
+    setDetailError("");
+    onTaskContextChange?.(null);
     setSelectedFamily("");
     setSelectedState("all");
-    void load();
+    const loading = load();
+    const signal = taskListRead.current?.signal;
+    void loading.then(() => {
+      if (signal && !signal.aborted && targetTaskId)
+        void open({ taskId: targetTaskId });
+    });
     return () => {
-      ++requestVersion.current;
+      taskListRead.current?.abort();
+      taskDetailRead.current?.abort();
     };
-  }, [app?.workspaceId, app?.applicationId, attentionOnly]);
+  }, [app?.workspaceId, app?.applicationId, attentionOnly, targetTaskId]);
 
-  const counts = useMemo(
-    () => ({
-      visible: tasks.length,
-      attention: tasks.filter((task) => stateClass(task.status) === "attention")
-        .length,
-      running: tasks.filter((task) => stateClass(task.status) === "running")
-        .length,
-      succeeded: tasks.filter((task) => task.status === "Succeeded").length,
-    }),
-    [tasks],
-  );
   const progressRows = useMemo(() => taskProgressRows(tasks), [tasks]);
+  const counts = useMemo(
+    () =>
+      progressRows.reduce(
+        (summary, row) => ({
+          visible: summary.visible + row.total,
+          attention: summary.attention + row.attention,
+          running: summary.running + row.running,
+          succeeded: summary.succeeded + row.succeeded,
+        }),
+        { visible: 0, attention: 0, running: 0, succeeded: 0 },
+      ),
+    [progressRows],
+  );
   const visibleTasks = useMemo(
     () =>
       tasks.filter(
@@ -377,8 +478,8 @@ export function Monitor({
           (!selectedFamily || task.sourceFamily === selectedFamily) &&
           (selectedState === "all" ||
             (selectedState === "other"
-              ? stateClass(task.status) === "neutral"
-              : stateClass(task.status) === selectedState)),
+              ? taskStateClass(task) === "neutral"
+              : taskStateClass(task) === selectedState)),
       ),
     [tasks, selectedFamily, selectedState, query],
   );
@@ -415,12 +516,24 @@ export function Monitor({
           >
             {attentionOnly ? "Show all work" : "Needs attention"}
           </button>
-          <button onClick={() => void load()} disabled={busy}>
+          <button
+            aria-disabled={busy || undefined}
+            onClick={() => {
+              if (busy) return;
+              void load();
+              if (selected) void open(selected, { refresh: true });
+            }}
+          >
             Refresh
           </button>
         </div>
       </div>
-      {attentionOnly && (
+      {targetTaskId && readingTaskId === targetTaskId && !selected && (
+        <p className="context-note" role="status">
+          Checking current access to the referenced task…
+        </p>
+      )}
+      {attentionOnly && taskListState === "ready" && (
         <p className="context-note" role="status">
           Showing the newest server-filtered tasks that need attention.
         </p>
@@ -430,21 +543,39 @@ export function Monitor({
           {error}
         </div>
       )}
-      <div className="monitor-summary" aria-label="Task status summary">
-        <SummaryMetric label="Visible work" value={counts.visible} />
+      <p id={taskResultsStatusId} role="status" aria-live="polite">
+        <span>
+          {taskListState === "loading"
+            ? "Reading task results…"
+            : taskListState === "unavailable"
+              ? "Task results are unavailable. Refresh to retry."
+              : busy
+                ? "Reading task details…"
+                : `${counts.visible} ${counts.visible === 1 ? "task" : "tasks"} loaded.${hasMore ? " More tasks are available." : ""}`}
+        </span>
+      </p>
+      <div
+        className="monitor-summary"
+        role="group"
+        aria-label="Loaded task counts"
+      >
+        <SummaryMetric
+          label="Loaded work"
+          value={taskListState === "ready" ? counts.visible : null}
+        />
         <SummaryMetric
           label="Needs attention"
-          value={counts.attention}
+          value={taskListState === "ready" ? counts.attention : null}
           tone="attention"
         />
         <SummaryMetric
           label="In progress"
-          value={counts.running}
+          value={taskListState === "ready" ? counts.running : null}
           tone="running"
         />
         <SummaryMetric
           label="Succeeded"
-          value={counts.succeeded}
+          value={taskListState === "ready" ? counts.succeeded : null}
           tone="succeeded"
         />
       </div>
@@ -462,10 +593,7 @@ export function Monitor({
               <div>
                 <span>Authoritative durable tasks</span>
                 <h2 id="workload-title">Workload and bottlenecks</h2>
-                <p>
-                  Group the current task projection by work family and durable
-                  state. Select one cell to filter the detail table.
-                </p>
+                <p>Select a count to filter the loaded task records.</p>
               </div>
               {(selectedFamily || selectedState !== "all") && (
                 <button
@@ -479,7 +607,13 @@ export function Monitor({
                 </button>
               )}
             </div>
-            <div className="workload-matrix-scroll">
+            <div
+              className="workload-matrix-scroll"
+              tabIndex={0}
+              role="region"
+              aria-label="Task progress matrix"
+              aria-busy={taskListState === "loading"}
+            >
               <table>
                 <caption>Task progress by work family</caption>
                 <thead>
@@ -517,7 +651,7 @@ export function Monitor({
                               selectedFamily === row.sourceFamily &&
                               selectedState === state
                             }
-                            aria-label={`${row.sourceFamily}, ${state}, ${value}`}
+                            aria-label={`${row.sourceFamily}, ${state === "running" ? "in progress" : state}, ${value}`}
                             disabled={!value}
                             onClick={() =>
                               selectProgress(row.sourceFamily, state)
@@ -533,26 +667,42 @@ export function Monitor({
                 </tbody>
               </table>
             </div>
-            {!progressRows.length && !busy && (
+            {!progressRows.length && !busy && taskListState === "ready" && (
               <p className="empty-monitor">No task families are visible.</p>
             )}
           </section>
-          {scope && <JobConsole scope={scope} catalog={catalog} />}
+          {scope && catalog?.applicationAccess.role === "Administrator" && (
+            <ApplicationQueue
+              key={outcomeAuthorityKey(scope, catalog)}
+              scope={scope}
+            />
+          )}
+          {scope && catalog && (
+            <JobConsole
+              key={`background-jobs:${outcomeAuthorityKey(scope, catalog)}`}
+              scope={scope}
+              catalog={catalog}
+              onRefreshCatalog={onRefreshCatalog}
+            />
+          )}
           <section className="monitor-table panel">
             <div className="monitor-search">
               <label>
                 Search loaded tasks
                 <input
+                  ref={taskSearch}
                   type="search"
                   value={query}
                   placeholder="Task, operation, status or initiator"
                   onChange={(event) => setQuery(event.target.value)}
                 />
               </label>
-              <span>
-                {visibleTasks.length} matching · {tasks.length} loaded
-                {hasMore ? " · more available" : ""}
-              </span>
+              {taskListState === "ready" && (
+                <span>
+                  {visibleTasks.length} matching · {tasks.length} loaded
+                  {hasMore ? " · more available" : ""}
+                </span>
+              )}
             </div>
             <div
               className="table-scroll"
@@ -577,11 +727,15 @@ export function Monitor({
                       <td>
                         <button
                           className="task-link"
-                          disabled={busy}
+                          aria-disabled={busy || undefined}
                           aria-pressed={selected?.taskId === task.taskId}
-                          onClick={() =>
-                            changeTaskContext(() => void open(task))
-                          }
+                          onClick={(event) => {
+                            if (busy) return;
+                            const opener = event.currentTarget;
+                            changeTaskContext(
+                              () => void open(task, { opener }),
+                            );
+                          }}
                         >
                           {task.function}
                         </button>
@@ -591,9 +745,7 @@ export function Monitor({
                         <strong>{task.sourceFamily}</strong>
                       </td>
                       <td>
-                        <span
-                          className={`task-state ${stateClass(task.status)}`}
-                        >
+                        <span className={`task-state ${taskStateClass(task)}`}>
                           {task.status}
                         </span>
                       </td>
@@ -603,22 +755,23 @@ export function Monitor({
                 </tbody>
               </table>
             </div>
-            {!visibleTasks.length && !busy && (
+            {!visibleTasks.length && !busy && taskListState === "ready" && (
               <p className="empty-monitor">
                 {tasks.length
-                  ? "No durable tasks match the selected matrix cell."
-                  : "No visible durable tasks for this application."}
+                  ? "No loaded tasks match the current filters."
+                  : attentionOnly
+                    ? "No visible tasks need attention."
+                    : "No visible durable tasks for this application."}
               </p>
             )}
             <footer>
-              <span>
-                {busy
-                  ? "Reading authoritative task state…"
-                  : `${visibleTasks.length} of ${tasks.length} visible tasks`}
-              </span>
               <button
-                disabled={busy || !hasMore}
-                onClick={() => void load(true)}
+                aria-disabled={busy || !hasMore || undefined}
+                aria-describedby={taskResultsStatusId}
+                tabIndex={hasMore ? 0 : -1}
+                onClick={() => {
+                  if (!busy && hasMore) void load(true);
+                }}
               >
                 Next tasks
               </button>
@@ -635,7 +788,13 @@ export function Monitor({
             ])}
             task={selected}
             scope={scope!}
-            close={() => changeTaskContext()}
+            catalog={catalog}
+            closeButtonRef={closeTaskButton}
+            close={
+              selected.taskId === targetTaskId && onCloseTask
+                ? onCloseTask
+                : closeTaskDetail
+            }
           />
         )}
       </div>
@@ -644,14 +803,11 @@ export function Monitor({
 }
 
 type JobRecord = {
-  job_id?: string;
-  jobId?: string;
-  status?: string;
-  claim_generation?: number;
-  attempts?: number;
-  receipt_revision?: number | null;
-  error_code?: string | null;
-  result?: unknown;
+  jobId: string;
+  status: string;
+  hasReceipt: boolean;
+  retryAt: string | null;
+  retryLimit: boolean;
 };
 
 type JobEvent = {
@@ -664,13 +820,74 @@ type JobEvent = {
 
 const JOB_ID = /^[0-9a-f]{32}$/;
 const CANCELLABLE = new Set(["accepted", "ready", "running", "staged"]);
+const JOB_STATES = new Set([
+  ...CANCELLABLE,
+  "published",
+  "failed",
+  "cancel_requested",
+  "cancelled",
+  "needs_inspection",
+]);
+const CANCELLATION_REFUSALS = new Set([
+  "APPLICATION_GRANT_REQUIRED",
+  "APPLICATION_UNAVAILABLE",
+  "WORKSPACE_UNAVAILABLE",
+  "JOB_UNAVAILABLE",
+]);
+const JOB_ACCESS_CHANGES = new Set([
+  "JOB_UNAVAILABLE",
+  "JOB_READ_AUTHORIZATION_STALE",
+  "APPLICATION_UNAVAILABLE",
+  "WORKSPACE_UNAVAILABLE",
+]);
+
+function jobAccessChanged(reason: unknown) {
+  return (
+    reason instanceof ApiError &&
+    (reason.kind === "authorization" ||
+      isDefiniteEffectRefusal(reason, JOB_ACCESS_CHANGES))
+  );
+}
+
+function exactJob(value: unknown, jobId: string): JobRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("The job response could not be verified.");
+  const result = value as Record<string, unknown>;
+  if (
+    (result.job_id ?? result.jobId) !== jobId ||
+    (result.jobId !== undefined && result.jobId !== jobId)
+  )
+    throw new Error("The response does not match the requested job.");
+  if (typeof result.status !== "string" || !JOB_STATES.has(result.status))
+    throw new Error("The job response could not be verified.");
+  return {
+    jobId,
+    status: result.status,
+    hasReceipt:
+      (result.status === "published" || result.status === "needs_inspection") &&
+      typeof result.receipt_revision === "number" &&
+      Number.isSafeInteger(result.receipt_revision) &&
+      result.receipt_revision > 0,
+    retryAt:
+      result.status === "ready" &&
+      typeof result.next_attempt_at === "string" &&
+      /^\d{4}-\d{2}-\d{2}T/.test(result.next_attempt_at) &&
+      Number.isFinite(Date.parse(result.next_attempt_at))
+        ? result.next_attempt_at
+        : null,
+    retryLimit:
+      result.status === "failed" && result.error_code === "RETRY_LIMIT",
+  };
+}
 
 function JobConsole({
   scope,
   catalog,
+  onRefreshCatalog,
 }: {
   scope: Scope;
-  catalog: ApplicationCatalog | null;
+  catalog: ApplicationCatalog;
+  onRefreshCatalog?: (signal?: AbortSignal) => Promise<ApplicationCatalog>;
 }) {
   const [open, setOpen] = useState(false);
   const [jobId, setJobId] = useState("");
@@ -678,16 +895,57 @@ function JobConsole({
   const [events, setEvents] = useState<JobEvent[]>([]);
   const [eventsAfter, setEventsAfter] = useState(0);
   const [eventsMore, setEventsMore] = useState(false);
+  const [eventsState, setEventsState] = useState<
+    "idle" | "loading" | "ready" | "unavailable"
+  >("idle");
   const [cancelReviewed, setCancelReviewed] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [accessNeedsRefresh, setAccessNeedsRefresh] = useState(false);
+  const [cancellationNotice, setCancellationNotice] = useState<
+    "unconfirmed" | "refused" | null
+  >(null);
+  const [operation, setOperation] = useState<
+    "read" | "cancel" | "events" | null
+  >(null);
+  const busy = operation !== null;
   const [error, setError] = useState("");
   const [inspectReceipt, setInspectReceipt] = useState("");
+  const activeRequest = useRef<AbortController | null>(null);
+  const refreshJobs = useRef<HTMLButtonElement>(null);
+  const jobEvents = useRef<HTMLDivElement>(null);
+  const moreJobs = useRef<HTMLButtonElement>(null);
+  const checkJob = useRef<HTMLButtonElement>(null);
+  const cancelJob = useRef<HTMLButtonElement>(null);
+  const restoreCancellationFocus = useRef(false);
 
-  const selectedId = job?.job_id || job?.jobId || "";
-  const selectedStatus = String(job?.status || "").toLowerCase();
+  useEffect(() => {
+    if (!cancellationNotice || busy || !restoreCancellationFocus.current)
+      return;
+    restoreCancellationFocus.current = false;
+    const control = checkJob.current;
+    if (
+      control &&
+      (control.closest("[inert]") || document.activeElement === document.body)
+    )
+      return focusWhenInteractive(control);
+  }, [busy, cancellationNotice]);
+
+  function startRequest() {
+    activeRequest.current?.abort();
+    const controller = new AbortController();
+    activeRequest.current = controller;
+    return controller.signal;
+  }
+
+  const selectedStatus = job?.status ?? "";
+  const groupAssigned =
+    catalog.applicationAccess.authorizationModel === "group_assignments";
   const cancelReady = Boolean(
-    JOB_ID.test(jobId) &&
-      selectedId === jobId &&
+    (groupAssigned
+      ? catalog.ownedJobOperations?.includes("cancel")
+      : ["Editor", "Administrator"].includes(catalog.applicationAccess.role)) &&
+      !accessNeedsRefresh &&
+      !cancellationNotice &&
+      job?.jobId === jobId &&
       CANCELLABLE.has(selectedStatus),
   );
   const selectableJobs = useMemo(() => {
@@ -712,76 +970,161 @@ function JobConsole({
     setEvents([]);
     setEventsAfter(0);
     setEventsMore(false);
+    setEventsState("idle");
+    setCancelReviewed(false);
+    setAccessNeedsRefresh(false);
+    setCancellationNotice(null);
+    setInspectReceipt("");
+    setOperation(null);
+    return () => activeRequest.current?.abort();
+  }, [scope.workspaceId, scope.applicationId]);
+
+  function clearJobEvents() {
+    setEvents([]);
+    setEventsAfter(0);
+    setEventsMore(false);
+    setEventsState("unavailable");
+  }
+
+  function invalidateJobAccess() {
+    setAccessNeedsRefresh(true);
+    setJob(null);
     setCancelReviewed(false);
     setInspectReceipt("");
-  }, [scope.workspaceId, scope.applicationId]);
+  }
+
+  async function refreshJobAccess(signal: AbortSignal) {
+    if (accessNeedsRefresh && onRefreshCatalog) {
+      await onRefreshCatalog(signal);
+      signal.throwIfAborted();
+      setAccessNeedsRefresh(false);
+    }
+  }
 
   async function read(id = jobId) {
     if (!JOB_ID.test(id) || busy) return;
-    setBusy(true);
+    const origin = document.activeElement;
+    const originInEvents = jobEvents.current?.contains(origin);
+    const signal = startRequest();
+    setOperation("read");
     setError("");
     setCancelReviewed(false);
+    setJob(null);
+    setInspectReceipt("");
+    if (id !== jobId) setCancellationNotice(null);
+    setJobId(id);
     try {
-      const result = await request<JobRecord>(
+      if (accessNeedsRefresh) await refreshJobAccess(signal);
+      const result = await request<unknown>(
         "/api/job",
         jobReadBody(scope, id),
+        signal,
       );
-      setJob(result);
-      setJobId(id);
+      if (signal.aborted) return;
+      setJob(exactJob(result, id));
+      setCancellationNotice(null);
     } catch (reason) {
+      if (signal.aborted) return;
       setJob(null);
+      if (jobAccessChanged(reason)) {
+        if (
+          originInEvents &&
+          (document.activeElement === origin ||
+            document.activeElement === document.body)
+        )
+          checkJob.current?.focus();
+        clearJobEvents();
+        invalidateJobAccess();
+      }
       setError(reason instanceof Error ? reason.message : "Unable to read job");
     } finally {
-      setBusy(false);
+      if (!signal.aborted) setOperation(null);
     }
   }
 
   async function readEvents(append = false) {
     if (busy) return;
-    setBusy(true);
+    const signal = startRequest();
+    setOperation("events");
+    setEventsState("loading");
     setError("");
     try {
+      if (accessNeedsRefresh) await refreshJobAccess(signal);
       const page = await request<{
         events: JobEvent[];
         nextSequence: number;
         hasMore: boolean;
-      }>("/api/events", {
-        ...scope,
-        afterSequence: append ? eventsAfter : 0,
-        limit: 100,
-      });
+      }>(
+        "/api/events",
+        {
+          ...scope,
+          afterSequence: append ? eventsAfter : 0,
+          limit: 100,
+        },
+        signal,
+      );
+      if (signal.aborted) return;
+      if (
+        !Array.isArray(page.events) ||
+        typeof page.hasMore !== "boolean" ||
+        !Number.isSafeInteger(page.nextSequence) ||
+        page.nextSequence < 0
+      )
+        throw new Error("Background job response is invalid.");
       setEvents((current) =>
         append ? [...current, ...page.events] : page.events,
       );
       setEventsAfter(page.nextSequence);
       setEventsMore(page.hasMore);
+      setEventsState("ready");
     } catch (reason) {
+      if (signal.aborted) return;
+      if (document.activeElement === moreJobs.current)
+        refreshJobs.current?.focus();
+      clearJobEvents();
+      if (jobAccessChanged(reason)) invalidateJobAccess();
       setError(
         reason instanceof Error ? reason.message : "Unable to read job events",
       );
     } finally {
-      setBusy(false);
+      if (!signal.aborted) setOperation(null);
     }
   }
 
   async function cancel() {
     if (!cancelReady || !cancelReviewed || busy) return;
     if (!window.confirm("Request cancellation of this current job?")) return;
-    setBusy(true);
+    restoreCancellationFocus.current =
+      document.activeElement === cancelJob.current;
+    if (restoreCancellationFocus.current) checkJob.current?.focus();
+    const signal = startRequest();
+    setOperation("cancel");
     setError("");
+    setJob(null);
+    setCancelReviewed(false);
+    setInspectReceipt("");
     try {
-      const result = await request<JobRecord>(
+      const result = await request<unknown>(
         "/api/cancel",
         jobCancelBody(scope, jobId),
+        signal,
       );
-      setJob(result);
-      setCancelReviewed(false);
+      if (signal.aborted) return;
+      const confirmed = exactJob(result, jobId);
+      if (CANCELLABLE.has(confirmed.status))
+        throw new Error("Cancellation response is inconclusive.");
+      setJob(confirmed);
     } catch (reason) {
-      setError(
-        reason instanceof Error ? reason.message : "Unable to cancel job",
-      );
+      if (signal.aborted) return;
+      const refused = isDefiniteEffectRefusal(reason, CANCELLATION_REFUSALS);
+      setCancellationNotice(refused ? "refused" : "unconfirmed");
+      if (refused) setError(reason.message);
+      if (jobAccessChanged(reason)) {
+        clearJobEvents();
+        invalidateJobAccess();
+      }
     } finally {
-      setBusy(false);
+      if (!signal.aborted) setOperation(null);
     }
   }
 
@@ -790,7 +1133,9 @@ function JobConsole({
       <div className="section-title">
         <div>
           <span>BACKGROUND WORK</span>
-          <h2 id="job-console-title">Background jobs</h2>
+          <h2 id="job-console-title">
+            {groupAssigned ? "My numeric jobs" : "Background jobs"}
+          </h2>
           <p>
             Review recent background work and request cancellation while it is
             still running.
@@ -802,7 +1147,7 @@ function JobConsole({
           onClick={() => {
             const next = !open;
             setOpen(next);
-            if (next && !events.length) void readEvents(false);
+            if (next && eventsState !== "ready") void readEvents(false);
           }}
         >
           {open ? "Hide jobs" : "Show jobs"}
@@ -811,46 +1156,110 @@ function JobConsole({
       {open && (
         <div id="job-console-body" className="job-console-body">
           <div className="job-read-controls">
-            <button disabled={busy} onClick={() => void readEvents(false)}>
+            <button
+              ref={refreshJobs}
+              aria-disabled={busy || undefined}
+              onClick={() => void readEvents(false)}
+            >
               Refresh jobs
             </button>
           </div>
-          {selectableJobs.length > 0 ? (
-            <div className="job-events" aria-label="Recent background jobs">
+          {selectableJobs.length > 0 && (
+            <div
+              ref={jobEvents}
+              className="job-events"
+              aria-label="Recent background jobs"
+            >
               {selectableJobs.map((event) => (
                 <button
                   key={event.job_id}
                   disabled={busy}
                   aria-pressed={jobId === event.job_id}
-                  onClick={() => {
-                    setJobId(event.job_id);
-                    setJob(null);
-                    setCancelReviewed(false);
-                    void read(event.job_id);
-                  }}
+                  onClick={() => void read(event.job_id)}
                 >
                   <strong>{event.status}</strong>
                   <small>{time(event.occurred_at)}</small>
                 </button>
               ))}
               <button
-                disabled={busy || !eventsMore}
-                onClick={() => void readEvents(true)}
+                ref={moreJobs}
+                aria-disabled={busy || !eventsMore || undefined}
+                onClick={() => {
+                  if (eventsMore) void readEvents(true);
+                }}
               >
                 More jobs
               </button>
             </div>
-          ) : (
-            !busy && (
-              <p className="empty-monitor">No recent jobs are visible.</p>
-            )
           )}
-          {job && (
+          {eventsState !== "idle" && (
+            <p className="empty-monitor" role="status">
+              {eventsState === "loading"
+                ? "Reading recent background jobs…"
+                : eventsState === "unavailable"
+                  ? "Background job results are unavailable. Refresh jobs to retry."
+                  : selectableJobs.length === 0
+                    ? "No recent jobs are visible."
+                    : null}
+            </p>
+          )}
+          {jobId && (
             <div className="job-record">
-              <div>
-                <small>Current authoritative state</small>
-                <strong>{job.status || "Unknown"}</strong>
-              </div>
+              {(operation === "read" || operation === "cancel") && (
+                <p role="status">
+                  {operation === "read"
+                    ? "Reading current job…"
+                    : "Requesting cancellation…"}
+                </p>
+              )}
+              {job && (
+                <div>
+                  <small>Last confirmed job state</small>
+                  <strong>{job.status}</strong>
+                </div>
+              )}
+              {job?.retryAt && (
+                <p role="status">
+                  The same job is eligible for another worker attempt from{" "}
+                  <time dateTime={job.retryAt}>
+                    {new Date(job.retryAt).toLocaleString()}
+                  </time>
+                  . Check this job again for its current state.
+                </p>
+              )}
+              {job?.retryLimit && (
+                <p role="status">
+                  This job reached its worker retry limit. Check its recorded
+                  outcome before starting new work.
+                </p>
+              )}
+              {selectedStatus === "needs_inspection" && (
+                <p role="status">
+                  This job needs inspection. Review its recorded outcome before
+                  starting new work.
+                </p>
+              )}
+              {cancellationNotice && (
+                <p role="status">
+                  {cancellationNotice === "unconfirmed"
+                    ? "Cancellation outcome unconfirmed. Check the current job before requesting cancellation again."
+                    : "Cancellation was refused. Check the current job before requesting cancellation again."}
+                </p>
+              )}
+              {selectedStatus === "cancel_requested" && (
+                <p role="status">
+                  Cancellation requested. Check the job again to confirm its
+                  final state.
+                </p>
+              )}
+              <button
+                type="button"
+                ref={checkJob}
+                aria-disabled={busy || undefined}
+                onClick={() => void read()}
+              >
+                Check current job
+              </button>
               <label className="review-check">
                 <input
                   type="checkbox"
@@ -862,17 +1271,20 @@ function JobConsole({
               </label>
               <button
                 className="danger-action"
+                ref={cancelJob}
                 disabled={!cancelReady || !cancelReviewed || busy}
                 onClick={cancel}
               >
                 Request cancellation
               </button>
-              {job.receipt_revision != null && selectedId && (
+              {job?.hasReceipt && !groupAssigned && (
                 <button
                   type="button"
-                  onClick={() => setInspectReceipt(selectedId)}
+                  onClick={() => setInspectReceipt(job.jobId)}
                 >
-                  View publication outcome
+                  {selectedStatus === "published"
+                    ? "View publication outcome"
+                    : "Inspect recorded receipt"}
                 </button>
               )}
             </div>
@@ -902,13 +1314,13 @@ function SummaryMetric({
   tone = "",
 }: {
   label: string;
-  value: number;
+  value: number | null;
   tone?: string;
 }) {
   return (
     <div className={tone}>
       <small>{label}</small>
-      <strong>{value}</strong>
+      <strong>{value ?? "—"}</strong>
     </div>
   );
 }
@@ -916,13 +1328,23 @@ function SummaryMetric({
 function TaskPanel({
   task,
   scope,
+  catalog,
   close,
+  closeButtonRef,
 }: {
   task: TaskDetail;
   scope: Scope;
+  catalog: ApplicationCatalog | null;
   close: () => void;
+  closeButtonRef: Ref<HTMLButtonElement>;
 }) {
-  const latest = task.events?.at(-1);
+  const latest = task.latestEvent;
+  const layoutTarget =
+    task.sourceId && task.sourceFamily === "LayoutReplacementBuild"
+      ? { kind: "replacement" as const, id: task.sourceId }
+      : task.sourceId && task.sourceFamily === "LayoutActivation"
+        ? { kind: "activation" as const, id: task.sourceId }
+        : null;
   const [log, setLog] = useState<TaskLogPage | null>(null);
   const [logBusy, setLogBusy] = useState(false);
   const [actionError, setActionError] = useState("");
@@ -970,13 +1392,26 @@ function TaskPanel({
   }
 
   return (
-    <aside className="task-drawer" aria-label="Selected task detail">
+    <aside
+      className="task-drawer"
+      aria-label="Selected task detail"
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || event.defaultPrevented) return;
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+      }}
+    >
       <div className="drawer-heading">
         <div>
           <span>Durable task</span>
           <h2>{task.function}</h2>
         </div>
-        <button aria-label="Close task detail" onClick={close}>
+        <button
+          ref={closeButtonRef}
+          aria-label="Close task detail"
+          onClick={close}
+        >
           ×
         </button>
       </div>
@@ -986,13 +1421,52 @@ function TaskPanel({
         <DetailMetric label="Created" valueText={time(task.createdAt)} />
         <DetailMetric label="Last updated" valueText={time(task.updatedAt)} />
       </div>
-      <p className={`task-outcome ${stateClass(task.status)}`}>
-        {task.status === "Succeeded"
-          ? "Completed successfully. The timeline is the durable execution evidence."
+      <p className={`task-outcome ${taskStateClass(task)}`}>
+        {task.progressState === "succeeded"
+          ? task.sourceFamily === "LayoutReplacementBuild"
+            ? "Private layout validation completed. Publication requires a separate activation."
+            : "Completed successfully. The timeline is the durable execution evidence."
           : task.status === "Failed"
             ? `This task failed${latest?.errorCode ? `: ${latest.errorCode}` : ""}.`
             : `Current durable state: ${task.status}.`}
       </p>
+      {layoutTarget && (
+        <LayoutActivation
+          scope={scope}
+          catalog={catalog}
+          target={layoutTarget}
+        />
+      )}
+      {task.status === "NeedsInspection" && (
+        <p className="context-note" role="status">
+          Review the diagnostic timeline. Reconcile the original task and
+          receipt before submitting new work. Recovery could not establish a
+          final outcome.
+        </p>
+      )}
+      {task.recoveryState === "workflowCancellationPaused" && (
+        <p className="context-note" role="status">
+          Cancellation recovery is paused. Review the diagnostic timeline,
+          restore required access or resolve the child task, then request
+          interruption again for this same task with an authorized client.{" "}
+          {workflowCountBasis} Committed work is retained. Repeating
+          interruption continues cancellation reconciliation only; it does not
+          restart the workflow.
+        </p>
+      )}
+      {task.recoveryState === "scheduleCancellationUnresolved" && (
+        <p className="context-note" role="status">
+          Scheduled cancellation remains unresolved. A current application
+          administrator can inspect this occurrence and its linked build or
+          workflow tasks, then request cancellation again for this same
+          scheduled occurrence with an authorized client to resume cancellation
+          checks. Restoring access alone does not resume parked recovery. A
+          missing historical link cannot prove that no work was accepted;
+          unknown work stays unresolved and is never attached by guessing.
+          Repeating cancellation cannot build, rerun or admit new work. Existing
+          receipts and confirmed work are retained.
+        </p>
+      )}
       <h3>Timeline</h3>
       <ol className="task-timeline">
         {(task.events || []).map((event, index) => (

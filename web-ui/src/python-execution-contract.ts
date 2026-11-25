@@ -1,4 +1,19 @@
 import type { ApplicationSummary, ApplicationCatalog } from "./types";
+import type { AdmittedEffectPacket } from "./api";
+
+/** Historical inspection selects the original native record, without admitting
+ * or dispatching another effect. The retained packet owns all reference fields. */
+export function pythonOriginalRequestReadBody(packet: AdmittedEffectPacket) {
+  return {
+    workspaceId: packet.body.workspaceId,
+    applicationId: packet.body.applicationId,
+    action: "read",
+    originalRequest: {
+      program: structuredClone(packet.body.program),
+      idempotencyKey: packet.body.idempotencyKey,
+    },
+  };
+}
 
 export function pythonBuildRequestBody(
   app: ApplicationSummary,

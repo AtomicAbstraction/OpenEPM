@@ -20,7 +20,8 @@ if __package__ in (None, ''):
 import psycopg
 from epm_core.postgres_connection import connect_postgres
 from epm_core.postgres_fresh_baseline import (
-    assert_pristine_database,database_profile,load_baseline_manifest,schema_fingerprint)
+    assert_pristine_database,canonical_chain_digest,database_profile,
+    load_baseline_manifest,schema_fingerprint)
 from epm_core.postgres_schema163_semantic_reference import (
     derive_historical_execution_statement)
 
@@ -29,6 +30,17 @@ LOCK_KEY = 0x45504D4D494752
 DEFAULT_DIR = Path(__file__).resolve().parents[1] / 'schema' / 'postgres'
 MIGRATION_LOCK_TIMEOUT_MS = 5_000
 MIGRATION_STATEMENT_TIMEOUT_MS = 600_000
+DATABASE_IDENTITY_SQL = """SELECT system_identifier::text || ' ' || oid::text
+    FROM pg_catalog.pg_control_system(), pg_catalog.pg_database
+    WHERE datname = pg_catalog.current_database()"""
+
+
+def migration_database_digest(identity: str) -> str:
+    """Bind a PostgreSQL cluster and database without recording its DSN."""
+    if not isinstance(identity, str) or re.fullmatch(
+            r'[1-9][0-9]{0,19} [1-9][0-9]{0,9}', identity) is None:
+        raise ValueError('MIGRATION_DATABASE_IDENTITY_INVALID')
+    return hashlib.sha256(b'openepm-migration-database-v1\0' + identity.encode('ascii')).hexdigest()
 
 
 def configure_migration_budgets(db) -> None:
@@ -41,19 +53,53 @@ def configure_migration_budgets(db) -> None:
         (MIGRATION_LOCK_TIMEOUT_MS, MIGRATION_STATEMENT_TIMEOUT_MS))
 
 
-def apply_migrations(dsn: str, directory: Path = DEFAULT_DIR, *,
-                     fresh_baseline_manifest: Path|None = None,
-                     _baseline_failure_point: str|None = None) -> list[str]:
+def migration_files(directory: Path = DEFAULT_DIR, *,
+                    expected_final_migration: str | None = None) -> list[tuple[int, str, Path]]:
     files = sorted(directory.glob('*.sql'))
     parsed = []
     for file in files:
-        match = re.fullmatch(r'(\d{4})_([a-z0-9_]+)\.sql', file.name)
-        if not match:
+        match = re.fullmatch(r'([0-9]{4})_([a-z0-9_]+)\.sql', file.name)
+        if not match or file.is_symlink() or not file.is_file():
             raise ValueError(f'Unexpected migration filename: {file.name}')
         parsed.append((int(match.group(1)), match.group(2), file))
     if not parsed or [version for version, _, _ in parsed] != list(
             range(1, len(parsed) + 1)):
         raise ValueError('PostgreSQL migrations must start at 0001 with no gaps')
+    if expected_final_migration is not None and parsed[-1][2].name != expected_final_migration:
+        raise ValueError('MIGRATION_TARGET_DIFFERS_FROM_RELEASE')
+    return parsed
+
+
+def verify_applied_migrations(files: list[tuple[int, str, Path]],
+                              applied: dict[int, str]) -> None:
+    """Verify the entire installed prefix before running any pending migration."""
+    if set(applied) - {version for version, _, _ in files}:
+        raise ValueError('Database has a migration absent from this release')
+    if set(applied) != set(range(1, len(applied) + 1)):
+        raise ValueError('Installed PostgreSQL migration history has a gap')
+    for version, _, file in files[:len(applied)]:
+        if applied[version] != hashlib.sha256(file.read_bytes()).hexdigest():
+            raise ValueError(f'Migration {version:04d} checksum changed')
+
+
+def apply_migrations(dsn: str, directory: Path = DEFAULT_DIR, *,
+                     fresh_baseline_manifest: Path|None = None,
+                     expected_final_migration: str | None = None,
+                     expected_source_ledger: str | None = None,
+                     expected_source_database: str | None = None,
+                     _baseline_failure_point: str|None = None) -> list[str]:
+    if fresh_baseline_manifest is not None and expected_final_migration is not None:
+        raise ValueError('MIGRATION_TARGET_INCOMPATIBLE_WITH_FRESH_BASELINE')
+    if (expected_source_ledger is not None and
+            (expected_final_migration is None
+             or not isinstance(expected_source_ledger, str)
+             or re.fullmatch(r'[0-9]{4} [a-f0-9]{64}', expected_source_ledger) is None)):
+        raise ValueError('MIGRATION_SOURCE_LEDGER_INVALID')
+    if (expected_source_database is not None and
+            (expected_source_ledger is None or not isinstance(expected_source_database, str)
+             or re.fullmatch(r'[a-f0-9]{64}', expected_source_database) is None)):
+        raise ValueError('MIGRATION_SOURCE_DATABASE_INVALID')
+    parsed = migration_files(directory, expected_final_migration=expected_final_migration)
 
     outcome = []
     baseline_applied=set()
@@ -66,6 +112,11 @@ def apply_migrations(dsn: str, directory: Path = DEFAULT_DIR, *,
             raise ValueError('Another PostgreSQL migration runner is active')
         try:
             configure_migration_budgets(db)
+            if expected_source_database is not None:
+                identity = db.execute(DATABASE_IDENTITY_SQL).fetchone()
+                if (identity is None or
+                        migration_database_digest(identity[0]) != expected_source_database):
+                    raise ValueError('MIGRATION_SOURCE_DATABASE_CHANGED')
             table = db.execute("SELECT to_regclass('epm.schema_migration')").fetchone()[0]
             existing = (dict(db.execute('SELECT version, checksum '
                                         'FROM epm.schema_migration').fetchall())
@@ -127,30 +178,42 @@ def apply_migrations(dsn: str, directory: Path = DEFAULT_DIR, *,
                     existing[164]=audit_checksum
                     baseline_applied.add(164)
                 outcome.append(f"baseline {baseline['baselineId']} materialized")
-            if set(existing) - {version for version, _, _ in parsed}:
-                raise ValueError('Database has a migration absent from this release')
+            verify_applied_migrations(parsed, existing)
+            if expected_source_ledger is not None:
+                digest = canonical_chain_digest([
+                    {'version': version, 'sha256': checksum}
+                    for version, checksum in sorted(existing.items())
+                ])
+                if expected_source_ledger != f'{len(existing):04d} {digest}':
+                    raise ValueError('MIGRATION_SOURCE_LEDGER_CHANGED')
             for version, description, file in parsed:
-                source = file.read_bytes()
-                checksum = hashlib.sha256(source).hexdigest()
                 if version in existing:
-                    if existing[version] != checksum:
-                        raise ValueError(f'Migration {version:04d} checksum changed')
                     outcome.append(f'{version:04d} ' +
                                    ('applied' if version in baseline_applied else 'verified'))
                     continue
-                if any(old_version not in existing for old_version in range(1, version)):
-                    raise ValueError(f'Migration {version:04d} has an unapplied predecessor')
-                with db.transaction():
-                    text=source.decode('utf-8')
-                    if 144 <= version <= 163:
-                        statement,_ = derive_historical_execution_statement(
-                            version,source)
-                        db.execute(statement)
-                    else:
-                        db.execute(text)
-                    db.execute('''INSERT INTO epm.schema_migration
-                        (version, description, checksum) VALUES (%s,%s,%s)''',
-                        (version, description.replace('_', ' '), checksum))
+                source = file.read_bytes()
+                checksum = hashlib.sha256(source).hexdigest()
+                try:
+                    with db.transaction():
+                        text=source.decode('utf-8')
+                        if 144 <= version <= 163:
+                            statement,_ = derive_historical_execution_statement(
+                                version,source)
+                            db.execute(statement)
+                        else:
+                            db.execute(text)
+                        db.execute('''INSERT INTO epm.schema_migration
+                            (version, description, checksum) VALUES (%s,%s,%s)''',
+                            (version, description.replace('_', ' '), checksum))
+                except psycopg.errors.RaiseException as error:
+                    if (version != 366 or error.diag.message_primary
+                            != 'DEFINITION_OWNER_0366_UNKNOWN_RULE_KIND'):
+                        raise
+                    raise ValueError(
+                        'DEFINITION_OWNER_0366_UNKNOWN_RULE_KIND. Migration 0366 refused stored rules '
+                        'without a supported owner. Preserve the source application and review the affected '
+                        'rule definitions for re-authoring before retrying.'
+                    ) from None
                 existing[version] = checksum
                 outcome.append(f'{version:04d} applied')
         finally:
@@ -165,15 +228,28 @@ def main() -> None:
     parser.add_argument('--dsn', default=os.environ.get('EPM_POSTGRES_ADMIN_DSN'),
                         help='Migration-owner DSN; prefer EPM_POSTGRES_ADMIN_DSN')
     parser.add_argument('--migrations-dir', type=Path, default=DEFAULT_DIR)
-    parser.add_argument('--fresh-baseline-manifest',type=Path,
+    variants = parser.add_mutually_exclusive_group()
+    variants.add_argument('--fresh-baseline-manifest',type=Path,
         help='Qualified pristine-install snapshot manifest; never valid for upgrades')
+    variants.add_argument('--expected-final-migration',
+        help='Exact final filename declared by the verified release manifest during upgrade')
+    parser.add_argument('--expected-source-ledger',
+        help='Source version and chain digest observed before upgrade backup, checked under the migration lock')
+    parser.add_argument('--expected-source-database',
+        help='Digest of the source PostgreSQL cluster and database checked under the migration lock')
     args = parser.parse_args()
     if not args.dsn:
         parser.error('Set EPM_POSTGRES_ADMIN_DSN or pass --dsn')
-    results=run_admin_cli(parser,'migrate',{'dsn':args.dsn,
-        'directory':str(args.migrations_dir.resolve()),
-        'freshBaselineManifest':(None if args.fresh_baseline_manifest is None else
-            str(args.fresh_baseline_manifest.resolve()))},args.timeout_seconds)
+    arguments = {'dsn': args.dsn, 'directory': str(args.migrations_dir.resolve())}
+    if args.fresh_baseline_manifest is not None:
+        arguments['freshBaselineManifest'] = str(args.fresh_baseline_manifest.resolve())
+    if args.expected_final_migration is not None:
+        arguments['expectedFinalMigration'] = args.expected_final_migration
+    if args.expected_source_ledger is not None:
+        arguments['expectedSourceLedger'] = args.expected_source_ledger
+    if args.expected_source_database is not None:
+        arguments['expectedSourceDatabase'] = args.expected_source_database
+    results = run_admin_cli(parser, 'migrate', arguments, args.timeout_seconds)
     for result in results:
         print(result)
 

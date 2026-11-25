@@ -152,6 +152,31 @@ def input_revision_status(row: dict) -> dict:
             'observedCommitRevision': row['observed_commit_revision']}
 
 
+def calculation_read_status_schema() -> dict:
+    from .metadata_read_contract import obj
+
+    revision = {'type': 'integer', 'minimum': 0}
+    boolean = {'type': 'boolean'}
+    revisions = obj(dict.fromkeys(('metadata', 'data', 'policy'), revision))
+    barrier = obj({'impactEpoch': revision, 'processedImpactEpoch': revision, 'pending': boolean})
+    return {
+        'inputRevisionStatus': obj({'matchesAtRead': boolean, 'revisionMatchesAtRead': boolean,
+                                    'expected': revisions, 'observed': revisions,
+                                    'observedCommitRevision': revision}, ['matchesAtRead']),
+        'resultCurrentness': obj({
+            'basis': {'enum': ['unavailable', 'legacy_revisions', 'scoped_manifest']},
+            'freshness': {'enum': ['unavailable', 'current', 'stale', 'impact_coverage_pending']},
+            'matchesAtRead': boolean, 'impactBarrier': {'anyOf': [{'type': 'null'}, barrier]},
+            'definitionStatus': {'type': ['object', 'null']},
+        }),
+        'producerCapabilities': obj({
+            'requiredCapabilities': {'type': 'array', 'items': {'type': 'string'}},
+            'enabledCapabilities': {'type': 'array', 'items': {'type': 'string'}},
+            'capabilityRevision': revision, 'enabled': boolean,
+        }),
+    }
+
+
 def typed_expression_raw_driver_status(db, scope, result_key: str,
                                        program: dict) -> dict | None:
     """Recheck every v29 row's exact present raw driver.
@@ -582,7 +607,7 @@ _CURRENTNESS_READ = ContextVar('openepm_currentness_read', default=None)
 
 
 @contextmanager
-def _currentness_read(db, scope, budget=None):
+def _currentness_read(db, scope, budget=None, *, pin_application_cut=False):
     current = _CURRENTNESS_READ.get()
     if current is not None:
         if current.db is not db or current.scope != scope:
@@ -592,17 +617,24 @@ def _currentness_read(db, scope, budget=None):
     current = _CurrentnessRead(db, scope, budget)
     token = _CURRENTNESS_READ.set(current)
     try:
+        if pin_application_cut:
+            current.cut = _observe_application_cut(db, scope)
+            if current.cut is None:
+                raise ValueError('APPLICATION_UNAVAILABLE')
         yield current
-        if current.cut is not None:
-            after = db.execute('''SELECT metadata_revision current_metadata_revision,
-                data_revision current_data_revision,policy_revision current_policy_revision,
-                commit_revision observed_commit_revision,schema_epoch,impact_epoch,processed_impact_epoch
-                FROM epm.application_state WHERE workspace_id=%s AND application_id=%s''',
-                (scope.workspace_id, scope.application_id)).fetchone()
-            if after is None or _read_cut(after) != current.cut:
-                raise ValueError('CALCULATION_CURRENTNESS_READ_CUT_CHANGED')
+        if current.cut is not None and _observe_application_cut(db, scope) != current.cut:
+            raise ValueError('CALCULATION_CURRENTNESS_READ_CUT_CHANGED')
     finally:
         _CURRENTNESS_READ.reset(token)
+
+
+def _observe_application_cut(db, scope):
+    row = db.execute('''SELECT metadata_revision current_metadata_revision,
+        data_revision current_data_revision,policy_revision current_policy_revision,
+        commit_revision observed_commit_revision,schema_epoch,impact_epoch,processed_impact_epoch
+        FROM epm.application_state WHERE workspace_id=%s AND application_id=%s''',
+        (scope.workspace_id, scope.application_id)).fetchone()
+    return _read_cut(row) if row is not None else None
 
 
 def _read_cut(row):

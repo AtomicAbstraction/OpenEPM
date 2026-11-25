@@ -7,10 +7,16 @@ import {
 } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { PythonDefinitionEditor } from "./PythonDefinitionEditor";
+import { PythonSourceValidation } from "./PythonSourceValidation";
 import { installOperationAdmissionFixture } from "./test-setup";
 import type { PythonDefinitionKind } from "./PythonDefinitionEditor";
 import type { ApplicationCatalog } from "./types";
-import { resetUnsavedWorkForTests, setDraftIdentity } from "./unsaved-work";
+import {
+  canPreserveUnsavedWork,
+  resetUnsavedWorkForTests,
+  setDraftIdentity,
+  unsavedWorkSnapshot,
+} from "./unsaved-work";
 vi.mock("./PythonRuleEditor", () => ({
   PythonRuleEditor: ({
     value,
@@ -69,13 +75,18 @@ const catalog: ApplicationCatalog = {
 };
 const binding = {
   programId: "source",
-  sourceToken: "c".repeat(64),
+  programSourceToken: "c".repeat(64),
   sourceDigest: digest,
   buildId: "old-build",
   active: true,
 };
 const source = {
   defined: true,
+  valid: true,
+  active: true,
+  sourceCurrent: true,
+  executable: true,
+  reason: null,
   programId: "source",
   stateToken: "b".repeat(64),
   sourceToken: "c".repeat(64),
@@ -94,6 +105,388 @@ const source = {
   },
 };
 const response = (result: unknown) => new Response(JSON.stringify({ result }));
+
+it.each(["current", "changed source", "changed environment"] as const)(
+  "lets a design-only user edit the bound source while preserving its exact state (%s)",
+  async (caseName) => {
+    setDraftIdentity("designer");
+    let current: Omit<typeof source, "reason"> & { reason: string | null } =
+      source;
+    const saved: Record<string, unknown>[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (_url, init) => {
+        const body = JSON.parse(String(init?.body));
+        if (body.program?.function === "python.program.read")
+          return response(current);
+        if (body.program?.function === "python.program.save") {
+          saved.push(body.program.arguments);
+          if (caseName === "changed environment")
+            return Response.json(
+              { error: "PYTHON_ENVIRONMENT_NOT_ACTIVE" },
+              { status: 409 },
+            );
+          return response({
+            status: "Inactive",
+            stateToken: "e".repeat(64),
+            sourceToken: "f".repeat(64),
+            sourceDigest: "1".repeat(64),
+            validation: {
+              buildId: "a".repeat(32),
+              purpose: "Validation",
+              status: "accepted",
+            },
+          });
+        }
+        if (body.action === "read")
+          return response({
+            buildId: "a".repeat(32),
+            purpose: "Validation",
+            status: "failed",
+          });
+        throw new Error("Unexpected request: " + JSON.stringify(body));
+      }),
+    );
+    installOperationAdmissionFixture("8");
+    const view = (policy: number) => (
+      <PythonDefinitionEditor
+        app={app}
+        catalog={{
+          ...catalog,
+          functions: { "python.program.read": {}, "python.program.save": {} },
+          revisions: { ...catalog.revisions, policy },
+        }}
+        kind="ApplicationRule"
+        definitionId="forecast"
+        binding={binding}
+      />
+    );
+    const browser = render(view(2));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Edit current source" }),
+    );
+    const editor = screen.getByLabelText(
+      "ApplicationRule Python source editor",
+    );
+    await waitFor(() => expect(editor).not.toHaveAttribute("readonly"));
+    expect(
+      screen.getByText("Approved environment: approved"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("ApplicationRule source environment"),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Activate source" }),
+    ).toBeNull();
+    const replacement = source.sourceText + "# revised source\n";
+    fireEvent.change(editor, { target: { value: replacement } });
+    const save = screen.getByRole("button", {
+      name: "Save and validate source",
+    });
+    expect(save).toBeEnabled();
+    expect(saved).toHaveLength(0);
+    if (caseName === "changed source") {
+      current = {
+        ...source,
+        stateToken: "9".repeat(64),
+        status: "Inactive",
+        active: false,
+        executable: false,
+        reason: "inactive",
+        sourceToken: "8".repeat(64),
+        sourceDigest: "7".repeat(64),
+      };
+      browser.rerender(view(3));
+      await screen.findByText(
+        "The saved source changed. This draft is still available to copy.",
+      );
+      expect(editor).toHaveValue(replacement);
+      expect(save).toBeDisabled();
+      expect(saved).toHaveLength(0);
+    } else {
+      fireEvent.click(save);
+      await waitFor(() => expect(saved).toHaveLength(1));
+      expect(saved[0]).toMatchObject({
+        expectedStateToken: source.stateToken,
+        definition: {
+          programId: source.programId,
+          sourceText: replacement,
+          environmentId: source.environmentId,
+          environmentStateToken: source.environmentStateToken,
+        },
+      });
+      if (caseName === "changed environment") {
+        await screen.findByText(
+          /The build environment binding is no longer active/,
+        );
+        expect(editor).toHaveValue(replacement);
+      }
+    }
+  },
+);
+
+it("lets a publisher recover and activate only their own source validation", async () => {
+  setDraftIdentity("publisher");
+  const buildId = "9".repeat(32);
+  const publisherCatalog = {
+    ...catalog,
+    applicationAccess: {
+      ...catalog.applicationAccess,
+      issuer: "issuer",
+      subjectId: "publisher",
+    },
+    functions: {
+      "python.program.read": {},
+      "python.program.validate": {},
+      "python.program.activate": {},
+    },
+  };
+  const inactive = {
+    ...source,
+    active: false,
+    executable: false,
+    reason: "inactive",
+    status: "Inactive",
+    validation: { ...source.validation, current: true, ownedByCaller: false },
+  };
+  const own = {
+    buildId,
+    status: "sealed",
+    purpose: "Validation",
+    current: true,
+    ownedByCaller: true,
+    definition: { kind: "ApplicationRule", definitionId: "forecast" },
+  };
+  let original: { program: unknown; idempotencyKey: unknown } | undefined;
+  let activated: Record<string, unknown> | undefined;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn<typeof fetch>(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.program?.function === "python.program.read")
+        return response(original ? { ...inactive, validation: own } : inactive);
+      if (body.program?.function === "python.program.validate") {
+        original = {
+          program: body.program,
+          idempotencyKey: body.idempotencyKey,
+        };
+        // The server accepted the build, but the client did not receive its acknowledgement.
+        return new Response(JSON.stringify({ error: "APPLICATION_BUSY" }), {
+          status: 409,
+        });
+      }
+      if (body.action === "read" && body.originalRequest) {
+        expect(body.originalRequest).toEqual(original);
+        return response({ ...own, current: undefined, definition: undefined });
+      }
+      if (body.program?.function === "python.program.activate") {
+        activated = body.program.arguments;
+        return response({ status: "Active" });
+      }
+      throw new Error("Unexpected request: " + JSON.stringify(body));
+    }),
+  );
+  installOperationAdmissionFixture("9");
+  render(
+    <PythonDefinitionEditor
+      app={app}
+      catalog={publisherCatalog}
+      kind="ApplicationRule"
+      definitionId="forecast"
+      binding={{ ...binding, active: false }}
+      template=""
+    />,
+  );
+  const activate = await screen.findByRole("button", {
+    name: "Activate source",
+  });
+  expect(activate).toBeDisabled();
+  expect(
+    screen.queryByRole("button", { name: "Edit current source" }),
+  ).toBeNull();
+  expect(screen.queryByRole("button", { name: "Test source" })).toBeNull();
+  fireEvent.change(screen.getByLabelText("Validation sample parameters"), {
+    target: { value: '{"rate":"0.123456789012345678"}' },
+  });
+  expect(unsavedWorkSnapshot().map((draft) => draft.label)).toEqual([
+    "Unsubmitted Python validation samples",
+  ]);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Validate saved source" }),
+  );
+  const recover = await screen.findByRole("button", {
+    name: "Check original validation",
+  });
+  expect(activate).toBeDisabled();
+  expect(unsavedWorkSnapshot().map((draft) => draft.label)).toEqual(
+    expect.arrayContaining([
+      "Unsubmitted Python validation samples",
+      "Python validation with an unconfirmed outcome",
+    ]),
+  );
+  expect(original?.program).toMatchObject({
+    function: "python.program.validate",
+    arguments: {
+      programId: "source",
+      programSourceToken: source.sourceToken,
+      parameters: { rate: "0.123456789012345678" },
+    },
+  });
+  fireEvent.click(recover);
+  await waitFor(() => expect(activate).toBeEnabled());
+  expect(unsavedWorkSnapshot()).toEqual([]);
+  fireEvent.click(activate);
+  await waitFor(() =>
+    expect(activated).toMatchObject({
+      programId: "source",
+      expectedStateToken: source.stateToken,
+      validationBuildId: buildId,
+    }),
+  );
+});
+
+it("retains validation samples for the exact application, identity and saved source", async () => {
+  setDraftIdentity("designer");
+  const designerCatalog = {
+    ...catalog,
+    applicationAccess: {
+      ...catalog.applicationAccess,
+      issuer: "issuer",
+      subjectId: "designer",
+    },
+    functions: { ...catalog.functions, "python.program.validate": {} },
+  };
+  const props = {
+    app,
+    catalog: designerCatalog,
+    source: { ...source, validation: null },
+    contextKey: "context",
+    suspended: false,
+    onAccepted: vi.fn(),
+  };
+  const { rerender } = render(<PythonSourceValidation {...props} />);
+  const samples = () => screen.getByLabelText("Validation sample parameters");
+  fireEvent.change(samples(), { target: { value: '{"period":"January"}' } });
+  await waitFor(() => expect(unsavedWorkSnapshot()).toHaveLength(1));
+  expect(canPreserveUnsavedWork()).toBe(true);
+
+  const otherScopes = [
+    { app: { ...app, workspaceId: "other" } },
+    { source: { ...props.source, programId: "different-program" } },
+    { source: { ...props.source, sourceToken: "e".repeat(64) } },
+    {
+      catalog: {
+        ...designerCatalog,
+        applicationAccess: {
+          ...designerCatalog.applicationAccess,
+          subjectId: "other-designer",
+        },
+      },
+    },
+  ];
+  for (const other of otherScopes) {
+    rerender(<PythonSourceValidation {...props} {...other} />);
+    expect(samples()).toHaveValue("{}");
+    rerender(<PythonSourceValidation {...props} />);
+    await waitFor(() => expect(samples()).toHaveValue('{"period":"January"}'));
+  }
+  expect(props.onAccepted).not.toHaveBeenCalled();
+});
+
+it.each([
+  null,
+  "dependency_stale",
+  "source_environment_stale",
+  "metadata_stale",
+] as const)(
+  "explains Active source acceptance independently of expired Validation: %s",
+  async (reason) => {
+    const current = {
+      ...source,
+      valid: reason === null,
+      executable: reason === null,
+      reason,
+      validation: { ...source.validation, status: "expired" },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url, init) => {
+        const body = JSON.parse(String(init?.body));
+        if (body.program.function === "python.program.read")
+          return response(current);
+        throw new Error("Unexpected effect or authority lookup");
+      }),
+    );
+    const view = render(
+      <PythonDefinitionEditor
+        app={app}
+        catalog={catalog}
+        kind="ApplicationRule"
+        binding={binding}
+        definitionId="definition"
+      />,
+    );
+    const availability = await screen.findByLabelText(
+      "Current definition availability",
+    );
+    expect(availability).toHaveTextContent(
+      reason === null ? "Executable" : "Revalidation required",
+    );
+    expect(screen.getByText(/Validation: expired/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/An expired build does not itself deactivate/),
+    ).toHaveTextContent(
+      "current actor authority, approved environment, dependencies and execution fences",
+    );
+    expect(
+      screen.getByRole("button", { name: "Activate source" }),
+    ).toBeDisabled();
+    const revoked = {
+      ...catalog,
+      functions: {},
+      revisions: { ...catalog.revisions, security: 99 },
+    };
+    view.rerender(
+      <PythonDefinitionEditor
+        app={app}
+        catalog={revoked}
+        kind="ApplicationRule"
+        binding={binding}
+        definitionId="definition"
+      />,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Activate source" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Deactivate source" }),
+    ).not.toBeInTheDocument();
+  },
+);
+
+it("rejects contradictory current owner validity rather than trusting an Active label", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => response({ ...source, reason: "dependency_stale" })),
+  );
+  render(
+    <PythonDefinitionEditor
+      app={app}
+      catalog={catalog}
+      kind="ApplicationRule"
+      binding={binding}
+      definitionId="definition"
+    />,
+  );
+  await screen.findByText("The bound Python source is unavailable.");
+  expect(
+    screen.queryByLabelText("Current definition availability"),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Activate source" }),
+  ).not.toBeInTheDocument();
+});
+
 it.each([
   "ApplicationRule",
   "MemberList",
@@ -102,6 +495,10 @@ it.each([
   "reopens %s's current bound Python, replaces it, validates, and activates that exact displayed artifact",
   async (kind) => {
     const descriptor = { kind, definitionId: "definition" };
+    const declaredOutput =
+      kind === "MemberList"
+        ? { ...descriptor, dimensionId: "Account" }
+        : descriptor;
     const calls: any[] = [];
     let saved = false,
       activated = false;
@@ -127,8 +524,12 @@ it.each([
             saved
               ? {
                   ...source,
+                  declaredOutput,
                   stateToken: activated ? "e".repeat(64) : "f".repeat(64),
                   status: activated ? "Active" : "Inactive",
+                  active: activated,
+                  executable: activated,
+                  reason: activated ? null : "inactive",
                   validation: {
                     buildId: "validation-five",
                     purpose: "Validation",
@@ -137,7 +538,7 @@ it.each([
                     definition: descriptor,
                   },
                 }
-              : source,
+              : { ...source, declaredOutput },
           );
         if (fn === "python.program.save") {
           saved = true;
@@ -203,6 +604,7 @@ it.each([
       definition: expect.objectContaining({
         programId: "source",
         sourceText: `${source.sourceText}# typed definition v3\n`,
+        declaredOutput,
       }),
     });
     fireEvent.click(activate);
@@ -220,34 +622,44 @@ it.each([
     ).toHaveLength(0);
   },
 );
-it("refuses a foreign source digest and never displays or activates that source", async () => {
-  const currentness = vi.fn();
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async () => response({ ...source, sourceDigest: "b".repeat(64) })),
-  );
-  installOperationAdmissionFixture("d");
-  render(
-    <PythonDefinitionEditor
-      app={app}
-      catalog={catalog}
-      kind="MemberList"
-      binding={binding}
-      onSourceCurrentness={currentness}
-    />,
-  );
-  await screen.findByText(
+it.each([
+  [
+    { sourceDigest: "b".repeat(64) },
     "The definition source digest does not match its immutable binding.",
-  );
-  expect(
-    screen.queryByLabelText("MemberList Python source editor"),
-  ).not.toBeInTheDocument();
-  expect(
-    screen.queryByRole("button", { name: "Activate source" }),
-  ).not.toBeInTheDocument();
-  expect(currentness).toHaveBeenNthCalledWith(1, "checking");
-  expect(currentness).toHaveBeenLastCalledWith("unavailable");
-});
+  ],
+  [
+    { sourceToken: "e".repeat(64) },
+    "The saved source no longer matches this definition. Refresh the definition before continuing.",
+  ],
+])(
+  "refuses a source that does not match the selected definition (%j)",
+  async (foreign, message) => {
+    const currentness = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => response({ ...source, ...foreign })),
+    );
+    installOperationAdmissionFixture("d");
+    render(
+      <PythonDefinitionEditor
+        app={app}
+        catalog={catalog}
+        kind="MemberList"
+        binding={binding}
+        onSourceCurrentness={currentness}
+      />,
+    );
+    await screen.findByText(message);
+    expect(
+      screen.queryByLabelText("MemberList Python source editor"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Activate source" }),
+    ).not.toBeInTheDocument();
+    expect(currentness).toHaveBeenNthCalledWith(1, "checking");
+    expect(currentness).toHaveBeenLastCalledWith("unavailable");
+  },
+);
 it("rejects a Validation that compiles a different definition and keeps its source readable", async () => {
   vi.stubGlobal(
     "fetch",
@@ -406,17 +818,19 @@ it("preserves a bound source draft across navigation and late source readback wi
   fireEvent.click(
     await screen.findByRole("button", { name: "Edit current source" }),
   );
-  fireEvent.change(
-    screen.getByLabelText("ApplicationRule Python source editor"),
-    { target: { value: "unsaved exact next source" } },
-  );
+  const editor = screen.getByLabelText("ApplicationRule Python source editor");
+  await waitFor(() => expect(editor).not.toHaveAttribute("readonly"));
+  fireEvent.change(editor, { target: { value: "unsaved exact next source" } });
   first.unmount();
-  const other = render(element({ ...binding, sourceToken: "e".repeat(64) }));
-  await waitFor(() =>
-    expect(
-      screen.getByLabelText("ApplicationRule Python source editor"),
-    ).toHaveValue(source.sourceText),
+  const other = render(
+    element({ ...binding, programSourceToken: "e".repeat(64) }),
   );
+  await screen.findByText(
+    "The saved source no longer matches this definition. Refresh the definition before continuing.",
+  );
+  expect(
+    screen.queryByLabelText("ApplicationRule Python source editor"),
+  ).not.toBeInTheDocument();
   other.unmount();
   const otherApp = render(element(binding, { ...app, applicationId: "other" }));
   await waitFor(() =>
@@ -514,7 +928,13 @@ it.each(["worker", "synchronous"] as const)(
             diagnostics: diagnostic,
           });
         if (body.program?.function === "python.program.read")
-          return response({ ...source, status: "Inactive" });
+          return response({
+            ...source,
+            status: "Inactive",
+            active: false,
+            executable: false,
+            reason: "inactive",
+          });
         throw new Error(`Unexpected ${JSON.stringify(body)}`);
       }),
     );
@@ -658,6 +1078,9 @@ it("reopens current source and activates only its exact current typed impact Tes
   const testedSource = {
     ...source,
     status: "Inactive",
+    active: false,
+    executable: false,
+    reason: "inactive",
     latestImpactTest: {
       buildId: "exact-impact",
       purpose: "ImpactTest",
@@ -678,6 +1101,9 @@ it("reopens current source and activates only its exact current typed impact Tes
         return response({
           ...testedSource,
           status: activated ? "Active" : "Inactive",
+          active: activated,
+          executable: activated,
+          reason: activated ? null : "inactive",
         });
       if (body.program?.function === "python.program.activate") {
         activated = true;
@@ -999,6 +1425,9 @@ it("reloads current validation after a restored draft is saved with a new source
     sourceText: "restored replacement",
     sourceToken: "f".repeat(64),
     status: "Inactive",
+    active: false,
+    executable: false,
+    reason: "inactive",
     validation: {
       buildId: "replacement-validation",
       purpose: "Validation",
@@ -1073,4 +1502,101 @@ it("reloads current validation after a restored draft is saved with a new source
     screen.getByLabelText("ApplicationRule Python source editor"),
   ).toHaveAttribute("readonly");
   expect(screen.getByText("Validation: sealed")).toBeInTheDocument();
+});
+
+it("saves a declared group-owned rule and observes the author's validation through source inspection", async () => {
+  const calls: Array<{
+    url: string;
+    program?: { function: string; arguments: Record<string, unknown> };
+  }> = [];
+  const validation = {
+    buildId: "a".repeat(32),
+    purpose: "Validation",
+    status: "accepted",
+  };
+  const functions = Object.fromEntries(
+    [
+      "python.program.save",
+      "python.program.read",
+      "python.environment.list",
+    ].map((name) => [name, {}]),
+  );
+  vi.stubGlobal(
+    "fetch",
+    vi.fn<typeof fetch>(async (url, init) => {
+      const body = JSON.parse(String(init?.body));
+      calls.push({ url: String(url), program: body.program });
+      if (body.program?.function === "python.environment.list")
+        return response({
+          environments: [
+            {
+              environment_id: "approved",
+              state_token: digest,
+              status: "Active",
+            },
+          ],
+          nextAfterEnvironmentId: null,
+        });
+      if (body.program?.function === "python.program.save")
+        return response({
+          stateToken: source.stateToken,
+          sourceToken: source.sourceToken,
+          status: "Inactive",
+          sourceDigest: digest,
+          validation,
+        });
+      if (body.program?.function === "python.program.read")
+        return response({
+          defined: true,
+          programId: "press-rule",
+          validation: {
+            ...validation,
+            status: "sealed",
+            current: true,
+            ownedByCaller: true,
+          },
+        });
+      throw new Error("Unexpected request");
+    }),
+  );
+  installOperationAdmissionFixture("e");
+  render(
+    <PythonDefinitionEditor
+      app={app}
+      catalog={{
+        ...catalog,
+        functions,
+        applicationAccess: {
+          role: "Assigned",
+          workspaceAdministrator: false,
+          authorizationModel: "group_assignments",
+        },
+      }}
+      kind="ApplicationRule"
+      template={source.sourceText}
+    />,
+  );
+  fireEvent.change(screen.getByLabelText("ApplicationRule source ID"), {
+    target: { value: "press-rule" },
+  });
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Save and validate source" }),
+    ).toBeEnabled(),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Save and validate source" }),
+  );
+  await screen.findByText("Validation: sealed");
+  expect(
+    calls.find((c) => c.program?.function === "python.program.save")?.program
+      ?.arguments.definition,
+  ).toMatchObject({
+    programId: "press-rule",
+    declaredOutput: { kind: "ApplicationRule", definitionId: "press-rule" },
+  });
+  expect(calls.filter((c) => c.url === "/api/python-build")).toHaveLength(0);
+  expect(
+    screen.queryByRole("button", { name: "Refresh compiled definition" }),
+  ).toBeNull();
 });

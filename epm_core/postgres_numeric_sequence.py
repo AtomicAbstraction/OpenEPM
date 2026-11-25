@@ -29,6 +29,70 @@ PLAN_DIGEST = _canonical_digest({'function': FUNCTION, 'version': 1,
     'events': 'all_statements_one_commit', 'projection': 'last_per_coordinate'})
 
 
+def numeric_result_cell_schema(identity_fields):
+    """The ordered evaluator's present/missing cell, with its caller-owned key."""
+    from .postgres_numeric_catalog import obj
+    amount = {'type': 'string',
+        'pattern': r'^-?(?:0|[1-9][0-9]{0,19})\.[0-9]{8}(?![\s\S])'}
+    return {'oneOf': [obj({**identity_fields,
+        'present': {'type': 'boolean', 'const': present},
+        'amount': amount if present else {'type': 'null'}})
+        for present in (True, False)]}
+
+
+def preview_result_schema():
+    """Both current ordered compiler versions, selected by explicit rounding."""
+    from .postgres_numeric_catalog import obj
+    from .postgres_numeric_sequence_expression import COMPILER as expression_compiler
+    fields = {
+        'languageVersion': {'type': 'integer', 'const': 2},
+        'function': {'const': FUNCTION}, 'previewToken': {'type': 'string', 'minLength': 1},
+        'programDigest': {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'},
+        'revisionVector': obj({key: {'type': 'integer', 'minimum': 0} for key in
+            ('metadata_revision', 'data_revision', 'policy_revision')}),
+        'statementCount': {'type': 'integer', 'minimum': 1, 'maximum': 500},
+        'targetCount': {'type': 'integer', 'minimum': 1, 'maximum': 500},
+        'statementResults': {'type': 'array', 'minItems': 1, 'maxItems': 500,
+            'items': numeric_result_cell_schema({
+                'statementIndex': {'type': 'integer', 'minimum': 0, 'maximum': 499}})},
+        'engine': {'const': 'postgres_exact_recursive_sql'}}
+    return {'$schema': 'https://json-schema.org/draft/2020-12/schema', 'oneOf': [
+        obj(fields), obj({**fields, 'compilerVersion': {'const': expression_compiler},
+            'rounding': {'const': 'half_even_8'}})]}
+
+
+def published_result_schema(*, maximum_statements=500):
+    """Ordered publication fields; iteration supplies its executed-effect bound."""
+    from .postgres_numeric_catalog import obj
+    from .postgres_planning_write_guard import planning_write_evidence_schema
+    return {'$schema': 'https://json-schema.org/draft/2020-12/schema', **obj({
+        'changedCount': {'type': 'integer', 'minimum': 1, 'maximum': 500},
+        'statementCount': {'type': 'integer', 'minimum': 1, 'maximum': maximum_statements},
+        'committedRevision': {'type': 'integer', 'minimum': 1},
+        'planningPolicy': planning_write_evidence_schema(),
+        'impactDigest': {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}})}
+
+
+def output_contract():
+    """Discovery only; retained results never pass through a new output decoder."""
+    from .postgres_jobs import job_submission_schema
+    submission = job_submission_schema()
+    return {'resultSchema': submission, 'resultSchemaScope': 'envelope',
+        'outputSchemas': {
+            'preview': {'schema': preview_result_schema(), 'scope': 'envelope',
+                'surface': 'preview_v2_program or browser /api/preview; read-only ordered evaluation'},
+            'submission': {'schema': submission, 'scope': 'envelope',
+                'surface': 'submit_v2_program or browser /api/submit; accepted durable job or matching original job'},
+            'publishedResult': {'schema': published_result_schema(), 'scope': 'result',
+                'surface': 'read_v2_job result when published, also operation receipt result; not the worker wrapper'}},
+        'outputRules': [
+            'A preview without explicit rounding uses the original compiler and omits compilerVersion/rounding. Explicit half_even_8 selects the expression compiler even for literal-only statements and returns both fields.',
+            'statementResults are in zero-based source order, one per statement. targetCount and published changedCount count distinct full coordinates, including same-value writes and clear operations; statementCount counts every event, not only value differences.',
+            'Presence and amount are coupled: missing has null, present has an exact eight-place decimal string. Set zero remains present. Published planning evidence comes from the current planning-write owner.',
+            'Expression previews bind the current compiler and execution plan inside previewToken. A changed plan requires a new preview before a new admission. Accepted old-plan work fails before evaluation; exact original job/receipt recovery retains its original outcome and never rebases or executes it again.',
+            'These are current direct-operation results. Historical saved-sequence receipts can retain savedProgram provenance from their original owner; authorized job/receipt reads preserve that stored result without reinterpreting it or enabling the unsupported saved lifecycle.']}
+
+
 def compiler_for(normalized):
     version = normalized.get('version') if isinstance(normalized, dict) else None
     if type(version) is not int:
@@ -212,24 +276,34 @@ def enforce_sequence_dimensional_security(db, identity, scope, normalized):
         db, identity, scope, coordinates, kind=AccessKind.WRITE)
 
 
-def preview(language, scope, raw):
+def preview(language, scope, raw, *, rule_admission=None, dependencies=()):
     normalized = compile_program(raw)
     with connect_postgres(language.dsn, row_factory=dict_row) as db:
         with db.transaction():
             PostgresNumericFactStore._set_scope(db, scope)
+            PostgresAccessChecker.lock_directory_membership_for_assignment(db)
             PostgresAccessChecker.lock_workspace(db, scope.workspace_id)
-            PostgresAccessChecker.check_in_transaction(db, language.identity, scope, 'write', function=FUNCTION)
+            permission_function = FUNCTION if rule_admission is None else 'application.rule.run'
+            PostgresAccessChecker.check_in_transaction(db, language.identity, scope, 'write', function=permission_function)
             state = db.execute('''SELECT a.status,s.processing_mode,s.metadata_revision,
                 s.data_revision,s.policy_revision FROM epm.application_state s JOIN epm.application a
                 USING(workspace_id,application_id) WHERE workspace_id=%s AND application_id=%s FOR SHARE OF s''',
                 (scope.workspace_id, scope.application_id)).fetchone()
             if state is None or state['status'] != 'Active' or state['processing_mode'] != 'Active':
                 raise ValueError('APPLICATION_NOT_WRITABLE')
+            if rule_admission is not None:
+                from .postgres_job_origin import verify_admission
+                PostgresAccessChecker.require_capability_in_transaction(db,scope,FUNCTION)
+                key = f'rule-{rule_admission.application_rule_workflow_id}-{rule_admission.unit_ordinal}'
+                verify_admission(db,scope,language.identity,rule_admission,function_name=FUNCTION,
+                    idempotency_key=key,dependencies=dependencies)
             enforce_sequence_dimensional_security(
                 db, language.identity, scope, normalized)
             trace = evaluate(db, scope, normalized)
             revisions = {k: state[k] for k in ('metadata_revision','data_revision','policy_revision')}
-    token, digest = language._sign_preview(scope, FUNCTION, normalized, revisions)
+    compiler, plan = compiler_for(normalized)
+    binding = {'compilerVersion': compiler, 'planDigest': plan} if normalized['version'] == 2 else {}
+    token, digest = language._sign_preview(scope, FUNCTION, normalized, revisions, extra=binding)
     return {'languageVersion': 2, 'function': FUNCTION, 'previewToken': token,
         'programDigest': digest, 'revisionVector': revisions,
         'statementCount': len(trace), 'targetCount': len({r['series_key'] for r in normalized['statements']}),
@@ -240,8 +314,7 @@ def preview(language, scope, raw):
            if normalized['version'] == 2 else {})}
 
 
-def submit(language, scope, raw, token, key, dependencies, *, execution_authority=None):
-    from .postgres_jobs import PostgresJobQueue, _KEY, _JOB_ID
+def _submission_program(raw):
     function = raw.get('function') if isinstance(raw, dict) else None
     resource = 'short'
     if function == 'facts.numeric.transform':
@@ -252,43 +325,91 @@ def submit(language, scope, raw, token, key, dependencies, *, execution_authorit
         function = FUNCTION
         normalized = compile_program(raw)
         compiler, digest = compiler_for(normalized)
+    return normalized, function, compiler, digest, resource
+
+
+def _validate_replay_key(key, dependencies, error):
+    from .postgres_jobs import _KEY, _JOB_ID
     if (not isinstance(key, str) or not _KEY.fullmatch(key)
             or not isinstance(dependencies, tuple) or len(dependencies)>16
             or any(not isinstance(value, str) or not _JOB_ID.fullmatch(value) for value in dependencies)
             or len(set(dependencies)) != len(dependencies)):
-        raise ValueError('NUMERIC_SEQUENCE_IDEMPOTENCY_OR_DEPENDENCY_INVALID')
-    # A retry after restart is a receipt lookup, not another admission. It must
-    # survive preview expiry and changed cells, while preserving current grants
-    # and the complete original request identity (including dependency order).
+        raise ValueError(error)
+
+
+def _replay_request(language, scope, normalized, function, resource, key, dependencies,
+                    *, execution_authority, conflict):
+    """Reconcile one retained ordered request; never validate fresh source state.
+
+    The original job supplies execution identity, while the current caller and
+    native compiler supply its exact requested program and authority. No old
+    plan is made executable by returning the existing job.
+    """
     with connect_postgres(language.dsn, row_factory=dict_row) as db:
         with db.transaction():
+            db.execute('SET TRANSACTION READ ONLY')
             PostgresNumericFactStore._set_scope(db, scope)
+            PostgresAccessChecker.lock_directory_membership_for_assignment(db)
             PostgresAccessChecker.lock_workspace(db, scope.workspace_id)
-            access=PostgresAccessChecker.check_in_transaction(
-                db,language.identity,scope,'write',function=function)
-            prior = db.execute('''SELECT job_id,status,request_digest,expected_metadata_revision,
-                expected_data_revision,expected_policy_revision,verified_groups,
-                authorization_scope_digest FROM epm.job WHERE workspace_id=%s
+            from .postgres_job_origin import ApplicationRuleAdmission
+            rule_sequence = function == FUNCTION and isinstance(execution_authority, ApplicationRuleAdmission)
+            access=PostgresAccessChecker.check_in_transaction(db,language.identity,scope,'write',
+                function='application.rule.run' if rule_sequence else function)
+            if rule_sequence:
+                PostgresAccessChecker.require_capability_in_transaction(db,scope,function)
+            prior = db.execute('''SELECT * FROM epm.job WHERE workspace_id=%s
                 AND application_id=%s AND issuer=%s AND subject_id=%s AND idempotency_key=%s''',
                 (scope.workspace_id,scope.application_id,language.identity.issuer,language.identity.subject_id,key)).fetchone()
             if prior:
                 auth_scope=_verify_job_replay_authorization(db,scope,
                     language.identity,prior,access=access,function_name=function)
+                program_digest = _canonical_digest(normalized)
+                if (prior['function_name'] != function or prior['resource_class'] != resource
+                        or prior['program_digest'] != program_digest
+                        or _canonical_digest(prior['normalized_program']) != program_digest):
+                    raise ValueError(conflict)
                 descriptor=_job_request_descriptor(scope,language.identity,
-                    function_name=function,program_digest=_canonical_digest(normalized),
-                    compiler_version=compiler,plan_digest=digest,
+                    function_name=function,program_digest=program_digest,
+                    compiler_version=prior['compiler_version'],plan_digest=prior['plan_digest'],
                     revisions=(prior['expected_metadata_revision'],
                         prior['expected_data_revision'],prior['expected_policy_revision']),
                     resource_class=resource,dependencies=dependencies,
                     authorization_scope_digest=auth_scope,
                     verified_groups=access.groups,
                     execution_authority=execution_authority)
-                if _canonical_digest(descriptor) != prior['request_digest']:
-                    raise ValueError('IDEMPOTENCY_KEY_REUSED')
+                descriptor['tokenIssuedAt'] = prior['token_issued_at']
+                from .postgres_job_origin import matches_retained_request
+                if not matches_retained_request(prior['request_digest'],descriptor,execution_authority):
+                    raise ValueError(conflict)
+                # Recheck parent run/delegation/schedule authority inside this
+                # same workspace fence, including a revocation after the
+                # workflow runner's earlier authorization call.
+                _require_python_job_authority(db, scope, prior, replay_only=True)
                 return {'jobId':prior['job_id'],'status':prior['status'],'duplicate':True}
+    return None
+
+
+def replay(language, scope, raw, key, dependencies, *, execution_authority=None):
+    normalized, function, _, _, resource = _submission_program(raw)
+    _validate_replay_key(key, dependencies, 'NUMERIC_SEQUENCE_IDEMPOTENCY_OR_DEPENDENCY_INVALID')
+    return _replay_request(language, scope, normalized, function, resource, key, dependencies,
+        execution_authority=execution_authority, conflict='IDEMPOTENCY_KEY_REUSED')
+
+
+def submit(language, scope, raw, token, key, dependencies, *, execution_authority=None):
+    from .postgres_jobs import PostgresJobQueue
+    normalized, function, compiler, digest, resource = _submission_program(raw)
+    _validate_replay_key(key, dependencies, 'NUMERIC_SEQUENCE_IDEMPOTENCY_OR_DEPENDENCY_INVALID')
+    prior = _replay_request(language, scope, normalized, function, resource, key, dependencies,
+        execution_authority=execution_authority, conflict='IDEMPOTENCY_KEY_REUSED')
+    if prior is not None:
+        return prior
     payload = language._unpack_preview(scope, function, token)
-    if (set(payload) != {'scope','identity','function','programDigest','revisions','expiresAt'}
-            or payload['programDigest'] != _canonical_digest(normalized)):
+    binding = ({'compilerVersion': compiler, 'planDigest': digest}
+        if function != FUNCTION or normalized['version'] == 2 else {})
+    if (set(payload) != {'scope','identity','function','programDigest','revisions','expiresAt'} | set(binding)
+            or payload['programDigest'] != _canonical_digest(normalized)
+            or any(payload.get(field) != value for field, value in binding.items())):
         raise ValueError('STALE_OR_MISMATCHED_V2_PREVIEW')
     revisions = payload['revisions']
     return PostgresJobQueue(language.dsn, identity=language.identity).submit(scope,
@@ -309,14 +430,14 @@ def apply_in_transaction(db, scope, job, job_id, *, identity,
         identity=identity,provenance=provenance,workflow_role=workflow_role)
 
 
-def enforce_sequence_target_policy(db,scope,normalized,workflow_role):
+def enforce_sequence_target_policy(db,scope,normalized,workflow_role,*,identity=None):
     from .postgres_planning_write_guard import enforce_active_planning_policy
     actions={'set':'Set','add':'Add','clear':'Clear'}
     return enforce_active_planning_policy(
         db,scope,writes=tuple((Coordinate.from_mapping(row['members']),
                                actions[row['op']])
                               for row in normalized['statements']),
-        workflow_role=workflow_role,ordered_actions=True)
+        workflow_role=workflow_role,ordered_actions=True,identity=identity)
 
 
 def _sequence_replay(db,scope,job,receipt):
@@ -419,19 +540,23 @@ class PostgresNumericSequencePublisher:
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
           with db.transaction():
             PostgresNumericFactStore._set_scope(db,scope)
+            PostgresAccessChecker.lock_directory_membership_for_assignment(db)
             state=db.execute('''SELECT a.status application_status,
               s.processing_mode,s.metadata_revision,s.data_revision,
               s.policy_revision,s.commit_revision FROM epm.application_state s
               JOIN epm.application a USING(workspace_id,application_id)
               WHERE s.workspace_id=%s AND s.application_id=%s''',keys).fetchone()
             if state is None:raise ValueError('APPLICATION_UNAVAILABLE')
-            access=PostgresAccessChecker.check_in_transaction(
-                db,self.identity,scope,'write',function=function)
-            if function=='rules.numeric_sequence.run':
-                PostgresAccessChecker.check_in_transaction(
-                    db,self.identity,scope,'rule_run')
             job=db.execute('''SELECT * FROM epm.job WHERE workspace_id=%s
               AND application_id=%s AND job_id=%s''',(*keys,claim['job_id'])).fetchone()
+            rule_sequence = bool(job and function == FUNCTION and job['admission_origin_kind']=='application_rule')
+            gate = 'application.rule.run' if rule_sequence else function
+            access=PostgresAccessChecker.check_in_transaction(db,self.identity,scope,'write',function=gate)
+            if rule_sequence:
+                PostgresAccessChecker.require_capability_in_transaction(db,scope,function)
+                _require_python_job_authority(db,scope,job,replay_only=True)
+            if function=='rules.numeric_sequence.run':
+                PostgresAccessChecker.check_in_transaction(db,self.identity,scope,'rule_run')
             receipt=db.execute('''SELECT committed_revision,actor_id,result
               FROM epm.operation_receipt WHERE workspace_id=%s
               AND application_id=%s AND operation_id=%s''',
@@ -463,7 +588,7 @@ class PostgresNumericSequencePublisher:
                     job['expected_metadata_revision'],
                     job['expected_policy_revision'])):
                 raise ValueError('STALE_JOB_INPUT_REVISION')
-            enforce_sequence_target_policy(db,scope,normalized,access.role)
+            enforce_sequence_target_policy(db,scope,normalized,access.role,identity=self.identity)
 
             PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
             final_state=db.execute('''SELECT a.status application_status,
@@ -498,7 +623,9 @@ class PostgresNumericSequencePublisher:
                 raise ValueError('STALE_WORKER_FENCE')
             _require_python_job_authority(db,scope,final_job)
             final_access=PostgresAccessChecker.check_in_transaction(
-                db,self.identity,scope,'write',function=function)
+                db,self.identity,scope,'write',function=gate)
+            if rule_sequence:
+                PostgresAccessChecker.require_capability_in_transaction(db,scope,function)
             if function=='rules.numeric_sequence.run':
                 PostgresAccessChecker.check_in_transaction(
                     db,self.identity,scope,'rule_run')
@@ -528,7 +655,7 @@ class PostgresNumericSequencePublisher:
                         or final_result_fields!=result_fields):
                     raise ValueError('NUMERIC_SEQUENCE_SOURCE_CHANGED')
             enforce_sequence_target_policy(
-                db,scope,normalized,final_access.role)
+                db,scope,normalized,final_access.role,identity=self.identity)
             job=final_job
             result=publish_trace(db,scope,job,claim['job_id'],normalized,trace,
                 identity=self.identity,provenance=provenance,
@@ -563,7 +690,7 @@ def publish_trace(db,scope,job,job_id,normalized,trace,*,identity,
     # iterative ordered publisher, including legacy fixed-runner entry points.
     enforce_sequence_dimensional_security(db,identity,scope,normalized)
     policy_evidence=enforce_sequence_target_policy(
-        db,scope,normalized,workflow_role)
+        db,scope,normalized,workflow_role,identity=identity)
     from .postgres_fact_batch import ensure_coordinates
     unique_rows=[{**row,'ordinal':index}
                  for index,row in enumerate(unique.values(),1)]

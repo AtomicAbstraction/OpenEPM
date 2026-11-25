@@ -244,11 +244,24 @@ export function PythonRuleEditor({
       <div
         ref={host}
         className="python-rule-editor__canvas"
-        hidden={state === "failed"}
+        hidden={readOnly || state === "failed"}
         style={{ height }}
       />
-      {state === "loading" && <p role="status">Loading Python editor…</p>}
-      {state === "failed" && (
+      {readOnly && (
+        <pre
+          className="python-rule-editor__source"
+          role="region"
+          aria-label={ariaLabel}
+          tabIndex={0}
+          style={{ maxHeight: height }}
+        >
+          {value || "No source text is stored for this program."}
+        </pre>
+      )}
+      {!readOnly && state === "loading" && (
+        <p role="status">Loading Python editor…</p>
+      )}
+      {!readOnly && state === "failed" && (
         <div className="python-rule-editor__fallback">
           <div role="alert">
             The enhanced Python editor could not load. The source remains

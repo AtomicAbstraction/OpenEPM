@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -18,6 +19,13 @@ class InventoryError(ValueError):
 
 
 def load(path: Path) -> dict:
+    try:
+        return parse(path.read_text("utf-8"))
+    except (OSError, UnicodeError) as error:
+        raise InventoryError(f"invalid release inventory: {error}") from error
+
+
+def parse(source: str) -> dict:
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -26,8 +34,8 @@ def load(path: Path) -> dict:
             result[key] = value
         return result
     try:
-        value = json.loads(path.read_text("utf-8"), object_pairs_hook=unique)
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        value = json.loads(source, object_pairs_hook=unique)
+    except (json.JSONDecodeError, RecursionError) as error:
         raise InventoryError(f"invalid release inventory: {error}") from error
     if (not isinstance(value, dict) or set(value) != {"format", "profile", "optionalProfiles"}
             or value.get("format") != "openepm-release-inventory-v2"
@@ -65,16 +73,20 @@ def load(path: Path) -> dict:
 
 
 def resolve(path: Path, *, optional_profiles: tuple[str, ...] = ()) -> dict:
-    value = load(path)
+    return resolve_inventory(load(path), optional_profiles=optional_profiles)
+
+
+def resolve_inventory(value: dict, *, optional_profiles: tuple[str, ...] = ()) -> dict:
+    """Resolve a previously validated inventory without changing the source profile."""
     if (len(set(optional_profiles)) != len(optional_profiles)
             or any(name not in value["optionalProfiles"] for name in optional_profiles)):
         raise InventoryError("unknown or repeated optional profile")
-    profile = value["profile"]
+    profile = deepcopy(value["profile"])
     for name in optional_profiles:
         extension = value["optionalProfiles"][name]
         profile["composeProfiles"].append(name)
         profile["services"].extend(extension["services"])
-        profile["healthDependencies"].update(extension["healthDependencies"])
+        profile["healthDependencies"].update(deepcopy(extension["healthDependencies"]))
     return profile
 
 
@@ -91,8 +103,10 @@ def main() -> int:
     parser.add_argument("--optional-profile", action="append", default=[])
     arguments = parser.parse_args()
     try:
-        profile = resolve(arguments.inventory, optional_profiles=tuple(arguments.optional_profile))
-    except InventoryError as error:
+        inventory_bytes = arguments.inventory.read_bytes()
+        inventory = parse(inventory_bytes.decode("utf-8"))
+        profile = resolve_inventory(inventory, optional_profiles=tuple(arguments.optional_profile))
+    except (OSError, UnicodeError, InventoryError) as error:
         parser.error(str(error))
     if arguments.field:
         value = profile[arguments.field]
@@ -102,13 +116,12 @@ def main() -> int:
             print(json.dumps(value, sort_keys=True, separators=(",", ":")))
     else:
         print(json.dumps({"format": "openepm-resolved-release-inventory-v2",
-            "inventorySha256": hashlib.sha256(
-                arguments.inventory.read_bytes()).hexdigest(),
-            "packagedServices": sorted(set(load(arguments.inventory)["profile"]["services"]) |
-                {service for optional in load(arguments.inventory)["optionalProfiles"].values()
+            "inventorySha256": hashlib.sha256(inventory_bytes).hexdigest(),
+            "packagedServices": sorted(set(inventory["profile"]["services"]) |
+                {service for optional in inventory["optionalProfiles"].values()
                  for service in optional["services"]}),
             "enabledServices": profile["services"],
-            "optionalProfiles": load(arguments.inventory)["optionalProfiles"],
+            "optionalProfiles": inventory["optionalProfiles"],
             **profile}, sort_keys=True, separators=(",", ":")))
     return 0
 

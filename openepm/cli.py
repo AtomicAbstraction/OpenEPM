@@ -154,11 +154,14 @@ def run_session(config: argparse.Namespace, *, input_stream: BinaryIO,
                 # A lost response may follow a commit: the caller must reconcile.
                 message = str(error)
                 code = error.code or (message if _ERROR_CODE.fullmatch(message) else "MCP_REQUEST_FAILED")
-                details = {"code": code, "outcome": "unconfirmed"}
+                details = {"code": code, "outcome":
+                    "unconfirmed" if error.request_dispatched else "not_dispatched"}
                 if error.http_status is not None:
                     details["httpStatus"] = error.http_status
                 if error.rpc_code is not None:
                     details["rpcCode"] = error.rpc_code
+                if error.details is not None:
+                    details["details"] = error.details
                 _emit(output_stream, {"id": active_id, "ok": False,
                     "error": details})
                 had_request_error = True

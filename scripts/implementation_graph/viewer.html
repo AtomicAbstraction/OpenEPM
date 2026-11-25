@@ -10,7 +10,7 @@
 </style>
 <header><div><div class="eyebrow">OPEN EPM / REPOSITORY ATLAS</div><h1>Implementation explorer <span class="muted">/ 3D</span></h1><div class="sub" id="snapshot-label"></div></div><div class="header-tools"><!-- local-only --><span id="save-state" class="save-state">Loading saved edits…</span><button id="save-edits" disabled>Save edits</button><button id="export-edits">Export edits</button><button id="import-edits">Import edits</button><input id="import-file" type="file" accept="application/json,.json" hidden><!-- /local-only --><button id="coverage-button">Evidence & coverage</button><!-- local-only --><button id="export-button">Export graph</button><!-- /local-only --></div></header>
 <div class="layout">
-<aside id="left"><h2>What can the tool do?</h2><p class="hint">Start with a functionality, then follow its real names into the implementation.</p><label for="search" class="hint">Search every node, symbol or path</label><input id="search" type="search" placeholder="Try: dimension, upload, access…" autocomplete="off"><div id="search-results"></div><label class="hint" for="perspective">Connected perspectives</label><select id="perspective"><option value="all">User + supporting platform</option><option value="user">User functionality</option><option value="platform">Supporting platform</option></select><h3>Functionalities <span id="function-count" class="count"></span></h3><div id="catalog"></div></aside>
+<aside id="left"><h2>What can the tool do?</h2><p class="hint">Start with a functionality, then follow its real names into the implementation.</p><label for="search" class="hint">Search every node, symbol or path</label><input id="search" type="search" placeholder="Try: dimension, upload, access…" autocomplete="off"><div id="search-results"></div><!-- local-only --><details id="improvement-plan" hidden><summary>Improvement plan</summary><div id="improvement-catalog"></div></details><!-- /local-only --><label class="hint" for="perspective">Connected perspectives</label><select id="perspective"><option value="all">User + supporting platform</option><option value="user">User functionality</option><option value="platform">Supporting platform</option></select><h3>Functionalities <span id="function-count" class="count"></span></h3><div id="catalog"></div></aside>
 <main><div id="toolbar"><button id="overview">Overview</button><label class="hint" for="detail">Detail</label><select id="detail"><option value="modules">Modules & operations</option><option value="symbols">Functions & methods</option><!-- local-only --><option value="evidence">Acceptance evidence</option><!-- /local-only --></select><button id="fit">Fit view</button><button id="labels-button" aria-pressed="true">Names on</button><button id="layers-button">Layers</button></div>
 <div id="stage"><div id="graph"></div><div id="labels"></div><div id="scene-heading"><div class="eyebrow">FUNCTIONALITY → IMPLEMENTATION</div><div id="scene-title">The built system, through its capabilities</div><div id="scene-help">Drag to rotate · scroll to zoom · right-drag to pan · click to inspect</div></div><div id="scene-footer"><span>Mint = functionality · blue = boundary · purple = core · amber = database</span><span id="visible-count"></span></div><div id="webgl-error">3D rendering could not start. Use the searchable catalogue and connection inspector, or reopen in a browser with WebGL enabled.</div></div>
 <div id="summary"></div></main>
@@ -43,6 +43,14 @@ const nodeAllowed=n=>activeLayers.has(n.layer);
 const other=(e,id)=>e.source===id?e.target:e.source;
 /* local-only */function sourceButton(path,line=1,label){return path?`<button class="source" data-source="${esc(path)}" data-line="${line}">${esc(label||path+':'+line)} ↗</button>`:''}/* /local-only */
 function nodeButton(id,label){return `<button class="connection" data-node="${esc(id)}">${esc(label||N.get(id)?.name||id)}</button>`}
+/* local-only */function improvementCatalog(){
+ const plan=DATA.meta.recordedAcceptance?.improvementPlan;
+ if(!plan)return;
+ const counts=plan.criterionStatuses,total=Object.values(counts).reduce((sum,n)=>sum+n,0);
+ $('improvement-plan').hidden=false;
+ const packages=DATA.nodes.filter(n=>n.kind==='acceptance package'&&n.id.startsWith('package:IP-'));
+ $('improvement-catalog').innerHTML=`<p class="hint">${counts.verified||0} of ${total} criteria accepted in this snapshot.</p>`+packages.map(n=>nodeButton(n.id)).join('');
+}/* /local-only */
 function catalog(q=''){
  const list=F.filter(n=>(!q||n.name.toLowerCase().includes(q.toLowerCase()))&&($('perspective').value==='all'||n.perspective===$('perspective').value));
  $('function-count').textContent=F.length;
@@ -66,7 +74,7 @@ function computeView(){
   [...shared].filter(([id,num])=>num>1).sort((a,b)=>b[1]-a[1]).slice(0,24).forEach(([id])=>ids.add(id));
  }else{
   ids.add(focus);
-  addNeighbors(ids,focus,(n,e)=> mode==='evidence'?n.layer==='Evidence':n.kind==='operation'||isFile(n)||isTerminal(n)||n.kind==='calculation mechanism'||n.kind==='functionality');
+  addNeighbors(ids,focus,(n,e)=> mode==='evidence'?n.layer==='Evidence'||e.kind==='EVIDENCE_BINDS_SOURCE':n.kind==='operation'||isFile(n)||isTerminal(n)||n.kind==='calculation mechanism'||n.kind==='functionality');
   const seeds=[...ids];
   for(const id of seeds){
    const n=N.get(id);
@@ -122,6 +130,9 @@ function updateView(fit=true){
 }
 function choose(id,asFocus=false){
  const n=N.get(id);if(!n)return;
+ /* local-only */if(n.id.startsWith('package:IP-')||['acceptance criterion','qualification evidence'].includes(n.kind)){
+  $('detail').value='evidence';asFocus=true;
+ }/* /local-only */
  selected=id;
  if(n.kind==='functionality'||asFocus){focus=id;extras.clear();updateView()}
  else {if(!currentNodes.some(v=>v.id===id)){extras.add(id);updateView()}inspect(id)}
@@ -146,6 +157,11 @@ function inspect(id){
   if(ops.length)html+=`<h3>UI / MCP coverage at a glance</h3><p class="hint">${ops.length} registered MCP operations; ${ops.filter(o=>o.interfaces?.UI.references?.length).length} with literal inspector references; ${ops.filter(o=>o.interfaces?.UI.recordedAssertions).length} with specifically mapped historical UI assertions. Others remain individually unmapped. Select an operation for exact availability/proof.</p>`;
  }
  if(n.scaleEvidence)html+=`<details><summary>Scale targets vs recorded evidence</summary><pre>${esc(JSON.stringify(n.scaleEvidence,null,2))}</pre></details>`;
+ if(n.sourceBindingCounts){
+  const counts=n.sourceBindingCounts,total=Object.values(counts).reduce((sum,value)=>sum+value,0);
+  html+=`<h3>Recorded source bindings</h3><p class="hint">${total?`${counts.matches} match this snapshot · ${counts.changed} changed · ${counts.missing} missing`:'No individual file digests are linked here.'}</p>`;
+  if(n.executedScenarios.length)html+=`<details><summary>Recorded scenarios (${n.executedScenarios.length})</summary><ul>${n.executedScenarios.map(name=>`<li>${esc(name)}</li>`).join('')}</ul></details>`;
+ }
  if(n.testCoverage)html+=`<h3>Test mapping</h3><p class="hint">${esc(n.testCoverage)} ${n.tests?.length||0} recorded/candidate links. ${authored?.tests?.filter(t=>t.status==='Active').length||0} active authored records; ${authored?.tests?.filter(t=>t.status==='Inactive').length||0} inactive. No passing run is inferred.</p>`;
  html+=sourceButton(n.path,n.line);
  if(n.pointer)html+=`<small>Record pointer: ${esc(n.pointer)}</small>`;/* /local-only */
@@ -336,7 +352,7 @@ try{
  graph.d3Force('charge').strength(-55);graph.d3Force('link').distance(72);
  let resizeTimer;const resize=()=>{graph.width($('stage').clientWidth).height($('stage').clientHeight);clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>graph.zoomToFit(300,65),100)};new ResizeObserver(resize).observe($('stage'));resize();
 }catch(e){$('webgl-error').style.display='block';console.error(e)}
-welcome();catalog();updateView();requestAnimationFrame(drawLabels);/* local-only */loadEdits();/* /local-only */
+welcome();catalog();updateView();requestAnimationFrame(drawLabels);/* local-only */improvementCatalog();loadEdits();/* /local-only */
 /* local-only */// Read-only state access supports repeatable local browser verification.
 window.epmGraph={data:DATA,getState:()=>({focus,selected,visibleNodes:currentNodes.length,visibleLinks:currentLinks.length,layers:[...activeLayers],detail:$('detail').value,webgl:!!graph}),getAuthorState:()=>({dirty,serverReady,revision:savedRevision,orphans:orphanIds(),annotations:structuredClone(annotations)}),choose,showSource,openCard,saveEdits,graph};/* /local-only */
 </script></body></html>

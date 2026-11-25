@@ -5,7 +5,15 @@ mutations provide current authority, revision lock, exact replay and receipt.
 """
 from __future__ import annotations
 
+from psycopg import sql
 from psycopg.types.json import Jsonb
+
+from .postgres_access import AccessDenied
+from .postgres_dimensional_scope import (
+    metadata_dimension_visible, metadata_page_token, metadata_reference_read_sql,
+    reject_mixed_metadata_reads, require_metadata_page_token,
+)
+from .postgres_processing_limits import configure_statement_timeout
 
 PREFIX = "metadata.hierarchy."
 MUTATIONS = {
@@ -36,7 +44,7 @@ def catalog():
     result = {name: {"mode": "atomic_write", "permission": "admin",
         "arguments": {**{key: descriptions[key] for key in sorted(fields)},
             "expectedMetadataRevision": "current nonnegative metadata revision"},
-        "result": "metadata revision and atomic receipt", "previewRequired": False,
+        "result": "atomic receipt with operationId, committedRevision and changedCount", "previewRequired": False,
         "idempotencyRequired": True, "workClass": "short"}
         for name, fields in MUTATIONS.items()}
     for name in READS:
@@ -45,7 +53,8 @@ def catalog():
             fields["hierarchyId"] = descriptions["hierarchyId"]
         result[name] = {"mode": "read", "permission": "read", "arguments": fields,
             "optionalArguments": ({"limit": "1–500", "afterId": "prior stable row ID",
-                "expectedMetadataRevision": "required on continuation"}
+                "expectedMetadataRevision": "required on continuation",
+                "expectedPageToken": "prior nextPageToken when returned"}
                 if name != PREFIX + "read" else {}),
             "result": "named hierarchy metadata or bounded node membership page with current revision",
             "previewRequired": False, "idempotencyRequired": False, "workClass": "short"}
@@ -122,6 +131,20 @@ def graph_members(db, scope, dimension, hierarchy):
             dimension, hierarchy["membership_mode"], hierarchy["hierarchy_id"])).fetchall()]
 
 
+def insert_relationship(db, scope, *, dimension_id, hierarchy_id, relationship_id,
+                        parent_member_id, child_member_id, name=None,
+                        short_description='', detailed_description='', status='Active'):
+    """Insert a validated placement within the caller's metadata transaction."""
+    db.execute('''INSERT INTO epm.relationship
+        (workspace_id, application_id, relationship_id, dimension_id,
+         parent_member_id, child_member_id, name, short_description,
+         detailed_description, hierarchy_id, status)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
+        (scope.workspace_id, scope.application_id, relationship_id, dimension_id,
+         parent_member_id, child_member_id, relationship_id if name is None else name,
+         short_description, detailed_description, hierarchy_id, status))
+
+
 def apply_mutation(db, scope, kind, payload):
     keys = (scope.workspace_id, scope.application_id, payload["dimensionId"])
     dimension = db.execute("""SELECT 1 FROM epm.dimension WHERE workspace_id=%s
@@ -187,9 +210,9 @@ def apply_mutation(db, scope, kind, payload):
         raise ValueError("HIERARCHY_MUTATION_UNSUPPORTED")
 
 
-def read(db, scope, function, args, revision):
+def read(db, scope, function, args, revision, *, authority, identity, cursor_secret):
     required = {"dimensionId"} | ({"hierarchyId"} if function != PREFIX + "list" else set())
-    optional = {"limit", "afterId", "expectedMetadataRevision"} if function != PREFIX + "read" else set()
+    optional = {"limit", "afterId", "expectedMetadataRevision", "expectedPageToken"} if function != PREFIX + "read" else set()
     if type(args) is not dict or not required <= set(args) or set(args) - required - optional:
         raise ValueError("HIERARCHY_READ_ARGUMENTS_INVALID")
     dimension = identifier(args["dimensionId"])
@@ -203,19 +226,41 @@ def read(db, scope, function, args, revision):
             raise ValueError("METADATA_PAGE_REVISION_REQUIRED")
     if expected is not None and (type(expected) is not int or expected != revision):
         raise ValueError("STALE_METADATA_REVISION")
+    if not metadata_dimension_visible(db, scope, authority, dimension):
+        raise ValueError("HIERARCHY_UNAVAILABLE")
     keys = (scope.workspace_id, scope.application_id, dimension)
-    if function == PREFIX + "members.list":
+    is_membership = function == PREFIX + "members.list"
+    hierarchy_id = None
+    if is_membership:
         hierarchy = resolve_hierarchy(db, scope, dimension, args["hierarchyId"], active=False)
+        hierarchy_id = hierarchy["hierarchy_id"]
+    context = [function, *keys, identity.issuer, identity.subject_id, hierarchy_id,
+               limit, revision, authority.scope_digest]
+    require_metadata_page_token(authority, cursor_secret, context, after, args.get("expectedPageToken"))
+    configure_statement_timeout(db, 30_000)
+    if is_membership:
         if hierarchy["membership_mode"] == "explicit":
-            rows = db.execute("""SELECT member_id AS "memberId",status FROM epm.hierarchy_member
-                WHERE workspace_id=%s AND application_id=%s AND dimension_id=%s AND hierarchy_id=%s
-                AND (%s::text IS NULL OR member_id>%s) ORDER BY member_id LIMIT %s""",
-                (*keys, hierarchy["hierarchy_id"], after, after, limit + 1)).fetchall()
+            population = sql.SQL('''FROM epm.hierarchy_member h JOIN epm.member m
+                USING (workspace_id,application_id,dimension_id,member_id)
+                WHERE m.workspace_id=%s AND m.application_id=%s
+                  AND m.dimension_id=%s AND h.hierarchy_id=%s''')
+            status = sql.SQL('h.status')
+            parameters = (*keys, hierarchy_id)
         else:
-            rows = db.execute("""SELECT member_id AS "memberId",status FROM epm.member
-                WHERE workspace_id=%s AND application_id=%s AND dimension_id=%s AND status='Active'
-                AND (%s::text IS NULL OR member_id>%s) ORDER BY member_id LIMIT %s""",
-                (*keys, after, after, limit + 1)).fetchall()
+            population = sql.SQL('''FROM epm.member m
+                WHERE m.workspace_id=%s AND m.application_id=%s
+                  AND m.dimension_id=%s AND m.status='Active' ''')
+            status = sql.SQL('m.status')
+            parameters = keys
+        visible = metadata_reference_read_sql(authority, 'm', dimension)
+        if reject_mixed_metadata_reads(authority) and db.execute(
+            sql.SQL('SELECT EXISTS(SELECT 1 {} AND NOT {}) AS denied').format(population, visible),
+            parameters).fetchone()['denied']:
+            raise AccessDenied('METADATA_DIRECTORY_SCOPE_UNAVAILABLE')
+        rows = db.execute(sql.SQL('''SELECT m.member_id AS "memberId", {status} {population}
+            AND {visible} AND (%s::text IS NULL OR m.member_id>%s)
+            ORDER BY m.member_id LIMIT %s''').format(status=status, population=population, visible=visible),
+            (*parameters, after, after, limit + 1)).fetchall()
         id_key = "memberId"
     else:
         hierarchy_id = identifier(args["hierarchyId"]) if function.endswith(".read") else None
@@ -236,9 +281,13 @@ def read(db, scope, function, args, revision):
             return {**dict(rows[0]), "dimensionId": dimension, "metadataRevision": revision}
     more = len(rows) > limit
     page = [dict(row) for row in rows[:limit]]
-    return {"dimensionId": dimension, **({"hierarchyId": hierarchy["hierarchy_id"]} if function == PREFIX + "members.list" else {}),
+    result = {"dimensionId": dimension, **({"hierarchyId": hierarchy_id} if is_membership else {}),
         "metadataRevision": revision, "rows": page,
         "hasMore": more, "nextAfterId": page[-1][id_key] if more else None}
+    if authority.policy is not None:
+        result["nextPageToken"] = metadata_page_token(
+            cursor_secret, context, result["nextAfterId"]) if more else None
+    return result
 
 
 def hierarchy_references(node):
@@ -271,3 +320,108 @@ def load_hierarchy_graphs(db, scope, dimension, requested_ids):
                                    "relationships": relationships}
         result[requested] = canonical[identity]
     return result
+
+
+def read_program_contract(function):
+    """Public wire projection of the existing named-hierarchy readers."""
+    if function not in READS:
+        return None
+    from .metadata_read_contract import read_contract, read_example, obj, METADATA_PAGE_TOKEN_SCHEMA
+    identifier_schema = {'type': 'string', 'minLength': 1, 'maxLength': 200}
+    revision = {'type': 'integer', 'minimum': 0}
+    fields = {'dimensionId': identifier_schema}
+    if function != PREFIX + 'list':
+        fields['hierarchyId'] = identifier_schema
+    required = list(fields)
+    row = obj({'hierarchyId': identifier_schema, 'name': identifier_schema,
+        'status': {'enum': ['Active', 'Inactive']},
+        'membershipMode': {'enum': ['explicit', 'all_active']},
+        'isDefault': {'type': 'boolean'}, 'stateToken': {'type': ['string', 'null']},
+        'builtMetadataRevision': {'anyOf': [revision, {'type': 'null'}]},
+        'current': {'type': 'boolean'}})
+    base = {'dimensionId': identifier_schema, 'metadataRevision': revision}
+    if function == PREFIX + 'read':
+        result = obj({**row['properties'], **base})
+    else:
+        fields.update({'limit': {'type': 'integer', 'minimum': 1, 'maximum': 500},
+            'afterId': {'anyOf': [identifier_schema, {'type': 'null'}]},
+            'expectedPageToken': METADATA_PAGE_TOKEN_SCHEMA,
+            'expectedMetadataRevision': {'anyOf': [revision, {'type': 'null'}]}})
+        if function == PREFIX + 'members.list':
+            row = obj({'memberId': identifier_schema,
+                'status': {'enum': ['Active', 'Inactive']}})
+            base['hierarchyId'] = identifier_schema
+        result_fields = {**base, 'rows': {'type': 'array', 'maxItems': 500, 'items': row},
+            'hasMore': {'type': 'boolean'},
+            'nextAfterId': {'anyOf': [identifier_schema, {'type': 'null'}]}}
+        result = obj({**result_fields, 'nextPageToken': {'anyOf': [METADATA_PAGE_TOKEN_SCHEMA,
+                     {'type': 'null'}]}}, list(result_fields))
+    arguments = obj(fields, required)
+    if function != PREFIX + 'read':
+        arguments['allOf'] = [{'if': {'required': ['afterId'],
+            'properties': {'afterId': {'type': 'string'}}},
+            'then': {'required': ['expectedMetadataRevision'],
+                     'properties': {'expectedMetadataRevision': revision}}},
+            {'if': {'required': ['expectedPageToken']},
+             'then': {'required': ['afterId', 'expectedMetadataRevision'],
+                      'properties': {'afterId': {'type': 'string'},
+                                     'expectedMetadataRevision': revision}}}]
+    example = {'dimensionId': 'custom-axis'}
+    if function != PREFIX + 'list':
+        example['hierarchyId'] = 'primary'
+    return read_contract(function, arguments, result, owner='postgres_hierarchies.read',
+        examples=[read_example(function, example, name='Read the selected named hierarchy',
+            binding='Use a current dimension ID and, where required, the hierarchyId returned by its authorized hierarchy list.')],
+        semantic_rules=[
+            'Native identifiers exclude control characters and leading/trailing whitespace. Current metadata authority and revision checks remain native.',
+            'The core rechecks current application access before returning a result. On METADATA_DIRECTORY_READ_AUTHORIZATION_STALE, restart the read under current access.',
+            'The selected dimension and member identities require current dimensional READ. Filter mode pages only visible memberships. Strict mode refuses a mixed member population.',
+            'When a page returns nextPageToken, the continuation must carry it as expectedPageToken with the original limit. Restart from the first page if the token is stale.',
+            'A continuation pins the prior metadata revision. A null build state means the named hierarchy has no current built state, not an empty member set.',
+            'Explicit membership and all_active membership remain distinct; inactive definitions may be inspected by these current metadata readers.'])
+
+
+def write_program_contract(function):
+    if function not in MUTATIONS:
+        return None
+    from .metadata_read_contract import metadata_mutation_receipt_schema, obj, read_contract, read_example
+
+    identifier_schema = {'type': 'string', 'minLength': 1, 'maxLength': 200,
+        'description': 'Use a nonempty value without leading or trailing whitespace or control characters.'}
+    status = {'enum': ['Active', 'Inactive']}
+    revision = {'type': 'integer', 'minimum': 0}
+    properties = {'dimensionId': identifier_schema, 'hierarchyId': identifier_schema,
+        'name': identifier_schema, 'membershipMode': {'enum': ['explicit', 'all_active']},
+        'isDefault': {'type': 'boolean'}, 'status': status,
+        'members': {'type': 'array', 'minItems': 1, 'maxItems': 500, 'uniqueItems': True,
+            'items': obj({'memberId': identifier_schema, 'status': status})}}
+    suffix = function.removeprefix(PREFIX)
+    caption, values, rule = {
+        'create': ('Create a named hierarchy',
+            {'name': 'Alternate hierarchy', 'membershipMode': 'explicit', 'isDefault': False},
+            'The first hierarchy in a dimension must be the default. For a dimension with a default, create an alternate and switch separately.'),
+        'rename': ('Rename a named hierarchy', {'name': 'Alternate rollup'},
+            'Select the exact existing hierarchy ID. Renaming leaves its ID and membership intact.'),
+        'members.set': ('Set explicit hierarchy membership', {'members': [
+            {'memberId': 'member-a', 'status': 'Active'}, {'memberId': 'member-b', 'status': 'Active'}]},
+            'Use distinct member IDs in an active explicit hierarchy. The fixed core checks member availability and active relationships.'),
+        'default.set': ('Switch to an active default hierarchy', {},
+            'Set an active alternate as the default. The fixed core switches the old and new default together.'),
+        'status.set': ('Deactivate a hierarchy outside the default',
+            {'hierarchyId': 'route-primary', 'status': 'Inactive'},
+            'Switch the default first if the hierarchy being deactivated is currently the default.'),
+    }[suffix]
+    example = {'dimensionId': 'custom-axis', 'hierarchyId': 'route-explicit',
+        'expectedMetadataRevision': 1, **values}
+    binding = ('Use authorized IDs and the current metadataRevision. Confirm the exact write before '
+               'requesting operation admission. ' + rule)
+    arguments = {field: properties[field] for field in sorted(MUTATIONS[function])}
+    arguments['expectedMetadataRevision'] = revision
+    contract = read_contract(function, obj(arguments), metadata_mutation_receipt_schema(),
+        owner='PostgresMetadataStore.hierarchy_mutation',
+        examples=[read_example(function, example, name=caption, binding=binding)],
+        semantic_rules=[rule, 'Use the authorized hierarchy read to inspect current membership, status and build state.'])
+    contract['programContract']['recovery'] = (
+        'On an uncertain outcome, read the original operation receipt or replay the exact admitted request. '
+        'After a definite stale refusal, refresh the hierarchy and revision, review the change and obtain new admission.')
+    return contract

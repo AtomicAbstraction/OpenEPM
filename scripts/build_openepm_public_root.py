@@ -35,6 +35,11 @@ CI_REQUIRED_PATHS = frozenset({
     "requirements-postgres-dev.txt",
     "requirements-postgres.txt",
 })
+INSTALL_REQUIRED_PATHS = frozenset({
+    "INSTALL.md",
+    "deploy/postgres/compose.yaml",
+    "deploy/postgres/.env.example",
+})
 
 
 def load_public_manifest(
@@ -89,6 +94,10 @@ def selected_files(root: Path, manifest_path: Path) -> tuple[dict, list[GitFile]
         by_path[destination] = GitFile(destination, item.mode, item.data)
     files = sorted(by_path.values(), key=lambda item: item.path.encode("utf-8"))
     selected = {item.path for item in files}
+    missing_install_paths = sorted(INSTALL_REQUIRED_PATHS - selected)
+    if missing_install_paths:
+        raise SourcePackageError(
+            f"public source installation dependencies are absent: {missing_install_paths}")
     if ".github/workflows/ci.yml" in selected:
         missing_ci_paths = sorted(CI_REQUIRED_PATHS - selected)
         if missing_ci_paths:

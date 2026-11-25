@@ -17,20 +17,12 @@ from .metadata_references import (MetadataReference, token_reference,
                                   BOOTSTRAP_CONTRACT, BOOTSTRAP_CONTRACT_DIGEST,
                                   reference_identity_key)
 from .member_lists import MemberListExpression
+from .diagnostics import MetadataAuthoringError
 from .selections import (
     INLINE_EXPRESSION_FORMAT,
     CubeSelection,
     DimensionSelection,
 )
-
-
-class MetadataAuthoringError(ValueError):
-    """Fixed metadata failure classification; never carries caller names/values."""
-
-    def __init__(self, code: str, kind: str):
-        self.code = code
-        self.kind = kind
-        super().__init__(code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +251,21 @@ class Dimension:
             return self.hierarchy(identity)
         return Hierarchy(self, {"stateToken": self.descriptor.get("hierarchyStateToken")})
 
+    def all_members(self) -> AxisSelection:
+        """All active dimension members, including members outside hierarchies."""
+        expression = MemberListExpression.navigation("all", scope="dimension")
+        return AxisSelection(self.application, self.id, None,
+            DimensionSelection.expression(self.id, expression).to_wire()["include"], expression)
+
+    def roots(self) -> AxisSelection:
+        return self._default_hierarchy().roots()
+
+    def all_base_members(self) -> AxisSelection:
+        return self._default_hierarchy().all_base_members()
+
+    def unplaced_members(self) -> AxisSelection:
+        return self._default_hierarchy().unplaced_members()
+
     def descendants(self, name: str | Member, *, include_self: bool = False) -> AxisSelection:
         return self._default_hierarchy().descendants(name, include_self=include_self)
 
@@ -441,6 +448,52 @@ class Hierarchy:
         """Retain every ordered edge from the declared root to this occurrence."""
         return Placement(self, self._member(root), tuple(path))
 
+    def navigation(self, operation: str, anchor: str | Member | None = None, *,
+            path_relationship_ids: tuple[str, ...] | None = None,
+            include_self: bool = False, all_parents: bool = False) -> AxisSelection:
+        """Compose a native selection; the fixed core validates current topology."""
+        if operation == "top":
+            raise ValueError("scope tops are not business coordinates")
+        self.state_token
+        if self.id is None:
+            raise MetadataAuthoringError("METADATA_HIERARCHY_UNAVAILABLE", "hierarchy")
+        expression = MemberListExpression.navigation(operation,
+            scope="dimension" if operation == "unplaced" else "hierarchy",
+            hierarchy_id=self.id,
+            member_id=None if anchor is None else self._member(anchor).id,
+            path_relationship_ids=path_relationship_ids,
+            include_self=include_self, all_parents=all_parents)
+        return AxisSelection(self.dimension.application, self.dimension.id, None,
+            DimensionSelection.expression(self.dimension.id, expression).to_wire()["include"], expression)
+
+    def all_members(self) -> AxisSelection:
+        return self.navigation("all")
+
+    def roots(self) -> AxisSelection:
+        return self.navigation("roots")
+
+    def all_base_members(self) -> AxisSelection:
+        return self.navigation("leaves")
+
+    def unplaced_members(self) -> AxisSelection:
+        return self.navigation("unplaced")
+
+    def leaf_descendants(self, name: str | Member, *, include_self: bool = False) -> AxisSelection:
+        return self.navigation("leaf_descendants", name, include_self=include_self)
+
+    def is_base(self, name: str | Member) -> AxisSelection:
+        """Select the starting member only when it is a base member."""
+        return self.navigation("is_base", name)
+
+    def same_level(self, name: str | Member, *, include_self: bool = False) -> AxisSelection:
+        return self.navigation("same_level", name, include_self=include_self)
+
+    def same_generation(self, name: str | Member, *,
+            path_relationship_ids: tuple[str, ...] | None = None,
+            include_self: bool = False) -> AxisSelection:
+        return self.navigation("same_generation", name,
+            path_relationship_ids=path_relationship_ids, include_self=include_self)
+
     def _selection(self, kind, name, include_self=False):
         if type(include_self) is not bool:
             raise ValueError("include_self must be boolean")
@@ -582,6 +635,11 @@ class Placement:
     @property
     def path_relationship_ids(self) -> tuple[str, ...]:
         return tuple(edge.id for edge in self.path)
+
+    def navigation(self, operation: str, *, include_self: bool = False) -> AxisSelection:
+        """Persist this occurrence's complete path in a native expression."""
+        return self.hierarchy.navigation(operation, self.member,
+            path_relationship_ids=self.path_relationship_ids, include_self=include_self)
 
     def to_reference(self) -> dict:
         application = self.hierarchy.dimension.application

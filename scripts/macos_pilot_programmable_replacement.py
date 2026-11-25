@@ -1815,6 +1815,131 @@ def _development_image_environment(root, origin, target):
                   value, count=1, flags=re.MULTILINE)
 
 
+def _prebound_image_qualification(path_value, image: str) -> dict:
+    """Validate evidence before adopting an already-bound exact image.
+
+    This path repairs durable controller state only; it never changes a
+    Compose binding or starts/stops a service.  Requiring installed evidence
+    and matching immutable image labels prevents a writable configuration file
+    from becoming deployment authority by itself.
+    """
+    if path_value is None:
+        raise ReplacementError(
+            "prebound image reconciliation requires qualification evidence")
+    supplied = Path(path_value)
+    if supplied.is_symlink():
+        raise ReplacementError(
+            "prebound image qualification evidence is invalid")
+    try:
+        path = supplied.resolve(strict=True)
+        metadata = path.lstat()
+        raw = path.read_bytes()
+    except (OSError, RuntimeError) as error:
+        raise ReplacementError(
+            "prebound image qualification evidence is unavailable") from error
+    if (not path.is_file() or metadata.st_size != len(raw)
+            or len(raw) > 1024 * 1024):
+        raise ReplacementError(
+            "prebound image qualification evidence is invalid")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReplacementError(
+            "prebound image qualification evidence is invalid") from error
+    runtime = value.get("runtime") if type(value) is dict else None
+    installed = value.get("installedChecks") if type(value) is dict else None
+    protection = (value.get("sharedStateProtection")
+                  if type(value) is dict else None)
+    if (value.get("format") != "openepm-installed-current-image-rebind-v1"
+            or value.get("status") != "passed" or type(runtime) is not dict
+            or runtime.get("state") != "active"
+            or runtime.get("verified") is not True
+            or runtime.get("applicationImage") != image
+            or runtime.get("imageLabelsMatchSource") is not True
+            or not re.fullmatch(r"[0-9a-f]{40}",
+                                str(runtime.get("sourceCommit", "")))
+            or not re.fullmatch(r"[0-9a-f]{40}",
+                                str(runtime.get("sourceTree", "")))
+            or type(installed) is not dict
+            or installed.get("applicationServicesOnExactImage") != 6
+            or installed.get("configuredHealthChecksPassed") != 5
+            or type(protection) is not dict
+            or protection.get("sharedBusinessApplicationMutation") is not False):
+        raise ReplacementError(
+            "prebound image qualification evidence differs")
+    try:
+        inspected = json.loads(docker(
+            "image", "inspect", "--format", "{{json .}}", image))
+    except (RuntimeError, TypeError, json.JSONDecodeError) as error:
+        raise ReplacementError(
+            "prebound image label identity is unavailable") from error
+    labels = inspected.get("Config", {}).get("Labels", {})
+    if (inspected.get("Id") != image
+            or labels.get("org.openepm.source.commit") !=
+                runtime["sourceCommit"]
+            or labels.get("org.openepm.source.tree") != runtime["sourceTree"]):
+        raise ReplacementError("prebound image label identity differs")
+    return {
+        "format": value["format"],
+        "path": str(path),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "qualifiedAt": value.get("qualifiedAt"),
+        "sourceCommit": runtime["sourceCommit"],
+        "sourceTree": runtime["sourceTree"],
+    }
+
+
+def _reconcile_prebound_development_image(root, state, target, pins,
+                                          qualification) -> dict:
+    """Adopt a verified running image without performing a second switch."""
+    command, environment = base(root)
+    _development_check_bindings(root, state, target)
+    if _development_image_pins(root, state, state["developmentTarget"]) != pins:
+        raise ReplacementError("prebound image source pins changed")
+    database = _development_database(command, environment, state, target)
+    identity = _development_identity(command, environment, state)
+    launcher = verify_development_launcher(
+        root, state, target, command, environment)
+    runtime_secrets = _development_runtime_python_secrets(
+        root, command, environment)
+    count = application_count(database)
+    evidence = owner.verify_generation(
+        command, environment, target["applicationImage"],
+        target["databaseImage"], target["expectedSchema"], count,
+        public=True)
+    record = {
+        "reconciledAt": datetime.now(timezone.utc).isoformat(),
+        "fromImage": state["applicationImage"],
+        "toImage": target["applicationImage"],
+        "qualification": qualification,
+        "serviceMutation": False,
+        "businessMutation": False,
+    }
+    history = list(state.get("imageReconciliationHistory", []))
+    history.append(record)
+    completed = {
+        **state,
+        "state": "active",
+        "applicationImage": target["applicationImage"],
+        "developmentTarget": target,
+        "expectedApplications": count,
+        "verified": True,
+        "activationVerification": {
+            **evidence,
+            "identity": identity,
+            "launcher": launcher,
+            "pythonSecretBindings": runtime_secrets,
+        },
+        "imageReconciliation": record,
+        "imageReconciliationHistory": history,
+    }
+    owner.write_json(owner.state_path(root), completed)
+    if load_state(root) != completed:
+        raise ReplacementError(
+            "prebound image reconciliation acknowledgement differs")
+    return completed
+
+
 def _upgrade_development_image(root, state, args, new_image):
     """Same-schema image switch under the caller's lock; never purge or migrate."""
     marker = state.get("activeUpgrade")
@@ -1853,6 +1978,14 @@ def _upgrade_development_image(root, state, args, new_image):
     _development_images(target)
     command, environment = base(root)
     if marker is None:
+        current_application = parse_env(root / "compose.env").get(
+            "EPM_APPLICATION_IMAGE")
+        if current_application == target["applicationImage"]:
+            qualification = _prebound_image_qualification(
+                getattr(args, "qualification_evidence", None),
+                target["applicationImage"])
+            return _reconcile_prebound_development_image(
+                root, state, target, pins, qualification)
         status_unlocked_development(root, state)
         database = compose(command, "ps", "-q", "db", environment=environment)
         # Refusal before any binding changes is reversible. Existing accepted
@@ -3521,6 +3654,8 @@ def main() -> int:
     parser.add_argument("--build-phase-stage", choices=("purge-ready", "activate-empty"))
     parser.add_argument("--oidc-issuer")
     parser.add_argument("--initial-admin-username")
+    parser.add_argument("--qualification-evidence", type=Path,
+                        help="installed evidence required only to reconcile an already-bound exact image")
     arguments = parser.parse_args()
     try:
         if arguments.command == "prepare":

@@ -136,6 +136,46 @@ EXECUTION={
  'publication':'All statement events/final cells/receipt/revision/published-job result commit atomically. A failed/cancelled/stale worker cannot publish partial effects.',
 }
 
+SOURCE_OWNED_REPLACEMENT={
+ 'ownerKind':'ApplicationRule',
+ 'authoring':'Author reviewed Python source returning ApplicationRule with a NumericSequence checkpoint; discover the current Python program contract and permitted source lifecycle in this application.',
+ 'bindingDiscovery':[
+     {'view':'functions','function':'application.state.read'},
+     {'view':'functions','function':'python.environment.list'},
+     {'view':'functions','function':'python.environment.read'},
+     {'view':'functions','function':'facts.cube.scan'}],
+ 'revisionPins':{'expectedMetadataRevision':'metadataRevision',
+     'expectedPolicyRevision':'policyRevision','expectedSchemaEpoch':'schemaEpoch'},
+ 'environmentPins':{'environmentId':'environment_id','environmentStateToken':'state_token'},
+ 'environmentBinding':'Use one reviewed Active row from the current registered environment reads. If those reads are unavailable under your grant, obtain the binding from an application administrator.',
+ 'rawCoordinateArguments':{'includeMissing':True,'limit':1},
+ 'coordinateBinding':'Pass the full exact coordinate as members to facts.cube.scan. Take numericChangeId from a matching authorized row, including a cleared row. An empty page alone does not prove a coordinate has no prior numeric event.',
+ 'authoringDiscovery':[
+     {'view':'functions','function':'python.program.save'},
+     {'view':'functions','function':'python.program.activate'}],
+ 'validationReview':{'statusTool':'read_v2_python_program_build',
+     'buildIdFromSave':'$.result.validation.buildId','buildIdArgument':'build_id',
+     'requiredStatus':'sealed','artifactTool':'read_v2_python_program_build_artifact',
+     'artifactSection':'PlanSummary'},
+ 'lifecycle':'Save queues Validation. Read and review the exact build before activation. Refresh the application revision pins and use the reviewed validationBuildId and current source state token. Inspect the activated rule and use separate run admission.',
+ 'inspection':'Use the permitted application.rule list/read/run contracts for the source-owned rule. Find ordered rules with the inspection filter, then inspect each rule before requesting an authorized run.',
+ 'inspectionFilter':{'containsOperation':'facts.numeric.sequence'},
+ 'inspectionDiscovery':[
+     {'view':'functions','function':'application.rule.list'},
+     {'view':'functions','function':'application.rule.read'}],
+ 'runDiscovery':{'view':'functions','function':'application.rule.run'},
+ 'runOutcome':{
+     'discovery':{'view':'functions','function':'application.rule.run.read'},
+     'workflowIdFromRun':'$.result.workflowId',
+     'guidance':('Keep the exact admitted run program and signed operation ID. Read the outcome by workflow ID, or use the original request if the acknowledgement is lost. '
+                 'Check the recorded status and committed checkpoints before reporting publication. An unavailable outcome remains unresolved.'),
+ },
+ 'semantics':'Review the full coordinate, typed parameter declarations, ordered statements and checkpoint boundaries. NumericSequence requires explicit first-touch expected_change_id; empty means no prior numeric event, not a previously cleared value.',
+ 'automaticMigration':False,
+ 'identity':'A legacy sequence ID, bindings or state token does not identify an ApplicationRule. Do not translate or copy them implicitly. Reauthoring requires deliberate review; legacy automatic runtime CAS is not reproduced by source authoring.',
+ 'history':'Existing routes, stored references and historical execution records remain. This guidance does not retire them, claim migration complete or authorize replay as new work.',
+}
+
 
 def examples():
     def wire(fn,args):return {'languageVersion':2,'function':fn,'arguments':args}
@@ -158,10 +198,32 @@ def examples():
             {'coordinate':{'Metric':{'type':'MemberParameter','name':'Target'}},'op':'add',
              'value':{'type':'NumericExpression','expression':{'op':'Multiply','left':{'op':'CurrentAmount'},'right':{'op':'Parameter','name':'Rate'}}}}]}
     typed_ordered=deepcopy(iterative);typed_ordered['function']=SEQUENCE;typed_ordered['arguments'].pop('convergence')
+    nonconvergent=deepcopy(iterative)
+    nonconvergent['arguments']['convergence']['maxIterations']=1
+    prerequisite=('A separate disposable application for this example: exactly one active fact axis Metric '
+        '(Custom), active members A and B, and no numeric events or supporting detail at either coordinate. '
+        'Current write authority includes these full coordinates, current read authority permits inspection, and planning scope is open. '
+        'These are explicit fixture conditions, not default product metadata or an application mode. The operation is a generic primitive. Empty expectedChangeId means no prior event; '
+        'a cleared tombstone does not satisfy it. Discover the actual full fact grain and current change IDs before rebinding another application.')
     return {SEQUENCE:[{'id':'ordered-literal-reference-clear','program':ordered,
-                'expectedFinal':{'A':None,'B':'105.00000000'}},
-            {'id':'ordered-typed-guard','program':typed_ordered,'expectedFinal':{'A':'100.00000000'}}],
-        ITERATE:[{'id':'bounded-recurrence','program':iterative,'expectedFinal':{'A':'111.11111111'},'expectedIterations':11}],
+                'prerequisites':prerequisite,
+                'expectedFinal':{'A':None,'B':'105.00000000'},
+                'expectedPreview':{'statementCount':4,'targetCount':2},
+                'expectedPublished':{'statementCount':4,'changedCount':2}},
+            {'id':'ordered-typed-guard','program':typed_ordered,'prerequisites':prerequisite,
+                'expectedFinal':{'A':'100.00000000'},
+                'expectedPreview':{'statementCount':1,'targetCount':1},
+                'expectedPublished':{'statementCount':1,'changedCount':1}}],
+        ITERATE:[{'id':'bounded-recurrence','program':iterative,'prerequisites':prerequisite,
+                'expectedFinal':{'A':'111.11111111'},'expectedIterations':11,
+                'expectedPreview':{'converged':True,'admissionAllowed':True,'executedStatementCount':11},
+                'expectedPublished':{'statementCount':11,'iterationStatementCount':1,'changedCount':1}},
+            {'id':'bounded-recurrence-does-not-converge','program':nonconvergent,'prerequisites':prerequisite,
+                'expectedPreview':{'converged':False,'admissionAllowed':False,'iterations':1,
+                    'executedStatementCount':1,'errorCode':'NUMERIC_ITERATION_NOT_CONVERGED',
+                    'diagnostics':[{'iteration':1,'presenceChanges':1,'maxAbsoluteDelta':'0.00000000'}]},
+                'expectedEvaluatedFinal':{'A':'100.00000000'},
+                'expectedPublication':'None; no signed preview or job is created by preview, and nonconvergence cannot admit publication.'}],
         SAVE:[{'id':'saved-typed-template','program':wire(SAVE,{'ruleId':'plan.example','definition':template,
             'expectedMetadataRevision':3,'expectedPolicyRevision':0})}],
         PUBLISH:[{'id':'activate-template','program':wire(PUBLISH,{'ruleId':'plan.example','expectedStateToken':'a'*64,'expectedMetadataRevision':3,'expectedPolicyRevision':0})}],
@@ -171,13 +233,8 @@ def examples():
             'expectedFinal':{'A':'125.00000000'}}]}
 
 
-def enrich(catalog):
-    """Add guidance only; never change dispatch, grants, compilers or definitions."""
-    samples=examples()
-    for function in (SEQUENCE,ITERATE,SAVE,PUBLISH,READ,LIST,RUN):
-        rules=(WIRE_RULES+ITERATION_RULES if function==ITERATE else WIRE_RULES if function==SEQUENCE
-               else SAVED_RULES+WIRE_RULES if function==SAVE else SAVED_RULES)
-        contract={'version':1,'validationScope':'JSON Schema wire structure plus required semanticRules; fixed compiler/core is authoritative',
+def _program_contract(function, rules, samples):
+    return {'version':1,'validationScope':'JSON Schema wire structure plus required semanticRules; fixed compiler/core is authoritative',
             'programSchema':argument_schema(function),'semanticRules':rules,'examples':samples[function],
             'examplePrerequisites':{'warning':'Synthetic examples; never run blindly in an existing business application.',
                 'application':'Separate fresh blank application for each data example; saved lifecycle examples share one fresh application. Consolidation disabled.',
@@ -186,10 +243,74 @@ def enrich(catalog):
                             {'function':'metadata.member.create','arguments':{'dimensionId':'Metric','memberId':'B','name':'B','expectedMetadataRevision':2}}],
                 'snapshot':'Metadata revision3/policy0; no prior numeric events. Saved examples run save→publish→read/list→run; save/publish revisions are examples, use actual current revisions.',
                 'authority':'Current write; saved lifecycle also needs separate design/publish/run grants. Reader can inspect saved read/list, not execute writes.'}}
-        if function in (SEQUENCE,ITERATE,RUN):contract['execution']=deepcopy(EXECUTION)
+
+
+def direct_program_contract(function, samples):
+    """Return the owner descriptor for direct ordered or iterative execution."""
+    from . import postgres_numeric_iteration, postgres_numeric_sequence
+
+    if function == SEQUENCE:
+        owner = postgres_numeric_sequence
+        rules = WIRE_RULES
+    elif function == ITERATE:
+        owner = postgres_numeric_iteration
+        rules = WIRE_RULES + ITERATION_RULES
+    else:
+        raise ValueError('DIRECT_NUMERIC_PROGRAM_FUNCTION_INVALID')
+    contract = _program_contract(function, rules, samples)
+    contract['execution'] = deepcopy(EXECUTION)
+    contract.update(owner.output_contract())
+    contract['examplePrerequisites'] = {
+        'warning':'Each example declares a complete isolated fixture; do not run blindly in an existing business application.',
+        'binding':'Discover the target application, active full fact grain, members, current numeric change IDs and current authority. Replace every illustrative coordinate and first-touch change ID together; never omit an active fact axis.',
+        'state':'Run each example independently from its declared empty numeric history. Metadata and policy revision numbers are server-pinned by preview, not universal constants.',
+        'workflow':'Inspect the preview and its exact amounts/diagnostics; only a convergent iteration returns a token. Obtain current operation admission and submit the unchanged program, preview and original operation identity. Poll the returned jobId; verify publication before treating preview amounts as stored facts.'}
+    contract['execution']['admission']='Transport operation admission remains required. Native matching-job replay after signed preview expiry does not promise acceptance of an expired outer admission token.'
+    contract['execution']['recovery']='Preserve the original program, ordered dependencies, verified identity, operation key and known jobId. Read that job and its receipt under current authority before retrying an unknown outcome; never create a new operation to guess whether the first committed.'
+    contract['execution']['history']='Current stage schemas describe current direct execution only. Authorized historical reads preserve stored result/provenance, without re-enabling unsupported saved owners or asserting cross-version resubmission compatibility.'
+    return contract
+
+
+def enrich(catalog):
+    """Add guidance only; never change dispatch, grants, compilers or definitions."""
+    samples=examples()
+    for function in (SEQUENCE, ITERATE):
+        catalog['functions'][function]['programContract'] = direct_program_contract(function, samples)
+    for function in (SAVE,PUBLISH,READ,LIST,RUN):
+        rules=SAVED_RULES+WIRE_RULES if function==SAVE else SAVED_RULES
+        contract=_program_contract(function, rules, samples)
+        if function==RUN:contract['execution']=deepcopy(EXECUTION)
         else:contract['execution']={'tool':'execute_v2_expression_rule_program' if function in (SAVE,PUBLISH) else 'read_v2_program',
             'scope':'Router additionally needs workspace_id/application_id; bound application listener does not.',
             'submission':'Authoring/publication needs program + unique idempotency_key, no preview; reads need only program.',
             'effects':'Save replaces the current inactive definition; activate permits it to run and advances policy revision, but never runs data calculations.'}
+        if function in (SAVE,PUBLISH,READ,LIST,RUN):
+            from .postgres_saved_numeric_sequence import current_owner_availability
+            availability=current_owner_availability()
+            catalog['functions'][function]['availability']=availability
+            contract['replacement']=deepcopy(SOURCE_OWNED_REPLACEMENT)
+            if availability['status']=='unsupported':
+                code=('APPLICATION_FUNCTION_RETIRED' if function in (SAVE,PUBLISH)
+                      else availability['code'])
+                contract['semanticRules']=[
+                    'The saved-template current owner is unsupported. Function registration and a valid wire shape do not make this lifecycle available.',
+                    'Schemas and example programs preserve legacy request interpretation only. They are not a working save/activate/read/list/run tutorial. Current public save and activate are retired.',
+                    'No ApplicationRule alias, synthetic empty list, automatic parameter conversion or new legacy owner is provided. Follow the source-owned replacement guidance deliberately.',
+                    'Current authorization still applies. Historical operation/job evidence uses its existing authorized read/replay contract; this availability marker does not grant access or authorize new work.',
+                ]
+                contract['examples']=[{**{key:value for key,value in sample.items()
+                    if key not in ('expectedFinal','expectedIterations')},
+                    'expectedError':code,'purpose':'legacy wire shape; unavailable current lifecycle'}
+                    for sample in samples[function]]
+                contract['examplePrerequisites']={
+                    'warning':'Diagnostic wire examples only; no metadata setup can create the unsupported current owner.',
+                    'authority':'The application catalogue filters current grants before exposing function contracts.'}
+                contract['execution']={
+                    'scope':EXECUTION['scope'], 'newExecutionAvailable':False,
+                    'diagnostic':code,
+                    'history':'Existing authorized historical job and receipt inspection is unchanged; do not reinterpret a legacy request as a new source-owned rule.'}
+                catalog['functions'][function]['result']=(
+                    'Current lifecycle unavailable: '+code+'. Legacy wire contract retained; '
+                    'see programContract.replacement for deliberate source-owned ApplicationRule authoring.')
         catalog['functions'][function]['programContract']=deepcopy(contract)
     return catalog

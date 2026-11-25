@@ -20,6 +20,7 @@ type Page<Row> = {
   rows: Row[];
   hasMore: boolean;
   nextAfterId: string | null;
+  nextPageToken?: string | null;
 };
 
 function collect<Row>(
@@ -30,16 +31,21 @@ function collect<Row>(
   valid: (row: Row) => boolean,
   hierarchyId?: string,
 ) {
+  let token: string | null | undefined;
   return collectAllContinuations<Page<Row>, Row>({
     label: "Named hierarchy metadata",
-    readPage: (afterId) =>
-      readPage({
+    readPage: async (afterId) => {
+      const page = await readPage({
         dimensionId,
         limit: 500,
         expectedMetadataRevision: revision,
         ...(hierarchyId === undefined ? {} : { hierarchyId }),
         ...(afterId === null ? {} : { afterId }),
-      }),
+        ...(afterId && token ? { expectedPageToken: token } : {}),
+      });
+      token = page.nextPageToken;
+      return page;
+    },
     rows: (page) => {
       if (
         page.dimensionId !== dimensionId ||

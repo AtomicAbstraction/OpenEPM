@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  adoptBrowserIdentity,
   admitApplicationEffect,
   listApplications,
   readPlatformProgram,
@@ -9,6 +10,8 @@ import {
   readSecurityProgram,
   request,
   requestAdmittedProgramEffect,
+  prepareAdmittedProgramEffect,
+  replayAdmittedEffect,
   reviewAndSubmit,
   previewAndSubmit,
   writePlatformProgram,
@@ -18,6 +21,7 @@ import {
   resetBrowserLifecycleForTests,
 } from "./browser-lifecycle";
 import serverContracts from "./server-contract-fixtures.json";
+import { browserIdentityFixture } from "./test-setup";
 import type { ApplicationSummary } from "./types";
 
 afterEach(() => {
@@ -26,6 +30,141 @@ afterEach(() => {
 });
 
 describe("presentation API adapter", () => {
+  it("rejects delayed responses from an earlier ownership of the same browser account", async () => {
+    const former = browserIdentityFixture("former");
+    const current = browserIdentityFixture("current");
+    let reply!: (response: Response) => void;
+    const fetchMock = vi.fn(
+      (_path: string, _init?: RequestInit) =>
+        new Promise<Response>((resolve) => {
+          reply = resolve;
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    adoptBrowserIdentity(former);
+    const first = request("/api/catalog", {});
+    adoptBrowserIdentity(current);
+    adoptBrowserIdentity(former);
+    reply(
+      new Response(JSON.stringify({ code: "WEB_OPERATION_OUTCOME_UNKNOWN" }), {
+        status: 503,
+      }),
+    );
+    await expect(first).rejects.toMatchObject({ name: "AbortError" });
+    expect(browserLifecycleSnapshot()).toMatchObject({
+      state: "bootstrapping",
+    });
+    const headers = new Headers(fetchMock.mock.calls[0][1]?.headers);
+    expect(headers.get("x-openepm-browser-identity")).toBe(
+      former.identityBinding,
+    );
+  });
+
+  it("stops a reviewed preview if its browser identity changes before admission", async () => {
+    adoptBrowserIdentity(browserIdentityFixture("former"));
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ previewToken: "exact-approved-preview" }),
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const confirm = vi.spyOn(window, "confirm").mockImplementation(() => {
+      adoptBrowserIdentity(browserIdentityFixture("current"));
+      return true;
+    });
+    try {
+      await expect(
+        reviewAndSubmit(
+          {
+            workspaceId: "ws",
+            applicationId: "app",
+            program: { function: "facts.numeric.batch" },
+            idempotencyKey: "initial-intent",
+            dependsOnJobIds: [],
+            confirmed: true,
+          },
+          "Review effect",
+        ),
+      ).rejects.toMatchObject({ name: "AbortError" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledWith("/api/preview", expect.anything());
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
+  it("captures the actual admitted packet and replays it unchanged after admission expiry", async () => {
+    const operationId = `oa1_zz_${"1".repeat(32)}_${"A".repeat(43)}`;
+    let admit!: (response: Response) => void;
+    const admission = new Promise<Response>((resolve) => {
+      admit = resolve;
+    });
+    const calls: Array<{ url: string; body: unknown }> = [];
+    let attempts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url, init) => {
+        calls.push({ url: String(url), body: JSON.parse(init.body) });
+        if (String(url) === "/api/operation-admission") return admission;
+        if (++attempts === 1) throw new TypeError("lost acknowledgement");
+        return new Response(
+          JSON.stringify({ jobId: "a".repeat(32), status: "published" }),
+        );
+      }),
+    );
+    const body = {
+      workspaceId: "packet-w",
+      applicationId: "packet-a",
+      confirmed: true,
+      program: {
+        languageVersion: 2,
+        function: "facts.numeric.batch",
+        arguments: { value: "100.00000001" },
+      },
+      previewToken: "exact-original-preview",
+      dependsOnJobIds: [],
+    };
+    const preparing = prepareAdmittedProgramEffect(
+      "/api/submit",
+      body,
+      "packet-intent",
+    );
+    body.program.arguments.value = "999";
+    admit(
+      new Response(
+        JSON.stringify({
+          operationId,
+          expiresAt: Math.floor(Date.now() / 1000) + 900,
+          intentDigest: "a".repeat(64),
+        }),
+      ),
+    );
+    const packet = await preparing;
+    await expect(replayAdmittedEffect(packet)).rejects.toThrow(
+      "lost acknowledgement",
+    );
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + 1_000_000);
+    try {
+      await expect(replayAdmittedEffect(packet)).resolves.toMatchObject({
+        status: "published",
+      });
+    } finally {
+      clock.mockRestore();
+    }
+    expect(calls.map((call) => call.url)).toEqual([
+      "/api/operation-admission",
+      "/api/submit",
+      "/api/submit",
+    ]);
+    expect(calls[1].body).toEqual(calls[2].body);
+    expect(calls[1].body).toMatchObject({
+      idempotencyKey: operationId,
+      previewToken: "exact-original-preview",
+      program: { arguments: { value: "100.00000001" } },
+    });
+  });
   it("serializes only application scope from a complete ApplicationSummary across catalog, security and program reads", async () => {
     const fetchMock = vi
       .fn()

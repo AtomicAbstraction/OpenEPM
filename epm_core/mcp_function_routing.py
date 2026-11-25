@@ -7,13 +7,18 @@ catalog discovery and generated public documentation.
 """
 from __future__ import annotations
 
+from .application_catalog_projection import with_example_use
+
 def application_tools(name, specification):
     """Document the public dispatcher paths selected by the fixed MCP adapters."""
     from epm_core.postgres_import_execution import PUBLIC_FUNCTIONS as import_functions
     from epm_core.postgres_transfer_orchestration import PUBLIC_FUNCTIONS as transfer_functions
+    from epm_core.slice_copy_contract import FUNCTION as slice_copy_function
+    from epm_core.python_execution_contract import BUILD_PURPOSES
 
     read = specification["mode"] in {"read", "read_only"}
-    if name in import_functions or name in transfer_functions or name.startswith("facts.source."):
+    if (name in import_functions or name in transfer_functions
+            or name == slice_copy_function or name.startswith("facts.source.")):
         return ("execute_v2_source_program",)
     if name.startswith("cube.write.policy."):
         return ("execute_v2_cube_write_policy",)
@@ -30,6 +35,8 @@ def application_tools(name, specification):
         else:
             tool = "execute_v2_application_workflow"
         return (tool, "read_v2_program") if read else (tool,)
+    if name.startswith("metadata.layout.populated.") and specification["mode"] == "durable_workflow":
+        return ("execute_v2_metadata_program",)
     if read or name.startswith(("cube.aggregate.", "facts.cube.aggregate.",
                                 "facts.cube.resolved.",
                                 "metadata.layout.populated.")) or name == "cube.selection.seal":
@@ -45,7 +52,7 @@ def application_tools(name, specification):
         return ("set_v2_rule_access",)
     if name.startswith("execution.delegation."):
         return ("execute_v2_execution_delegation",)
-    if name in {"python.program.build", "python.program.test"}:
+    if name in BUILD_PURPOSES:
         return ("execute_v2_python_program_build",)
     if name == "python.program.run":
         return ("execute_v2_python_program_run",)
@@ -67,6 +74,7 @@ def application_tools(name, specification):
 
 def public_dispatch(application, workspace, reset, platform):
     from epm_core.postgres_identity_directory import READ_FUNCTIONS
+    from epm_core.postgres_platform_provision import OPERATION_RECEIPT_READ
 
     result = {name: application_tools(name, spec) for name, spec in application.items()}
     for name in workspace:
@@ -74,7 +82,9 @@ def public_dispatch(application, workspace, reset, platform):
             tool = "execute_v2_application_purge"
         elif name == "workspace.application.create":
             tool = "execute_v2_workspace_program"
-        elif name == "security.workspace.group-access.list":
+        elif name in ("security.workspace.group-access.list", "security.workspace.people.list",
+                      "security.workspace.person-applications.list","security.workspace.bootstrap-groups.list",
+                      "security.workspace.authorization-migration.review"):
             tool = "read_v2_workspace_access"
         elif name.startswith("security.workspace."):
             tool = "set_v2_workspace_access"
@@ -86,14 +96,15 @@ def public_dispatch(application, workspace, reset, platform):
             raise ValueError(f"No reviewed workspace tool dispatch for {name}")
         result[name] = (tool,)
     result.update({name: ("apply_v2_workspace_reset",) for name in reset})
-    result.update({name: ("read_v2_platform_program" if name in READ_FUNCTIONS
+    platform_reads = READ_FUNCTIONS | {OPERATION_RECEIPT_READ}
+    result.update({name: ("read_v2_platform_program" if name in platform_reads
                           else "execute_v2_platform_program",) for name in platform})
     return result
 
 
 
 def with_mcp_tools(functions: dict, *, scope: str) -> dict:
-    """Project routing onto an already-authorized catalog without mutating it."""
+    """Project routing and control-plane example use onto an authorized catalog."""
     if scope == 'application':
         dispatch = public_dispatch(functions, {}, {}, {})
     elif scope == 'workspace':
@@ -106,5 +117,7 @@ def with_mcp_tools(functions: dict, *, scope: str) -> dict:
         dispatch = public_dispatch({}, {}, {}, functions)
     else:
         raise ValueError('MCP_FUNCTION_ROUTE_SCOPE_INVALID')
-    return {name: {**specification, 'mcpTools': list(dispatch[name])}
+    return {name: {**(specification if scope == 'application'
+                     else with_example_use(name, specification)),
+                   'mcpTools': list(dispatch[name])}
             for name, specification in functions.items()}

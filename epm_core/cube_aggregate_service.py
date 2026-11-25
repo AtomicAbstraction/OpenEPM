@@ -15,9 +15,10 @@ from typing import Callable, Protocol
 
 from .cube_aggregate_ir import CubeAggregateIR, compile_cube_aggregate
 from .cube_aggregate_lifecycle import (
+    AMOUNT_MEASURE_REQUIRED, AUTHORIZATION_REVOKED, STALE_CONTEXT, AggregateAmountMeasureRequired,
     AggregateCursor, AggregateCursorCodec, AggregateQueryBudgets,
     AggregateQueryRecord, AggregateQueryRepository, AggregateQueryStatus,
-    AggregateSourcePins, AggregateTechnicalCertificate)
+    AggregateSourcePins, AggregateTechnicalCertificate, technical_worker_outcome)
 from .persistence_contract import ApplicationScope
 from .postgres_access import VerifiedIdentity
 
@@ -44,6 +45,10 @@ class AggregateDurableRepository(AggregateQueryRepository, Protocol):
     """Extra sealing fence implemented by the PostgreSQL repository."""
 
     def seal(self, current: AggregateQueryRecord) -> AggregateQueryRecord: ...
+
+    def settle_amount_failure_claim(self, claim: dict) -> bool: ...
+
+    def read_placement_lineage(self, scope: ApplicationScope, query_id: str) -> dict: ...
 
 
 class CubeAggregateService:
@@ -182,9 +187,7 @@ class CubeAggregateService:
         # visibility fence resumes at sealing; it must never rerun the scan.
         if record.status == AggregateQueryStatus.COMPUTED:
             sealed = self.repository.seal(record)
-            return {'queryId': query_id, 'status': sealed.status.value,
-                    'technicalCertificate': self._certificate_wire(
-                        sealed.certificate)}
+            return technical_worker_outcome(sealed, self._certificate_wire)
         if record.status != AggregateQueryStatus.READY:
             raise ValueError('CUBE_AGGREGATE_NOT_READY')
         claimant='inline-'+sha256(query_id.encode('utf-8')).hexdigest()
@@ -224,6 +227,13 @@ class CubeAggregateService:
                 max_groups=record.budgets.max_groups,
                 max_result_bytes=record.budgets.max_result_bytes,
                 statement_timeout_ms=statement_timeout_ms,cancel_event=cancel_event)
+        except AggregateAmountMeasureRequired:
+            if self.repository.settle_amount_failure_claim(claim):
+                return {'queryId': record.query_id, 'status': 'failed',
+                        'errorCode': AMOUNT_MEASURE_REQUIRED}
+            if self.repository.settle_cancelled_claim(claim):
+                return {'queryId': record.query_id, 'status': 'cancelled'}
+            raise ValueError('CUBE_AGGREGATE_STALE_WORKER_FENCE') from None
         except Exception:
             if cancel_event.is_set():
                 observed=self._get(record.scope,record.query_id)
@@ -244,8 +254,7 @@ class CubeAggregateService:
         completed=self.repository.store_computed(observed,certificate,
             computed['rows'],claim=claim)
         sealed=self.repository.seal(completed)
-        return {'queryId':record.query_id,'status':sealed.status.value,
-                'technicalCertificate':self._certificate_wire(certificate)}
+        return technical_worker_outcome(sealed, self._certificate_wire)
 
 
     @staticmethod
@@ -269,7 +278,6 @@ class CubeAggregateService:
                 self.repository.compare_and_transition(record, expired)
             elif record.status in (AggregateQueryStatus.ACCEPTED,
                                    AggregateQueryStatus.READY,
-                                   AggregateQueryStatus.COMPUTED,
                                    AggregateQueryStatus.RUNNING,
                                    AggregateQueryStatus.CANCEL_REQUESTED):
                 terminal = (record.transition(AggregateQueryStatus.CANCELLED)
@@ -279,7 +287,10 @@ class CubeAggregateService:
                 self.repository.compare_and_transition(record,terminal)
             raise ValueError('CUBE_AGGREGATE_RESULT_EXPIRED')
         if record.status != AggregateQueryStatus.SEALED or record.certificate is None:
-            return {'queryId': query_id, 'status': record.status.value}
+            result = {'queryId': query_id, 'status': record.status.value}
+            if record.error_code in (AMOUNT_MEASURE_REQUIRED, AUTHORIZATION_REVOKED, STALE_CONTEXT):
+                result['errorCode'] = record.error_code
+            return result
         if cursor is None:
             size, after = page_size or record.budgets.page_size, 0
         else:
@@ -331,8 +342,6 @@ class CubeAggregateTechnicalWorker:
         computed=repository.pending_computed(scope)
         if computed is not None:
             sealed=repository.seal(computed)
-            return {'queryId':sealed.query_id,'status':sealed.status.value,
-                    'technicalCertificate':self.service._certificate_wire(
-                        sealed.certificate)}
+            return technical_worker_outcome(sealed, self.service._certificate_wire)
         claim=repository.claim(scope,claimant,lease_seconds=lease_seconds)
         return None if claim is None else self.service.worker_run_claim(claim)

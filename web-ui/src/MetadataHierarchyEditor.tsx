@@ -1,5 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { requestAdmittedEffect } from "./api";
+import { MetadataReceiptRecovery } from "./MetadataReceiptRecovery";
+import {
+  namedHierarchyFunction,
+  useNamedHierarchyRecovery,
+  type NamedHierarchyAction,
+  type NamedHierarchyChange,
+} from "./named-hierarchy-recovery";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
 import type {
   HierarchyMember,
@@ -38,40 +44,104 @@ export function MetadataHierarchyEditor({
   const [membershipMode, setMembershipMode] = useState<
     "explicit" | "all_active"
   >("explicit");
+  const [creationRevision, setCreationRevision] = useState(metadataRevision);
   const [name, setName] = useState(hierarchy?.name || "");
   const [changes, setChanges] = useState<Record<string, boolean>>({});
   const [draftRevision, setDraftRevision] = useState(metadataRevision);
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(0);
-  const [busy, setBusy] = useState(false);
-  const [acceptedRevision, setAcceptedRevision] = useState<number | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [acceptedCut, setAcceptedCut] = useState<{
+    owner: string;
+    revision: number;
+  } | null>(null);
   const [error, setError] = useState("");
   const [result, setResult] = useState("");
   const key = useStableMutationIntentKey("hierarchy-ui");
-  const can = (suffix: string) =>
-    Boolean(catalog?.functions[`metadata.hierarchy.${suffix}`]);
+  const can = (action: NamedHierarchyAction) =>
+    Boolean(catalog?.functions[namedHierarchyFunction(action)]);
+  const creationChanged = Boolean(newId || newName);
   const changed = Boolean(
-    newId ||
-      newName ||
-      Object.keys(changes).length ||
-      (hierarchy && name !== hierarchy.name),
+    Object.keys(changes).length || (hierarchy && name !== hierarchy.name),
   );
-  const context = JSON.stringify([
+  const owner = JSON.stringify([
     app?.workspaceId,
     app?.applicationId,
-    dimensionId,
-    hierarchy?.hierarchyId,
     catalog?.applicationAccess.issuer,
     catalog?.applicationAccess.subjectId,
+  ]);
+  const editorContext = JSON.stringify([dimensionId, hierarchy?.hierarchyId]);
+  const context = JSON.stringify([
+    owner,
+    editorContext,
+    catalog?.applicationAccess.role,
     catalog?.revisions.security,
+    catalog?.revisions.capability,
   ]);
   const liveContext = useRef(context);
   liveContext.current = context;
-  const revisionCurrent =
+
+  function refreshHierarchy() {
+    const view = liveContext.current;
+    setRefreshing(true);
+    void Promise.resolve()
+      .then(onChanged)
+      .catch(() => {
+        if (liveContext.current === view)
+          setError("Refresh the model to see the current hierarchy.");
+      })
+      .finally(() => setRefreshing(false));
+  }
+
+  const recovery = useNamedHierarchyRecovery(
+    app,
+    catalog,
+    context,
+    (attempt, source) => {
+      setAcceptedCut({ owner, revision: attempt.metadataRevision });
+      const change = attempt.change;
+      if (
+        change.action === "create" &&
+        attempt.dimensionId === dimensionId &&
+        newId === change.hierarchyId &&
+        newName === change.name &&
+        membershipMode === change.membershipMode
+      ) {
+        setNewId("");
+        setNewName("");
+      }
+      if (
+        change.action === "members.set" &&
+        attempt.editorContext === editorContext
+      ) {
+        setChanges((current) => {
+          const remaining = { ...current };
+          for (const member of change.members) {
+            if (remaining[member.memberId] === (member.status === "Active"))
+              delete remaining[member.memberId];
+          }
+          return remaining;
+        });
+      }
+      setResult(
+        source === "receipt"
+          ? "The original hierarchy change was recorded."
+          : "Hierarchy change saved.",
+      );
+      refreshHierarchy();
+    },
+  );
+  const busy = refreshing || recovery.busy || recovery.pending;
+  const sourceCurrent =
     current &&
+    Boolean(catalog?.applicationAccess.subjectId) &&
     metadataRevision !== null &&
-    draftRevision === metadataRevision &&
-    acceptedRevision !== metadataRevision;
+    !(
+      acceptedCut?.owner === owner && acceptedCut.revision === metadataRevision
+    );
+  const creationCurrent =
+    sourceCurrent && creationRevision === metadataRevision;
+  const revisionCurrent = sourceCurrent && draftRevision === metadataRevision;
   const validName = (value: string) =>
     Boolean(
       value &&
@@ -98,14 +168,25 @@ export function MetadataHierarchyEditor({
   usePreservedDraft(
     app?.workspaceId || "none",
     app?.applicationId || "none",
-    `metadata-hierarchy:${dimensionId}:${hierarchy?.hierarchyId || "none"}`,
-    "Unsaved named hierarchy changes",
-    changed,
-    { newId, newName, membershipMode, name, changes, draftRevision },
+    `metadata-hierarchy-create:${dimensionId}`,
+    "Unsaved hierarchy creation",
+    creationChanged,
+    { newId, newName, membershipMode, creationRevision },
     (draft) => {
       setNewId(draft.newId);
       setNewName(draft.newName);
       setMembershipMode(draft.membershipMode);
+      setCreationRevision(draft.creationRevision);
+    },
+  );
+  usePreservedDraft(
+    app?.workspaceId || "none",
+    app?.applicationId || "none",
+    `metadata-hierarchy:${dimensionId}:${hierarchy?.hierarchyId || "none"}`,
+    "Unsaved named hierarchy changes",
+    changed,
+    { name, changes, draftRevision },
+    (draft) => {
       setName(draft.name);
       setChanges(draft.changes);
       setDraftRevision(draft.draftRevision);
@@ -114,22 +195,31 @@ export function MetadataHierarchyEditor({
 
   useEffect(() => {
     if (!changed) setDraftRevision(metadataRevision);
-  }, [metadataRevision, changed]);
+    if (!creationChanged) setCreationRevision(metadataRevision);
+  }, [metadataRevision, changed, creationChanged]);
 
-  async function execute(suffix: string, values: Record<string, unknown>) {
-    if (!app || !revisionCurrent || !can(suffix)) return;
-    const submittedContext = context;
+  async function execute(change: NamedHierarchyChange) {
+    const actorId = catalog?.applicationAccess.subjectId;
+    const { action, ...values } = change;
+    if (
+      !app ||
+      !actorId ||
+      busy ||
+      !(action === "create" ? creationCurrent : revisionCurrent) ||
+      metadataRevision === null ||
+      !can(action)
+    )
+      return;
     const args = {
       dimensionId,
       ...values,
       expectedMetadataRevision: metadataRevision,
     };
-    const functionName = `metadata.hierarchy.${suffix}`;
-    setBusy(true);
+    const functionName = namedHierarchyFunction(action);
     setError("");
     setResult("");
-    try {
-      await requestAdmittedEffect("/api/metadata-action", {
+    await recovery.submit(
+      {
         workspaceId: app.workspaceId,
         applicationId: app.applicationId,
         confirmed: true,
@@ -139,26 +229,9 @@ export function MetadataHierarchyEditor({
           function: functionName,
           arguments: args,
         },
-      });
-      if (liveContext.current !== submittedContext) return;
-      setAcceptedRevision(metadataRevision);
-      if (suffix === "create") {
-        setNewId("");
-        setNewName("");
-      }
-      if (suffix === "members.set") setChanges({});
-      setResult("Hierarchy change saved. Refreshing current metadata…");
-      await onChanged();
-    } catch (reason) {
-      if (liveContext.current === submittedContext)
-        setError(
-          reason instanceof Error
-            ? reason.message
-            : "Unable to save hierarchy changes.",
-        );
-    } finally {
-      if (liveContext.current === submittedContext) setBusy(false);
-    }
+      },
+      { change, actorId, dimensionId, metadataRevision, editorContext },
+    );
   }
 
   return (
@@ -168,12 +241,34 @@ export function MetadataHierarchyEditor({
           {error}
         </p>
       )}
+      <MetadataReceiptRecovery
+        object="hierarchy"
+        recovery={recovery}
+        onClose={() => {
+          const attempt = recovery.closeRecovery();
+          if (!attempt) return;
+          if (
+            attempt.change.action === "create" &&
+            attempt.dimensionId === dimensionId &&
+            creationChanged
+          )
+            setCreationRevision(null);
+          if (
+            attempt.change.action !== "create" &&
+            attempt.editorContext === editorContext &&
+            changed
+          )
+            setDraftRevision(null);
+          refreshHierarchy();
+        }}
+      />
       {result && <p role="status">{result}</p>}
       {changed && draftRevision !== metadataRevision && (
         <p role="status">
           Metadata changed. Your hierarchy draft is retained.
           <button
             type="button"
+            disabled={busy}
             onClick={() => setDraftRevision(metadataRevision)}
           >
             Review hierarchy draft against current metadata
@@ -184,6 +279,17 @@ export function MetadataHierarchyEditor({
         <details>
           <summary>Create hierarchy</summary>
           <fieldset disabled={busy}>
+            {creationChanged && creationRevision !== metadataRevision && (
+              <div role="status">
+                <p>Metadata changed since this hierarchy draft began.</p>
+                <button
+                  type="button"
+                  onClick={() => setCreationRevision(metadataRevision)}
+                >
+                  Review new hierarchy against current metadata
+                </button>
+              </div>
+            )}
             <label>
               New hierarchy ID
               <input
@@ -223,7 +329,7 @@ export function MetadataHierarchyEditor({
             <button
               type="button"
               disabled={
-                !revisionCurrent ||
+                !creationCurrent ||
                 !validName(newId) ||
                 !validName(newName) ||
                 hierarchies.some(
@@ -234,7 +340,8 @@ export function MetadataHierarchyEditor({
                 )
               }
               onClick={() =>
-                void execute("create", {
+                void execute({
+                  action: "create",
                   hierarchyId: newId,
                   name: newName,
                   membershipMode,
@@ -272,7 +379,8 @@ export function MetadataHierarchyEditor({
                   name === hierarchy.name
                 }
                 onClick={() =>
-                  void execute("rename", {
+                  void execute({
+                    action: "rename",
                     hierarchyId: hierarchy.hierarchyId,
                     name,
                   })
@@ -289,7 +397,8 @@ export function MetadataHierarchyEditor({
                 type="button"
                 disabled={busy || !revisionCurrent}
                 onClick={() =>
-                  void execute("default.set", {
+                  void execute({
+                    action: "default.set",
                     hierarchyId: hierarchy.hierarchyId,
                   })
                 }
@@ -306,7 +415,8 @@ export function MetadataHierarchyEditor({
                   hierarchy.status === "Inactive" ||
                   window.confirm(`Deactivate hierarchy ${hierarchy.name}?`)
                 )
-                  void execute("status.set", {
+                  void execute({
+                    action: "status.set",
                     hierarchyId: hierarchy.hierarchyId,
                     status:
                       hierarchy.status === "Active" ? "Inactive" : "Active",
@@ -419,7 +529,8 @@ export function MetadataHierarchyEditor({
                     Object.keys(changes).length > 500
                   }
                   onClick={() =>
-                    void execute("members.set", {
+                    void execute({
+                      action: "members.set",
                       hierarchyId: hierarchy.hierarchyId,
                       members: Object.entries(changes).map(
                         ([memberId, included]) => ({

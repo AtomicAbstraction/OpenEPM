@@ -8,6 +8,7 @@ to a caller-provided/shared database. OwnedDockerRun owns every Docker effect.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import importlib
 import json
@@ -28,6 +29,66 @@ from scripts.audit_disposable_docker_cleanup_candidates import (
     CleanupError, OwnedDockerRun, bound_command, docker, write_json)
 
 TEST_SUITES = {
+    'metadata-security-tag-authoring': ('tests.test_public_mutation_contracts_postgres',
+                                       'PublicMutationContractsPostgresTests',
+                                       'openepm-metadata-security-tag-authoring-qualification-v1'),
+    'metadata-model-state': ('tests.test_public_mutation_contracts_postgres',
+                             'PublicMutationContractsPostgresTests',
+                             'openepm-metadata-model-state-qualification-v1'),
+    'hierarchy-build-recovery': ('tests.test_public_mutation_contracts_postgres',
+                                 'PublicMutationContractsPostgresTests',
+                                 'openepm-hierarchy-build-recovery-qualification-v1'),
+    'metadata-relationship-discovery': ('tests.test_public_mutation_contracts_postgres',
+                                        'PublicMutationContractsPostgresTests',
+                                        'openepm-metadata-relationship-discovery-qualification-v1'),
+    'metadata-structure-discovery': ('tests.test_public_mutation_contracts_postgres',
+                                     'PublicMutationContractsPostgresTests',
+                                     'openepm-metadata-structure-discovery-qualification-v1'),
+    'python-schedule-observation': ('tests.test_python_schedule_control_replay_postgres',
+                                    'PythonScheduleControlReplayPostgresTests',
+                                    'openepm-python-schedule-observation-qualification-v1'),
+    'python-source-discovery': ('tests.test_postgres_numeric_store',
+                                'PostgresNumericStoreTests',
+                                'openepm-python-source-discovery-qualification-v1'),
+    'python-environment-discovery': ('tests.test_postgres_numeric_store',
+                                     'PostgresNumericStoreTests',
+                                     'openepm-python-environment-discovery-qualification-v1'),
+    'workflow-rule-evidence': ('tests.test_postgres_numeric_store',
+                               'PostgresNumericStoreTests',
+                               'openepm-workflow-rule-evidence-qualification-v1'),
+    'calculation-read-authority': ('tests.test_generic_model_scenarios_postgres',
+                                  'GenericModelScenariosPostgresTests',
+                                  'openepm-calculation-read-authority-qualification-v1'),
+    'metadata-directory-read-authority': ('tests.test_generic_model_scenarios_postgres',
+                                          'GenericModelScenariosPostgresTests',
+                                          'openepm-metadata-directory-read-authority-qualification-v1'),
+    'saved-member-list-read-authority': ('tests.test_generic_model_scenarios_postgres',
+                                         'GenericModelScenariosPostgresTests',
+                                         'openepm-saved-member-list-read-authority-v1'),
+    'saved-view-read-authority': ('tests.test_generic_model_scenarios_postgres',
+                                  'GenericModelScenariosPostgresTests', 'openepm-saved-view-read-authority-v1'),
+    'governance-definition-authority': ('tests.test_generic_model_scenarios_postgres',
+                                         'GenericModelScenariosPostgresTests', 'openepm-governance-definition-authority-v1'),
+    'native-selection-attribute-authority': ('tests.test_generic_model_scenarios_postgres',
+                                             'GenericModelScenariosPostgresTests',
+                                             'openepm-native-selection-attribute-authority-v1'),
+    'scenario-comparison': ('tests.test_generic_model_scenarios_postgres',
+                            'GenericModelScenariosPostgresTests',
+                            'openepm-scenario-comparison-qualification-v1'),
+    'workforce-allocation': ('tests.test_generic_model_scenarios_postgres',
+                             'GenericModelScenariosPostgresTests',
+                             'openepm-workforce-allocation-qualification-v1'),
+    'job-outcome-read-authority': (
+        'tests.test_native_member_selection_postgres', 'NativeMemberSelectionPostgresTests',
+        'openepm-job-outcome-read-authority-qualification-v1'),
+    'external-public-mcp-hosts': (
+        'tests.test_public_mcp_external_hosts_postgres',
+        'PublicMCPExternalHostPostgresTests',
+        'openepm-external-public-mcp-hosts-v1'),
+    'external-mcp-oauth': (
+        'tests.test_public_mcp_host_oauth_postgres',
+        'PublicMCPHostOAuthPostgresTests',
+        'openepm-external-mcp-oauth-qualification-v1'),
     'security-identity-display': (
         'tests.test_postgres_numeric_store',
         'PostgresNumericStoreTests',
@@ -153,6 +214,10 @@ TEST_SUITES = {
         'tests.test_postgres_numeric_store',
         'PostgresNumericStoreTests',
         'openepm-reference-retirement-qualification-v1'),
+    'legacy-sequence-upgrade': (
+        'tests.test_definition_owner_lifecycle_postgres',
+        'DefinitionOwnerLifecyclePostgresTests',
+        'openepm-legacy-sequence-upgrade-qualification-v1'),
     'source-output-replacement': (
         'tests.test_definition_owner_lifecycle_postgres',
         'DefinitionOwnerLifecyclePostgresTests',
@@ -178,6 +243,18 @@ TEST_SUITES = {
     'definition-ownership': ('tests.test_definition_owner_lifecycle_postgres',
                              'DefinitionOwnerLifecyclePostgresTests',
                              'openepm-definition-owner-qualification-v1'),
+    'definition-invalidation': (
+        'tests.test_definition_owner_lifecycle_postgres',
+        'DefinitionOwnerLifecyclePostgresTests',
+        'openepm-definition-invalidation-qualification-v1'),
+    'definition-role-separation': (
+        'tests.test_definition_owner_lifecycle_postgres',
+        'DefinitionOwnerLifecyclePostgresTests',
+        'openepm-definition-role-separation-qualification-v1'),
+    'definition-execution-fences': (
+        'tests.test_definition_owner_lifecycle_postgres',
+        'DefinitionOwnerLifecyclePostgresTests',
+        'openepm-definition-execution-fences-qualification-v1'),
     'orphan-reconciliation': (
         'tests.test_definition_owner_lifecycle_postgres',
         'DefinitionOwnerLifecyclePostgresTests',
@@ -187,6 +264,140 @@ TEST_SUITES = {
                           'openepm-receipt-retention-qualification-v1'),
 }
 TEST_CASES = {
+    'legacy-sequence-upgrade': (
+        'tests.test_definition_owner_lifecycle_postgres.'
+        'DefinitionOwnerLifecyclePostgresTests.'
+        'test_pre366_saved_sequence_refuses_upgrade_with_actionable_operator_error',
+        'tests.test_definition_owner_lifecycle_postgres.'
+        'DefinitionOwnerLifecyclePostgresTests.'
+        'test_populated_367_producer_upgrade_preserves_rows_and_rejects_unproven_adoption',
+    ),
+    'metadata-security-tag-authoring': (
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_discovered_security_tag_edits_preserve_dependency_guards',
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_metadata_security_tag_current_pages_and_revocation',
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_security_tag_dependency_upgrade_preserves_existing_references',
+    ),
+    'metadata-model-state': (
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_discovered_model_state_edits_follow_lifecycle_dependencies',
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_discovered_relationship_edits_preserve_placement',
+    ),
+    'hierarchy-build-recovery': (
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_discovered_hierarchy_build_receipts_and_publication_fences',
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_metadata_hierarchy_edges_and_members_pinned_contracts',
+    ),
+    'metadata-relationship-discovery': (
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_discovered_relationship_edits_preserve_placement',
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_metadata_hierarchy_edges_and_members_pinned_contracts',
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_discovered_dimension_and_member_edits_preserve_stable_coordinates',
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_metadata_member_selection_and_current_list_contracts',
+    ),
+    'metadata-structure-discovery': (
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_discovered_dimension_and_member_edits_preserve_stable_coordinates',
+        'tests.test_public_mutation_contracts_postgres.PublicMutationContractsPostgresTests.'
+        'test_metadata_authoring_calendar_current_scope_contracts',
+    ),
+    'python-schedule-observation': (
+        'tests.test_python_schedule_control_replay_postgres.PythonScheduleControlReplayPostgresTests.'
+        'test_public_schedule_reads_project_current_scope_and_recheck_authority',
+        'tests.test_python_schedule_control_replay_postgres.PythonScheduleControlReplayPostgresTests.'
+        'test_occurrence_history_pages_match_in_browser_and_mcp',
+        'tests.test_python_schedule_control_replay_postgres.PythonScheduleControlReplayPostgresTests.'
+        'test_manual_schedule_control_recovers_exact_outcomes_in_both_channels',
+    ),
+    'python-source-discovery': (
+        'tests.test_postgres_numeric_store.PostgresNumericStoreTests.'
+        'test_python_source_reads_publish_current_contract_and_keep_one_snapshot',
+    ),
+    'python-environment-discovery': (
+        'tests.test_postgres_numeric_store.PostgresNumericStoreTests.'
+        'test_trusted_python_environment_registration_live',
+    ),
+    'workflow-rule-evidence': (
+        'tests.test_postgres_numeric_store.PostgresNumericStoreTests.'
+        'test_workflow_reviews_current_rule_publication_basis',
+    ),
+    'calculation-read-authority': (
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_calculated_reads_pin_directory_authority',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_service_quantity_weighted_rate_exact_policy_and_missing',
+    ),
+    'metadata-directory-read-authority': (
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_metadata_directory_reads_recheck_current_application_authority',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_scoped_metadata_directory_filters_before_paging_and_pins_authority',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_workforce_hierarchy_and_attribute_reads_use_dimensional_authority',
+    ),
+    'saved-member-list-read-authority': (
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_saved_member_list_reads_require_dimensional_authority',
+    ),
+    'saved-view-read-authority': (
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_saved_view_reads_and_effects_enforce_current_selector_authority',
+    ),
+    'governance-definition-authority': (
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_governance_definition_pages_enforce_current_selector_and_link_authority',
+    ),
+    'native-selection-attribute-authority': (
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_native_member_selection_projects_typed_references_before_comparison',
+    ),
+    'scenario-comparison': (
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_scenario_comparison_uses_one_layout_when_a_new_axis_is_published',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_aligned_scenario_comparison_is_exact_current_and_authorized',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_current_calculated_scenarios_compare_exact_publication_and_unit',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_scenario_comparison_refuses_transient_dimensional_authority',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_finance_exact_alternative_promotion_replay_and_missing_zero',
+    ),
+    'workforce-allocation': (
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_workforce_sparse_eligibility_control_prevents_duplicate_capacity',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_workforce_preview_rejects_concurrent_relation_replacement',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_workforce_preview_refuses_directory_revocation_before_return',
+    ),
+    'job-outcome-read-authority': (
+        'tests.test_native_member_selection_postgres.NativeMemberSelectionPostgresTests.'
+        'test_job_outcome_reads_recheck_directory_authority_after_query',
+    ),
+    'definition-execution-fences': (
+        'tests.test_public_numeric_sequence_owner.PublicSequenceReplacementPostgresTests.'
+        'test_expired_validation_environment_replacement_fences_fresh_and_pending_runs',
+        'tests.test_public_numeric_sequence_owner.PublicSequenceReplacementPostgresTests.'
+        'test_expired_validation_native_list_change_fences_fresh_and_pending_runs',
+        'tests.test_definition_owner_lifecycle_postgres.DefinitionOwnerLifecyclePostgresTests.'
+        'test_schema_inventory_covers_current_typed_reference_dependencies',
+    ),
+    'definition-role-separation': (
+        'tests.test_public_numeric_sequence_owner.PublicSequenceReplacementPostgresTests.'
+        'test_designer_save_and_inspection_do_not_grant_activation_or_run',
+        'tests.test_public_numeric_sequence_owner.PublicSequenceReplacementPostgresTests.'
+        'test_runner_current_run_and_read_do_not_grant_source_or_security_rights',
+        'tests.test_definition_owner_lifecycle_postgres.DefinitionOwnerLifecyclePostgresTests.'
+        'test_schema_inventory_covers_current_typed_reference_dependencies',
+    ),
     'security-identity-display':
         'tests.test_postgres_numeric_store.'
         'PostgresNumericStoreTests.'
@@ -307,9 +518,27 @@ TEST_CASES = {
         'test_w07_partition_publication_is_cas_and_lost_ack_safe',
     ),
     'resolved-layer-meaning': (
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_revoked_technical_computation_settles_and_unblocks_ready_work',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_populated_technical_result_retention_upgrade_preserves_evidence',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_computed_query_settles_stale_layout_before_result_visibility',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_queued_technical_read_settles_immutable_stale_selection_once',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_saved_view_and_technical_query_use_current_layout_pins',
+        'tests.test_generic_model_scenarios_postgres.GenericModelScenariosPostgresTests.'
+        'test_scenario_comparison_uses_one_layout_when_a_new_axis_is_published',
+        'tests.test_cube_view_read_integration.CubeViewReadIntegrationTests.'
+        'test_public_saved_grid_examples_and_recovery_through_browser_and_mcp',
         'tests.test_postgres_numeric_store.'
         'PostgresNumericStoreTests.'
         'test_w08_resolved_own_read_preserves_raw_cube_semantics',
+        'tests.test_postgres_numeric_store.PostgresNumericStoreTests.'
+        'test_w08_resolved_direct_read_keeps_one_snapshot_during_write',
+        'tests.test_postgres_numeric_store.PostgresNumericStoreTests.'
+        'test_w08_resolved_technical_cancel_recover_and_lost_ack',
         'tests.test_postgres_numeric_store.'
         'PostgresNumericStoreTests.'
         'test_typed_expression_compiles_exact_set_stage_and_publishes',
@@ -361,6 +590,9 @@ TEST_CASES = {
         'tests.test_cell_editability_postgres.'
         'CellEditabilityPostgresTests.'
         'test_raw_calculated_policy_and_lock_use_one_authoritative_guard',
+        'tests.test_cell_editability_postgres.'
+        'CellEditabilityPostgresTests.'
+        'test_browser_and_mcp_hide_unreadable_raw_cell_policy',
     ),
     'application-switch-isolation': (
         'tests.test_postgres_numeric_store.'
@@ -404,6 +636,9 @@ TEST_CASES = {
         'tests.test_python_definition_sources_postgres.'
         'PythonDefinitionSourcePostgresTests.'
         'test_compiled_run_rejects_changed_publication_after_inspection',
+        'tests.test_python_definition_sources_postgres.'
+        'PythonDefinitionSourcePostgresTests.'
+        'test_identical_source_bytes_require_the_new_source_binding',
         'tests.test_definition_owner_lifecycle_postgres.'
         'DefinitionOwnerLifecyclePostgresTests.'
         'test_source_replacement_physically_discards_obsolete_compiled_payload',
@@ -420,6 +655,9 @@ TEST_CASES = {
         'tests.test_definition_owner_lifecycle_postgres.'
         'DefinitionOwnerLifecyclePostgresTests.'
         'test_inactive_never_run_consumer_blocks_native_list_delete',
+        'tests.test_definition_owner_lifecycle_postgres.'
+        'DefinitionOwnerLifecyclePostgresTests.'
+        'test_published_calculated_member_rebind_preserves_rows_after_list_retirement',
         'tests.test_postgres_numeric_store.'
         'PostgresNumericStoreTests.'
         'test_saved_view_blocks_member_retirement_until_explicit_view_delete',
@@ -434,6 +672,31 @@ TEST_CASES = {
         'tests.test_definition_owner_lifecycle_postgres.'
         'DefinitionOwnerLifecyclePostgresTests.'
         'test_extra_same_kind_and_cross_kind_owners_and_detach_are_rejected',
+    ),
+    'definition-invalidation': (
+        'tests.test_definition_owner_lifecycle_postgres.'
+        'DefinitionOwnerLifecyclePostgresTests.'
+        'test_source_replacement_physically_discards_obsolete_compiled_payload',
+        'tests.test_python_save_validation_postgres.'
+        'PythonSaveValidationPostgresTests',
+        'tests.test_python_definition_sources_postgres.'
+        'PythonDefinitionSourcePostgresTests.'
+        'test_logically_expired_test_cannot_activate_before_cleanup',
+        'tests.test_python_definition_sources_postgres.'
+        'PythonDefinitionSourcePostgresTests.'
+        'test_compiled_run_rejects_changed_publication_after_inspection',
+        'tests.test_python_definition_sources_postgres.'
+        'PythonDefinitionSourcePostgresTests.'
+        'test_application_rule_private_test_activate_and_expiry_keeps_definition',
+        'tests.test_python_definition_sources_postgres.'
+        'PythonDefinitionSourcePostgresTests.'
+        'test_calculated_member_private_test_activate_and_expiry_keeps_definition',
+        'tests.test_definition_owner_lifecycle_postgres.'
+        'DefinitionOwnerLifecyclePostgresTests.'
+        'test_current_acceptance_survives_bounded_validation_diagnostic_expiry',
+        'tests.test_definition_owner_lifecycle_postgres.'
+        'DefinitionOwnerLifecyclePostgresTests.'
+        'test_schema_inventory_covers_current_typed_reference_dependencies',
     ),
     'definition-deactivation': (
         'tests.test_python_definition_sources_postgres.'
@@ -488,6 +751,20 @@ TEST_CASES = {
 }
 TEST_MODULE = TEST_SUITES['native-selection'][0]
 SOURCE_FILES = (
+    'tests/test_cell_editability_postgres.py',
+    'tests/test_public_mutation_contracts_postgres.py',
+    'tests/test_public_contract_diagnostics_postgres.py',
+    'tests/test_expired_operation_replay_postgres.py',
+    'tests/test_source_change_review_postgres.py',
+    'tests/test_python_schedule_control_replay_postgres.py',
+    'tests/test_python_scheduled_authority_postgres.py',
+    'tests/python_occurrence_native_cases.py',
+    'tests/test_generic_model_scenarios_postgres.py',
+    'tests/test_public_mcp_external_hosts_postgres.py',
+    'tests/test_public_mcp_host_oauth_postgres.py',
+    'tests/qualify_postgres_real_oidc.py',
+    'tests/test_public_numeric_sequence_owner.py',
+    'platform_postgres_web_http.py',
     'tests/test_postgres_calculation_dependencies.py',
     'tests/test_application_purge.py',
     'tests/test_calculation_semantic_fanout_postgres.py',
@@ -500,6 +777,7 @@ SOURCE_FILES = (
     'tests/qualify_postgres_compose_signed.py',
     'scripts/bootstrap_macos_pilot_application.py',
     'scripts/qualify_macos_pilot_mcp_oauth.py',
+    'scripts/openepm_keycloak_bootstrap.py',
     'scripts/serve_openepm_postgres_worker.py',
     'tests/test_documented_owned_rule_postgres.py',
     'tests/public_documentation_python_example.py',
@@ -536,11 +814,14 @@ SOURCE_FILES = (
     'tests/test_native_member_selection_postgres.py',
     'tests/test_postgres_numeric_store.py',
     'tests/test_cube_layer_report.py',
+    'tests/test_cube_view_read_integration.py',
     'tests/test_cube_aggregate_repository.py',
     'tests/test_resolved_cube_read_contract.py',
     'tests/test_resolved_cube_read_planner.py',
     'tests/pov_source_replace_concurrency_fixture.py',
     'tests/test_definition_owner_lifecycle_postgres.py',
+    'tests/saved_numeric_sequence_fixture.py',
+    'scripts/openepm_release_operations.py',
     'tests/test_operation_receipt_retention_postgres.py',
     'tests/test_reset_source_evidence_graph_identity_migration.py',
     'tests/test_python_definition_sources_postgres.py',
@@ -612,7 +893,15 @@ def scenario_ids(suite):
     return result
 
 
-def qualify(*, output: Path, database_image: str, test_suite: str='native-selection'):
+def qualify(*, output: Path, database_image: str, test_suite: str='native-selection',
+            finalize_proof=None):
+    """Qualify owned fixtures and publish only a fully finalized proof.
+
+    An optional finalizer may augment the proof or reject additional gates.
+    It runs after owned resource cleanup and before the final source check and
+    sole canonical write, so rejection preserves the last accepted proof.
+    """
+    executed_at = datetime.now(timezone.utc).isoformat(timespec='seconds')
     import psycopg
     from psycopg.conninfo import make_conninfo
 
@@ -626,6 +915,8 @@ def qualify(*, output: Path, database_image: str, test_suite: str='native-select
         raise QualificationError('LOCAL_DATABASE_IMAGE_REQUIRED')
     if test_suite not in TEST_SUITES:
         raise QualificationError('FIXED_TEST_SUITE_REQUIRED')
+    if test_suite in ('external-public-mcp-hosts', 'external-mcp-oauth') and not os.environ.get('EPM_TEST_MCP_INSPECTOR_BIN'):
+        raise QualificationError('PINNED_MCP_INSPECTOR_REQUIRED')
     module_name,class_name,proof_format=TEST_SUITES[test_suite]
     saved_environment = {name: os.environ.get(name) for name in FIXTURE_ENVIRONMENT}
     manifest = output.with_name(output.name + '.run.json')
@@ -696,6 +987,7 @@ def qualify(*, output: Path, database_image: str, test_suite: str='native-select
                 raise QualificationError('TESTED_SOURCE_CHANGED_DURING_RUN')
             proof = {
                 'format': proof_format, 'testSuite':test_suite,
+                'executedAt': executed_at,
                 'testsRun': result.testsRun, 'failures': 0, 'errors': 0, 'skipped': 0,
                 'testScenarioIds': scenarios,
                 'invocation': {
@@ -723,21 +1015,30 @@ def qualify(*, output: Path, database_image: str, test_suite: str='native-select
                 'extraFixtureCleanup':{'ownedDatabasesChecked':len(extra_databases),'ownedRolesChecked':len(extra_roles),
                     'remainingOwnedDatabases':remaining_extra_databases,'remainingOwnedRoles':remaining_extra_roles},
                 'databaseRoleCleanup': database_cleanup, 'localPostgresImage': image_id,
+                # The owned manifest is removed after verified cleanup. Retain
+                # only its nonsecret identity for post-cleanup proof finalizers.
+                'ownedRunIdentity': {key: owned.manifest[key]
+                                     for key in ('runId', 'context', 'daemonId')},
                 'externalAuthenticationClaimed': False,
                 'sharedApplicationReadOrMutation': False,
             }
         if not owned.report or not owned.report['cleanupVerified']:
             raise QualificationError('DOCKER_CLEANUP_PENDING')
+        proof['cleanup'] = owned.report
+        proof['completedAt'] = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        if finalize_proof is not None:
+            finalize_proof(proof)
         if (proof['sourceSha256'] != source_hashes()
                 or proof['coreSource'] != core_source_binding()):
             raise QualificationError('TESTED_SOURCE_CHANGED_BEFORE_PROOF')
-        proof['cleanup'] = owned.report
         # A failed run never overwrites the last accepted current proof.
         write_json(output, proof)
         return proof
     except BaseException:
         if 'owned' in locals() and owned.report is not None:
             print(json.dumps({'status':'failed','testSuite':test_suite,
+                              'executedAt':executed_at,
+                              'completedAt':datetime.now(timezone.utc).isoformat(timespec='seconds'),
                               'cleanup':owned.report},sort_keys=True),file=sys.stderr)
         raise
     finally:

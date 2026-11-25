@@ -13,16 +13,27 @@ from collections.abc import Collection
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .application_workflow import ApplicationWorkflow,compile_application_workflow
-from .current_object_contract import collection_token,new_state_token,require_state_token
+from .application_workflow import (
+    FORMAT, ApplicationWorkflow, compile_application_workflow, workflow_definition_schema)
+from .current_object_contract import (
+    STATE_TOKEN_PATTERN, new_state_token, require_state_token)
 from .persistence_contract import ApplicationScope
 from .postgres_access import PostgresAccessChecker,VerifiedIdentity,assert_nonowner_role
 from .postgres_application_assignments import PostgresApplicationAssignments
+from .postgres_application_workflow_evidence import (
+    validate_workflow_receipt_contract, validate_workflow_view_evidence_scope)
 from .postgres_connection import connect_postgres
+from .postgres_definition_lifecycle import (
+    governance_revisions, read_governance_definition, read_governance_definition_page)
 from .postgres_jobs import _canonical_digest
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_processing_limits import configure_lock_wait,configure_statement_timeout
 from .postgres_selection_preview import resolve_selection_in_transaction
+from .selection_contract import FORMAT as SELECTION_FORMAT, structural_schema_definitions
+
+RETIRED_SEQUENCE_FUNCTIONS = frozenset((
+    "rules.numeric_sequence.read", "rules.numeric_sequence.list",
+    "rules.numeric_sequence.run"))
 
 
 SAVE="application.workflow.save"
@@ -37,6 +48,111 @@ _ID=re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,299}\Z")
 _KEY=re.compile(r"[A-Za-z0-9._-]{8,128}\Z")
 
 
+def workflow_program_contract(function: str) -> dict:
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    identifier = {"type": "string", "pattern": "^" + _ID.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}
+    token = {"type": "string", "pattern": "^" + STATE_TOKEN_PATTERN.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}
+    nullable_identifier = {"anyOf": [identifier, {"type": "null"}]}
+    revision = {"type": "integer", "minimum": 0}
+    revisions = {"metadataRevision": revision, "policyRevision": revision, "schemaEpoch": revision}
+    expected = dict.fromkeys(("expectedMetadataRevision", "expectedPolicyRevision", "expectedSchemaEpoch"), revision)
+    definition = {"$ref": "#/$defs/workflowDefinition"}
+    summary = {"flowId": identifier, "stateToken": token, "definitionDigest": token,
+               "status": {"enum": ["Saved", "Active"]}}
+    flow_id = "example-workflow"
+    example_token = "a" * 64
+
+    if function in READS:
+        observed = {**revisions, "commitRevision": revision}
+        record = {**summary, "name": {"type": "string", "minLength": 1, "maxLength": 200},
+            "definition": definition, "updatedAt": {"type": "string"},
+            "updatedBy": obj({"issuer": {"type": "string"}, "subjectId": {"type": "string"}})}
+        if function == READ:
+            arguments = obj({"flowId": identifier})
+            result = obj({**record, **observed})
+            examples = [read_example(function, {"flowId": flow_id},
+                name="Read the exact current workflow",
+                binding="Replace example-workflow with a flowId from the same application's authorized list.")]
+        else:
+            arguments = obj({"limit": {**revision, "minimum": 1, "maximum": 100},
+                "afterFlowId": nullable_identifier, "collectionToken": token,
+                "status": summary["status"]}, [])
+            result = obj({"workflows": {"type": "array", "maxItems": 100, "items": obj(record)},
+                "nextAfterFlowId": nullable_identifier, "collectionToken": token, **observed})
+            examples = [read_example(function, {"limit": 1}, name="Read the first workflow page",
+                binding="Choose a currently readable application from discovery."),
+                read_example(function, {"limit": 1, "afterFlowId": flow_id, "collectionToken": example_token},
+                    name="Continue the same workflow collection",
+                    binding="Copy nextAfterFlowId and collectionToken from the previous page and keep any status filter. A null cursor ends the list."),
+                read_example(function, {"limit": 20, "status": "Active"},
+                    name="Find active workflows to start",
+                    binding="Choose a currently readable application. Read an exact active definition before proposing a start.")]
+    else:
+        pins = dict.fromkeys(expected, 1)
+        if function == SAVE:
+            arguments = obj({"definition": definition, **expected,
+                "expectedStateToken": {"anyOf": [token, {"type": "null"}]}}, ["definition", *expected])
+            example_definition = {"format": FORMAT, "workspaceId": "example-workspace",
+                "applicationId": "example-application", "flowId": flow_id, "name": "Review inputs",
+                "selection": {"format": SELECTION_FORMAT, "metadataRevision": 1, "dimensions": [
+                    {"dimensionId": "custom-axis", "include": {"kind": "member", "memberId": "member-a"},
+                     "exclude": None}]},
+                "activities": [{"activityId": "check", "name": "Check inputs", "kind": "Action",
+                    "dependsOn": [], "returnTo": None, "assignmentRef": {
+                        "assignmentSetId": "example-assignment", "stateToken": example_token,
+                        "digest": example_token, "assignmentId": "review"},
+                    "destination": {"kind": "CubeView", "viewId": "example-view", "digest": example_token},
+                    "evidenceContract": {"kind": "ManualAttestation", "statement": "I checked the selected inputs."}}]}
+            create = {"definition": example_definition, **pins}
+            binding = ("Bind the routed scope, complete current cube selection and revision pins. Use the active "
+                       "assignment's stateToken, definitionDigest and exact assignmentId. Bind destination.viewId "
+                       "and digest to gridId and canonicalDigest from the saved view read.")
+            examples = [read_example(function, create, name="Save a new workflow definition", binding=binding),
+                read_example(function, {**create, "expectedStateToken": example_token},
+                    name="Replace the exact current workflow definition",
+                    binding=binding + " Use the exact current definition and stateToken from application.workflow.read.")]
+        else:
+            arguments = obj({"flowId": identifier, "expectedStateToken": token, **expected})
+            examples = [read_example(function, {"flowId": flow_id, "expectedStateToken": example_token, **pins},
+                name="Activate the exact saved workflow" if function == ACTIVATE else "Deactivate the exact active workflow",
+                binding="Use the flowId, stateToken and revision pins from an exact current workflow read.")]
+        result = obj({**summary, **revisions, "status": {"const": "Active" if function == ACTIVATE else "Saved"},
+            "operationId": {"type": "string", "pattern": "^" + _KEY.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}})
+    definitions = ({**structural_schema_definitions(),
+                    "workflowDefinition": workflow_definition_schema(include_retired=function in READS)}
+        if function in READS or function == SAVE else None)
+    contract = read_contract(function, arguments, result, owner="PostgresApplicationWorkflows",
+        examples=examples, definitions=definitions, semantic_rules=[
+            "The native owner checks complete current selection grain, exact assignment and destination references, and valid activity dependencies on Save.",
+            "Save leaves the workflow Saved. Activate and Deactivate change availability for new occurrences and advance the policy revision.",
+            "An active workflow occurrence blocks replacement. Occurrence start separately checks current references, access and the active workflow token.",
+            "Reads and list pages return definitions and revision pins from the same database snapshot.",
+            *(["Current dimensional READ covers the workflow selection, linked assignment sets and saved-view destinations before a complete definition is returned. Protected and absent definitions share the same unavailable outcome. Protected list continuations bind the current actor and scope."] if function in READS else []),
+            "ApplicationSequence references can describe existing history. Current authoring requires a currently supported destination.",
+            *(["Every operation-receipt choice must match a current fixed-core validator for the activity destination. "
+                "APPLICATION_WORKFLOW_RECEIPT_CONTRACT_UNSUPPORTED means the workflow needs a supported evidence condition.",
+                "A receipt-backed saved view must resolve to the workflow selection. Read the current view and review its "
+                "effective members after APPLICATION_WORKFLOW_EVIDENCE_VIEW_SCOPE_MISMATCH."]
+                if function in (SAVE, ACTIVATE) else []),
+            *(
+                ["List accepts status Active or Saved. The filter applies before pagination, and continuation keeps the same filter."]
+                if function == LIST else []
+            ),
+        ])
+    if function in READS:
+        contract["programSchema"].pop("$defs")
+    elif function == SAVE:
+        contract["resultSchema"].pop("$defs")
+    contract["programContract"]["recovery"] = (
+        "Restart list discovery after APPLICATION_WORKFLOW_COLLECTION_CHANGED. For a stale write or unavailable reference, "
+        "read the current definition and dependency pins before proposing a new intent. Retry the exact signed packet "
+        "to recover an unanswered operation. After admission expires, current administrators can recover its "
+        "original receipt only if it committed.")
+    return contract
+
+
 def catalog() -> dict:
     common={"previewRequired":False,"workClass":"short",
             "requiredCapabilities":[]}
@@ -45,7 +161,7 @@ def catalog() -> dict:
         "expectedSchemaEpoch":"current schema epoch"}
     mutation={**common,"permission":"admin","idempotencyRequired":True}
     read={**common,"permission":"read","idempotencyRequired":False}
-    return {
+    functions = {
         SAVE:{**mutation,"mode":"current_workflow_write","arguments":{
             "definition":"canonical application-task-flow v2",
             **revisions},"optionalArguments":{"expectedStateToken":
@@ -62,8 +178,12 @@ def catalog() -> dict:
         READ:{**read,"mode":"read","arguments":{"flowId":"stable workflow ID"},
             "result":"verified current workflow definition"},
         LIST:{**read,"mode":"read","arguments":{},"optionalArguments":{
-            "limit":"1-100","afterFlowId":"keyset cursor"},
+            "limit":"1-100","afterFlowId":"keyset cursor",
+            "status":"optional Active or Saved workflow filter",
+            "collectionToken":"collection pin returned by the previous page"},
             "result":"bounded latest workflow definitions"}}
+    return {function: {**entry, **workflow_program_contract(function)}
+            for function, entry in functions.items()}
 
 
 def _identifier(value: object) -> str:
@@ -144,7 +264,7 @@ class PostgresApplicationWorkflows:
     @classmethod
     def _validate_references(cls,db,scope: ApplicationScope,
             model: ApplicationWorkflow,available_functions: Collection[str],
-            metadata_revision: int) -> dict:
+            metadata_revision: int, *, validate_receipt_contracts: bool = False) -> dict:
         functions=cls._functions(available_functions)
         selection=model.normalized()["selection"]
         resolved=resolve_selection_in_transaction(db,scope,selection,
@@ -168,8 +288,10 @@ class PostgresApplicationWorkflows:
                     item.assignment_id for item in assignment_cache[key].assignments}:
                 raise ValueError("APPLICATION_WORKFLOW_ASSIGNMENT_UNAVAILABLE")
             destination=dict(activity.destination)
+            view=None
             if destination["kind"]=="CubeView":
-                view=db.execute("""SELECT canonical_digest
+                view=db.execute("""SELECT canonical_digest,definition,metadata_revision,
+                    definition#>>'{dataSource,kind}' AS source_kind
                     FROM epm.saved_grid_definition WHERE workspace_id=%s
                       AND application_id=%s AND grid_id=%s""",(
                     scope.workspace_id,scope.application_id,
@@ -178,6 +300,10 @@ class PostgresApplicationWorkflows:
                     raise ValueError("APPLICATION_WORKFLOW_VIEW_UNAVAILABLE")
             elif destination["kind"]=="Artifact":
                 kind=destination["artifactKind"]
+                if kind=="ApplicationSequence":
+                    # Decoding old workflow history remains valid; new/current
+                    # references cannot target the retired public owner.
+                    raise ValueError("APPLICATION_FUNCTION_RETIRED")
                 read_function={
                     "ApplicationRule":"application.rule.read",
                     "CalculatedMember":"calculated.member.read",
@@ -210,12 +336,22 @@ class PostgresApplicationWorkflows:
                         stored_function)).fetchone()
                 if (artifact is None or artifact["digest"]!=destination["digest"]):
                     raise ValueError("APPLICATION_WORKFLOW_ARTIFACT_UNAVAILABLE")
+            elif destination["function"] in RETIRED_SEQUENCE_FUNCTIONS:
+                raise ValueError("APPLICATION_FUNCTION_RETIRED")
             elif destination["function"] not in functions:
                 raise ValueError("APPLICATION_WORKFLOW_FUNCTION_UNAVAILABLE")
             evidence=dict(activity.evidence_contract)
-            if evidence["kind"]=="OperationReceipt" and not set(
-                    evidence["allowedFunctions"])<=functions:
-                raise ValueError("APPLICATION_WORKFLOW_FUNCTION_UNAVAILABLE")
+            if evidence["kind"]=="OperationReceipt":
+                if RETIRED_SEQUENCE_FUNCTIONS.intersection(evidence["allowedFunctions"]):
+                    raise ValueError("APPLICATION_FUNCTION_RETIRED")
+                if not set(evidence["allowedFunctions"])<=functions:
+                    raise ValueError("APPLICATION_WORKFLOW_FUNCTION_UNAVAILABLE")
+                if validate_receipt_contracts:
+                    validate_workflow_receipt_contract(destination,evidence["allowedFunctions"],
+                        view_source_kind=view["source_kind"] if view is not None else None)
+                    if view is not None:
+                        validate_workflow_view_evidence_scope(db,scope,view,destination,resolved,
+                            require_current=evidence["requireCurrent"])
         return resolved
 
     @staticmethod
@@ -231,10 +367,10 @@ class PostgresApplicationWorkflows:
 
     def execute(self,scope: ApplicationScope,program: object,*,
             idempotency_key: str|None=None,
-            available_functions: Collection[str]|None=None)->dict:
+            available_functions: Collection[str]|None=None,replay_only: bool=False)->dict|None:
         function,args=_program(program)
         if function in READS:
-            if idempotency_key is not None:
+            if idempotency_key is not None or replay_only:
                 raise ValueError("APPLICATION_WORKFLOW_IDEMPOTENCY_UNEXPECTED")
             return self.read_program(scope,program)
         if type(idempotency_key) is not str or _KEY.fullmatch(idempotency_key) is None:
@@ -254,7 +390,7 @@ class PostgresApplicationWorkflows:
                 raise ValueError("APPLICATION_WORKFLOW_ARGUMENTS_INVALID")
             flow_id=_identifier(args["flowId"]);model=None
             expected_token=args["expectedStateToken"]
-        if expected_token is not None:
+        if function != SAVE or expected_token is not None:
             require_state_token(expected_token,error="APPLICATION_WORKFLOW_STATE_TOKEN_INVALID")
         metadata=_revision(args["expectedMetadataRevision"],
             "APPLICATION_WORKFLOW_METADATA_REVISION_INVALID")
@@ -267,8 +403,9 @@ class PostgresApplicationWorkflows:
             self.identity.subject_id],"program":program})
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
           with db.transaction():
+            if replay_only:db.execute("SET TRANSACTION READ ONLY")
             self._scope(db,scope);PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-            state=self._context(db,scope,lock=True)
+            state=None if replay_only else self._context(db,scope,lock=True)
             PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"write")
             PostgresAccessChecker.check_in_transaction(db,self.identity,scope,"admin")
             prior=db.execute("""SELECT command_digest,actor_id,result
@@ -279,6 +416,7 @@ class PostgresApplicationWorkflows:
                 if prior["command_digest"]!=command_digest or prior["actor_id"]!=self.identity.subject_id:
                     raise ValueError("APPLICATION_WORKFLOW_IDEMPOTENCY_CONFLICT")
                 return prior["result"]
+            if replay_only:return None
             if state["application_status"]!="Active" or state["processing_mode"]!="Active":
                 raise ValueError("APPLICATION_NOT_WRITABLE")
             self._assert_context(state,metadata,policy,schema)
@@ -300,9 +438,14 @@ class PostgresApplicationWorkflows:
                 raise ValueError("APPLICATION_WORKFLOW_NOT_ACTIVE")
             if function==SAVE:
                 assert model is not None
-                self._validate_references(db,scope,model,available_functions,metadata)
+                self._validate_references(db,scope,model,available_functions,metadata,
+                                          validate_receipt_contracts=True)
                 definition=model.normalized();digest=model.digest;name=model.name;status="Saved"
             else:
+                if function==ACTIVATE:
+                    model=self._verified(scope,current)
+                    self._validate_references(db,scope,model,available_functions,metadata,
+                                              validate_receipt_contracts=True)
                 definition=current["definition"];digest=current["definition_digest"]
                 name=current["name"];status="Active" if function==ACTIVATE else "Saved"
             commit=state["commit_revision"]+1
@@ -359,39 +502,30 @@ class PostgresApplicationWorkflows:
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
           with db.transaction():
             db.execute("SET TRANSACTION READ ONLY");self._scope(db,scope)
-            PostgresAccessChecker.check_in_transaction(
+            access = PostgresAccessChecker.check_in_transaction(
                 db,self.identity,scope,"read",function=function)
-            state=self._context(db,scope,lock=False)
             if function==READ:
                 if set(args)!={"flowId"}:
                     raise ValueError("APPLICATION_WORKFLOW_ARGUMENTS_INVALID")
-                row=db.execute("""SELECT * FROM epm.application_workflow_definition
-                    WHERE workspace_id=%s AND application_id=%s AND flow_id=%s""",
-                    (scope.workspace_id,scope.application_id,
-                     _identifier(args["flowId"]))).fetchone()
+                row = read_governance_definition(db, scope, 'Workflow', _identifier(args['flowId']),
+                    identity=self.identity, function=function, access=access)
                 if row is None:raise ValueError("APPLICATION_WORKFLOW_UNAVAILABLE")
-                return {**self._result(scope,row),
-                    "metadataRevision":state["metadata_revision"],
-                    "policyRevision":state["policy_revision"],
-                    "schemaEpoch":state["schema_epoch"],
-                    "commitRevision":state["commit_revision"]}
-            if set(args)-{"limit","afterFlowId","collectionToken"}:
+                return {**self._result(scope, row), **governance_revisions(row)}
+            if set(args)-{"limit","afterFlowId","collectionToken","status"}:
                 raise ValueError("APPLICATION_WORKFLOW_ARGUMENTS_INVALID")
             limit=args.get("limit",100);after=args.get("afterFlowId")
             if type(limit) is not int or not 1<=limit<=100:
                 raise ValueError("APPLICATION_WORKFLOW_LIST_LIMIT_INVALID")
             if after is not None:_identifier(after)
-            rows=db.execute("""SELECT * FROM epm.application_workflow_definition
-                WHERE workspace_id=%s AND application_id=%s ORDER BY flow_id""",
-                (scope.workspace_id,scope.application_id)).fetchall()
-            token=collection_token((row["flow_id"],row["state_token"]) for row in rows)
+            status = args.get("status")
+            if "status" in args and status not in ("Saved", "Active"):
+                raise ValueError("APPLICATION_WORKFLOW_LIST_STATUS_INVALID")
+            page, token, revisions = read_governance_definition_page(
+                db, scope, 'Workflow', after=after, limit=limit, status=status,
+                identity=self.identity, function=function, access=access)
             if "collectionToken" in args and args["collectionToken"]!=token:
                 raise ValueError("APPLICATION_WORKFLOW_COLLECTION_CHANGED")
-            page=[row for row in rows if after is None or row["flow_id"]>after]
             values=[self._result(scope,row) for row in page[:limit]]
             return {"workflows":values,"collectionToken":token,
                 "nextAfterFlowId":(values[-1]["flowId"] if len(page)>limit else None),
-                "metadataRevision":state["metadata_revision"],
-                "policyRevision":state["policy_revision"],
-                "schemaEpoch":state["schema_epoch"],
-                "commitRevision":state["commit_revision"]}
+                **revisions}

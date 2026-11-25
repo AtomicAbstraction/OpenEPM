@@ -9,7 +9,7 @@ it("resolves exact artifact destinations without silently opening another editor
   for (const [kind, section] of [
     ["ApplicationRule", "rules"],
     ["CalculatedMember", "calculations"],
-    ["ApplicationSequence", "sequences"],
+    ["ApplicationSequence", "rules"],
     ["ApplicationSchedule", "schedules"],
   ]) {
     expect(resolveWorkspaceSection("rules", undefined, kind)).toBe(section);
@@ -39,5 +39,11 @@ it("opens Python authoring as the normal rules workspace without changing exact 
   expect(resolveWorkspaceSection("rules")).toBe("python");
   expect(resolveWorkspaceSection("rules", undefined, "ApplicationRule")).toBe(
     "rules",
+  );
+});
+
+it("removes the obsolete saved-sequence navigation entry", () => {
+  expect(workspaceSections.rules.map((item) => item.id)).not.toContain(
+    "sequences",
   );
 });

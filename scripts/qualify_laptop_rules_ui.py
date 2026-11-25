@@ -36,6 +36,7 @@ WORKSPACE_ID = "ws-pilot"
 APPLICATION_ID = "AIcompanies"
 PROGRAM_ID = "source-rule-aic.apportion.policy"
 PROGRAM_NAME = "AIC Apportion Policy"
+IMAGE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 READ_PROGRAM = r"""async ({workspaceId, applicationId, programId}) => {
   const response = await fetch('/api/python-program', {
@@ -137,7 +138,31 @@ def wait_for_visible_source(page, editor: Locator, source: str) -> str:
     raise LifecycleError("RULES_UI_EDITOR_SOURCE_NOT_RENDERED")
 
 
+def active_runtime_target(state_root: Path) -> dict:
+    """Bind the browser result to the controller's exact active target."""
+    try:
+        state = json.loads((state_root / "state.json").read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise LifecycleError("RULES_UI_RUNTIME_STATE_UNAVAILABLE") from error
+    image = state.get("applicationImage")
+    target = state.get("developmentTarget")
+    if (state.get("state") != "active" or state.get("verified") is not True
+            or not isinstance(image, str) or IMAGE.fullmatch(image) is None
+            or not isinstance(target, dict)
+            or target.get("applicationImage") != image
+            or not isinstance(state.get("expectedSchema"), int)
+            or not isinstance(state.get("expectedApplications"), int)):
+        raise LifecycleError("RULES_UI_RUNTIME_TARGET_INVALID")
+    return {
+        "applicationImage": image,
+        "expectedSchema": state["expectedSchema"],
+        "expectedApplications": state["expectedApplications"],
+    }
+
+
 def qualify(state_root: Path) -> dict:
+    runtime_target = active_runtime_target(state_root)
     preflight = public_preflight()
     run_id = secrets.token_hex(8)
     username = "openepm-rules-ui-" + run_id
@@ -271,16 +296,22 @@ def qualify(state_root: Path) -> dict:
                 row = page.get_by_role("row").filter(has_text=PROGRAM_NAME)
                 if row.count() != 1:
                     raise LifecycleError("RULES_UI_PROGRAM_ROW_INVALID")
-                row.get_by_role("button", name="Open", exact=True).click()
+                row.get_by_role(
+                    "button", name="View code for " + PROGRAM_NAME,
+                    exact=True).click()
                 page.get_by_role(
                     "heading", name="Current source", exact=True
                 ).wait_for(timeout=60_000)
                 viewer = page.get_by_role(
-                    "textbox", name="Authorized Python source", exact=True)
+                    "region", name="Authorized Python source", exact=True)
                 viewer.wait_for(timeout=60_000)
-                page.locator(".python-program-detail .monaco-editor").wait_for(
-                    timeout=60_000)
-                wait_for_visible_source(page, viewer, oracle["sourceText"])
+                if viewer.text_content() != oracle["sourceText"]:
+                    raise LifecycleError("RULES_UI_SOURCE_NOT_RENDERED_EXACTLY")
+                detail = page.get_by_label(
+                    "Python program detail", exact=True)
+                if not detail.evaluate(
+                        "element => element === document.activeElement"):
+                    raise LifecycleError("RULES_UI_DETAIL_FOCUS_MISSING")
 
                 body = page.locator("body").inner_text()
                 hidden_tokens = [
@@ -414,10 +445,13 @@ def qualify(state_root: Path) -> dict:
         raise primary_error
     if result is None:
         raise LifecycleError("RULES_UI_QUALIFICATION_INCOMPLETE")
+    if active_runtime_target(state_root) != runtime_target:
+        raise LifecycleError("RULES_UI_RUNTIME_TARGET_CHANGED")
     return {
         "format": "openepm-laptop-installed-rules-ui-v1",
         "qualifiedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "publicPreflight": preflight,
+        "runtimeTarget": runtime_target,
         **result,
         "governedRunOwnedIdentity": True,
         "temporaryApplicationAdministratorGranted": True,

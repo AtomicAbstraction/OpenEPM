@@ -309,7 +309,7 @@
   ],
   "dependencyScope": {
     "lockPath": "requirements-postgres.lock",
-    "lockSha256": "5901c2d0a3787e37fade607b1404a7f748b487d3807f5209909615e283c2e341",
+    "lockSha256": "341bd4215b52f43184f6fcf00a89d34a1be62507138bf0286ecec26dd547e339",
     "status": "target-source-and-image-inventory-regeneration-required",
     "trustedSourceCompliance": false,
     "boundary": "Retained exact evidence is unreviewed historical input. Current builder/runtime dependency and license evidence must be regenerated from the target release; removal is not a legal approval."

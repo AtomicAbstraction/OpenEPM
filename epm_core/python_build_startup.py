@@ -62,6 +62,8 @@ def create_python_build_worker(environment, *, executor=None,
             metadata_revision=context['metadataRevision'],
             policy_revision=context['policyRevision'],
             schema_epoch=context['schemaEpoch'],
+            build_purpose=context['purpose'],
+            build_id=context['record'].build_id,
             source_program=(context['programId'], context['programSourceToken']))
     def impact_evaluator_factory(scope, identity, context):
         from .postgres_python_impact import PostgresPythonImpactEvaluator

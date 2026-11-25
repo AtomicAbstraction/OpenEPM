@@ -60,7 +60,12 @@ _WORKER_STATUSES = frozenset((
     "cancelled", "needs_inspection", "error"))
 _WORKER_FAMILIES = frozenset((
     "none", "aggregate", "python_build", "python_workflow",
-    "python_schedule", "sequence", "business"))
+    "python_schedule", "sequence", "business", "calculation_impact"))
+_QUEUE_AGE_FAMILIES = (_WORKER_FAMILIES - {"none", "sequence"}) | {
+    "application_rule", "application_schedule", "import_execution",
+    "export_producer", "layout_replacement_build", "layout_activation",
+    "expression_rule_sequence", "full_aggregate_sequence",
+}
 _CORRELATION = re.compile(r"^[0-9a-f]{32}$")
 _ROUTE = re.compile(r"^/[A-Za-z0-9._:/*-]{1,96}$")
 _EVENT_FIELDS = {
@@ -98,7 +103,7 @@ def record_operational_signal(signal: str, value: object = 1, *,
     elif signal == "signing_key_available":
         _SIGNING_KEY_AVAILABLE.record(1 if value is True else 0, {})
     elif signal == "queue_oldest_age":
-        label = family if isinstance(family, str) and family in _WORKER_FAMILIES else "unknown"
+        label = family if isinstance(family, str) and family in _QUEUE_AGE_FAMILIES else "unknown"
         bounded = value if type(value) is int and 0 <= value <= 31_536_000 else 31_536_000
         _QUEUE_OLDEST_AGE.record(bounded, {"family": label})
     else:

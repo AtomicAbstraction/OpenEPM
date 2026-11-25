@@ -1,23 +1,31 @@
 """Governed extensible metadata attributes on PostgreSQL.
 
-The catalogue is the schema-247 authority for new definitions. Legacy
-``metadata.semantic_column.*`` functions remain a compatibility boundary until
-their admitted consumers are migrated; this module never invents physical
-columns or evaluates caller SQL.
+The catalogue is the schema-247 public authority for definitions and values.
+Legacy ``metadata.semantic_column.*`` functions remain private only for
+historical receipt interpretation; this module never invents physical columns
+or evaluates caller SQL.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 import json
 import re
 
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .current_object_contract import new_state_token, require_state_token
 from .persistence_contract import ApplicationScope, NumericCell
-from .postgres_access import PostgresAccessChecker, VerifiedIdentity
+from .postgres_access import AccessDenied, PostgresAccessChecker, VerifiedIdentity
 from .postgres_connection import connect_postgres
+from .postgres_dimensional_scope import (
+    metadata_dimension_reference_read_sql, metadata_dimension_visible,
+    metadata_linked_member_read_sql, metadata_page_token, metadata_reference_read_sql,
+    metadata_relationship_read_sql, reject_mixed_metadata_reads,
+    require_metadata_page_token, resolve_effective_dimensional_scope,
+)
 from .postgres_jobs import _canonical_digest
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_processing_limits import configure_statement_timeout
@@ -112,10 +120,11 @@ def _constraints(kind: str, value: object) -> dict:
     choices = result.get("allowedValues")
     if choices is not None:
         if (kind != "Text" or not isinstance(choices, list)
-                or len(choices) > 1000 or len(set(choices)) != len(choices)
+                or len(choices) > 1000
                 or any(not isinstance(item, str) or not item
                        or len(item) > 200 or "\x00" in item
-                       for item in choices)):
+                       for item in choices)
+                or len(set(choices)) != len(choices)):
             raise ValueError("ATTRIBUTE_ALLOWED_VALUES_INVALID")
     reference = result.get("referenceDimensionId")
     if kind == "MemberReference":
@@ -148,8 +157,8 @@ def _typed_value(db, application: ApplicationScope, definition: dict,
     kind = definition["value_type"]
     constraints = definition["validation_constraints"]
     if kind == "Text":
-        maximum = constraints.get("maximumLength", 10000)
-        value = _text(supplied, maximum)
+        maximum = constraints.get("maximumLength")
+        value = _text(supplied, 10000 if maximum is None else maximum)
         choices = constraints.get("allowedValues")
         if choices and value not in choices:
             raise ValueError("ATTRIBUTE_VALUE_CHOICE_INVALID")
@@ -187,13 +196,15 @@ def _typed_value(db, application: ApplicationScope, definition: dict,
 
 
 class PostgresAttributeCatalog:
-    def __init__(self, dsn: str, *, identity: VerifiedIdentity):
+    def __init__(self, dsn: str, *, identity: VerifiedIdentity,
+                 cursor_secret: bytes | None = None):
         if not isinstance(dsn, str) or not dsn:
             raise ValueError("A PostgreSQL runtime DSN is required")
         if not isinstance(identity, VerifiedIdentity):
             raise ValueError("A verified identity is required")
         self.dsn = dsn
         self.identity = identity
+        self.cursor_secret = cursor_secret
 
     @staticmethod
     def _definition_payload(function: str, args: dict) -> dict:
@@ -277,6 +288,99 @@ class PostgresAttributeCatalog:
         return {"valueCount": count,
                 "sampleObjectIds": [row["object_id"] for row in rows[:limit]],
                 "sampleTruncated": len(rows) > limit}
+
+    @staticmethod
+    def _read_population(application, scope, dimension, authority):
+        table, identifier = {
+            "Dimension": ("dimension", "dimension_id"),
+            "Member": ("member", "member_id"),
+            "Relationship": ("relationship", "relationship_id"),
+        }[scope]
+        population = sql.SQL("FROM {} m WHERE m.workspace_id=%s AND m.application_id=%s").format(
+            sql.Identifier("epm", table))
+        keys = (application.workspace_id, application.application_id)
+        if dimension:
+            population += sql.SQL(" AND m.dimension_id=%s")
+            keys += (dimension,)
+        visible = (metadata_relationship_read_sql(authority, "m", dimension)
+                   if scope == "Relationship" else
+                   metadata_reference_read_sql(authority, "m", dimension or None))
+        return population, keys, sql.Identifier("m", identifier), visible
+
+    @staticmethod
+    def _value_visibility(authority, definition):
+        if definition["value_type"] != "MemberReference":
+            return sql.SQL("TRUE")
+        return metadata_linked_member_read_sql(authority, "m",
+            sql.Literal(definition["validation_constraints"]["referenceDimensionId"]),
+            sql.SQL("m.custom_values->>{}").format(sql.Literal(definition["attribute_id"])))
+
+    @classmethod
+    def _visible_usage(cls, db, application, scope, dimension, definition, authority):
+        if authority.policy is None or authority.administrator_bypass:
+            return cls._usage(db, application, scope, dimension, definition["attribute_id"])
+        population, keys, identifier, visible = cls._read_population(
+            application, scope, dimension, authority)
+        population += sql.SQL(" AND m.custom_values ? %s")
+        keys += (definition["attribute_id"],)
+        visible = sql.SQL("({} AND {})").format(visible, cls._value_visibility(authority, definition))
+        if reject_mixed_metadata_reads(authority) and db.execute(
+            sql.SQL("SELECT EXISTS(SELECT 1 {} AND NOT {}) AS denied").format(population, visible),
+            keys).fetchone()["denied"]:
+            raise AccessDenied("ATTRIBUTE_USAGE_SCOPE_UNAVAILABLE")
+        rows = db.execute(sql.SQL("""SELECT {identifier} AS object_id,count(*) OVER () AS total
+            {population} AND {visible} ORDER BY {identifier} LIMIT 51""").format(
+                identifier=identifier, population=population, visible=visible), keys).fetchall()
+        return {"valueCount": rows[0]["total"] if rows else 0,
+                "sampleObjectIds": [row["object_id"] for row in rows[:50]],
+                "sampleTruncated": len(rows) > 50}
+
+    @classmethod
+    def _visible_value(cls, db, application, scope, dimension, object_id, definition, authority):
+        population, keys, identifier, visible = cls._read_population(
+            application, scope, dimension, authority)
+        record = db.execute(sql.SQL("""SELECT m.custom_values, {value_visible} AS value_visible
+            {population} AND {identifier}=%s AND m.status='Active' AND {visible}""").format(
+                value_visible=cls._value_visibility(authority, definition), population=population,
+                identifier=identifier, visible=visible), (*keys, object_id)).fetchone()
+        if record is None:
+            raise ValueError("ACTIVE_ATTRIBUTE_OBJECT_REQUIRED")
+        attribute = definition["attribute_id"]
+        values = record["custom_values"] if record["value_visible"] else {}
+        return {"objectId": object_id, "present": attribute in values, "value": values.get(attribute)}
+
+    @contextmanager
+    def _read_snapshot(self, application):
+        with connect_postgres(self.dsn, row_factory=dict_row) as db:
+            with db.transaction():
+                db.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY")
+                configure_statement_timeout(db, 5000)
+                PostgresNumericFactStore._set_scope(db, application)
+                access = PostgresAccessChecker.check_in_transaction(db, self.identity, application, "read")
+                revision = self._read_revision(db, application)
+                authority = resolve_effective_dimensional_scope(db, self.identity, application, access=access)
+                try:
+                    yield db, revision, authority
+                except ValueError:
+                    self._require_current_read(db, application, revision, access)
+                    raise
+                self._require_current_read(db, application, revision, access)
+
+    @staticmethod
+    def _read_revision(db, application):
+        row = db.execute("""SELECT metadata_revision FROM epm.application_state
+            WHERE workspace_id=%s AND application_id=%s""",
+            (application.workspace_id, application.application_id)).fetchone()
+        if row is None:
+            raise ValueError("APPLICATION_UNAVAILABLE")
+        return row["metadata_revision"]
+
+    def _require_current_read(self, db, application, revision, access):
+        if self._read_revision(db, application) != revision:
+            raise ValueError("METADATA_CHANGED_DURING_READ")
+        # Directory membership can change outside the workspace grant fence.
+        if PostgresAccessChecker.check_in_transaction(db, self.identity, application, "read") != access:
+            raise ValueError("METADATA_ATTRIBUTE_READ_AUTHORIZATION_STALE")
 
     def execute(self, application: ApplicationScope, program: dict, *,
                 idempotency_key: str) -> dict:
@@ -671,7 +775,7 @@ class PostgresAttributeCatalog:
         if function == DEFINITION_LIST:
             args = _program(program, function, {"scope"}, {
                 "dimensionId", "status", "query", "limit",
-                "afterAttributeId"})
+                "afterAttributeId", "expectedMetadataRevision", "expectedPageToken"})
             scope = _scope(args["scope"])
             dimension = _context(scope, args)
             status = args.get("status")
@@ -684,6 +788,12 @@ class PostgresAttributeCatalog:
             after = args.get("afterAttributeId")
             if after is not None:
                 after = _id(after)
+            expected_revision = args.get("expectedMetadataRevision")
+            if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
+                raise ValueError("METADATA_PAGE_REVISION_INVALID")
+            page_token = args.get("expectedPageToken")
+            if page_token is not None and expected_revision is None:
+                raise ValueError("METADATA_PAGE_REVISION_REQUIRED")
         elif function in (DEFINITION_USAGE, VALUE_READ):
             required = {"scope", "attributeId"}
             if function == VALUE_READ:
@@ -694,88 +804,262 @@ class PostgresAttributeCatalog:
                 object_id = _id(args["objectId"])
         else:
             raise ValueError("ATTRIBUTE_PROGRAM_INVALID")
-        with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY")
-                configure_statement_timeout(db, 5000)
-                PostgresNumericFactStore._set_scope(db, application)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, application, "read")
-                start = db.execute("""SELECT metadata_revision
-                    FROM epm.application_state WHERE workspace_id=%s
-                      AND application_id=%s""",
-                    (application.workspace_id,
-                     application.application_id)).fetchone()
-                if start is None:
-                    raise ValueError("APPLICATION_UNAVAILABLE")
-                keys = (application.workspace_id,
-                        application.application_id)
-                if function == DEFINITION_LIST:
-                    rows = db.execute("""SELECT attribute_id,default_name,
-                            display_name,short_description,semantic_description,
-                            value_type,validation_constraints,status,
-                            state_token
-                        FROM epm.attribute_definition
-                        WHERE workspace_id=%s AND application_id=%s
-                          AND scope=%s AND dimension_id=%s
-                          AND (%s::text IS NULL OR status=%s)
-                          AND (%s='' OR attribute_id ILIKE '%%'||%s||'%%'
-                               OR display_name ILIKE '%%'||%s||'%%'
-                               OR semantic_description ILIKE '%%'||%s||'%%')
-                          AND (%s::text IS NULL OR attribute_id>%s)
-                        ORDER BY attribute_id LIMIT %s""",
-                        (*keys, scope, dimension, status, status,
-                         query, query, query, query, after, after,
-                         limit + 1)).fetchall()
-                    result = {"scope": scope,
-                              "dimensionId": dimension or None,
-                              "rows": [dict(row) for row in rows[:limit]],
-                              "hasMore": len(rows) > limit,
-                              "nextAfterAttributeId":
-                                  rows[limit - 1]["attribute_id"]
-                                  if len(rows) > limit else None}
-                else:
-                    payload = {"scope": scope, "dimensionId": dimension,
-                               "attributeId": attribute}
-                    definition = self._definition(db, application, payload)
-                    if definition is None:
-                        raise ValueError("ATTRIBUTE_DEFINITION_UNAVAILABLE")
-                    usage = self._usage(db, application, scope, dimension,
-                                        attribute)
-                    if function == DEFINITION_USAGE:
-                        result = {"scope": scope,
-                                  "dimensionId": dimension or None,
-                                  "definition": dict(definition), **usage}
-                    else:
-                        table, id_column = {
-                            "Dimension": ("dimension", "dimension_id"),
-                            "Member": ("member", "member_id"),
-                            "Relationship": ("relationship",
-                                             "relationship_id"),
-                        }[scope]
-                        where = "" if scope == "Dimension" else (
-                            " AND dimension_id=%s")
-                        parameters: tuple = (*keys,)
-                        if scope != "Dimension":
-                            parameters += (dimension,)
-                        parameters += (object_id,)
-                        record = db.execute("SELECT custom_values FROM epm." +
-                            table + " WHERE workspace_id=%s AND application_id=%s" +
-                            where + " AND " + id_column +
-                            "=%s AND status='Active'", parameters).fetchone()
-                        if record is None:
-                            raise ValueError("ACTIVE_ATTRIBUTE_OBJECT_REQUIRED")
-                        result = {"scope": scope,
-                                  "dimensionId": dimension or None,
-                                  "objectId": object_id,
-                                  "definition": dict(definition),
-                                  "present": attribute in record["custom_values"],
-                                  "value": record["custom_values"].get(attribute)}
-                end = db.execute("""SELECT metadata_revision
-                    FROM epm.application_state WHERE workspace_id=%s
-                      AND application_id=%s""", keys).fetchone()
-                if (end is None or end["metadata_revision"] !=
-                        start["metadata_revision"]):
-                    raise ValueError("METADATA_CHANGED_DURING_READ")
-                return {**result,
-                        "metadataRevision": start["metadata_revision"]}
+        with self._read_snapshot(application) as (db, revision, authority):
+            result = {"scope": scope, "dimensionId": dimension or None, "metadataRevision": revision}
+            if function == DEFINITION_LIST:
+                if expected_revision is not None and revision != expected_revision:
+                    raise ValueError("STALE_METADATA_REVISION")
+                page_context = [DEFINITION_LIST, application.workspace_id, application.application_id,
+                    self.identity.issuer, self.identity.subject_id, scope, dimension, status, query,
+                    limit, revision, authority.scope_digest]
+                require_metadata_page_token(authority, self.cursor_secret,
+                                            page_context, after, page_token)
+            context_visible = not dimension or metadata_dimension_visible(
+                db, application, authority, dimension)
+            if function == DEFINITION_LIST:
+                if not context_visible:
+                    return {**result, "rows": [], "hasMore": False, "nextAfterAttributeId": None,
+                            **({"nextPageToken": None} if authority.policy is not None else {})}
+                target = metadata_dimension_reference_read_sql(authority, "a",
+                    sql.SQL("a.validation_constraints->>'referenceDimensionId'"))
+                rows = db.execute(sql.SQL("""SELECT attribute_id,default_name,
+                        display_name,short_description,semantic_description,value_type,
+                        CASE WHEN value_type='MemberReference' AND NOT {visible}
+                            THEN validation_constraints - 'referenceDimensionId'
+                            ELSE validation_constraints END AS validation_constraints,
+                        status,state_token
+                    FROM epm.attribute_definition a
+                    WHERE workspace_id=%s AND application_id=%s AND scope=%s AND dimension_id=%s
+                      AND (%s::text IS NULL OR status=%s)
+                      AND (%s='' OR attribute_id ILIKE '%%'||%s||'%%'
+                           OR display_name ILIKE '%%'||%s||'%%'
+                           OR semantic_description ILIKE '%%'||%s||'%%')
+                      AND (%s::text IS NULL OR attribute_id>%s)
+                    ORDER BY attribute_id LIMIT %s""").format(visible=target),
+                    (application.workspace_id, application.application_id,
+                     scope, dimension, status, status, query, query, query, query,
+                     after, after, limit + 1)).fetchall()
+                more = len(rows) > limit
+                next_id = rows[limit - 1]["attribute_id"] if more else None
+                result.update(rows=[dict(row) for row in rows[:limit]], hasMore=more,
+                              nextAfterAttributeId=next_id)
+                if authority.policy is not None:
+                    result["nextPageToken"] = (metadata_page_token(self.cursor_secret, page_context,
+                                                                  next_id) if next_id else None)
+                return result
+            if not context_visible:
+                raise ValueError("ATTRIBUTE_DEFINITION_UNAVAILABLE")
+            payload = {"scope": scope, "dimensionId": dimension, "attributeId": attribute}
+            definition = self._definition(db, application, payload)
+            if definition is None:
+                raise ValueError("ATTRIBUTE_DEFINITION_UNAVAILABLE")
+            if function == DEFINITION_USAGE:
+                detail = self._visible_usage(db, application, scope, dimension, definition, authority)
+            else:
+                detail = self._visible_value(db, application, scope, dimension, object_id, definition, authority)
+            target_dimension = definition["validation_constraints"].get("referenceDimensionId")
+            if target_dimension and not metadata_dimension_visible(db, application, authority, target_dimension):
+                definition = {**definition, "validation_constraints": {
+                    key: value for key, value in definition["validation_constraints"].items()
+                    if key != "referenceDimensionId"}}
+            return {**result, **detail, "definition": dict(definition)}
+
+
+def _attribute_constraint_schema(identifier):
+    from .metadata_read_contract import obj
+
+    return obj({
+        'allowedValues': {'anyOf': [{'type': 'array', 'maxItems': 1000,
+            'uniqueItems': True, 'items': {'type': 'string', 'minLength': 1, 'maxLength': 200}}, {'type': 'null'}]},
+        'referenceDimensionId': {'anyOf': [identifier, {'type': 'null'}]},
+        'maximumLength': {'type': ['integer', 'null'], 'minimum': 1, 'maximum': 10000},
+        'minimum': {'type': 'string'}, 'maximum': {'type': 'string'}}, [])
+
+
+def _attribute_scope_conditions(identifier):
+    return [
+        {'if': {'properties': {'scope': {'const': 'Dimension'}}},
+         'then': {'properties': {'dimensionId': {'type': 'null'}}}},
+        {'if': {'properties': {'scope': {'enum': ['Member', 'Relationship']}}},
+         'then': {'required': ['dimensionId'], 'properties': {'dimensionId': identifier}}}]
+
+
+def write_program_contract(function):
+    """Project the current attribute writes with their exact receipt envelope."""
+    from .metadata_read_contract import obj, read_contract, read_example
+
+    if function not in WRITE_FUNCTIONS:
+        return None
+    identifier = {'type': 'string', 'pattern': '^' + _ID.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    token = {'type': 'string', 'minLength': 64, 'maxLength': 64, 'pattern': '^[0-9a-f]{64}$'}
+    revision = {'type': 'integer', 'minimum': 0}
+    value = {'type': ['string', 'boolean', 'null']}
+    fields = {'scope': {'enum': sorted(_SCOPES)},
+              'dimensionId': {'anyOf': [identifier, {'type': 'null'}]},
+              'attributeId': identifier, 'expectedMetadataRevision': revision}
+    conditions = _attribute_scope_conditions(identifier)
+    common = {'scope': 'Member', 'dimensionId': 'Account', 'attributeId': 'unit',
+              'expectedMetadataRevision': 1}
+    base_binding = ('Use the current application and its metadataRevision from application.state.read. '
+                    'Confirm the exact effect before obtaining operation admission.')
+    names = {
+        DEFINITION_CREATE: 'Define a controlled measure unit',
+        DEFINITION_UPDATE: 'Update the current unit definition',
+        DEFINITION_STATUS: 'Deactivate an unused attribute definition',
+        VALUE_SET: 'Record the unit for a measure',
+        VALUES_REPLACE: 'Replace the declared units on the selected members',
+    }
+    example = dict(common)
+    binding = base_binding
+    if function in (DEFINITION_CREATE, DEFINITION_UPDATE):
+        fields.update({'displayName': {'type': 'string', 'minLength': 1, 'maxLength': 200},
+                       'shortDescription': {'type': 'string', 'maxLength': 500},
+                       'semanticDescription': {'type': 'string', 'maxLength': 10000},
+                       'valueType': {'enum': sorted(_TYPES)},
+                       'validationConstraints': _attribute_constraint_schema(identifier)})
+        conditions.extend([
+            {'if': {'properties': {'valueType': {'const': 'MemberReference'}}},
+             'then': {'properties': {'validationConstraints': {'required': ['referenceDimensionId'],
+                 'properties': {'referenceDimensionId': identifier}}}},
+             'else': {'properties': {'validationConstraints': {
+                 'properties': {'referenceDimensionId': {'type': 'null'}}}}}},
+            {'if': {'properties': {'valueType': {'not': {'const': 'Text'}}}},
+             'then': {'properties': {'validationConstraints': {'properties': {
+                 'allowedValues': {'type': 'null'}, 'maximumLength': {'type': 'null'}}}}}},
+            {'if': {'properties': {'valueType': {'not': {'const': 'Decimal'}}}},
+             'then': {'properties': {'validationConstraints': {'properties': {
+                 'minimum': False, 'maximum': False}}}}},
+        ])
+        example.update(displayName='Unit', shortDescription='Business unit for the measure',
+            semanticDescription='Use the unit in which the measure is authored.',
+            valueType='Text', validationConstraints={'allowedValues': ['hours', 'cases', 'cases-per-hour']})
+        if function == DEFINITION_CREATE:
+            fields['defaultName'] = fields['displayName']
+            example['defaultName'] = 'Unit'
+            binding += ' Use a new stable attribute ID within the selected scope.'
+        else:
+            example['displayName'] = 'Measure unit'
+    if function in (DEFINITION_UPDATE, DEFINITION_STATUS):
+        fields['expectedStateToken'] = token
+        example['expectedStateToken'] = 'a' * 64
+        binding += ' Use the exact state_token from the current attribute definition.'
+    if function == DEFINITION_STATUS:
+        fields['status'] = {'enum': ['Active', 'Inactive']}
+        example['status'] = 'Inactive'
+        binding += ' Inspect current usage before deactivation.'
+    elif function == VALUE_SET:
+        fields.update(objectId=identifier, value=value)
+        example.update(objectId='ProductiveHours', value='hours')
+        binding += ' Use an active object and the type and constraints from its current attribute definition.'
+    elif function == VALUES_REPLACE:
+        fields = {'scope': {'const': 'Member'}, 'dimensionId': identifier,
+            'attributeIds': {'type': 'array', 'minItems': 1, 'maxItems': _MAX_DEFINITIONS_PER_CONTEXT,
+                'uniqueItems': True, 'items': identifier},
+            'rows': {'type': 'array', 'minItems': 1, 'maxItems': _MAX_REPLACE_OBJECTS, 'items': obj({
+                'objectId': identifier,
+                'values': {'type': 'object', 'maxProperties': _MAX_DEFINITIONS_PER_CONTEXT,
+                    'propertyNames': identifier, 'additionalProperties': value}})},
+            'expectedMetadataRevision': revision}
+        conditions = []
+        example = {'scope': 'Member', 'dimensionId': 'Account', 'expectedMetadataRevision': 1,
+            'attributeIds': ['unit'], 'rows': [
+                {'objectId': 'ProductiveHours', 'values': {'unit': 'hours'}},
+                {'objectId': 'CompletedCases', 'values': {'unit': 'cases'}}]}
+        binding += ' Supply only declared attribute IDs. Omission or null clears a declared value for that row.'
+    required = [key for key in fields if key != 'dimensionId' or function == VALUES_REPLACE]
+    arguments = obj(fields, required)
+    if conditions:
+        arguments['allOf'] = conditions
+    examples = [read_example(function, example, name=names[function], binding=binding)]
+    if function == DEFINITION_STATUS:
+        examples.append(read_example(function, {**example, 'status': 'Active'},
+            name='Activate an inactive attribute definition',
+            binding=base_binding + ' Use the exact inactive definition state_token.'))
+    if function == VALUE_SET:
+        examples.append(read_example(function, {**example, 'value': None},
+            name='Clear the unit for a measure', binding=binding))
+    contract = read_contract(function, arguments, obj({
+        'function': {'const': function}, 'metadataRevision': revision, 'committedRevision': revision,
+        'contentDigest' if function == VALUES_REPLACE else 'stateToken': token,
+        'payloadDigest': token, 'impactDigest': token, 'operationId': {
+            'type': 'string', 'pattern': '^' + _KEY.pattern.removesuffix(r'\Z') + r'(?![\s\S])'},
+        'duplicate': {'type': 'boolean'}}), owner='PostgresAttributeCatalog.execute', examples=examples,
+        semantic_rules=[
+            'Definitions own value types and constraints. A blank Text value is present. Use null to clear a value. '
+            'Send exact Decimal strings, genuine Booleans, and stable member IDs for MemberReference values.',
+            'Replacement validates unique member identities, the complete declared attribute set, all values and the '
+            'native request byte and value limits before it publishes one change. Unlisted members and attributes remain unchanged.',
+            'The fixed core checks current application authority, the metadata revision, definition state, existing usage '
+            'and the identity and payload bound to the operation admission. Replay returns the original revision and digests.',
+        ])
+    contract['programContract']['recovery'] = (
+        'After a definite stale refusal, read the application state and current definition, review the change, and obtain '
+        'new admission. If the outcome is unknown, reconcile the original operation or replay the exact accepted request.')
+    return contract
+
+
+def read_program_contract(function):
+    if function not in READ_FUNCTIONS:
+        return None
+    from .metadata_read_contract import read_contract, read_example, obj
+    identifier = {'type': 'string', 'pattern': '^[A-Za-z][A-Za-z0-9._-]{0,199}$'}
+    revision = {'type': 'integer', 'minimum': 0}
+    scope = {'enum': sorted(_SCOPES)}
+    constraints = _attribute_constraint_schema(identifier)
+    definition = obj({'attribute_id': identifier, 'default_name': {'type': 'string'},
+        'display_name': {'type': 'string'}, 'short_description': {'type': 'string'},
+        'semantic_description': {'type': 'string'}, 'value_type': {'enum': sorted(_TYPES)},
+        'validation_constraints': constraints, 'status': {'enum': ['Active', 'Inactive']},
+        'state_token': {'type': 'string'}})
+    arguments = {'scope': scope, 'dimensionId': {'anyOf': [identifier, {'type': 'null'}]}}
+    required = ['scope']
+    common = {'scope': scope, 'dimensionId': {'anyOf': [identifier, {'type': 'null'}]},
+        'metadataRevision': revision}
+    conditions = _attribute_scope_conditions(identifier)
+    if function == DEFINITION_LIST:
+        page_token = {'type': 'string', 'pattern': r'^[0-9]{1,12}\.[0-9a-f]{64}$'}
+        arguments.update({'status': {'enum': ['Active', 'Inactive', None]},
+            'query': {'type': 'string', 'maxLength': 200},
+            'limit': {'type': 'integer', 'minimum': 1, 'maximum': 500},
+            'afterAttributeId': {'anyOf': [identifier, {'type': 'null'}]},
+            'expectedMetadataRevision': revision,
+            'expectedPageToken': page_token})
+        conditions.append({'if': {'required': ['expectedPageToken']},
+            'then': {'required': ['afterAttributeId', 'expectedMetadataRevision'],
+                     'properties': {'afterAttributeId': identifier}}})
+        result_fields = {**common, 'rows': {'type': 'array', 'maxItems': 500, 'items': definition},
+            'hasMore': {'type': 'boolean'},
+            'nextAfterAttributeId': {'anyOf': [identifier, {'type': 'null'}]}}
+        result = obj({**result_fields, 'nextPageToken': {'anyOf': [page_token, {'type': 'null'}]}},
+                     list(result_fields))
+    else:
+        arguments['attributeId'] = identifier
+        required.append('attributeId')
+        if function == VALUE_READ:
+            arguments['objectId'] = identifier
+            required.append('objectId')
+            result = obj({**common, 'objectId': identifier, 'definition': definition,
+                'present': {'type': 'boolean'}, 'value': {'type': ['string', 'boolean', 'null']}})
+            result['allOf'] = [{'if': {'properties': {'present': {'const': False}}},
+                'then': {'properties': {'value': {'type': 'null'}}}}]
+        else:
+            result = obj({**common, 'definition': definition,
+                'valueCount': revision, 'sampleObjectIds': {'type': 'array', 'maxItems': 50,
+                    'items': identifier}, 'sampleTruncated': {'type': 'boolean'}})
+    shape = obj(arguments, required)
+    shape['allOf'] = conditions
+    example = {'scope': 'Member', 'dimensionId': 'custom-axis'}
+    if function != DEFINITION_LIST:
+        example['attributeId'] = 'category'
+    if function == VALUE_READ:
+        example['objectId'] = 'member-a'
+    return read_contract(function, shape, result, owner='PostgresAttributeCatalog.read',
+        examples=[read_example(function, example, name='Read current typed metadata',
+            binding='Use a current dimension and, when required, attribute/object IDs returned by authorized metadata lists. No fact value or source-provenance access is implied.')],
+        semantic_rules=['Native text/NUL rules, typed constraints and current authority remain authoritative.',
+            'Dimension and object READ apply before disclosure. An inaccessible typed reference reads as absent. Usage counts and samples include only authorized objects and reference targets, or refuse a mixed selection under reject_all.',
+            'Decimal attributes travel as exact decimal strings; a blank Text value differs from an absent attribute. MemberReference values remain stable member IDs.',
+            'Continue with the same scope, filters and limit. Use the exact nextAfterAttributeId and, when returned, nextPageToken as expectedPageToken with the prior metadataRevision as expectedMetadataRevision.',
+            'An active dimensional policy requires a signed continuation bound to the caller, application, query, revision and effective access. On METADATA_DIRECTORY_CURSOR_REQUIRED or METADATA_DIRECTORY_CURSOR_STALE, discard prior pages and restart.',
+            'The core rechecks effective application access before returning a result. On METADATA_ATTRIBUTE_READ_AUTHORIZATION_STALE, refresh the current application catalogue and restart the read.',
+            'Usage returns a bounded sample plus the exact total; sampleTruncated distinguishes those quantities.'])

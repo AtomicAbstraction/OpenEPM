@@ -11,14 +11,26 @@ COMPILER = 'ordered-numeric-expressions-v2'
 PLAN_DIGEST = _canonical_digest({'version': 2, 'function': 'facts.numeric.sequence',
     'types': 'shared_expression_kernel', 'arithmetic': 'exact_integer_rationals',
     'rounding': 'half_even_8_at_statement_boundary_including_add',
+    'roundedUnitConversion': 'exact_numeric_scale_eight',
     'conditionals': 'only_selected_errors_propagate', 'nodesPerExpression': 64,
     'depth': 12, 'nodesPerProgram': 2048, 'statements': 500,
     'engine': 'postgres_exact_recursive_sql', 'events': 'one_atomic_commit'})
+
+# The shared expression kernel also serves other execution profiles. Its new
+# nodes must never become ordered instructions without an explicit owner change.
+_EXPRESSION_OPERATIONS = frozenset((
+    'AmountLiteral', 'RatioLiteral', 'Add', 'Subtract', 'Multiply', 'Divide',
+    'Compare', 'If', 'CurrentAmount', 'CurrentPresent',
+    'StatementAmount', 'StatementPresent',
+))
+_INSTRUCTION_OPERATIONS = _EXPRESSION_OPERATIONS | {'Publish'}
 
 
 def compile_expression(raw, statement_index):
     def leaves(node):
         op = node.get('op')
+        if type(op) is not str or op not in _EXPRESSION_OPERATIONS:
+            raise ValueError('NUMERIC_SEQUENCE_EXPRESSION_SOURCE_UNSUPPORTED')
         if op in ('StatementAmount', 'StatementPresent'):
             if (set(node) != {'op', 'statementIndex'}
                     or type(node['statementIndex']) is not int
@@ -29,8 +41,6 @@ def compile_expression(raw, statement_index):
             if set(node) != {'op'}:
                 raise ValueError('NUMERIC_SEQUENCE_EXPRESSION_CURRENT_INVALID')
             return dict(node), 'amount' if op == 'CurrentAmount' else 'boolean'
-        if op in ('SourceAmount', 'SourceValue', 'PublishedAmount'):
-            raise ValueError('NUMERIC_SEQUENCE_EXPRESSION_SOURCE_UNSUPPORTED')
         return None
     normalized, kind = _expression(raw, leaf_parser=leaves)
     if kind != 'amount':
@@ -44,6 +54,9 @@ def instructions(rows):
     for row in rows:
         local = []
         def visit(node):
+            if (not isinstance(node, dict) or type(node.get('op')) is not str
+                    or node['op'] not in _EXPRESSION_OPERATIONS):
+                raise ValueError('NUMERIC_SEQUENCE_EXPRESSION_INSTRUCTION_INVALID')
             item = {'op': node['op']}
             for field in ('left', 'right', 'test', 'then', 'else'):
                 if field in node: item[field + '_index'] = visit(node[field])
@@ -84,6 +97,10 @@ def evaluate_partitions(db, tape, partitions, *, exact_results=False):
     """
     if type(exact_results) is not bool:
         raise ValueError('NUMERIC_SEQUENCE_EXACT_MODE_INVALID')
+    if (not isinstance(tape, list) or any(not isinstance(item, dict)
+            or type(item.get('op')) is not str or item['op'] not in _INSTRUCTION_OPERATIONS
+            for item in tape)):
+        raise ValueError('NUMERIC_SEQUENCE_EXPRESSION_INSTRUCTION_INVALID')
     if exact_results and any(item.get('op') in (
             'StatementAmount', 'StatementPresent', 'CurrentAmount', 'CurrentPresent')
             or item.get('op') == 'Publish' and item.get('mutation') != 'set'
@@ -91,10 +108,13 @@ def evaluate_partitions(db, tape, partitions, *, exact_results=False):
         raise ValueError('NUMERIC_SEQUENCE_EXACT_PREPARED_INPUT_REQUIRED')
     # The opt-in prepared-input projection exposes the same exact register
     # arithmetic. It must not evaluate an eight-place rounded cast first.
+    # The integer unit count is already half-even rounded. Multiplication by
+    # a scale-eight numeric preserves it exactly; numeric division can choose
+    # a smaller scale at large magnitudes and round again before the cast.
     rounding_sql = "NULL::numeric" if exact_results else """CASE WHEN i.op='Publish' AND i.mutation<>'clear'
                 AND coalesce(value.cell->>'error','')='' THEN
                 (sign(scaled.n)*(remainder.q+CASE WHEN remainder.r*2>scaled.d OR
-                    (remainder.r*2=scaled.d AND mod(remainder.q,2)=1) THEN 1 ELSE 0 END)/100000000)::numeric(28,8)
+                    (remainder.r*2=scaled.d AND mod(remainder.q,2)=1) THEN 1 ELSE 0 END)*0.00000001)::numeric(28,8)
                 ELSE NULL END"""
     result_sql = ("partition_key,statement_ordinal ordinal,"
         "(registers->-1->>'n')::numeric numerator,"

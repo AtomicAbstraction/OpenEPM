@@ -349,10 +349,12 @@ def verify_access_jwt(token: str, audience: str, *, jwks: dict | None = None,
                                 login_id)):
         raise AuthError('Access token has no bounded native user identity',
                         code='AUTH_IDENTITY_INVALID')
-    groups=claim.get('groups',[])
+    groups=claim.get('openepm_group_ids',[])
     if (not isinstance(groups,list) or len(groups)>100
             or any(not isinstance(group,str) or not group
-                   or len(group)>300 or '*' in group for group in groups)
+                   or len(group)>300 or group != group.strip() or '*' in group
+                   or any(ord(character)<32 for character in group)
+                   for group in groups)
             or len(groups)!=len(set(groups))):
         raise AuthError('Access token has invalid group claims',
                         code='AUTH_GROUPS_INVALID')

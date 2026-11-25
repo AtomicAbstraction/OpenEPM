@@ -127,7 +127,7 @@ it("bounds a 10,000-row and 200-attribute catalogue without accessibility violat
   expect(within(relationshipTable).getAllByRole("row")).toHaveLength(51);
   expect(within(memberTable).getAllByRole("columnheader")).toHaveLength(25);
   expect(within(relationshipTable).getAllByRole("columnheader")).toHaveLength(
-    26,
+    25,
   );
   expect(screen.getAllByRole("checkbox")).toHaveLength(400);
   expect(

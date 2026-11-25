@@ -1,14 +1,28 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
+  ApiError,
+  prepareAdmittedProgramEffect,
+  replayAdmittedEffect,
+  type AdmittedEffectPacket,
   readCatalog,
   readProgram,
   request,
-  requestAdmittedProgramEffect,
 } from "./api";
-import { collectCapabilityDimensions } from "./metadata-data";
+import {
+  activeFactDimensions,
+  collectCapabilityDimensions,
+  type MetadataDimension,
+} from "./metadata-data";
 import { ReceiptInspector } from "./ReceiptInspector";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
 import { usePreservedDraft } from "./unsaved-work";
+import { ExactScopeSelector, serializedExactScope } from "./ExactScopeSelector";
+import { transferAction } from "./data-transfer-action";
+import {
+  ImportChangeReview,
+  validateImportReview,
+  type ImportReview,
+} from "./ImportChangeReview";
 import "./data-workspaces.css";
 
 type PreparedInput = {
@@ -16,6 +30,7 @@ type PreparedInput = {
   bytes: number;
   digest: string;
   name: string;
+  emptyReplacementDimensions?: string[];
   sourceBundle?: {
     artifactId: string;
     bundleDigest: string;
@@ -34,7 +49,37 @@ type Diagnostic = {
   message: string;
 };
 
+type StagingAttempt = {
+  identity: string;
+  context: string;
+  inputDigest: string;
+  mode: string;
+  scopeMembers: Record<string, string>;
+  scopeAll: boolean;
+  metadataRevision: number;
+  dataRevision: number;
+  step: "begin" | "append" | "seal" | "manifest" | "ready";
+  nextChunk: number;
+  acknowledgedChunkRows?: number[];
+  // Older drafts used raw UTF-8 sizes. Their admitted chunk boundaries still apply.
+  chunkEncoding?: "json";
+  batch: BatchProgress | null;
+  packet: AdmittedEffectPacket | null;
+  // Undefined on older restored records means the packet may already have run.
+  packetDispatched?: boolean;
+  inputRejection?: {
+    code: string;
+    packet: AdmittedEffectPacket;
+    correctionText: string;
+  };
+};
+
 type ImportState = {
+  staging: StagingAttempt | null;
+  review: ImportReview | null;
+  publicationUncertain: boolean;
+  publicationPacket: AdmittedEffectPacket | null;
+  reviewContext: string;
   batchId: string;
   contentDigest: string;
   rowCount: number;
@@ -46,15 +91,29 @@ type ImportState = {
   warningCount: number;
   requestId: string;
   status: string;
+  retryPending: boolean;
   committedRevision: number | null;
   receiptId: string;
 };
 
 type ImportIntentKeys = {
   begin: string;
+  append?: string;
   manifest: string;
   publish: string;
 };
+
+const importActivityMessages = {
+  stage: "Staging CSV…",
+  reconcileStage: "Checking the original staging step…",
+  correct: "Reviewing corrected CSV…",
+  preview: "Checking exact import changes…",
+  publish: "Submitting publication request…",
+  reconcilePublication: "Checking the original publication…",
+  status: "Checking publication status…",
+  diagnostics: "Reading validation diagnostics…",
+};
+type StagingControl = "reconcile" | "continue" | "correct";
 
 export function newImportIntentKeys(): ImportIntentKeys {
   return {
@@ -65,6 +124,11 @@ export function newImportIntentKeys(): ImportIntentKeys {
 }
 
 const EMPTY_STATE: ImportState = {
+  staging: null,
+  review: null,
+  publicationUncertain: false,
+  publicationPacket: null,
+  reviewContext: "",
   batchId: "",
   contentDigest: "",
   rowCount: 0,
@@ -76,6 +140,7 @@ const EMPTY_STATE: ImportState = {
   warningCount: 0,
   requestId: "",
   status: "",
+  retryPending: false,
   committedRevision: null,
   receiptId: "",
 };
@@ -121,11 +186,23 @@ async function sha256(text: string) {
     .join("");
 }
 
+function compareUnicodeCodePoints(left: string, right: string): number {
+  // Native export identities use Python's Unicode code-point key ordering.
+  // Locale collation and JavaScript's UTF-16 ordering both produce different
+  // hashed bytes for valid dimension IDs; neither may define a checksum.
+  const a = Array.from(left, (character) => character.codePointAt(0)!);
+  const b = Array.from(right, (character) => character.codePointAt(0)!);
+  for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
+    if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  return a.length - b.length;
+}
+
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   return `{${Object.entries(value as Record<string, unknown>)
-    .sort(([left], [right]) => left.localeCompare(right))
+    .sort(([left], [right]) => compareUnicodeCodePoints(left, right))
     .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
     .join(",")}}`;
 }
@@ -455,10 +532,11 @@ export async function exportBundleToCsv(text: string): Promise<{
 
 const MAX_CSV_ROWS_PER_CHUNK = 500;
 const MAX_CSV_CHUNK_BYTES = 4_000_000;
+type CsvChunkEncoding = "raw" | "json";
 const BATCH_ID = /^[0-9a-f]{32}$/;
 const CONTENT_DIGEST = /^[0-9a-f]{64}$/;
 
-function exampleImportCsv(dimensions: string[]): string {
+function exampleImportCsv(dimensions: string[], numericOnly: boolean): string {
   const header = [
     ...dimensions.map((dimension) => `axis.${dimension}`),
     "literalType",
@@ -470,7 +548,7 @@ function exampleImportCsv(dimensions: string[]): string {
   const examples = [
     ["AmountLiteral", "100.00000000", "example-amount"],
     ["AmountLiteral", "0.00000000", "example-zero"],
-    ["TextLiteral", "", "example-empty-text"],
+    ...(numericOnly ? [] : [["TextLiteral", "", "example-empty-text"]]),
   ];
   return [
     header,
@@ -489,6 +567,10 @@ function exampleImportCsv(dimensions: string[]): string {
 
 function encodeCsvCell(value: string) {
   return /[",\r\n]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
+}
+
+function encodeCsvRecord(record: string[]): string {
+  return record.map(encodeCsvCell).join(",");
 }
 
 function parseCsvRecords(text: string): string[][] {
@@ -552,32 +634,166 @@ export function csvRowCount(text: string): number {
 
 export function csvChunks(text: string): string[] {
   const [header, ...rows] = parseCsvRecords(text);
-  const line = (row: string[]) => row.map(encodeCsvCell).join(",");
-  const headerLine = line(header);
+  return planCsvChunks(header, rows, "json");
+}
+
+function planCsvChunks(
+  header: string[],
+  rows: string[][],
+  encoding: CsvChunkEncoding,
+): string[] {
+  const encoder = new TextEncoder();
+  const lineBytes = (line: string) =>
+    encoding === "raw"
+      ? encoder.encode(line).length
+      : encoder.encode(JSON.stringify(line)).length - 2;
+  const separatorBytes = encoding === "raw" ? 1 : 2;
+  const headerLine = encodeCsvRecord(header);
+  // Leave room for the program and its recovery reference outside the CSV string.
+  const headerBytes = lineBytes(headerLine);
   const chunks: string[] = [];
   let current: string[] = [];
+  let currentBytes = headerBytes;
   for (const row of rows) {
-    const encoded = line(row);
-    const candidate = [headerLine, ...current, encoded].join("\n");
-    if (
-      current.length &&
-      (current.length >= MAX_CSV_ROWS_PER_CHUNK ||
-        new TextEncoder().encode(candidate).length > MAX_CSV_CHUNK_BYTES)
-    ) {
-      chunks.push([headerLine, ...current].join("\n"));
-      current = [];
-    }
-    if (
-      new TextEncoder().encode([headerLine, encoded].join("\n")).length >
-      MAX_CSV_CHUNK_BYTES
-    )
+    const encoded = encodeCsvRecord(row);
+    const rowBytes = separatorBytes + lineBytes(encoded);
+    if (headerBytes + rowBytes > MAX_CSV_CHUNK_BYTES)
       throw new Error(
         "A single CSV record is too large for the bounded upload envelope.",
       );
+    if (
+      current.length &&
+      (current.length >= MAX_CSV_ROWS_PER_CHUNK ||
+        currentBytes + rowBytes > MAX_CSV_CHUNK_BYTES)
+    ) {
+      chunks.push([headerLine, ...current].join("\n"));
+      current = [];
+      currentBytes = headerBytes;
+    }
     current.push(encoded);
+    currentBytes += rowBytes;
   }
   if (current.length) chunks.push([headerLine, ...current].join("\n"));
   return chunks;
+}
+
+/** Retain the acknowledged prefix exactly; only unsubmitted rows may change. */
+export function correctedCsvRemainder(
+  original: string,
+  nextChunk: number,
+  correction: string,
+  acknowledgedChunkRows?: number[],
+  encoding: CsvChunkEncoding = "json",
+): { text: string; acknowledgedChunkRows: number[] } {
+  const chunks = stagingCsvChunks(original, acknowledgedChunkRows, encoding);
+  if (
+    !Number.isSafeInteger(nextChunk) ||
+    nextChunk < 0 ||
+    nextChunk >= chunks.length ||
+    (acknowledgedChunkRows !== undefined &&
+      acknowledgedChunkRows.length !== nextChunk)
+  )
+    throw new Error("The original CSV correction boundary is unavailable.");
+  const [header, ...originalRows] = parseCsvRecords(original);
+  const [correctedHeader, ...remaining] = parseCsvRecords(correction);
+  if (nextChunk > 0 && canonicalJson(header) !== canonicalJson(correctedHeader))
+    throw new Error("Keep the original CSV header and coordinate columns.");
+  const prefix = chunks
+    .slice(0, nextChunk)
+    .flatMap((chunk) => parseCsvRecords(chunk).slice(1));
+  const text = [
+    nextChunk === 0 ? correctedHeader : header,
+    ...prefix,
+    ...remaining,
+  ]
+    .map(encodeCsvRecord)
+    .join("\n");
+  if (prefix.length + remaining.length > 100_000)
+    throw new Error("Corrected CSV exceeds the 100,000-row import limit.");
+  if (new TextEncoder().encode(text).length > 8_000_000)
+    throw new Error("Corrected UTF-8 CSV content is limited to 8 MB.");
+  const boundaries = chunks.slice(0, nextChunk).map(csvRowCount);
+  const revised = stagingCsvChunks(text, boundaries);
+  if (
+    chunks.slice(0, nextChunk).some((chunk, index) => revised[index] !== chunk)
+  )
+    throw new Error("Correction must preserve every acknowledged CSV chunk.");
+  if (text === [header, ...originalRows].map(encodeCsvRecord).join("\n"))
+    throw new Error(
+      "Correct the rejected input before reviewing a new request.",
+    );
+  return { text, acknowledgedChunkRows: boundaries };
+}
+
+export function stagingCsvChunks(
+  text: string,
+  acknowledgedChunkRows: number[] = [],
+  encoding: CsvChunkEncoding = "json",
+): string[] {
+  const [header, ...rows] = parseCsvRecords(text);
+  let offset = 0;
+  const chunks: string[] = [];
+  for (const count of acknowledgedChunkRows) {
+    if (
+      !Number.isSafeInteger(count) ||
+      count < 1 ||
+      count > MAX_CSV_ROWS_PER_CHUNK ||
+      offset + count > rows.length
+    )
+      throw new Error("The acknowledged CSV chunk boundaries are unavailable.");
+    const chunk = [header, ...rows.slice(offset, offset + count)]
+      .map(encodeCsvRecord)
+      .join("\n");
+    if (new TextEncoder().encode(chunk).length > MAX_CSV_CHUNK_BYTES)
+      throw new Error(
+        "An acknowledged CSV chunk exceeds the original upload bound.",
+      );
+    chunks.push(chunk);
+    offset += count;
+  }
+  if (offset < rows.length)
+    chunks.push(...planCsvChunks(header, rows.slice(offset), encoding));
+  return chunks;
+}
+
+function csvRemainder(chunks: string[], nextChunk: number): string {
+  const remaining = chunks
+    .slice(nextChunk)
+    .flatMap((chunk, index) => parseCsvRecords(chunk).slice(index ? 1 : 0));
+  return remaining.map(encodeCsvRecord).join("\n");
+}
+
+function csvInputRejected(
+  reason: unknown,
+  operation: unknown,
+): reason is ApiError {
+  if (
+    !(reason instanceof ApiError) ||
+    reason.status !== 400 ||
+    !object(operation)
+  )
+    return false;
+  const declaration = operation.inputRejections;
+  return (
+    object(declaration) &&
+    Object.keys(declaration).sort().join(",") ===
+      "changedInput,codes,firstDispatchOnly,format,httpStatus,phase,priorUncertainty" &&
+    declaration.format === "openepm-csv-input-rejections-v1" &&
+    declaration.phase === "before_chunk_write" &&
+    declaration.httpStatus === 400 &&
+    declaration.firstDispatchOnly === true &&
+    declaration.priorUncertainty === "retain_original" &&
+    declaration.changedInput === "new_admission" &&
+    Array.isArray(declaration.codes) &&
+    declaration.codes.length > 0 &&
+    declaration.codes.length <= 32 &&
+    declaration.codes.every(
+      (code) =>
+        typeof code === "string" && /^[A-Z][A-Z0-9_]{2,127}$/.test(code),
+    ) &&
+    new Set(declaration.codes).size === declaration.codes.length &&
+    declaration.codes.includes(reason.code)
+  );
 }
 
 type BatchProgress = {
@@ -603,6 +819,7 @@ type ImportExecution = {
 };
 
 type ImportPreview = {
+  review: ImportReview;
   previewToken: string;
   setCount: number;
   clearCount: number;
@@ -615,13 +832,14 @@ type ImportPreview = {
 
 function exactImportPreview(
   value: unknown,
-  batchId: string,
-  contentDigest: string,
+  staged: StagingAttempt & { batch: BatchProgress },
+  factDimensions: readonly string[],
 ): ImportPreview {
   if (
     !object(value) ||
-    value.batchId !== batchId ||
-    value.contentDigest !== contentDigest ||
+    value.batchId !== staged.batch.batchId ||
+    value.contentDigest !== staged.batch.contentDigest ||
+    (value.mode !== undefined && value.mode !== staged.mode) ||
     typeof value.previewToken !== "string" ||
     !value.previewToken ||
     !Number.isSafeInteger(value.setCount) ||
@@ -640,6 +858,30 @@ function exactImportPreview(
             Number(value.diagnostics.warningCount) < 0))))
   )
     throw new Error("INVALID_SOURCE_PREVIEW_RESPONSE");
+  if (value.setCount !== staged.batch.rowCount)
+    throw new Error(
+      "The preview set count does not match the sealed row count.",
+    );
+  const review = validateImportReview(
+    value.review,
+    staged.mode,
+    { setCount: Number(value.setCount), clearCount: Number(value.clearCount) },
+    factDimensions,
+  );
+  if (
+    review.scopeAll !== staged.scopeAll ||
+    canonicalJson(review.scopeMembers) !== canonicalJson(staged.scopeMembers) ||
+    review.periodSelection !== null
+  )
+    throw new Error("SOURCE_PREVIEW_SCOPE_MISMATCH");
+  // The core may preview a replacement at a newer data revision after
+  // proving the replacement scope has not changed.
+  if (
+    review.metadataRevision !== staged.metadataRevision ||
+    review.dataRevision < staged.dataRevision ||
+    (staged.mode === "merge" && review.dataRevision !== staged.dataRevision)
+  )
+    throw new Error("The preview revisions do not match the sealed import.");
   return value as unknown as ImportPreview;
 }
 
@@ -652,16 +894,37 @@ const IMPORT_STATUSES = new Set([
   "Cancelled",
 ]);
 
+type CompletionIdentity = {
+  batchId: string;
+  contentDigest: string;
+  mode: string;
+  setCount: number;
+  clearCount: number;
+  committedRevision?: number | null;
+};
+
+function exactImportReceipt(result: unknown, expected: CompletionIdentity) {
+  if (
+    !object(result) ||
+    result.batchId !== expected.batchId ||
+    result.contentDigest !== expected.contentDigest ||
+    result.mode !== expected.mode ||
+    result.setCount !== expected.setCount ||
+    result.clearCount !== expected.clearCount ||
+    result.changedCount !== expected.setCount + expected.clearCount ||
+    !Number.isSafeInteger(result.committedRevision) ||
+    Number(result.committedRevision) < 1 ||
+    (expected.committedRevision != null &&
+      result.committedRevision !== expected.committedRevision)
+  )
+    throw new Error("INVALID_IMPORT_COMPLETION_RESPONSE");
+  return result;
+}
+
 export function exactImportExecution(
   value: unknown,
-  expected: {
+  expected: CompletionIdentity & {
     requestId?: string;
-    batchId: string;
-    contentDigest: string;
-    mode: string;
-    setCount: number;
-    clearCount: number;
-    committedRevision?: number | null;
     terminalStatus?: string;
   },
 ): ImportExecution {
@@ -689,25 +952,20 @@ export function exactImportExecution(
     throw new Error("INVALID_IMPORT_EXECUTION_RESPONSE");
 
   const terminal = ["Completed", "Failed", "Cancelled"].includes(value.status);
-  if (!terminal && (value.result !== null || value.errorCode !== null))
+  const retryPending =
+    value.status === "Accepted" &&
+    typeof value.errorCode === "string" &&
+    value.errorCode.length > 0 &&
+    value.errorCode.length <= 200;
+  if (
+    !terminal &&
+    (value.result !== null || (!retryPending && value.errorCode !== null))
+  )
     throw new Error("INVALID_IMPORT_EXECUTION_RESPONSE");
 
   if (value.status === "Completed") {
-    const result = value.result;
-    if (
-      !object(result) ||
-      result.batchId !== expected.batchId ||
-      result.contentDigest !== expected.contentDigest ||
-      result.mode !== expected.mode ||
-      result.setCount !== expected.setCount ||
-      result.clearCount !== expected.clearCount ||
-      result.changedCount !== expected.setCount + expected.clearCount ||
-      !Number.isSafeInteger(result.committedRevision) ||
-      Number(result.committedRevision) < 1 ||
-      (expected.committedRevision != null &&
-        result.committedRevision !== expected.committedRevision) ||
-      value.errorCode !== null
-    )
+    exactImportReceipt(value.result, expected);
+    if (value.errorCode !== null)
       throw new Error("INVALID_IMPORT_COMPLETION_RESPONSE");
   } else if (terminal) {
     if (value.result !== null)
@@ -751,39 +1009,172 @@ export function DataLoad({
   app?: ApplicationSummary;
   catalog: ApplicationCatalog | null;
 }) {
+  const grouped =
+    catalog?.applicationAccess.authorizationModel === "group_assignments";
   const [csv, setCsv] = useState("");
   const [prepared, setPrepared] = useState<PreparedInput | null>(null);
-  const [mode, setMode] = useState("merge");
-  const [scopeText, setScopeText] = useState("");
-  const [scopeAll, setScopeAll] = useState(false);
-  const [allowWarnings, setAllowWarnings] = useState(false);
+  const [selectedMode, setMode] = useState("merge");
+  const [selectedScopeText, setScopeText] = useState("");
+  const [selectedScopeAll, setScopeAll] = useState(false);
+  const [selectedWarnings, setAllowWarnings] = useState(false);
+  const mode = grouped ? "merge" : selectedMode;
+  const scopeText = grouped ? "" : selectedScopeText;
+  const scopeAll = grouped || selectedScopeAll;
+  const allowWarnings = !grouped && selectedWarnings;
   const [reviewedStage, setReviewedStage] = useState(false);
   const [reviewedPublish, setReviewedPublish] = useState(false);
   const [state, setState] = useState(EMPTY_STATE);
   const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([]);
   const [intentKeys, setIntentKeys] = useState(newImportIntentKeys);
-  const [busy, setBusy] = useState(false);
+  const [activity, setActivity] = useState<
+    keyof typeof importActivityMessages | null
+  >(null);
+  const busy = activity !== null;
+  const [focusedStagingControl, setFocusedStagingControl] =
+    useState<StagingControl | null>(null);
+  const rejectionDescriptionId = useId();
+  const stageRunning = useRef(false);
   const [error, setError] = useState("");
   const [inspectReceipt, setInspectReceipt] = useState(false);
+  const [missingStage, setMissingStage] = useState<string | null>(null);
+  const [missingPublication, setMissingPublication] = useState<string | null>(
+    null,
+  );
+  const identity = JSON.stringify([
+    app?.workspaceId,
+    app?.applicationId,
+    catalog?.applicationAccess.issuer,
+    catalog?.applicationAccess.subjectId,
+    ...(grouped ? ["numeric_merge"] : []),
+  ]);
+  const appendOperation = catalog?.functions["facts.source.csv.append"];
+  const context = JSON.stringify([
+    identity,
+    catalog?.accessContext,
+    catalog?.applicationAccess,
+    catalog?.revisions,
+    Object.keys(catalog?.functions || {}).sort(),
+    object(appendOperation) ? appendOperation.inputRejections : null,
+  ]);
+  const live = useRef({ identity, context, generation: 0, mounted: true });
+  if (live.current.context !== context) live.current.generation += 1;
+  live.current.identity = identity;
+  live.current.context = context;
+  useEffect(() => {
+    live.current.mounted = true;
+    return () => {
+      live.current.mounted = false;
+      live.current.generation += 1;
+    };
+  }, []);
+  const priorIdentity = useRef(identity);
+  useEffect(() => {
+    if (priorIdentity.current !== identity) {
+      priorIdentity.current = identity;
+      setCsv("");
+      setPrepared(null);
+      setMode("merge");
+      setScopeText("");
+      setScopeAll(false);
+      setAllowWarnings(false);
+      setInspectReceipt(false);
+      setFocusedStagingControl(null);
+      setState(EMPTY_STATE);
+      setIntentKeys(newImportIntentKeys());
+      setReviewedStage(false);
+    } else {
+      setState((current) =>
+        current.reviewContext && current.reviewContext !== context
+          ? {
+              ...current,
+              review: null,
+              reviewContext: "",
+              previewToken: current.publicationUncertain
+                ? current.previewToken
+                : "",
+            }
+          : current,
+      );
+    }
+    setReviewedPublish(false);
+    setDiagnostics([]);
+    setError("");
+    setActivity(null);
+    setMissingPublication(null);
+    setMissingStage(null);
+  }, [context, identity]);
+  function ticket() {
+    const generation = ++live.current.generation;
+    return () =>
+      live.current.mounted &&
+      live.current.context === context &&
+      live.current.generation === generation;
+  }
+  function stagingAction(
+    control: StagingControl,
+    blocked: boolean,
+    run: () => Promise<void>,
+  ) {
+    return {
+      ...transferAction(blocked, run),
+      onFocus: () => setFocusedStagingControl(control),
+      onBlur: () => setFocusedStagingControl(null),
+    };
+  }
+  const reviewCurrent = state.reviewContext === context;
+  const showReview = reviewCurrent && state.review !== null;
+  const showCounts =
+    showReview ||
+    (!grouped && (state.publicationUncertain || !!state.requestId)) ||
+    (reviewCurrent && !!state.receiptId);
+
+  const sourceGrain = useMemo(() => {
+    if (!prepared) return null;
+    if (prepared.emptyReplacementDimensions)
+      return { dimensions: prepared.emptyReplacementDimensions, types: [] };
+    const [header, ...rows] = parseCsvRecords(prepared.text);
+    const typeColumn = header.indexOf("literalType");
+    const types = new Map<string, number>();
+    for (const row of rows) {
+      const kind = row[typeColumn] || "Missing type";
+      types.set(kind, (types.get(kind) || 0) + 1);
+    }
+    return {
+      dimensions: header
+        .filter((name) => name.startsWith("axis."))
+        .map((name) => name.slice(5)),
+      types: [...types.entries()],
+    };
+  }, [prepared]);
 
   const [example, setExample] = useState<{
     context: string;
     csv?: string;
     error?: string;
   } | null>(null);
+  const [scopeDimensions, setScopeDimensions] = useState<MetadataDimension[]>(
+    [],
+  );
+  const [scopeMetadataRevision, setScopeMetadataRevision] = useState<
+    number | null
+  >(null);
   const canReadDimensions = Boolean(
     catalog?.functions["metadata.dimension.list"],
   );
   const exampleContext = JSON.stringify([
     app?.workspaceId,
     app?.applicationId,
+    catalog?.accessContext,
     catalog?.applicationAccess.issuer,
     catalog?.applicationAccess.subjectId,
     catalog?.revisions.metadata,
     catalog?.revisions.security,
     canReadDimensions,
+    grouped,
   ]);
   useEffect(() => {
+    setScopeDimensions([]);
+    setScopeMetadataRevision(null);
     if (!app || !canReadDimensions) return;
     const controller = new AbortController();
     const context = exampleContext;
@@ -795,19 +1186,20 @@ export function DataLoad({
         controller.signal,
       ),
     )
-      .then(({ rows }) => {
+      .then(({ rows, finalPage }) => {
         if (controller.signal.aborted) return;
-        const dimensions = rows
-          .filter(
-            (row) => row.status === "Active" && row.model_role !== "Currency",
-          )
-          .map((row) => row.dimension_id);
+        const active = activeFactDimensions(rows);
+        setScopeDimensions(active);
+        setScopeMetadataRevision(finalPage.metadataRevision);
+        const dimensions = active.map((row) => row.dimension_id);
         if (!dimensions.length)
           throw new Error("No active fact dimensions are available.");
-        setExample({ context, csv: exampleImportCsv(dimensions) });
+        setExample({ context, csv: exampleImportCsv(dimensions, grouped) });
       })
       .catch((reason: unknown) => {
         if (controller.signal.aborted) return;
+        setScopeDimensions([]);
+        setScopeMetadataRevision(null);
         setExample({
           context,
           error:
@@ -817,19 +1209,53 @@ export function DataLoad({
         });
       });
     return () => controller.abort();
-  }, [exampleContext, app?.workspaceId, app?.applicationId, canReadDimensions]);
+  }, [
+    exampleContext,
+    app?.workspaceId,
+    app?.applicationId,
+    canReadDimensions,
+    grouped,
+  ]);
   const currentExample = example?.context === exampleContext ? example : null;
 
   const functions = catalog?.functions || {};
-  const canStage = [
-    "facts.source.begin",
-    "facts.source.csv.append",
-    "facts.source.seal",
-    "facts.source.manifest.attach",
-  ].every((name) => Object.hasOwn(functions, name));
+  const beginSpec = functions["facts.source.begin"];
+  const numericProfile =
+    object(beginSpec) && beginSpec.sourceImportProfile === "numeric_merge";
+  const supportedInput =
+    !grouped || sourceGrain?.types.every(([kind]) => kind === "AmountLiteral");
+  const emptyReplacementDimensions = prepared?.emptyReplacementDimensions;
+  const emptyReplacement = Boolean(emptyReplacementDimensions);
+  const canStage =
+    ["facts.source.begin", "facts.source.seal"].every((name) =>
+      Object.hasOwn(functions, name),
+    ) &&
+    (emptyReplacement ||
+      (Object.hasOwn(functions, "facts.source.csv.append") &&
+        (grouped
+          ? numericProfile
+          : Object.hasOwn(functions, "facts.source.manifest.attach"))));
   const canPreview = Object.hasOwn(functions, "facts.source.preview");
-  const canPublish = Object.hasOwn(functions, "facts.transfer.import.request");
+  const canPublish = Object.hasOwn(
+    functions,
+    grouped ? "facts.source.publish" : "facts.transfer.import.request",
+  );
   const canRead = Object.hasOwn(functions, "facts.transfer.import.read");
+  const canCheckStage = Object.hasOwn(functions, "facts.source.staging.read");
+  const stagingRead = functions["facts.source.staging.read"];
+  const canRecoverOriginal =
+    grouped &&
+    state.publicationUncertain &&
+    object(stagingRead) &&
+    stagingRead.publicationRecovery === "facts.source.publish";
+  const stagingPacket = state.staging?.packet;
+  const stagingMayHaveRun = Boolean(
+    stagingPacket && state.staging?.packetDispatched !== false,
+  );
+  const canRetryStage =
+    stagingMayHaveRun &&
+    canCheckStage &&
+    missingStage === stagingPacket?.body.idempotencyKey;
   const canReadDiagnostics = Object.hasOwn(
     functions,
     "facts.transfer.import.diagnostics.read",
@@ -841,51 +1267,99 @@ export function DataLoad({
       return null;
     }
   }, [scopeText]);
-  const scopeReady = scopeAll || Boolean(scope && Object.keys(scope).length);
+  const exactReplacementReady = Boolean(
+    mode === "replace" &&
+      !scopeAll &&
+      currentExample?.csv &&
+      scopeMetadataRevision === catalog?.revisions.metadata &&
+      scope &&
+      Object.keys(scope).length === scopeDimensions.length &&
+      scopeDimensions.every(({ dimension_id }) =>
+        Object.hasOwn(scope, dimension_id),
+      ),
+  );
+  const scopeReady = emptyReplacementDimensions
+    ? exactReplacementReady &&
+      scope &&
+      emptyReplacementDimensions.length === scopeDimensions.length &&
+      emptyReplacementDimensions.every((dimension) =>
+        Object.hasOwn(scope, dimension),
+      )
+    : scopeAll || Boolean(scope && Object.keys(scope).length);
+  const terminalPublication = ["Completed", "Failed", "Cancelled"].includes(
+    state.status,
+  );
+  const unresolvedPublication =
+    state.publicationUncertain ||
+    Boolean(state.requestId && !terminalPublication);
+  const retainedStaging = Boolean(
+    state.staging && !state.requestId && !state.receiptId,
+  );
+  const inputLocked = busy || unresolvedPublication || retainedStaging;
   const stageReady = Boolean(
-    app && prepared && scopeReady && canStage && reviewedStage,
+    app &&
+      prepared &&
+      supportedInput &&
+      scopeReady &&
+      canStage &&
+      reviewedStage &&
+      !state.staging,
   );
   const publishReady = Boolean(
-    state.batchId &&
-      state.previewToken &&
-      !state.errorCount &&
-      (!state.warningCount || allowWarnings) &&
-      canPublish &&
-      reviewedPublish,
+    (canPublish || canRecoverOriginal) &&
+      !state.requestId &&
+      !state.receiptId &&
+      state.batchId &&
+      (state.publicationUncertain
+        ? grouped
+          ? !!state.publicationPacket
+          : missingPublication &&
+            missingPublication === state.publicationPacket?.body.idempotencyKey
+        : reviewCurrent &&
+          state.previewToken &&
+          state.review &&
+          !state.errorCount &&
+          (!state.warningCount || allowWarnings) &&
+          reviewedPublish),
   );
   const hasUnpublishedInput = Boolean(
     !state.requestId &&
+      !state.receiptId &&
       (csv ||
         prepared ||
         mode !== "merge" ||
         scopeText ||
-        scopeAll ||
+        (selectedScopeAll && !grouped) ||
         allowWarnings ||
         reviewedStage ||
         reviewedPublish ||
         state.batchId ||
         state.previewToken),
   );
-  usePreservedDraft(
+  const draftValue = {
+    csv,
+    prepared,
+    mode,
+    scopeText,
+    scopeAll,
+    allowWarnings,
+    reviewedStage,
+    reviewedPublish,
+    state,
+    diagnostics,
+    intentKeys,
+    identity,
+  };
+  const recovery = usePreservedDraft(
     app?.workspaceId || "none",
     app?.applicationId || "none",
     "data-load-publication",
     "Unpublished data load",
-    hasUnpublishedInput,
-    {
-      csv,
-      prepared,
-      mode,
-      scopeText,
-      scopeAll,
-      allowWarnings,
-      reviewedStage,
-      reviewedPublish,
-      state,
-      diagnostics,
-      intentKeys,
-    },
+    hasUnpublishedInput || unresolvedPublication,
+    draftValue,
     (draft) => {
+      if (draft.identity !== identity) return;
+      live.current.generation += 1;
       setCsv(draft.csv);
       setPrepared(draft.prepared);
       setMode(draft.mode);
@@ -893,14 +1367,25 @@ export function DataLoad({
       setScopeAll(draft.scopeAll);
       setAllowWarnings(draft.allowWarnings);
       setReviewedStage(draft.reviewedStage);
-      setReviewedPublish(draft.reviewedPublish);
-      setState(draft.state);
-      setDiagnostics(draft.diagnostics);
+      // The server preview may expire while away even if cached revisions
+      // are unchanged. Restore input, never an unsubmitted approval.
+      setReviewedPublish(false);
+      setState({
+        ...draft.state,
+        review: null,
+        reviewContext: "",
+        previewToken: draft.state.publicationUncertain
+          ? draft.state.previewToken
+          : "",
+      });
+      setDiagnostics([]);
       setIntentKeys(draft.intentKeys);
     },
   );
 
   function resetAfterDraftChange() {
+    if (unresolvedPublication || retainedStaging) return;
+    live.current.generation += 1;
     setIntentKeys(newImportIntentKeys());
     setPrepared(null);
     setReviewedStage(false);
@@ -910,6 +1395,9 @@ export function DataLoad({
   }
 
   function invalidateTarget() {
+    if (unresolvedPublication || retainedStaging) return;
+    live.current.generation += 1;
+    if (emptyReplacement) setPrepared(null);
     setIntentKeys(newImportIntentKeys());
     setReviewedStage(false);
     setReviewedPublish(false);
@@ -917,7 +1405,36 @@ export function DataLoad({
     setDiagnostics([]);
   }
 
+  async function prepareEmptyReplacement() {
+    if (inputLocked || !exactReplacementReady || !scope) return;
+    resetAfterDraftChange();
+    setCsv("");
+    setError("");
+    const current = ticket();
+    const dimensions = scopeDimensions.map(({ dimension_id }) => dimension_id);
+    try {
+      const digest = await sha256(canonicalJson({ emptyReplacement: scope }));
+      if (current())
+        setPrepared({
+          text: "",
+          bytes: 0,
+          digest,
+          name: "Empty replacement",
+          emptyReplacementDimensions: dimensions,
+        });
+    } catch (reason) {
+      if (current())
+        setError(
+          reason instanceof Error
+            ? reason.message
+            : "Unable to prepare the empty replacement.",
+        );
+    }
+  }
+
   async function prepare() {
+    if (retainedStaging || unresolvedPublication) return;
+    const current = ticket();
     setError("");
     const bytes = new TextEncoder().encode(csv).length;
     if (!bytes) return setError("Paste UTF-8 CSV text first.");
@@ -930,244 +1447,627 @@ export function DataLoad({
         reason instanceof Error ? reason.message : "CSV is invalid.",
       );
     }
-    setPrepared({
-      text: csv,
-      bytes,
-      digest: await sha256(csv),
-      name: "pasted.csv",
-    });
-    setReviewedStage(false);
+    try {
+      const digest = await sha256(csv);
+      if (!current()) return;
+      setPrepared({ text: csv, bytes, digest, name: "pasted.csv" });
+      setReviewedStage(false);
+    } catch (reason) {
+      if (current())
+        setError(
+          reason instanceof Error ? reason.message : "Unable to prepare CSV",
+        );
+    }
   }
 
   async function prepareFile(file?: File) {
-    if (!file) return;
+    if (!file || retainedStaging || unresolvedPublication) return;
+    resetAfterDraftChange();
+    const current = ticket();
     setError("");
-    const isBundle =
-      file.name.toLowerCase().endsWith(".json") ||
-      file.type === "application/json";
-    const limit = isBundle ? 128 * 1024 * 1024 : 8_000_000;
-    if (file.size > limit)
-      return setError(
-        isBundle
-          ? "Export bundles are limited to 128 MiB in the browser re-import journey."
-          : "CSV files are limited to 8 MB.",
-      );
-    const original = await file.text();
-    if (new TextEncoder().encode(original).length > limit)
-      return setError("The UTF-8 source exceeds the browser import limit.");
-    let text = original;
-    let sourceBundle: PreparedInput["sourceBundle"];
-    if (isBundle) {
-      try {
-        const converted = await exportBundleToCsv(original);
-        if (converted.rowCount > 100_000)
+    try {
+      const isBundle =
+        file.name.toLowerCase().endsWith(".json") ||
+        file.type === "application/json";
+      if (grouped && isBundle)
+        return setError("Choose a CSV containing numeric amounts.");
+      const limit = isBundle ? 128 * 1024 * 1024 : 8_000_000;
+      if (file.size > limit)
+        return setError(
+          isBundle
+            ? "Export bundles are limited to 128 MiB in the browser re-import journey."
+            : "CSV files are limited to 8 MB.",
+        );
+      const original = await file.text();
+      if (!current()) return;
+      if (new TextEncoder().encode(original).length > limit)
+        return setError("The UTF-8 source exceeds the browser import limit.");
+      let text = original;
+      let sourceBundle: PreparedInput["sourceBundle"];
+      if (isBundle) {
+        try {
+          const converted = await exportBundleToCsv(original);
+          if (!current()) return;
+          if (converted.rowCount > 100_000)
+            return setError(
+              "Export bundle exceeds the 100,000-row import limit.",
+            );
+          text = converted.csv;
+          sourceBundle = {
+            artifactId: converted.artifactId,
+            bundleDigest: converted.bundleDigest,
+            manifestDigest: converted.manifestDigest,
+            payloadDigest: converted.payloadDigest,
+            chunkCount: converted.chunkCount,
+          };
+        } catch (reason) {
+          if (!current()) return;
           return setError(
-            "Export bundle exceeds the 100,000-row import limit.",
+            reason instanceof Error
+              ? reason.message
+              : "Export bundle is invalid.",
           );
-        text = converted.csv;
-        sourceBundle = {
-          artifactId: converted.artifactId,
-          bundleDigest: converted.bundleDigest,
-          manifestDigest: converted.manifestDigest,
-          payloadDigest: converted.payloadDigest,
-          chunkCount: converted.chunkCount,
-        };
+        }
+      }
+      const bytes = new TextEncoder().encode(text).length;
+      try {
+        csvChunks(text);
       } catch (reason) {
         return setError(
+          reason instanceof Error ? reason.message : "CSV is invalid.",
+        );
+      }
+      const digest = await sha256(text);
+      if (!current()) return;
+      setCsv("");
+      setPrepared({
+        text,
+        bytes,
+        digest,
+        name:
+          file.name.replace(/[\u0000-\u001f\u007f]/g, "_").slice(0, 1000) ||
+          "upload.csv",
+        sourceBundle,
+      });
+    } catch (reason) {
+      if (current())
+        setError(
           reason instanceof Error
             ? reason.message
-            : "Export bundle is invalid.",
+            : "Unable to read source file",
         );
-      }
     }
-    const bytes = new TextEncoder().encode(text).length;
-    try {
-      csvChunks(text);
-    } catch (reason) {
-      return setError(
-        reason instanceof Error ? reason.message : "CSV is invalid.",
-      );
-    }
-    setCsv("");
-    resetAfterDraftChange();
-    setPrepared({
-      text,
-      bytes,
-      digest: await sha256(text),
-      name:
-        file.name.replace(/[\u0000-\u001f\u007f]/g, "_").slice(0, 1000) ||
-        "upload.csv",
-      sourceBundle,
-    });
   }
 
-  async function stage() {
-    if (!app || !prepared || !scope || !stageReady) return;
-    setBusy(true);
+  async function stage(action: "continue" | "inspect" = "continue") {
+    if (
+      !app ||
+      !prepared ||
+      !scope ||
+      busy ||
+      stageRunning.current ||
+      unresolvedPublication
+    )
+      return;
+    const original = state.staging;
+    if (
+      original
+        ? original.identity !== identity ||
+          original.inputDigest !== prepared.digest ||
+          Boolean(original.inputRejection) ||
+          original.step === "ready"
+        : !stageReady || action === "inspect"
+    )
+      return;
+    if (
+      action === "continue" &&
+      original &&
+      (original.context !== context ||
+        !canStage ||
+        (stagingMayHaveRun && !canRetryStage))
+    )
+      return;
+    if (action === "inspect" && (!canCheckStage || !original?.packet)) return;
+    const isCurrent = ticket();
+    const sameIdentity = () =>
+      live.current.mounted && live.current.identity === identity;
+    stageRunning.current = true;
+    setMissingStage(null);
+    setActivity(action === "inspect" ? "reconcileStage" : "stage");
     setError("");
-    try {
-      const current = await readCatalog({
-        workspaceId: app.workspaceId,
-        applicationId: app.applicationId,
-      });
-      const revisions = {
-        metadataRevision: current.revisions.metadata,
-        dataRevision: current.revisions.data,
+    let lease = recovery.lease;
+    let work = original ? structuredClone(original) : null;
+    const baseState = {
+      ...state,
+      review: null,
+      reviewContext: "",
+      previewToken: "",
+    };
+    const persist = () => {
+      if (!work) throw new Error("Original staging context is unavailable.");
+      const next: ImportState = {
+        ...baseState,
+        staging: structuredClone(work),
       };
-      const begin = await requestAdmittedProgramEffect<{ result: unknown }>(
-        "/api/source-load",
-        sourceProgramBody(
-          app,
-          "facts.source.begin",
-          {
-            idempotencyKey: intentKeys.begin,
-            mode,
-            scopeMembers: scopeAll ? {} : scope,
-            scopeAll,
-            expectedMetadataRevision: revisions.metadataRevision,
-            expectedDataRevision: revisions.dataRevision,
-          },
-          true,
-        ),
-        intentKeys.begin,
-      );
-      const beginProgress = exactBatchProgress(begin.result);
-      const chunks = csvChunks(prepared.text);
-      const totalRows = csvRowCount(prepared.text);
-      let minimumRows = 0;
-      let appended: BatchProgress | null = null;
-      for (const [chunkIndex, csvText] of chunks.entries()) {
-        minimumRows += csvRowCount(csvText);
-        const response = await requestAdmittedProgramEffect<{
-          result: unknown;
-        }>(
-          "/api/source-load",
-          sourceProgramBody(
-            app,
-            "facts.source.csv.append",
-            {
-              batchId: beginProgress.batchId,
-              chunkIndex,
-              csvText,
-            },
-            true,
-          ),
-          intentKeys.begin,
-        );
-        appended = exactBatchProgress(
-          response.result,
-          beginProgress.batchId,
-          chunkIndex,
-        );
-        if (appended.rowCount < minimumRows || appended.rowCount > totalRows)
-          throw new Error("INVALID_SOURCE_BATCH_PROGRESS");
+      if (work.step === "ready" && work.batch) {
+        next.batchId = work.batch.batchId;
+        next.contentDigest = work.batch.contentDigest;
+        next.rowCount = work.batch.rowCount;
       }
-      if (!appended) throw new Error("CSV produced no upload chunks.");
-      if (appended.rowCount !== totalRows)
-        throw new Error("INVALID_SOURCE_BATCH_PROGRESS");
-      const sealedResponse = await requestAdmittedProgramEffect<{
-        result: unknown;
-      }>(
-        "/api/source-load",
-        sourceProgramBody(
-          app,
-          "facts.source.seal",
-          {
-            batchId: beginProgress.batchId,
-            expectedRows: appended.rowCount,
-            expectedContentDigest: appended.contentDigest,
-          },
-          true,
-        ),
-        intentKeys.begin,
+      lease = recovery.retain(
+        {
+          ...draftValue,
+          state: next,
+          reviewedStage: false,
+          reviewedPublish: false,
+        },
+        lease,
       );
-      const sealed = exactBatchProgress(
-        sealedResponse.result,
-        beginProgress.batchId,
-      );
-      if (
-        sealed.status !== "ready" ||
-        sealed.rowCount !== appended.rowCount ||
-        sealed.contentDigest !== appended.contentDigest
-      )
-        throw new Error("INVALID_SOURCE_SEAL_RESPONSE");
+      if (sameIdentity()) {
+        setState(next);
+        setReviewedStage(false);
+        setReviewedPublish(false);
+      }
+    };
+    try {
+      if (original && !lease)
+        throw new Error(
+          "Original staging recovery is unavailable. No request was sent.",
+        );
+      if (!work) {
+        const current = await readCatalog({
+          workspaceId: app.workspaceId,
+          applicationId: app.applicationId,
+        });
+        if (!isCurrent()) return;
+        const activeBegin = current.functions?.["facts.source.begin"];
+        if (
+          (current.applicationAccess?.authorizationModel ===
+            "group_assignments") !==
+            grouped ||
+          (grouped &&
+            (!object(activeBegin) ||
+              activeBegin.sourceImportProfile !== "numeric_merge"))
+        )
+          throw new Error(
+            "Import access changed. Refresh the application before staging.",
+          );
+        if (
+          ![current.revisions.metadata, current.revisions.data].every(
+            (value) => Number.isSafeInteger(value) && value >= 0,
+          )
+        )
+          throw new Error("Current import revisions are unavailable.");
+        if (
+          emptyReplacement &&
+          current.revisions.metadata !== scopeMetadataRevision
+        )
+          throw new Error(
+            "The target dimensions changed. Refresh the application and choose the exact cell again.",
+          );
+        work = {
+          identity,
+          context,
+          inputDigest: prepared.digest,
+          mode,
+          scopeMembers: scopeAll ? {} : { ...scope },
+          scopeAll,
+          metadataRevision: current.revisions.metadata,
+          dataRevision: current.revisions.data,
+          step: "begin",
+          nextChunk: 0,
+          acknowledgedChunkRows: [],
+          chunkEncoding: "json",
+          batch: null,
+          packet: null,
+        };
+        persist(); // Reserve the reviewed input and original revisions before admission.
+      }
+      const chunks = emptyReplacement
+        ? []
+        : stagingCsvChunks(
+            prepared.text,
+            work.acknowledgedChunkRows,
+            work.chunkEncoding ?? "raw",
+          );
+      let cumulativeRows = 0;
+      const expectedRowsByChunk = chunks.map((chunk) => {
+        cumulativeRows += csvRowCount(chunk);
+        return cumulativeRows;
+      });
       const schemaVersion = prepared.sourceBundle
         ? "openepm.export-bundle-reimport.v1"
         : "openepm.typed-csv.v1";
-      const manifestResponse = await requestAdmittedProgramEffect<{
-        result: unknown;
-      }>(
-        "/api/source-load",
-        sourceProgramBody(
-          app,
-          "facts.source.manifest.attach",
-          {
-            batchId: sealed.batchId,
-            requestKey: intentKeys.manifest,
-            originKind: "file",
-            originRef: prepared.name,
-            schemaVersion,
-            schema: {
-              format: "text/csv",
-              encoding: "UTF-8",
-              coordinateColumns: "axis.<dimensionId>",
-              valueColumns: ["literalType", "value", "sourceRef"],
-              ...(prepared.sourceBundle
-                ? { sourceExportBundle: prepared.sourceBundle }
-                : {}),
-            },
-            contentDigest: sealed.contentDigest,
-          },
-          true,
-        ),
-        intentKeys.manifest,
-      );
-      const manifest = manifestResponse.result;
-      if (
-        !object(manifest) ||
-        manifest.batchId !== sealed.batchId ||
-        manifest.requestKey !== intentKeys.manifest ||
-        manifest.schemaVersion !== schemaVersion ||
-        manifest.contentDigest !== sealed.contentDigest ||
-        typeof manifest.manifestDigest !== "string" ||
-        !CONTENT_DIGEST.test(manifest.manifestDigest)
-      )
-        throw new Error("INVALID_SOURCE_MANIFEST_RESPONSE");
-      setState({
-        ...EMPTY_STATE,
-        batchId: sealed.batchId,
-        contentDigest: sealed.contentDigest,
-        rowCount: sealed.rowCount,
-      });
-      setReviewedStage(false);
+      while (work.step !== "ready") {
+        if (!isCurrent()) return;
+        let firstDispatch = false;
+        if (!work.packet) {
+          if (
+            action === "inspect" ||
+            work.context !== live.current.context ||
+            !canStage
+          )
+            return;
+          let fn: string;
+          let args: Record<string, unknown>;
+          if (work.step === "begin") {
+            fn = "facts.source.begin";
+            args = {
+              idempotencyKey: intentKeys.begin,
+              mode: work.mode,
+              scopeMembers: work.scopeMembers,
+              scopeAll: work.scopeAll,
+              expectedMetadataRevision: work.metadataRevision,
+              expectedDataRevision: work.dataRevision,
+            };
+          } else if (work.step === "append") {
+            fn = "facts.source.csv.append";
+            args = {
+              batchId: work.batch!.batchId,
+              chunkIndex: work.nextChunk,
+              csvText: chunks[work.nextChunk],
+            };
+          } else if (work.step === "seal") {
+            fn = "facts.source.seal";
+            args = {
+              batchId: work.batch!.batchId,
+              expectedRows: work.batch!.rowCount,
+              expectedContentDigest: work.batch!.contentDigest,
+            };
+          } else {
+            fn = "facts.source.manifest.attach";
+            args = {
+              batchId: work.batch!.batchId,
+              requestKey: intentKeys.manifest,
+              originKind: "file",
+              originRef: prepared.name,
+              schemaVersion,
+              schema: {
+                format: "text/csv",
+                encoding: "UTF-8",
+                coordinateColumns: "axis.<dimensionId>",
+                valueColumns: ["literalType", "value", "sourceRef"],
+                ...(prepared.sourceBundle
+                  ? { sourceExportBundle: prepared.sourceBundle }
+                  : {}),
+              },
+              contentDigest: work.batch!.contentDigest,
+            };
+          }
+          const packet = await prepareAdmittedProgramEffect(
+            "/api/source-load",
+            sourceProgramBody(app, fn, args, true),
+            work.step === "manifest"
+              ? intentKeys.manifest
+              : work.step === "append"
+                ? intentKeys.append || intentKeys.begin
+                : intentKeys.begin,
+          );
+          if (!isCurrent() || work.context !== live.current.context) return;
+          work.packet = packet;
+          work.packetDispatched = false;
+          persist(); // Failed capacity update leaves the previous acknowledged state intact.
+          firstDispatch = true;
+        }
+        let response: { result: unknown };
+        try {
+          if (action === "inspect") {
+            const originalPacket = work.packet;
+            const checked = await request<{ result: unknown }>(
+              "/api/source-load",
+              sourceProgramBody(app, "facts.source.staging.read", {
+                originalProgram: originalPacket.body.program,
+                operationId: originalPacket.body.idempotencyKey,
+              }),
+            );
+            if (!isCurrent()) return;
+            if (
+              !object(checked.result) ||
+              checked.result.originalFunction !==
+                originalPacket.body.program.function
+            )
+              throw new Error(
+                "The staging status does not match the original step.",
+              );
+            response = { result: checked.result.outcome };
+          } else {
+            work.packetDispatched = true;
+            persist(); // A remount must treat a dispatched packet as possibly accepted.
+            response = await replayAdmittedEffect<{ result: unknown }>(
+              work.packet,
+            );
+          }
+        } catch (reason) {
+          if (
+            action === "inspect" &&
+            isCurrent() &&
+            reason instanceof ApiError &&
+            reason.code === "SOURCE_STAGING_STATUS_UNAVAILABLE"
+          ) {
+            setMissingStage(work.packet!.body.idempotencyKey);
+            setError(
+              "The recorded staging step is unavailable. Its outcome remains unconfirmed.",
+            );
+            return;
+          }
+          // Only a fresh packet's first response in the same current authorized
+          // catalogue may establish this narrow owner-declared pre-write refusal.
+          if (
+            firstDispatch &&
+            isCurrent() &&
+            work.step === "append" &&
+            csvInputRejected(reason, functions["facts.source.csv.append"])
+          ) {
+            work.inputRejection = {
+              code: reason.code,
+              packet: work.packet,
+              correctionText: csvRemainder(chunks, work.nextChunk),
+            };
+            work.packet = null;
+            work.packetDispatched = false;
+            persist();
+          }
+          throw reason;
+        }
+        // Acknowledged progress belongs to the captured owner even after navigation.
+        // Retention rejects explicit identity/logout abandonment; no old actor is recreated.
+        if (work.step === "manifest") {
+          const manifest = response.result;
+          if (
+            !object(manifest) ||
+            manifest.batchId !== work.batch!.batchId ||
+            manifest.requestKey !== work.packet.body.idempotencyKey ||
+            manifest.schemaVersion !== schemaVersion ||
+            manifest.contentDigest !== work.batch!.contentDigest ||
+            typeof manifest.manifestDigest !== "string" ||
+            !CONTENT_DIGEST.test(manifest.manifestDigest)
+          )
+            throw new Error("INVALID_SOURCE_MANIFEST_RESPONSE");
+          work.step = "ready";
+        } else {
+          const progress = exactBatchProgress(
+            response.result,
+            work.batch?.batchId,
+            work.step === "append" ? work.nextChunk : undefined,
+          );
+          if (work.step === "begin") {
+            if (progress.status !== "staging" || progress.rowCount !== 0)
+              throw new Error("INVALID_SOURCE_BEGIN_RESPONSE");
+            work.step = chunks.length ? "append" : "seal";
+          } else if (work.step === "append") {
+            if (progress.rowCount !== expectedRowsByChunk[work.nextChunk])
+              throw new Error("INVALID_SOURCE_BATCH_PROGRESS");
+            work.nextChunk += 1;
+            work.acknowledgedChunkRows = chunks
+              .slice(0, work.nextChunk)
+              .map(csvRowCount);
+            if (work.nextChunk === chunks.length) work.step = "seal";
+          } else {
+            if (
+              progress.status !== "ready" ||
+              progress.rowCount !== work.batch!.rowCount ||
+              progress.contentDigest !== work.batch!.contentDigest
+            )
+              throw new Error("INVALID_SOURCE_SEAL_RESPONSE");
+            work.step = grouped || emptyReplacement ? "ready" : "manifest";
+          }
+          work.batch = progress;
+        }
+        work.packet = null;
+        work.packetDispatched = false;
+        persist(); // If this fails, the stored exact packet remains the recovery witness.
+        if (action === "inspect" || canRetryStage || !isCurrent()) return;
+      }
     } catch (reason) {
-      setError(
-        reason instanceof Error ? reason.message : "Unable to stage CSV",
-      );
+      if (sameIdentity())
+        setError(
+          reason instanceof Error ? reason.message : "Unable to stage CSV",
+        );
     } finally {
-      setBusy(false);
+      stageRunning.current = false;
+      if (sameIdentity()) setActivity(null);
+    }
+  }
+
+  function editRejectedRemainder(text: string) {
+    const work = state.staging;
+    if (
+      busy ||
+      !work?.inputRejection ||
+      work.packet ||
+      work.identity !== identity ||
+      work.context !== context ||
+      !recovery.lease
+    )
+      return;
+    try {
+      const next = {
+        ...state,
+        staging: {
+          ...work,
+          inputRejection: {
+            ...work.inputRejection,
+            correctionText: text,
+          },
+        },
+      };
+      recovery.retain({ ...draftValue, state: next }, recovery.lease);
+      live.current.generation += 1;
+      setState(next);
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  async function reviewRejectedRemainder() {
+    const work = state.staging;
+    if (
+      busy ||
+      !prepared ||
+      !canStage ||
+      !work?.inputRejection ||
+      work.packet ||
+      work.identity !== identity ||
+      work.context !== context ||
+      !recovery.lease
+    )
+      return;
+    const current = ticket();
+    const lease = recovery.lease;
+    setActivity("correct");
+    setError("");
+    try {
+      if (work.nextChunk === 0 && work.batch?.rowCount !== 0)
+        throw new Error(
+          "The acknowledged CSV correction boundary is unavailable.",
+        );
+      const corrected = correctedCsvRemainder(
+        prepared.text,
+        work.nextChunk,
+        work.inputRejection.correctionText,
+        work.acknowledgedChunkRows,
+        work.chunkEncoding ?? "raw",
+      );
+      const digest = await sha256(corrected.text);
+      if (!current()) return;
+      const nextPrepared: PreparedInput = {
+        text: corrected.text,
+        digest,
+        bytes: new TextEncoder().encode(corrected.text).length,
+        name: prepared.name,
+      }; // Edited rows no longer claim the original export-bundle provenance.
+      const { inputRejection: _rejected, ...accepted } = work;
+      const next = {
+        ...EMPTY_STATE,
+        staging: {
+          ...accepted,
+          inputDigest: digest,
+          acknowledgedChunkRows: corrected.acknowledgedChunkRows,
+          chunkEncoding: "json" as const,
+          packet: null,
+          packetDispatched: false,
+        },
+      };
+      const keys = {
+        ...intentKeys,
+        append: `source-correction-ui-${crypto.randomUUID()}`,
+        manifest: `source-manifest-ui-${crypto.randomUUID()}`,
+        publish: `source-import-ui-${crypto.randomUUID()}`,
+      };
+      recovery.retain(
+        {
+          ...draftValue,
+          csv: "",
+          prepared: nextPrepared,
+          state: next,
+          intentKeys: keys,
+          reviewedStage: false,
+          reviewedPublish: false,
+          diagnostics: [],
+        },
+        lease,
+      );
+      setCsv("");
+      setPrepared(nextPrepared);
+      setState(next);
+      setIntentKeys(keys);
+      setReviewedStage(false);
+      setReviewedPublish(false);
+      setDiagnostics([]);
+    } catch (reason) {
+      if (current())
+        setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (current()) setActivity(null);
+    }
+  }
+
+  function leaveStagingUnpublished() {
+    if (
+      busy ||
+      stageRunning.current ||
+      !state.staging ||
+      state.staging.packet ||
+      unresolvedPublication ||
+      state.requestId ||
+      !recovery.lease
+    )
+      return;
+    const nextKeys = newImportIntentKeys();
+    try {
+      recovery.release(
+        recovery.lease,
+        {
+          ...draftValue,
+          state: EMPTY_STATE,
+          intentKeys: nextKeys,
+          reviewedStage: false,
+          reviewedPublish: false,
+        },
+        true,
+      );
+      setState(EMPTY_STATE);
+      setIntentKeys(nextKeys);
+      setReviewedStage(false);
+      setReviewedPublish(false);
+      setDiagnostics([]);
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
     }
   }
 
   async function preview() {
-    if (!app || !state.batchId || !canPreview) return;
-    setBusy(true);
+    if (
+      !app ||
+      !state.batchId ||
+      !canPreview ||
+      unresolvedPublication ||
+      state.receiptId ||
+      busy
+    )
+      return;
+    const isCurrent = ticket();
+    setActivity("preview");
     setError("");
+    setReviewedPublish(false);
+    setDiagnostics([]);
+    setState((current) => ({ ...current, previewToken: "", review: null }));
     try {
+      const staged = state.staging;
+      const batch = staged?.batch;
+      if (
+        staged?.step !== "ready" ||
+        batch?.batchId !== state.batchId ||
+        batch.contentDigest !== state.contentDigest ||
+        staged.inputDigest !== prepared?.digest ||
+        !sourceGrain?.dimensions.length
+      )
+        throw new Error(
+          "The sealed import context could not be verified. Check the original staging before previewing.",
+        );
       const response = await request<{ result: unknown }>(
         "/api/source-load",
         sourceProgramBody(app, "facts.source.preview", {
-          batchId: state.batchId,
+          batchId: batch.batchId,
           allowWarnings,
         }),
       );
+      if (!isCurrent()) return;
       const result = exactImportPreview(
         response.result,
-        state.batchId,
-        state.contentDigest,
+        { ...staged, batch },
+        sourceGrain.dimensions,
       );
+      if (emptyReplacement && result.clearCount > 1)
+        throw new Error(
+          "The replacement preview would clear more than the selected cell.",
+        );
       setState((current) => ({
         ...current,
+        review: result.review,
+        reviewContext: context,
         previewToken: result.previewToken,
         setCount: result.setCount,
         clearCount: result.clearCount,
@@ -1177,34 +2077,70 @@ export function DataLoad({
       }));
       setReviewedPublish(false);
     } catch (reason) {
+      if (!isCurrent()) return;
       setError(
         reason instanceof Error ? reason.message : "Unable to preview CSV",
       );
     } finally {
-      setBusy(false);
+      if (isCurrent()) setActivity(null);
     }
   }
 
-  async function publish() {
-    if (!app || !publishReady) return;
-    setBusy(true);
+  async function publish(checkOriginal = false) {
+    const original = state.publicationPacket;
+    if (!app || busy || (checkOriginal ? !canRead || !original : !publishReady))
+      return;
+    const isCurrent = ticket();
+    setActivity(checkOriginal ? "reconcilePublication" : "publish");
+    setMissingPublication(null);
     setError("");
+    const wasUncertain = state.publicationUncertain;
+    let sent = false;
+    let reserved = false;
+    let lease = recovery.lease;
     try {
-      const response = await requestAdmittedProgramEffect<{ result: unknown }>(
-        "/api/source-load",
-        sourceProgramBody(
-          app,
-          "facts.transfer.import.request",
-          {
-            idempotencyKey: intentKeys.publish,
-            batchId: state.batchId,
-            previewToken: state.previewToken,
-          },
-          true,
-        ),
-        intentKeys.publish,
-      );
-      const execution = exactImportExecution(response.result, {
+      const packet =
+        original ||
+        (await prepareAdmittedProgramEffect(
+          grouped ? "/api/source-action" : "/api/source-load",
+          sourceProgramBody(
+            app,
+            grouped ? "facts.source.publish" : "facts.transfer.import.request",
+            {
+              ...(grouped ? {} : { idempotencyKey: intentKeys.publish }),
+              batchId: state.batchId,
+              previewToken: state.previewToken,
+            },
+            true,
+          ),
+          intentKeys.publish,
+        ));
+      if (!isCurrent() || (!wasUncertain && live.current.context !== context))
+        return;
+      let response: { result: unknown };
+      if (checkOriginal) {
+        if (!lease)
+          throw new Error("Original publication recovery is unavailable.");
+        response = await request(
+          "/api/source-load",
+          sourceProgramBody(app, "facts.transfer.import.read", {
+            operationId: packet.body.idempotencyKey,
+          }),
+        );
+      } else {
+        const pending = {
+          ...state,
+          publicationUncertain: true,
+          publicationPacket: packet,
+        };
+        lease = recovery.retain({ ...draftValue, state: pending }, lease);
+        reserved = true;
+        setState(pending);
+        sent = true;
+        response = await replayAdmittedEffect(packet);
+      }
+      if (!isCurrent()) return;
+      const expected = {
         batchId: state.batchId,
         contentDigest: state.contentDigest,
         mode,
@@ -1216,32 +2152,106 @@ export function DataLoad({
         )
           ? state.status
           : undefined,
-      });
-      const completion =
-        execution.status === "Completed" ? execution.result : null;
-      setState((current) => ({
-        ...current,
+      };
+      const execution = grouped
+        ? null
+        : exactImportExecution(response.result, expected);
+      const completion = grouped
+        ? exactImportReceipt(response.result, expected)
+        : execution?.status === "Completed"
+          ? execution.result
+          : null;
+      const next = {
+        ...state,
+        publicationUncertain: false,
+        publicationPacket: null,
         previewToken: "",
-        requestId: execution.requestId,
-        status: execution.status,
+        requestId: execution?.requestId ?? "",
+        reviewContext: grouped ? context : state.reviewContext,
+        status: execution?.status ?? "Completed",
+        retryPending:
+          execution?.status === "Accepted" && execution.errorCode !== null,
         committedRevision: completion
           ? Number(completion.committedRevision)
           : null,
-        receiptId: completion ? current.batchId : "",
-      }));
+        receiptId: completion ? state.batchId : "",
+      };
+      const nextDraft = { ...draftValue, state: next, reviewedPublish: false };
+      if (["Completed", "Failed", "Cancelled"].includes(next.status))
+        recovery.release(lease, nextDraft);
+      else lease = recovery.retain(nextDraft, lease);
+      setState(next);
       setReviewedPublish(false);
     } catch (reason) {
+      if (!isCurrent()) return;
+      if (
+        checkOriginal &&
+        reason instanceof ApiError &&
+        reason.code === "IMPORT_EXECUTION_UNAVAILABLE"
+      ) {
+        setMissingPublication(original!.body.idempotencyKey);
+        setError(
+          "The recorded publication is unavailable. The outcome remains unconfirmed.",
+        );
+        return;
+      }
+      if (!reserved) {
+        setError(
+          reason instanceof Error
+            ? reason.message
+            : checkOriginal
+              ? "Unable to check the original publication."
+              : "Unable to reserve publication recovery.",
+        );
+        return; // Failed CAS/capacity admission leaves the prior record untouched.
+      }
+      // A previously unknown attempt stays unknown even if current authority
+      // is now denied. Retain its exact preview and request identity.
+      if (
+        !wasUncertain &&
+        (!sent ||
+          (reason instanceof ApiError &&
+            [400, 401, 403, 409, 412, 422].includes(reason.status)))
+      ) {
+        const next = {
+          ...state,
+          publicationUncertain: false,
+          publicationPacket: null,
+          previewToken: "",
+          review: null,
+        };
+        if (lease) {
+          const nextDraft = {
+            ...draftValue,
+            state: next,
+            reviewedPublish: false,
+          };
+          try {
+            if (state.staging) lease = recovery.retain(nextDraft, lease);
+            else recovery.release(lease, nextDraft, true);
+          } catch (changed) {
+            setError(
+              changed instanceof Error ? changed.message : String(changed),
+            );
+            return; // A later replay or status read owns the current recovery record.
+          }
+        }
+        setState(next);
+        setReviewedPublish(false);
+      }
       setError(
         reason instanceof Error ? reason.message : "Unable to publish CSV",
       );
     } finally {
-      setBusy(false);
+      if (isCurrent()) setActivity(null);
     }
   }
 
   async function readStatus() {
-    if (!app || !state.requestId || !canRead) return;
-    setBusy(true);
+    if (!app || !state.requestId || !canRead || busy) return;
+    const isCurrent = ticket();
+    let lease = recovery.lease;
+    setActivity("status");
     setError("");
     try {
       const response = await request<{ result: unknown }>(
@@ -1250,6 +2260,7 @@ export function DataLoad({
           requestId: state.requestId,
         }),
       );
+      if (!isCurrent()) return;
       const execution = exactImportExecution(response.result, {
         requestId: state.requestId,
         batchId: state.batchId,
@@ -1266,26 +2277,38 @@ export function DataLoad({
       });
       const completion =
         execution.status === "Completed" ? execution.result : null;
-      setState((current) => ({
-        ...current,
+      const next = {
+        ...state,
         status: execution.status,
+        retryPending:
+          execution.status === "Accepted" && execution.errorCode !== null,
         committedRevision: completion
           ? Number(completion.committedRevision)
           : null,
-        receiptId: completion ? current.batchId : "",
-      }));
+        receiptId: completion ? state.batchId : "",
+      };
+      if (lease) {
+        const nextDraft = { ...draftValue, state: next };
+        if (["Completed", "Failed", "Cancelled"].includes(execution.status))
+          recovery.release(lease, nextDraft);
+        else lease = recovery.retain(nextDraft, lease);
+      }
+      setState(next);
     } catch (reason) {
+      if (!isCurrent()) return;
       setError(
         reason instanceof Error ? reason.message : "Unable to read import",
       );
     } finally {
-      setBusy(false);
+      if (isCurrent()) setActivity(null);
     }
   }
 
   async function readDiagnostics() {
-    if (!app || !state.artifactId || !canReadDiagnostics) return;
-    setBusy(true);
+    if (!app || !showReview || !state.artifactId || !canReadDiagnostics || busy)
+      return;
+    const isCurrent = ticket();
+    setActivity("diagnostics");
     setError("");
     try {
       const response = await request<{
@@ -1296,13 +2319,15 @@ export function DataLoad({
           artifactId: state.artifactId,
         }),
       );
+      if (!isCurrent()) return;
       setDiagnostics(response.result.artifact.diagnostics || []);
     } catch (reason) {
+      if (!isCurrent()) return;
       setError(
         reason instanceof Error ? reason.message : "Unable to read diagnostics",
       );
     } finally {
-      setBusy(false);
+      if (isCurrent()) setActivity(null);
     }
   }
 
@@ -1311,9 +2336,11 @@ export function DataLoad({
     { label: "Stage", complete: Boolean(state.batchId) },
     {
       label: "Validate",
-      complete: Boolean(state.previewToken || state.requestId),
+      complete: Boolean(
+        state.previewToken || state.requestId || state.receiptId,
+      ),
     },
-    { label: "Submit", complete: Boolean(state.requestId) },
+    { label: "Submit", complete: Boolean(state.requestId || state.receiptId) },
     {
       label: "Receipt",
       complete:
@@ -1323,12 +2350,32 @@ export function DataLoad({
     },
   ];
   const currentStep = progress.findIndex((step) => !step.complete);
+  const statusMessage = activity
+    ? importActivityMessages[activity]
+    : state.publicationUncertain
+      ? "Publication outcome unknown"
+      : state.status
+        ? state.retryPending
+          ? "Import retry pending"
+          : `Import ${state.status.toLowerCase()}`
+        : state.staging?.inputRejection
+          ? "CSV correction required"
+          : state.staging?.packet
+            ? "Staging outcome unknown"
+            : reviewCurrent && state.review
+              ? state.errorCount
+                ? `Preview has ${state.errorCount} validation errors`
+                : "Exact changes ready for review"
+              : state.staging?.step === "ready"
+                ? "Staging complete"
+                : state.staging
+                  ? "Staging ready to continue"
+                  : "No change before Publish";
 
   return (
     <section
       className="panel data-load-journey"
       aria-labelledby="data-load-heading"
-      aria-busy={busy}
     >
       <div className="section-heading-row">
         <div>
@@ -1340,10 +2387,9 @@ export function DataLoad({
         </div>
         <span
           className={`task-state ${state.status === "Completed" ? "active" : "neutral"}`}
+          role="status"
         >
-          {state.status
-            ? `Import ${state.status.toLowerCase()}`
-            : "No change before Publish"}
+          {statusMessage}
         </span>
       </div>
       <ol className="journey-steps" aria-label="CSV load progress">
@@ -1363,12 +2409,13 @@ export function DataLoad({
       </ol>
       {!canStage && catalog && (
         <div className="inline-error" role="status">
-          Your current role cannot stage CSV data.
+          CSV staging is not available in the current application context.
         </div>
       )}
-      <fieldset
+      <div
         className="data-load-layout"
-        disabled={busy}
+        role="group"
+        aria-busy={busy}
         aria-label="Import input and target"
       >
         <div className="data-load-form">
@@ -1376,14 +2423,25 @@ export function DataLoad({
             <span>01</span>
             <div>
               <h3>Prepare your source</h3>
-              <p>Upload a CSV or a complete Open EPM export bundle.</p>
+              <p>
+                {grouped
+                  ? "Upload or paste a CSV of numeric amounts."
+                  : "Upload a CSV or a complete Open EPM export bundle."}
+              </p>
             </div>
           </div>
           <label>
-            Choose CSV or governed export bundle
+            {grouped
+              ? "Choose numeric CSV"
+              : "Choose CSV or governed export bundle"}
             <input
               type="file"
-              accept=".csv,.json,text/csv,application/json"
+              disabled={inputLocked}
+              accept={
+                grouped
+                  ? ".csv,text/csv"
+                  : ".csv,.json,text/csv,application/json"
+              }
               onChange={(event) =>
                 void prepareFile(event.currentTarget.files?.[0])
               }
@@ -1397,6 +2455,7 @@ export function DataLoad({
             <textarea
               rows={7}
               spellCheck={false}
+              disabled={inputLocked}
               value={csv}
               placeholder="axis.Account,axis.Department,…,literalType,value,sourceRef"
               onChange={(event) => {
@@ -1405,13 +2464,46 @@ export function DataLoad({
               }}
             />
           </label>
-          <button disabled={busy || !csv} onClick={() => void prepare()}>
+          <button {...transferAction(inputLocked || !csv, prepare)}>
             Prepare pasted CSV
           </button>
-          {prepared && (
+          {emptyReplacement ? (
             <p role="status">
-              Prepared {prepared.bytes} bytes for governed validation.
+              Prepared an empty source. The reviewed replacement can clear the
+              selected cell.
             </p>
+          ) : (
+            prepared && (
+              <p role="status">
+                Prepared {prepared.bytes} bytes for governed validation.
+              </p>
+            )
+          )}
+          {sourceGrain && (
+            <div aria-label="Prepared input mapping">
+              <p>
+                Dimension columns (exact IDs):{" "}
+                {sourceGrain.dimensions.join(", ") || "none"}.
+              </p>
+              {sourceGrain.types.length > 0 && (
+                <p>
+                  Value types:{" "}
+                  {sourceGrain.types
+                    .slice(0, 10)
+                    .map(([kind, count]) => `${kind}: ${count} rows`)
+                    .join("; ")}
+                  {sourceGrain.types.length > 10
+                    ? "; additional types require correction during validation"
+                    : ""}
+                  .
+                </p>
+              )}
+              <p>
+                {grouped && !supportedInput
+                  ? "Each input row must use AmountLiteral for this import."
+                  : "Staging validates members and declared value rules before publication."}
+              </p>
+            </div>
           )}
           <details>
             <summary>Required columns</summary>
@@ -1421,10 +2513,12 @@ export function DataLoad({
               <code>value</code> and <code>sourceRef</code>.
             </p>
             <p>
-              The example demonstrates an amount, an explicit numeric zero and
-              an explicit empty text value. Its columns use this application's
-              active fact dimensions. Replace every example member ID with the
-              exact IDs shown in Metadata before staging.
+              {grouped
+                ? "The example includes a numeric amount and an explicit zero."
+                : "The example demonstrates an amount, an explicit numeric zero and an explicit empty text value."}{" "}
+              Its columns use this application's active fact dimensions. Replace
+              every example member ID with the exact IDs shown in Metadata
+              before staging.
             </p>
             {currentExample?.csv ? (
               <a
@@ -1453,66 +2547,217 @@ export function DataLoad({
               <p>Define which cells this import is allowed to change.</p>
             </div>
           </div>
-          <label>
-            Target handling
-            <select
-              value={mode}
-              onChange={(event) => {
-                setMode(event.target.value);
-                invalidateTarget();
-              }}
-            >
-              <option value="merge">Merge supplied cells</option>
-              <option value="replace">Replace exact selected scope</option>
-            </select>
-          </label>
-          <label>
-            Exact scope
-            <input
-              disabled={scopeAll}
-              value={scopeText}
-              placeholder="Entity=Europe; Period=Jan"
-              onChange={(event) => {
-                setScopeText(event.target.value);
-                invalidateTarget();
-              }}
-            />
-          </label>
-          <label className="review-check">
-            <input
-              type="checkbox"
-              checked={scopeAll}
-              onChange={(event) => {
-                setScopeAll(event.target.checked);
-                invalidateTarget();
-              }}
-            />
-            Whole application scope
-          </label>
-          <p className="data-field-help">
-            {mode === "replace"
-              ? "Replace can clear values inside this scope that are absent from the source. Review the clear count before publishing."
-              : "Merge updates the supplied cells. Other cells in the selected scope remain unchanged."}
-          </p>
-          {!scopeAll && scopeText && !scope && (
-            <p className="inline-error" role="alert">
-              Use Dimension=Member pairs separated by semicolons.
+          {grouped ? (
+            <p>
+              Only the numeric cells listed in your CSV can change. Every
+              destination requires current read and write access.
             </p>
+          ) : (
+            <>
+              <label>
+                Target handling
+                <select
+                  value={mode}
+                  disabled={inputLocked}
+                  onChange={(event) => {
+                    setMode(event.target.value);
+                    invalidateTarget();
+                  }}
+                >
+                  <option value="merge">Merge supplied cells</option>
+                  <option value="replace">Replace exact selected scope</option>
+                </select>
+              </label>
+              <ExactScopeSelector
+                app={app}
+                catalog={catalog}
+                value={scope || {}}
+                dimensions={scopeDimensions}
+                metadataRevision={scopeMetadataRevision}
+                disabled={inputLocked || scopeAll}
+                onChange={(next) => {
+                  setScopeText(serializedExactScope(next));
+                  invalidateTarget();
+                }}
+              />
+              <label className="review-check">
+                <input
+                  type="checkbox"
+                  checked={scopeAll}
+                  disabled={inputLocked}
+                  onChange={(event) => {
+                    setScopeAll(event.target.checked);
+                    invalidateTarget();
+                  }}
+                />
+                Whole application scope
+              </label>
+              <p className="data-field-help">
+                {mode === "replace"
+                  ? "Replace can clear values inside this scope that are absent from the source. Review the clear count before publishing."
+                  : "Merge updates the supplied cells. Other cells in the selected scope remain unchanged."}
+              </p>
+            </>
+          )}
+          {mode === "replace" && !scopeAll && (
+            <>
+              <button
+                {...transferAction(
+                  inputLocked || !exactReplacementReady,
+                  prepareEmptyReplacement,
+                )}
+              >
+                Prepare empty replacement
+              </button>
+              <p className="data-field-help">
+                Choose one member for every fact dimension to review clearing
+                that cell.
+              </p>
+            </>
           )}
           <label className="review-check">
             <input
               type="checkbox"
               checked={reviewedStage}
-              disabled={!prepared || !scopeReady || !canStage}
+              disabled={
+                inputLocked ||
+                !prepared ||
+                !supportedInput ||
+                !scopeReady ||
+                !canStage
+              }
               onChange={(event) => setReviewedStage(event.target.checked)}
             />
             I reviewed the exact input and target scope
           </label>
-          <button disabled={busy || !stageReady} onClick={() => void stage()}>
-            Stage and validate CSV
+          <button
+            {...transferAction(inputLocked || !stageReady, () => stage())}
+          >
+            {emptyReplacement
+              ? "Stage empty replacement"
+              : "Stage and validate CSV"}
           </button>
         </div>
-      </fieldset>
+      </div>
+      {retainedStaging && state.staging && (
+        <section aria-label="Original CSV staging recovery">
+          <h3>Original staged input</h3>
+          <p
+            id={
+              state.staging.inputRejection ? rejectionDescriptionId : undefined
+            }
+          >
+            {state.staging.inputRejection
+              ? `The original chunk was rejected before staging: ${state.staging.inputRejection.code}. No rows from that chunk were accepted.`
+              : state.staging.packet && !busy
+                ? `The ${state.staging.step} response is unconfirmed. This tab retains its exact request.`
+                : state.staging.step === "ready"
+                  ? grouped
+                    ? "The sealed numeric batch is ready for review."
+                    : "The original batch and manifest are ready for review."
+                  : busy
+                    ? "The original staging request is retained in this tab."
+                    : `Acknowledged staging is retained; the next step is ${state.staging.step}.`}
+          </p>
+          {state.staging.batch && (
+            <p>Original batch: {state.staging.batch.batchId}</p>
+          )}
+          {state.staging.inputRejection && (
+            <fieldset
+              disabled={busy || state.staging.context !== context || !canStage}
+            >
+              <legend>Correct rejected input</legend>
+              <p>
+                {state.staging.batch?.rowCount || 0} acknowledged rows remain
+                unchanged in the original batch. Edit only the rejected and
+                remaining rows below.
+                {state.staging.nextChunk === 0
+                  ? " No rows are acknowledged, so you may also correct the header."
+                  : " Keep the exact original header and coordinate columns."}{" "}
+                Review creates a new input intent; continuing staging requests a
+                fresh admission and never resends acknowledged chunks.
+              </p>
+              <label>
+                Rejected and remaining CSV
+                <textarea
+                  value={state.staging.inputRejection.correctionText}
+                  aria-describedby={rejectionDescriptionId}
+                  onChange={(event) =>
+                    editRejectedRemainder(event.target.value)
+                  }
+                />
+              </label>
+            </fieldset>
+          )}
+          {(state.staging.inputRejection ||
+            focusedStagingControl === "correct") && (
+            <button
+              {...stagingAction(
+                "correct",
+                busy ||
+                  !state.staging.inputRejection ||
+                  state.staging.context !== context ||
+                  !canStage,
+                reviewRejectedRemainder,
+              )}
+            >
+              Review corrected remainder
+            </button>
+          )}
+          {state.staging.context !== context &&
+            state.staging.step !== "ready" && (
+              <p>
+                The application context changed. No later staging step will
+                start automatically.
+                {state.staging.packet
+                  ? " Check the original request before leaving this input unpublished."
+                  : " This acknowledged input may be left unpublished; continuing requires its original context."}
+              </p>
+            )}
+          {(state.staging.packet || focusedStagingControl === "reconcile") && (
+            <button
+              {...stagingAction(
+                "reconcile",
+                busy || !state.staging.packet || !canCheckStage,
+                () => stage("inspect"),
+              )}
+            >
+              Check original staging status
+            </button>
+          )}
+          {((state.staging.step !== "ready" && !state.staging.inputRejection) ||
+            focusedStagingControl === "continue") && (
+            <button
+              {...stagingAction(
+                "continue",
+                busy ||
+                  !canStage ||
+                  (stagingMayHaveRun && !canRetryStage) ||
+                  state.staging.context !== context ||
+                  state.staging.step === "ready" ||
+                  Boolean(state.staging.inputRejection),
+                () => stage(),
+              )}
+            >
+              {canRetryStage
+                ? "Retry original staging step"
+                : "Continue original staging"}
+            </button>
+          )}
+          {!state.staging.packet && (
+            <>
+              <p>
+                Leaving this input unpublished clears this tab's staging intent.
+                Any native batch remains recorded under its existing lifecycle;
+                this action does not cancel it or publish data.
+              </p>
+              <button disabled={busy} onClick={leaveStagingUnpublished}>
+                Leave staged input unpublished
+              </button>
+            </>
+          )}
+        </section>
+      )}
       {state.batchId && (
         <div className="data-load-review">
           <div className="data-section-heading">
@@ -1531,40 +2776,61 @@ export function DataLoad({
             </article>
             <article>
               <span>Sets</span>
-              <strong>{state.setCount}</strong>
+              <strong>{showCounts ? state.setCount : "—"}</strong>
             </article>
             <article>
               <span>Clears</span>
-              <strong>{state.clearCount}</strong>
+              <strong>{showCounts ? state.clearCount : "—"}</strong>
             </article>
             <article>
               <span>Errors</span>
-              <strong>{state.errorCount}</strong>
+              <strong>{showReview ? state.errorCount : "—"}</strong>
             </article>
             <article>
               <span>Warnings</span>
-              <strong>{state.warningCount}</strong>
+              <strong>{showReview ? state.warningCount : "—"}</strong>
             </article>
           </div>
-          <fieldset
+          <ImportChangeReview review={reviewCurrent ? state.review : null} />
+          {state.publicationUncertain && !busy && (
+            <p>
+              {grouped
+                ? "The publication outcome is unconfirmed. Retry the same reviewed publication to receive its original receipt or complete it once."
+                : "The publication outcome is unconfirmed. Check the original publication before retrying."}
+            </p>
+          )}
+          <div
             className="reviewed-inline-action data-review-actions"
-            disabled={busy}
+            role="group"
             aria-label="Import review and publication"
           >
-            <label className="review-check">
-              <input
-                type="checkbox"
-                checked={allowWarnings}
-                onChange={(event) => {
-                  setAllowWarnings(event.target.checked);
-                  setReviewedPublish(false);
-                }}
-              />
-              Permit reviewed warnings
-            </label>
+            {!grouped && (
+              <label className="review-check">
+                <input
+                  type="checkbox"
+                  checked={allowWarnings}
+                  disabled={busy || state.publicationUncertain}
+                  onChange={(event) => {
+                    setAllowWarnings(event.target.checked);
+                    setReviewedPublish(false);
+                    setState((current) => ({
+                      ...current,
+                      previewToken: "",
+                      review: null,
+                    }));
+                  }}
+                />
+                Permit reviewed warnings
+              </label>
+            )}
             <button
-              disabled={busy || !canPreview}
-              onClick={() => void preview()}
+              {...transferAction(
+                busy ||
+                  !canPreview ||
+                  unresolvedPublication ||
+                  !!state.receiptId,
+                preview,
+              )}
             >
               Preview exact changes
             </button>
@@ -1573,8 +2839,11 @@ export function DataLoad({
                 type="checkbox"
                 checked={reviewedPublish}
                 disabled={
+                  busy ||
+                  !reviewCurrent ||
                   !state.previewToken ||
                   Boolean(state.errorCount) ||
+                  state.publicationUncertain ||
                   Boolean(state.warningCount && !allowWarnings)
                 }
                 onChange={(event) => setReviewedPublish(event.target.checked)}
@@ -1582,24 +2851,51 @@ export function DataLoad({
               I reviewed the exact set and clear counts
             </label>
             <button
-              disabled={busy || !publishReady}
-              onClick={() => void publish()}
+              {...transferAction(
+                busy ||
+                  (state.publicationUncertain && !grouped
+                    ? !canRead
+                    : !publishReady),
+                () => publish(state.publicationUncertain && !grouped),
+              )}
             >
-              Start durable publication
+              {grouped
+                ? state.publicationUncertain
+                  ? "Retry the same reviewed publication"
+                  : "Publish reviewed numeric rows"
+                : state.publicationUncertain && activity !== "publish"
+                  ? "Check original publication status"
+                  : "Start durable publication"}
             </button>
-          </fieldset>
+            {!grouped && state.publicationUncertain && publishReady && (
+              <button {...transferAction(busy, () => publish())}>
+                Retry original publication
+              </button>
+            )}
+          </div>
           <dl className="receipt-facts">
             <dt>Publication</dt>
-            <dd>{state.requestId ? "Submitted" : "Prepared"}</dd>
+            <dd>
+              {state.receiptId
+                ? "Published"
+                : state.requestId
+                  ? "Submitted"
+                  : "Prepared"}
+            </dd>
+            {grouped && reviewCurrent && state.receiptId && (
+              <>
+                <dt>Publication receipt</dt>
+                <dd>{state.receiptId}</dd>
+                <dt>Committed revision</dt>
+                <dd>{state.committedRevision}</dd>
+              </>
+            )}
             {state.requestId && (
               <>
                 <dt>Durable status</dt>
                 <dd>
                   {state.status || "Accepted"}{" "}
-                  <button
-                    disabled={busy || !canRead}
-                    onClick={() => void readStatus()}
-                  >
+                  <button {...transferAction(busy || !canRead, readStatus)}>
                     Refresh
                   </button>
                 </dd>
@@ -1616,17 +2912,16 @@ export function DataLoad({
               </>
             )}
           </dl>
-          {state.artifactId && (
+          {showReview && state.artifactId && (
             <button
-              disabled={busy || !canReadDiagnostics}
-              onClick={() => void readDiagnostics()}
+              {...transferAction(busy || !canReadDiagnostics, readDiagnostics)}
             >
               Read validation diagnostics
             </button>
           )}
         </div>
       )}
-      {diagnostics.length > 0 && (
+      {showReview && canReadDiagnostics && diagnostics.length > 0 && (
         <div className="react-grid-scroll">
           <table className="react-cube-grid">
             <caption>CSV validation diagnostics</caption>
@@ -1674,8 +2969,9 @@ export function DataLoad({
         </div>
       )}
       <p className="authority-note">
-        Submitting starts publication. Wait for Completed and view the outcome
-        to confirm the committed result.
+        {grouped
+          ? "A successful publication returns the batch receipt and committed revision."
+          : "Submitting starts publication. Wait for Completed and view the outcome to confirm the committed result."}
       </p>
     </section>
   );

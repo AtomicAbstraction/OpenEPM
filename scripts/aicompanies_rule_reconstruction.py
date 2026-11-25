@@ -238,12 +238,14 @@ async def _relation_catalog(call, scope):
 async def _member_catalog(call, scope, dimensions):
     values = []
     for dimension in sorted(dimensions):
-        after, revision = None, None
+        after, revision, token = None, None, None
         for _ in range(10_001):
             arguments = {"dimension": dimension, "limit": 500}
             if after is not None:
                 arguments.update(afterMemberId=after,
                                  expectedMetadataRevision=revision)
+                if token is not None:
+                    arguments["expectedPageToken"] = token
             page = (await call("read_v2_program", {**scope,
                 "program": _program("metadata.member.list",
                                     arguments)}))["result"]
@@ -252,6 +254,7 @@ async def _member_catalog(call, scope, dimensions):
             revision = page["metadataRevision"]
             values.extend(page["rows"])
             after = page["nextAfterMemberId"]
+            token = page.get("nextPageToken")
             if after is None:
                 break
         else:

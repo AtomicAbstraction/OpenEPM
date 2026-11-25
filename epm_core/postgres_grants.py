@@ -6,6 +6,7 @@ credential; the live V1 service has not been cut over.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from hashlib import sha256
 import json
 import re
@@ -16,8 +17,12 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .persistence_contract import ApplicationScope
+from .application_authorization_actions import DIMENSION_METADATA_TAGS_READ_FUNCTION, MEMBER_TAGS_READ_FUNCTION
 from .postgres_access import AccessDenied, PostgresAccessChecker, VerifiedIdentity
 from .security_string import render_security_string
+
+
+WORKSPACE_SECURITY_AUTHORIZATION_STALE = 'WORKSPACE_SECURITY_AUTHORIZATION_STALE'
 
 
 def _validate_group_id(group_id: object) -> str:
@@ -29,6 +34,7 @@ def _validate_group_id(group_id: object) -> str:
 
 
 _SECURITY_ACTION_LABELS = {
+    'application-authorization.apply': 'Changed group authorization configuration',
     'application.grant': 'Granted application access',
     'application.revoke': 'Revoked application access',
     'group.grant': 'Granted group application access',
@@ -49,11 +55,56 @@ def _security_action_label(action: str) -> str:
         action, action.replace('.', ' ').replace('_', ' ').capitalize())
 
 
+def _advance_application_security_revision(db, scope: ApplicationScope) -> None:
+    updated = db.execute('''UPDATE epm.application_state
+        SET security_revision=security_revision+1
+        WHERE workspace_id=%s AND application_id=%s''',
+        (scope.workspace_id, scope.application_id))
+    if updated.rowcount != 1:
+        raise AccessDenied('APPLICATION_UNAVAILABLE')
+
+
 class PostgresGrantStore:
     def __init__(self, dsn: str):
         if not isinstance(dsn, str) or not dsn:
             raise ValueError('A PostgreSQL security-writer DSN is required')
         self.dsn = dsn
+
+    @staticmethod
+    @contextmanager
+    def _workspace_security_transaction(db, workspace_id: str,
+                                        actor: VerifiedIdentity, *, write: bool, fence_directory: bool = False):
+        with db.transaction():
+            if not write:
+                db.execute('SET TRANSACTION READ ONLY')
+            else:
+                PostgresAccessChecker.lock_directory_membership_for_assignment(db)
+            if fence_directory:
+                PostgresAccessChecker.lock_directory_membership_for_assignment(db)
+            db.execute("SELECT set_config('epm.workspace_id',%s,true)",
+                       (workspace_id,))
+            opening_groups = PostgresAccessChecker.check_workspace_administrator_in_transaction(
+                db, actor, workspace_id, exclusive=write)
+
+            def verify_current_directory():
+                # The workspace lock holds the grant cut. Check directory authority
+                # separately so an authorized transaction can revoke its own grant.
+                if PostgresAccessChecker.current_groups_in_transaction(db, actor) != opening_groups:
+                    raise ValueError(WORKSPACE_SECURITY_AUTHORIZATION_STALE)
+
+            try:
+                yield
+            except ValueError:
+                verify_current_directory()
+                raise
+            else:
+                verify_current_directory()
+
+    @staticmethod
+    def _require_reachable_workspace_admin(db):
+        reachable = db.execute('SELECT epm.workspace_has_reachable_admin() AS reachable').fetchone()
+        if not reachable['reachable']:
+            raise ValueError('LAST_WORKSPACE_ADMINISTRATOR')
 
     def record_privileged_denial(
             self, scope: ApplicationScope, *, actor: VerifiedIdentity,
@@ -119,6 +170,10 @@ class PostgresGrantStore:
                                .encode('utf-8')).hexdigest()
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
+                db.execute("SELECT set_config('epm.workspace_id',%s,true)",
+                           (scope.workspace_id,))
+                db.execute("SELECT set_config('epm.application_id',%s,true)",
+                           (scope.application_id,))
                 # Exclusive workspace lock serializes every grant change with
                 # effect transactions that hold the matching shared lock.
                 PostgresAccessChecker.lock_workspace(
@@ -160,6 +215,8 @@ class PostgresGrantStore:
                         epm.application_access_grant WHERE issuer=%s
                         AND subject_id=%s AND workspace_id=%s
                         AND application_id=%s''', keys).rowcount)
+                if changed:
+                    _advance_application_security_revision(db, scope)
                 result = {
                     'workspaceId': scope.workspace_id,
                     'applicationId': scope.application_id,
@@ -199,10 +256,7 @@ class PostgresGrantStore:
                 or not 1 <= limit <= 100):
             raise ValueError('APPLICATION_GRANT_LIST_ARGUMENTS_INVALID')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute('SET TRANSACTION READ ONLY')
-                PostgresAccessChecker.check_in_transaction(
-                    db, actor, scope, 'admin')
+            with PostgresAccessChecker.application_security_read(db, actor, scope):
                 rows = db.execute('''SELECT g.subject_id,g.role,
                         g.read_security_tags,g.write_security_tags,g.granted_at,
                         r.can_design,r.can_publish,r.can_run,
@@ -250,10 +304,7 @@ class PostgresGrantStore:
                 or not 1 <= limit <= 100):
             raise ValueError('APPLICATION_SUBJECT_LIST_ARGUMENTS_INVALID')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute('SET TRANSACTION READ ONLY')
-                PostgresAccessChecker.check_in_transaction(
-                    db, actor, scope, 'admin')
+            with PostgresAccessChecker.application_security_read(db, actor, scope):
                 rows = db.execute('''SELECT subject_id,display_name,username
                     FROM epm.identity_user_directory_state
                     WHERE issuer=%s AND status='Active'
@@ -288,12 +339,13 @@ class PostgresGrantStore:
                 or not 1 <= limit <= 100):
             raise ValueError('SECURITY_AUDIT_LIST_ARGUMENTS_INVALID')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute('SET TRANSACTION READ ONLY')
-                PostgresAccessChecker.check_in_transaction(
-                    db, actor, scope, 'admin')
+            with PostgresAccessChecker.application_security_read(db, actor, scope,
+                    function='security.application.audit.list', fence_directory=True):
                 rows = db.execute('''SELECT audit.audit_id,audit.occurred_at,
                         audit.action,audit.outcome,
+                        audit.detail->>'authorizationMode' AS authorization_mode,
+                        audit.detail->'requesterBenefit'->>'classification' AS benefit_classification,
+                        audit.detail->'requesterBenefit'->>'applicationEntry' AS benefit_entry,
                         coalesce(actor.display_name,actor.username,
                                  'Unavailable directory identity') AS actor_name,
                         coalesce(target_user.display_name,target_user.username,
@@ -327,6 +379,10 @@ class PostgresGrantStore:
                     'targetName': row['target_name'],
                     'outcome': row['outcome'],
                     'detailsKey': row['operation_id'],
+                    **({'authorizationMode':row['authorization_mode'], 'requesterBenefit':{
+                        'classification':row['benefit_classification'],'applicationEntry':row['benefit_entry'],
+                        'grants':[],'grantsComplete':row['benefit_classification']=='none'}}
+                       if row.get('benefit_classification') is not None else {}),
                 } for row in rows[:limit]]
                 return {
                     'events': events,
@@ -345,14 +401,17 @@ class PostgresGrantStore:
                 or any(ord(char) < 32 for char in operation_id)):
             raise ValueError('SECURITY_RECEIPT_READ_ARGUMENTS_INVALID')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute('SET TRANSACTION READ ONLY')
-                PostgresAccessChecker.check_in_transaction(
-                    db, actor, scope, 'admin')
+            with PostgresAccessChecker.application_security_read(db, actor, scope,
+                    function='security.application.receipt.read', fence_directory=True):
                 row = db.execute('''SELECT receipt.operation_id,
                         receipt.action,receipt.committed_at,
                         receipt.command_digest,receipt.payload_digest,
-                        receipt.actor_digest
+                        receipt.actor_digest,
+                        CASE WHEN receipt.action='application-authorization.apply'
+                             THEN receipt.result->'impact'->'requesterBenefit' END AS requester_benefit,
+                        CASE WHEN receipt.action='application-authorization.apply'
+                             THEN receipt.result->'impact'->'reviewedWorkflowDuties' END AS reviewed_workflow_duties,
+                        receipt.result->>'authorizationMode' AS authorization_mode
                     FROM epm.security_operation_receipt AS receipt
                     WHERE receipt.workspace_id=%s
                       AND receipt.operation_id=%s
@@ -376,6 +435,10 @@ class PostgresGrantStore:
                     'commandDigest': row['command_digest'],
                     'payloadDigest': row['payload_digest'],
                     'actorDigest': row['actor_digest'],
+                    **({'reviewedWorkflowDuties':row['reviewed_workflow_duties']}
+                       if row.get('reviewed_workflow_duties') else {}),
+                    **({'requesterBenefit':row['requester_benefit'],'authorizationMode':row['authorization_mode']}
+                       if row.get('requester_benefit') is not None else {}),
                 }
 
     def apply_application_group_grant(
@@ -464,6 +527,8 @@ class PostgresGrantStore:
                         epm.application_group_access_grant WHERE issuer=%s
                         AND group_id=%s AND workspace_id=%s
                         AND application_id=%s''', keys).rowcount)
+                if changed:
+                    _advance_application_security_revision(db, scope)
                 result = {
                     'workspaceId': scope.workspace_id,
                     'applicationId': scope.application_id,
@@ -501,20 +566,16 @@ class PostgresGrantStore:
                 or not 1 <= limit <= 100):
             raise ValueError('APPLICATION_GROUP_GRANT_LIST_ARGUMENTS_INVALID')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute('SET TRANSACTION READ ONLY')
-                db.execute("SELECT set_config('epm.workspace_id',%s,true)",
-                           (scope.workspace_id,))
-                db.execute("SELECT set_config('epm.application_id',%s,true)",
-                           (scope.application_id,))
-                PostgresAccessChecker.check_in_transaction(
-                    db, actor, scope, 'admin')
+            with PostgresAccessChecker.application_security_read(db, actor, scope):
                 rows = db.execute('''SELECT g.group_id,g.role,
                         g.read_security_tags,g.write_security_tags,
-                        g.granted_at,r.can_design,r.can_publish,r.can_run
+                        g.granted_at,r.can_design,r.can_publish,r.can_run,
+                        d.display_name,d.group_name,d.status AS directory_status
                     FROM epm.application_group_access_grant g
                     LEFT JOIN epm.rule_group_access_grant r
                       USING(issuer,group_id,workspace_id,application_id)
+                    LEFT JOIN epm.identity_group_directory_state d
+                      ON d.issuer=g.issuer AND d.group_id=g.group_id
                     WHERE g.workspace_id=%s AND g.application_id=%s
                       AND g.issuer=%s
                       AND (%s::text IS NULL OR g.group_id>%s)
@@ -523,6 +584,9 @@ class PostgresGrantStore:
                      after_group_id, after_group_id, limit + 1)).fetchall()
                 values = [{
                     'groupId': row['group_id'], 'role': row['role'],
+                    'displayName': row['display_name'],
+                    'groupName': row['group_name'],
+                    'directoryStatus': row['directory_status'],
                     'readTags': row['read_security_tags'],
                     'writeTags': row['write_security_tags'],
                     'rulePermissions': ({
@@ -688,14 +752,7 @@ class PostgresGrantStore:
         keys = (target.issuer, target.subject_id,
                 scope.workspace_id, scope.application_id)
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute('SET TRANSACTION READ ONLY')
-                db.execute("SELECT set_config('epm.workspace_id',%s,true)",
-                           (scope.workspace_id,))
-                db.execute("SELECT set_config('epm.application_id',%s,true)",
-                           (scope.application_id,))
-                PostgresAccessChecker.check_in_transaction(
-                    db, actor, scope, 'admin')
+            with PostgresAccessChecker.application_security_read(db, actor, scope):
                 row = db.execute('''SELECT g.role,g.read_security_tags,
                         g.write_security_tags,s.security_revision
                     FROM epm.application_access_grant g
@@ -869,14 +926,7 @@ class PostgresGrantStore:
         keys = (actor.issuer, group_id,
                 scope.workspace_id, scope.application_id)
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute('SET TRANSACTION READ ONLY')
-                db.execute("SELECT set_config('epm.workspace_id',%s,true)",
-                           (scope.workspace_id,))
-                db.execute("SELECT set_config('epm.application_id',%s,true)",
-                           (scope.application_id,))
-                PostgresAccessChecker.check_in_transaction(
-                    db, actor, scope, 'admin')
+            with PostgresAccessChecker.application_security_read(db, actor, scope):
                 row = db.execute('''SELECT g.role,g.read_security_tags,
                         g.write_security_tags,s.security_revision
                     FROM epm.application_group_access_grant g
@@ -904,14 +954,7 @@ class PostgresGrantStore:
                 or not isinstance(actor, VerifiedIdentity)):
             raise ValueError('Scope and verified identity are required')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute('SET TRANSACTION READ ONLY')
-                db.execute("SELECT set_config('epm.workspace_id',%s,true)",
-                           (scope.workspace_id,))
-                db.execute("SELECT set_config('epm.application_id',%s,true)",
-                           (scope.application_id,))
-                PostgresAccessChecker.check_in_transaction(
-                    db, actor, scope, 'admin')
+            with PostgresAccessChecker.application_security_read(db, actor, scope):
                 state = db.execute('''SELECT metadata_revision,
                         security_revision FROM epm.application_state
                     WHERE workspace_id=%s AND application_id=%s''',
@@ -965,23 +1008,21 @@ class PostgresGrantStore:
                 or member_id != member_id.strip()):
             raise ValueError('MEMBER_SECURITY_TAG_READ_ARGUMENTS_INVALID')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute('SET TRANSACTION READ ONLY')
-                db.execute("SELECT set_config('epm.workspace_id',%s,true)",
-                           (scope.workspace_id,))
-                db.execute("SELECT set_config('epm.application_id',%s,true)",
-                           (scope.application_id,))
-                PostgresAccessChecker.check_in_transaction(
-                    db, actor, scope, 'admin')
+            with PostgresAccessChecker.application_security_read(
+                    db, actor, scope, function=MEMBER_TAGS_READ_FUNCTION) as access:
                 row = db.execute('''SELECT m.name,m.status,
                         m.read_security_tags,m.write_security_tags,
                         s.metadata_revision,s.security_revision
                     FROM epm.member m JOIN epm.application_state s
                       USING(workspace_id,application_id)
                     WHERE m.workspace_id=%s AND m.application_id=%s
-                      AND m.dimension_id=%s AND m.member_id=%s''',
+                      AND m.dimension_id=%s AND m.member_id=%s
+                      AND (NOT %s OR (m.status='Active' AND EXISTS (
+                          SELECT 1 FROM epm.dimension d
+                          WHERE d.workspace_id=m.workspace_id AND d.application_id=m.application_id
+                            AND d.dimension_id=m.dimension_id AND d.status='Active')))''',
                     (scope.workspace_id, scope.application_id,
-                     dimension_id, member_id)).fetchone()
+                     dimension_id, member_id, access.authorization_model == 'group_assignments')).fetchone()
                 if row is None:
                     raise ValueError('MEMBER_UNAVAILABLE')
                 return {
@@ -1007,23 +1048,17 @@ class PostgresGrantStore:
                 or dimension_id != dimension_id.strip()):
             raise ValueError('DIMENSION_SECURITY_TAG_READ_ARGUMENTS_INVALID')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute('SET TRANSACTION READ ONLY')
-                db.execute("SELECT set_config('epm.workspace_id',%s,true)",
-                           (scope.workspace_id,))
-                db.execute("SELECT set_config('epm.application_id',%s,true)",
-                           (scope.application_id,))
-                PostgresAccessChecker.check_in_transaction(
-                    db, actor, scope, 'admin')
+            with PostgresAccessChecker.application_security_read(
+                    db, actor, scope, function=DIMENSION_METADATA_TAGS_READ_FUNCTION) as access:
                 row = db.execute('''SELECT d.name,d.status,
                         d.read_security_tags,d.write_security_tags,
                         s.metadata_revision,s.security_revision
                     FROM epm.dimension d JOIN epm.application_state s
                       USING(workspace_id,application_id)
                     WHERE d.workspace_id=%s AND d.application_id=%s
-                      AND d.dimension_id=%s''',
+                      AND d.dimension_id=%s AND (NOT %s OR d.status='Active')''',
                     (scope.workspace_id, scope.application_id,
-                     dimension_id)).fetchone()
+                     dimension_id, access.authorization_model == 'group_assignments')).fetchone()
                 if row is None:
                     raise ValueError('DIMENSION_UNAVAILABLE')
                 return {
@@ -1049,14 +1084,7 @@ class PostgresGrantStore:
                 or relationship_id != relationship_id.strip()):
             raise ValueError('RELATIONSHIP_SECURITY_TAG_READ_ARGUMENTS_INVALID')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute('SET TRANSACTION READ ONLY')
-                db.execute("SELECT set_config('epm.workspace_id',%s,true)",
-                           (scope.workspace_id,))
-                db.execute("SELECT set_config('epm.application_id',%s,true)",
-                           (scope.application_id,))
-                PostgresAccessChecker.check_in_transaction(
-                    db, actor, scope, 'admin')
+            with PostgresAccessChecker.application_security_read(db, actor, scope):
                 row = db.execute('''SELECT r.dimension_id,r.name,r.status,
                         r.read_security_tags,r.write_security_tags,
                         s.metadata_revision,s.security_revision
@@ -1113,28 +1141,7 @@ class PostgresGrantStore:
         target_digest = sha256((target.issuer + '\0' + target.subject_id)
                                .encode()).hexdigest()
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute("SELECT set_config('epm.workspace_id',%s,true)",
-                           (workspace_id,))
-                PostgresAccessChecker.lock_workspace(
-                    db, workspace_id, exclusive=True)
-                workspace = db.execute('''SELECT status FROM epm.workspace
-                    WHERE workspace_id=%s''', (workspace_id,)).fetchone()
-                if not workspace or workspace['status'] != 'Active':
-                    raise AccessDenied('WORKSPACE_UNAVAILABLE')
-                administrator = db.execute('''SELECT
-                    EXISTS (SELECT 1 FROM epm.workspace_access_grant
-                        WHERE workspace_id=%s AND issuer=%s
-                        AND subject_id=%s AND role='Administrator')
-                    OR EXISTS (SELECT 1 FROM epm.workspace_group_access_grant
-                        WHERE workspace_id=%s AND issuer=%s
-                        AND group_id=ANY(%s::text[])
-                        AND role='Administrator') AS allowed''',
-                    (workspace_id, actor.issuer, actor.subject_id,
-                     workspace_id, actor.issuer, list(actor.groups))
-                    ).fetchone()['allowed']
-                if not administrator:
-                    raise AccessDenied('WORKSPACE_ADMIN_REQUIRED')
+            with self._workspace_security_transaction(db, workspace_id, actor, write=True):
                 previous = db.execute('''SELECT command_digest,payload_digest,
                     result FROM epm.security_operation_receipt
                     WHERE workspace_id=%s AND operation_id=%s''',
@@ -1166,18 +1173,10 @@ class PostgresGrantStore:
                         AND subject_id=%s AND workspace_id=%s''',
                         keys).fetchone() is not None
                     if present:
-                        count = db.execute('''SELECT
-                            (SELECT count(*) FROM epm.workspace_access_grant
-                                WHERE workspace_id=%s)
-                          + (SELECT count(*) FROM
-                                epm.workspace_group_access_grant
-                                WHERE workspace_id=%s) AS total''',
-                            (workspace_id, workspace_id)).fetchone()['total']
-                        if count <= 1:
-                            raise ValueError('LAST_WORKSPACE_ADMINISTRATOR')
                         db.execute('''DELETE FROM epm.workspace_access_grant
                             WHERE issuer=%s AND subject_id=%s
                             AND workspace_id=%s''', keys)
+                        self._require_reachable_workspace_admin(db)
                     changed = present
                 result = {'workspaceId': workspace_id, 'action': action,
                           'role': 'Administrator' if action == 'grant' else None,
@@ -1225,28 +1224,7 @@ class PostgresGrantStore:
                                .encode()).hexdigest()
         keys = (actor.issuer, group_id, workspace_id)
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute("SELECT set_config('epm.workspace_id',%s,true)",
-                           (workspace_id,))
-                PostgresAccessChecker.lock_workspace(
-                    db, workspace_id, exclusive=True)
-                workspace = db.execute('''SELECT status FROM epm.workspace
-                    WHERE workspace_id=%s''', (workspace_id,)).fetchone()
-                if not workspace or workspace['status'] != 'Active':
-                    raise AccessDenied('WORKSPACE_UNAVAILABLE')
-                allowed = db.execute('''SELECT
-                    EXISTS (SELECT 1 FROM epm.workspace_access_grant
-                        WHERE workspace_id=%s AND issuer=%s
-                        AND subject_id=%s AND role='Administrator')
-                    OR EXISTS (SELECT 1 FROM epm.workspace_group_access_grant
-                        WHERE workspace_id=%s AND issuer=%s
-                        AND group_id=ANY(%s::text[])
-                        AND role='Administrator') AS allowed''',
-                    (workspace_id, actor.issuer, actor.subject_id,
-                     workspace_id, actor.issuer, list(actor.groups))
-                    ).fetchone()['allowed']
-                if not allowed:
-                    raise AccessDenied('WORKSPACE_ADMIN_REQUIRED')
+            with self._workspace_security_transaction(db, workspace_id, actor, write=True):
                 previous = db.execute('''SELECT command_digest,payload_digest,
                     result FROM epm.security_operation_receipt
                     WHERE workspace_id=%s AND operation_id=%s''',
@@ -1273,18 +1251,10 @@ class PostgresGrantStore:
                             VALUES (%s,%s,%s,'Administrator')''', keys)
                 else:
                     if current:
-                        count = db.execute('''SELECT
-                            (SELECT count(*) FROM epm.workspace_access_grant
-                                WHERE workspace_id=%s)
-                          + (SELECT count(*) FROM
-                                epm.workspace_group_access_grant
-                                WHERE workspace_id=%s) AS total''',
-                            (workspace_id, workspace_id)).fetchone()['total']
-                        if count <= 1:
-                            raise ValueError('LAST_WORKSPACE_ADMINISTRATOR')
                         db.execute('''DELETE FROM
                             epm.workspace_group_access_grant WHERE issuer=%s
                             AND group_id=%s AND workspace_id=%s''', keys)
+                        self._require_reachable_workspace_admin(db)
                     changed = current is not None
                 result = {'workspaceId': workspace_id, 'groupId': group_id,
                           'action': action,
@@ -1317,23 +1287,7 @@ class PostgresGrantStore:
                 or not 1 <= limit <= 100):
             raise ValueError('WORKSPACE_GROUP_LIST_ARGUMENTS_INVALID')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute('SET TRANSACTION READ ONLY')
-                db.execute("SELECT set_config('epm.workspace_id',%s,true)",
-                           (workspace_id,))
-                allowed = db.execute('''SELECT
-                    EXISTS (SELECT 1 FROM epm.workspace_access_grant
-                        WHERE workspace_id=%s AND issuer=%s
-                        AND subject_id=%s AND role='Administrator')
-                    OR EXISTS (SELECT 1 FROM epm.workspace_group_access_grant
-                        WHERE workspace_id=%s AND issuer=%s
-                        AND group_id=ANY(%s::text[])
-                        AND role='Administrator') AS allowed''',
-                    (workspace_id, actor.issuer, actor.subject_id,
-                     workspace_id, actor.issuer, list(actor.groups))
-                    ).fetchone()['allowed']
-                if not allowed:
-                    raise AccessDenied('WORKSPACE_ADMIN_REQUIRED')
+            with self._workspace_security_transaction(db, workspace_id, actor, write=False):
                 rows = db.execute('''SELECT group_id,role,granted_at
                     FROM epm.workspace_group_access_grant
                     WHERE workspace_id=%s AND issuer=%s

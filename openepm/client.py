@@ -38,8 +38,18 @@ class EpmClient:
             raise ValueError("An authenticated MCP transport is required")
         self._transport = transport
 
-    def discover(self, application: Application | None = None) -> Mapping[str, Any]:
+    def discover(self, application: Application | None = None, *,
+                 discovery: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        """Read full discovery or an explicit summary/bounded contract page.
+
+        ``discovery={"view": "summary"}`` starts compact onboarding. For a
+        page use ``view=functions`` with family/function and an optional limit;
+        return its ``discovery.next`` as ``after`` with the same query. Every
+        call rechecks current authority, and stale continuations must restart.
+        """
         arguments={} if application is None else application.to_wire()
+        if discovery is not None:
+            arguments['discovery'] = _canonical_copy(discovery, label='discovery')
         return self._transport.call("list_v2_functions", arguments)
 
     def functions(self,application: Application | None = None) -> FunctionRegistry:
@@ -52,6 +62,32 @@ class EpmClient:
                    "arguments": _canonical_copy(arguments, label="arguments")}
         return self._transport.call("read_v2_program", {
             **application.to_wire(), "program": program})
+
+    def select_members(self, application: Application, *, dimension_id: str,
+                       expression, limit: int = 100,
+                       placements: bool = False) -> Mapping[str, Any]:
+        """Read one bounded, authorized page from the core selection engine."""
+        from .member_lists import MemberListExpression
+
+        if not isinstance(expression, MemberListExpression) or type(placements) is not bool:
+            raise ValueError("A typed member-list expression and boolean placement option are required")
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("limit must be an integer from 1 through 500")
+        arguments = {"dimensionId": _identifier(dimension_id, "dimension_id"),
+                     "expression": expression.to_wire(), "limit": limit}
+        if placements:
+            arguments["resultMode"] = "placements"
+        return self.read(application, "metadata.member.select", arguments)
+
+    def selection_top(self, application: Application, *, dimension_id: str,
+                      hierarchy_id: str | None = None) -> Mapping[str, Any]:
+        """Discover a typed dimension or named-hierarchy top without selecting a cell."""
+        from .member_lists import MemberListExpression
+
+        return self.select_members(application, dimension_id=dimension_id,
+            expression=MemberListExpression.navigation(
+                "top", scope="hierarchy" if hierarchy_id is not None else "dimension",
+                hierarchy_id=hierarchy_id))
 
     def authoring_context(self, application: Application) -> BuildContext:
         """Fetch authorized metadata for readable, revision-bound plan construction."""
@@ -98,6 +134,19 @@ class EpmClient:
     def status(self, handle: JobHandle) -> Mapping[str, Any]:
         return self._transport.call("read_v2_job", {
             **handle.application.to_wire(), "job_id": handle.job_id})
+
+    def status_by_operation(self, application: Application, *,
+                            operation_id: str) -> Mapping[str, Any]:
+        """Read the original caller's job when the submit reply did not arrive.
+
+        Use the retained admission or request key in the original application.
+        The server checks current read authority. JOB_UNAVAILABLE leaves the
+        prior outcome unconfirmed. This call never submits or retries work.
+        """
+        if not isinstance(operation_id, str) or not _REQUEST_KEY.fullmatch(operation_id):
+            raise ValueError("operation_id must be an exact original operation key")
+        return self._transport.call("read_v2_job", {
+            **application.to_wire(), "operation_id": operation_id})
 
     def cancel(self, handle: JobHandle) -> Mapping[str, Any]:
         return self._transport.call("cancel_v2_job", {
@@ -440,7 +489,13 @@ class EpmClient:
             "idempotency_key": request_key})
 
     def read_python_build(self, application: Application,
-                          build_id: str) -> Mapping[str, Any]:
+                          build_id: str | None = None, *,
+                          original_request: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        if original_request is not None:
+            if build_id is not None or not isinstance(original_request, Mapping):
+                raise ValueError('Supply a build ID or one original request')
+            return self._transport.call('read_v2_python_program_build', {
+                **application.to_wire(), 'original_request': dict(original_request)})
         return self._transport.call("read_v2_python_program_build", {
             **application.to_wire(), "build_id": self._build_id(build_id)})
 
@@ -580,7 +635,13 @@ class EpmClient:
             "idempotency_key": request_key})
 
     def read_python_workflow(self, application: Application,
-                             workflow_id: str) -> Mapping[str, Any]:
+                             workflow_id: str | None = None, *,
+                             original_request: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        if original_request is not None:
+            if workflow_id is not None or not isinstance(original_request, Mapping):
+                raise ValueError('Supply a workflow ID or one original request')
+            return self._transport.call('read_v2_python_program_workflow', {
+                **application.to_wire(), 'original_request': dict(original_request)})
         return self._transport.call("read_v2_python_program_workflow", {
             **application.to_wire(), "workflow_id": self._build_id(workflow_id)})
 

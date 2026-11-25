@@ -12,12 +12,12 @@ import time
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .current_object_contract import new_state_token,require_state_token
+from .current_object_contract import STATE_TOKEN_PATTERN,new_state_token,require_state_token
 from .persistence_contract import ApplicationScope
 from .postgres_access import PostgresAccessChecker, VerifiedIdentity
 from .postgres_connection import connect_postgres
 from .postgres_numeric_store import PostgresNumericFactStore
-from .postgres_hierarchies import resolve_hierarchy, graph_members
+from .postgres_hierarchies import resolve_hierarchy, graph_members, insert_relationship
 
 
 PREVIEW='metadata.hierarchy.relationships.preview'
@@ -41,7 +41,7 @@ def catalog():
       APPLY:{'mode':'atomic_write','permission':'admin',
       'arguments':{**common,'previewToken':'server-signed exact preview'},
       'optionalArguments':{'hierarchyId':'named hierarchy; omission resolves default'},
-      'result':'one metadata/commit revision, fresh hierarchy state token and receipt',
+      'result':'published hierarchy state, exact graph and closure digests, affected paths and committed revision',
       'previewRequired':True,'idempotencyRequired':True,'workClass':'medium'}}
 
 
@@ -214,14 +214,15 @@ class PostgresHierarchyRelationshipPatch:
       AND relationship_id=ANY(%s::text[]) LIMIT 1''',(*keys,deactivated)).fetchone():
       raise ValueError('RELATIONSHIP_HAS_ACTIVE_OWNERSHIP')
     activated=[c['relationshipId'] for c in args['changes'] if c['action'] in ('Create','Activate')]
-    if activated and db.execute('''SELECT 1 FROM epm.semantic_column c JOIN epm.relationship r
+    if activated and db.execute('''SELECT 1 FROM epm.attribute_definition c JOIN epm.relationship r
       ON r.workspace_id=c.workspace_id AND r.application_id=c.application_id
       AND r.dimension_id=c.dimension_id LEFT JOIN epm.member m ON m.workspace_id=r.workspace_id
-      AND m.application_id=r.application_id AND m.dimension_id=c.properties->>'referenceDimensionId'
-      AND m.member_id=r.custom_values->>('Custom'||lpad(c.slot::text,2,'0')) AND m.status='Active'
+      AND m.application_id=r.application_id
+      AND m.dimension_id=c.validation_constraints->>'referenceDimensionId'
+      AND m.member_id=r.custom_values->>c.attribute_id AND m.status='Active'
       WHERE c.workspace_id=%s AND c.application_id=%s AND c.dimension_id=%s
-      AND c.scope='Relationship' AND c.properties->>'valueType'='MemberReference'
-      AND r.relationship_id=ANY(%s::text[]) AND r.custom_values ? ('Custom'||lpad(c.slot::text,2,'0'))
+      AND c.scope='Relationship' AND c.status='Active' AND c.value_type='MemberReference'
+      AND r.relationship_id=ANY(%s::text[]) AND r.custom_values ? c.attribute_id
       AND m.member_id IS NULL LIMIT 1''',(*keys,args['dimensionId'],activated)).fetchone():
       raise ValueError('SEMANTIC_REFERENCE_MEMBER_UNAVAILABLE')
     closure_rows=[{'ancestorMemberId':a,'descendantMemberId':d,
@@ -281,10 +282,9 @@ class PostgresHierarchyRelationshipPatch:
           raise ValueError('HIERARCHY_PATCH_PREVIEW_STALE')
         for change in args['changes']:
           if change['action']=='Create':
-            db.execute('''INSERT INTO epm.relationship(workspace_id,application_id,
-              relationship_id,dimension_id,parent_member_id,child_member_id,hierarchy_id)
-              VALUES(%s,%s,%s,%s,%s,%s,%s)''',(*keys,change['relationshipId'],args['dimensionId'],
-              change['parentMemberId'],change['childMemberId'],plan['hierarchyId']))
+            insert_relationship(db, scope, dimension_id=args['dimensionId'],
+              hierarchy_id=plan['hierarchyId'], relationship_id=change['relationshipId'],
+              parent_member_id=change['parentMemberId'], child_member_id=change['childMemberId'])
           else:
             db.execute('''UPDATE epm.relationship SET status=%s,updated_at=transaction_timestamp()
               WHERE workspace_id=%s AND application_id=%s AND relationship_id=%s''',(
@@ -333,3 +333,70 @@ class PostgresHierarchyRelationshipPatch:
         record_calculation_impact(db,scope,operation_id=idempotency_key,
           impact=hierarchy_impact)
         return result
+
+
+def program_contract(function):
+    if function not in FUNCTIONS:
+        return None
+    from .metadata_read_contract import read_contract, read_example, obj
+    from .postgres_metadata import _MEMBERSHIP_SEMANTICS
+    identifier = {'type': 'string', 'pattern': '^' + _ID.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    token = {'type': 'string', 'pattern': '^' + STATE_TOKEN_PATTERN.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    count = {'type': 'integer', 'minimum': 0}
+    changes = {'type': 'array', 'minItems': 1, 'maxItems': 100, 'items': {'oneOf': [
+        obj({'action': {'const': 'Create'}, 'relationshipId': identifier,
+            'parentMemberId': identifier, 'childMemberId': identifier}),
+        obj({'action': {'enum': ['Activate', 'Deactivate']}, 'relationshipId': identifier})]}}
+    fields = {'dimensionId': identifier, 'hierarchyId': identifier,
+        'changes': changes, 'expectedMetadataRevision': count,
+        'expectedHierarchyStateToken': token}
+    required = ['dimensionId', 'changes', 'expectedMetadataRevision', 'expectedHierarchyStateToken']
+    opaque_preview = {'type': 'string', 'minLength': 1}
+    published = {'hierarchyId': identifier, 'metadataRevision': count,
+        'graphDigest': token, 'closureDigest': token,
+        'memberCount': count, 'edgeCount': count, 'closureCount': count,
+        'affectedPathCount': count, 'affectedRelationshipIds': {'type': 'array',
+            'minItems': 1, 'maxItems': 100, 'uniqueItems': True, 'items': identifier}}
+    if function == APPLY:
+        arguments = obj({**fields, 'previewToken': opaque_preview}, [*required, 'previewToken'])
+        result = obj({**published, 'kind': {'const': 'hierarchy.build'},
+            'operation': {'const': 'relationship.patch'}, 'stateToken': token,
+            'committedRevision': count, 'impactDigest': token})
+        sample = {'dimensionId': 'custom-axis', 'hierarchyId': 'route-explicit',
+            'expectedMetadataRevision': 1, 'expectedHierarchyStateToken': 'a' * 64,
+            'previewToken': 'signed-preview-from-preceding-read'}
+        create = {'action': 'Create', 'relationshipId': 'route-old',
+            'parentMemberId': 'member-a', 'childMemberId': 'member-b'}
+        move = [{'action': 'Deactivate', 'relationshipId': 'route-old'},
+            {'action': 'Create', 'relationshipId': 'route-new',
+             'parentMemberId': 'member-c', 'childMemberId': 'member-b'}]
+        binding = ('Run metadata.hierarchy.relationships.preview with the exact changes and current hierarchy '
+            'revision and token. Review its affected paths. Bind the returned previewToken and request operation admission.')
+        examples = [read_example(function, {**sample, 'changes': sample_changes},
+            name=caption, binding=binding) for caption, sample_changes in (
+                ('Publish one new hierarchy placement', [create]),
+                ('Move an existing placement in one publication', move))]
+        contract = read_contract(function, arguments, result,
+            owner='PostgresHierarchyRelationshipPatch.apply', examples=examples,
+            semantic_rules=[
+                'The fixed core verifies current admin authority and the exact reviewed graph before publishing the relationships and closure together.',
+                'A new placement uses its stable relationship ID as its display name. Inspect committed placement and closure through the authorized hierarchy reads.',
+                'Read the durable application operation receipt using the admitted operation ID. The apply result identifies the committed revision and fresh hierarchy state token.'])
+        contract['programContract']['recovery'] = (
+            'If the outcome is unknown, read the original operation receipt or replay the exact admitted packet. '
+            'After a definite stale refusal, read the current hierarchy and request a new preview before seeking admission.')
+        return contract
+    arguments = obj(fields, required)
+    result = obj({**published, 'dimensionId': identifier, 'changes': changes,
+        'hierarchyStateToken': token, 'membershipSemantics': {'enum': sorted(_MEMBERSHIP_SEMANTICS)},
+        'previewToken': opaque_preview})
+    return read_contract(function, arguments, result, owner='PostgresHierarchyRelationshipPatch.preview',
+        examples=[read_example(function, {'dimensionId': 'custom-axis', 'hierarchyId': 'primary',
+            'changes': [{'action': 'Create', 'relationshipId': 'new-edge',
+                'parentMemberId': 'parent-a', 'childMemberId': 'child-a'}],
+            'expectedMetadataRevision': 1, 'expectedHierarchyStateToken': 'a' * 64},
+            name='Preview one explicit hierarchy relationship change',
+            binding='Bind the current hierarchy read metadataRevision and stateToken. Both members must already belong to the current built hierarchy; choose a new relationship ID that creates no cycle or duplicate edge.')],
+        semantic_rules=['Preview is read-only and requires current admin authority; it does not apply the proposed graph.',
+            'Native duplicate-edge, cycle, closure-budget, active-ownership and typed-reference checks remain authoritative.',
+            'Use the returned signed preview only for the exact apply program under the same actor, application and current graph/revision; this read contract does not admit apply.'])

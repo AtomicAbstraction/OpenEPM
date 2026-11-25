@@ -22,6 +22,7 @@ VERSION=1
 MAX_INTENT_BYTES=16384
 MAX_SELECTED_MEMBERS=10000
 MAX_AXIS_MEMBERS=5000
+MAX_CURSOR_CHARACTERS=65536
 
 
 def _id(value):
@@ -79,14 +80,16 @@ def program(raw):
             or not isinstance(raw['arguments'],dict)):
         raise ValueError('CUBE_SELECTION_PROGRAM_INVALID')
     if set(raw['arguments'])=={'cursor'}:
-        if not isinstance(raw['arguments']['cursor'],str):raise ValueError('CUBE_SELECTION_CURSOR_INVALID')
+        if (not isinstance(raw['arguments']['cursor'],str)
+                or len(raw['arguments']['cursor'])>MAX_CURSOR_CHARACTERS):
+            raise ValueError('CUBE_SELECTION_CURSOR_INVALID')
         return raw['arguments']
     return arguments(raw['arguments'])
 
 
 class PostgresCubeSelect(PostgresCubeQuery):
     def _cursor(self,token,scope):
-        if not isinstance(token,str) or len(token)>65536:raise ValueError('CUBE_SELECTION_CURSOR_INVALID')
+        if not isinstance(token,str) or len(token)>MAX_CURSOR_CHARACTERS:raise ValueError('CUBE_SELECTION_CURSOR_INVALID')
         try:
             value=base64.b64decode(token,altchars=b'-_',validate=True);raw,signature=value[:-32],value[-32:]
             if not hmac.compare_digest(hmac.new(self.cursor_secret,raw,sha256).digest(),signature):raise ValueError('signature')
@@ -236,7 +239,7 @@ def catalog():
     fields={'grain':obj({'mode':{'const':'full_coordinate'},'dimensions':{'type':'array','minItems':1,'maxItems':128,'uniqueItems':True,'items':id_schema}}),
         'selectors':{'type':'object','minProperties':1,'maxProperties':16,'propertyNames':id_schema,'additionalProperties':{'oneOf':[member,hierarchy]}},
         'limit':{'type':'integer','minimum':1,'maximum':500},'includeMissing':{'type':'boolean'},'snapshotRevision':{'type':'integer','minimum':0}}
-    first=obj(fields,['grain','selectors']);cursor=obj({'cursor':{'type':'string','maxLength':65536}})
+    first=obj(fields,['grain','selectors']);cursor=obj({'cursor':{'type':'string','maxLength':MAX_CURSOR_CHARACTERS}})
     schema=program_schema(FUNCTION,{'oneOf':[first,cursor]})
     sample={'languageVersion':2,'function':FUNCTION,'arguments':{'grain':{'mode':'full_coordinate','dimensions':['Metric']},
         'selectors':{'Metric':{'kind':'Leaves','rootMemberId':'Total','includeSelf':False}},'limit':100}}
@@ -260,7 +263,8 @@ def catalog():
     return {FUNCTION:{'mode':'read','permission':'read','arguments':fields,
         'result':'unaggregated exact source rows, explicit full grain, metadata/snapshot/hierarchy pins, bounded page and signed continuation',
         'previewRequired':False,'idempotencyRequired':False,'workClass':'bounded_read',
-        'programContract':{'version':VERSION,'programSchema':schema,'resultSchema':result_schema,'semanticRules':[
+        'programContract':{'version':VERSION,'programSchema':schema,'resultSchema':result_schema,
+            'resultSchemaScope':'result','semanticRules':[
             'Selectors form AND across axes and set membership within an axis; no aggregation, Cartesian expansion or duplicate source cell for shared paths.',
             'grain dimensions must equal all active fact axes except Currency; stable canonical IDs only. Counts are strict integers, never booleans/decimal tokens.',
             'Members require active IDs. Hierarchy selector roots/versions are scoped to this application/axis and built at current metadata revision. Stale hierarchy versions fail; no implicit rebuild.',

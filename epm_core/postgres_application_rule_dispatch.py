@@ -67,7 +67,7 @@ class PostgresApplicationRuleDispatch:
             raise ValueError('APPLICATION_RULE_WORKER_RENEW_INVALID')
         return self._control('application_rule_worker_renew',claim,lease_seconds)
 
-    def settle_failed(self,claim: dict,error_code: str) -> bool:
+    def settle_failed(self,claim: dict,error_code: str) -> str | None:
         self._validate(claim,'APPLICATION_RULE_WORKER_SETTLEMENT_INVALID')
         if error_code not in ('APPLICATION_RULE_AUTHORIZATION_REVOKED',
                               'APPLICATION_RULE_STALE_CONTEXT'):

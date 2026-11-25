@@ -5,9 +5,19 @@ current representations; a diagnostic build is never a runtime owner lookup.
 """
 from __future__ import annotations
 
+from hashlib import sha256
+import json
+
+from psycopg import sql
 from psycopg.types.json import Jsonb
 
+from .current_object_contract import collection_token
+from .postgres_access import AccessDenied
 from .postgres_capability_contract import SOURCE_PURPOSE_CONTRACT
+from .postgres_dimensional_scope import (
+    metadata_dimension_reference_read_sql, metadata_linked_member_read_sql,
+    metadata_selection_visible_sql, reject_mixed_metadata_reads, resolve_effective_dimensional_scope,
+)
 
 OWNER_TABLES = {
     'ApplicationRule': ('expression_rule_definition', 'rule_id'),
@@ -18,6 +28,140 @@ OWNER_TABLES = {
 STORED_KINDS = {'application.rule.plan': 'ApplicationRule',
     'calculated.member.definition': 'CalculatedMember',
     'facts.expression.calculate': 'ExpressionRule'}
+_GOVERNANCE_TABLES = {
+    'Assignment': ('application_assignment_definition', 'assignment_set_id'),
+    'Workflow': ('application_workflow_definition', 'flow_id'),
+}
+_GOVERNANCE_SECURITY_REVISIONS = ('metadata_revision', 'policy_revision', 'schema_epoch', 'security_revision')
+
+
+def governance_revisions(row):
+    return {'metadataRevision': row['metadata_revision'], 'policyRevision': row['policy_revision'],
+        'schemaEpoch': row['schema_epoch'], 'commitRevision': row['commit_revision']}
+
+
+def _assignment_visible_sql(authority, alias):
+    owner = sql.Identifier(alias)
+    dimension = sql.SQL('assignment_axis.dimension_id')
+    return sql.SQL("""(jsonb_typeof({owner}.definition->'assignments')='array' AND NOT EXISTS (
+        SELECT 1 FROM jsonb_array_elements({owner}.definition->'assignments') entry(item)
+        CROSS JOIN LATERAL jsonb_each(entry.item->'memberSelectors') assignment_axis(dimension_id,members)
+        WHERE NOT {axis_visible} OR EXISTS (
+            SELECT 1 FROM jsonb_array_elements_text(assignment_axis.members) reference(member_id)
+            WHERE NOT {member_visible}
+        )))""").format(owner=owner,
+            axis_visible=metadata_dimension_reference_read_sql(authority, alias, dimension),
+            member_visible=metadata_linked_member_read_sql(authority, alias, dimension, sql.SQL('reference.member_id')))
+
+
+def _governance_visible_sql(authority, kind):
+    if authority.policy is None or authority.administrator_bypass:
+        return sql.SQL('TRUE')
+    if kind == 'Assignment':
+        return _assignment_visible_sql(authority, 'governed')
+    from .postgres_saved_grids import _view_visible_sql
+
+    return sql.SQL("""({selection} AND jsonb_typeof(governed.definition->'activities')='array'
+        AND NOT EXISTS (
+            SELECT 1 FROM jsonb_array_elements(governed.definition->'activities') activity(item)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM epm.application_assignment_definition bound_assignment
+                WHERE bound_assignment.workspace_id=governed.workspace_id
+                  AND bound_assignment.application_id=governed.application_id
+                  AND bound_assignment.assignment_set_id=activity.item#>>'{{assignmentRef,assignmentSetId}}'
+                  AND {assignment}
+            ) OR (activity.item#>>'{{destination,kind}}'='CubeView' AND NOT EXISTS (
+                SELECT 1 FROM epm.saved_grid_definition bound_view
+                WHERE bound_view.workspace_id=governed.workspace_id
+                  AND bound_view.application_id=governed.application_id
+                  AND bound_view.grid_id=activity.item#>>'{{destination,viewId}}' AND {view}
+            ))
+        ))""").format(
+            selection=metadata_selection_visible_sql(authority, 'governed', sql.SQL("governed.definition->'selection'")),
+            assignment=_assignment_visible_sql(authority, 'bound_assignment'),
+            view=_view_visible_sql(authority, 'bound_view'))
+
+
+def _require_current_governance_read(db, scope, identity, kind, function, authority, observed):
+    current = resolve_effective_dimensional_scope(db, identity, scope, function=function)
+    if current.access != authority.access or current.scope_digest != authority.scope_digest:
+        raise ValueError(f'APPLICATION_{kind.upper()}_AUTHORIZATION_STALE')
+    if authority.policy is None:
+        return
+    revisions = db.execute('''SELECT metadata_revision,policy_revision,schema_epoch,security_revision
+        FROM epm.application_state WHERE workspace_id=%s AND application_id=%s''',
+        (scope.workspace_id, scope.application_id)).fetchone()
+    if revisions is None or any(revisions[key] != observed[key] for key in _GOVERNANCE_SECURITY_REVISIONS):
+        raise ValueError(f'APPLICATION_{kind.upper()}_READ_STALE')
+
+
+def read_governance_definition(db, scope, kind, definition_id, *, identity, function, access):
+    """Read a definition and its application revisions in one PostgreSQL snapshot."""
+    table, key = _GOVERNANCE_TABLES[kind]
+    authority = resolve_effective_dimensional_scope(db, identity, scope, access=access)
+    row = db.execute(sql.SQL('''SELECT governed.*,s.metadata_revision,s.policy_revision,s.schema_epoch,
+        s.commit_revision,s.security_revision
+        FROM epm.application_state s
+        LEFT JOIN epm.{table} governed
+          ON governed.workspace_id=s.workspace_id AND governed.application_id=s.application_id
+           AND governed.{key}=%s AND {visible}
+        WHERE s.workspace_id=%s AND s.application_id=%s''').format(
+            table=sql.Identifier(table), key=sql.Identifier(key), visible=_governance_visible_sql(authority, kind)),
+        (definition_id, scope.workspace_id, scope.application_id)).fetchone()
+    if row is None:
+        raise ValueError('APPLICATION_UNAVAILABLE')
+    _require_current_governance_read(db, scope, identity, kind, function, authority, row)
+    return row if row[key] is not None else None
+
+
+def read_governance_definition_page(db, scope, kind, *, after, limit, identity, function, access, status=None):
+    """Read the collection identity, bounded page and revisions from one snapshot."""
+    table, key = _GOVERNANCE_TABLES[kind]
+    authority = resolve_effective_dimensional_scope(db, identity, scope, access=access)
+    hidden = sql.SQL('FALSE')
+    if reject_mixed_metadata_reads(authority):
+        hidden = sql.SQL('''EXISTS (SELECT 1 FROM epm.{table} hidden
+          WHERE hidden.workspace_id=%(workspace)s AND hidden.application_id=%(application)s
+            AND (%(status)s::text IS NULL OR hidden.status=%(status)s)
+            AND NOT EXISTS (SELECT 1 FROM visible WHERE {key}=hidden.{key}))''').format(
+                table=sql.Identifier(table), key=sql.Identifier(key))
+    # Off-page rows carry only the ID and token needed for collection fencing.
+    rows = db.execute(sql.SQL('''WITH visible AS MATERIALIZED (
+        SELECT governed.{key},governed.state_token FROM epm.{table} governed
+        WHERE governed.workspace_id=%(workspace)s AND governed.application_id=%(application)s
+          AND (%(status)s::text IS NULL OR governed.status=%(status)s) AND {visible}
+    ), page AS (
+        SELECT governed.* FROM epm.{table} governed JOIN visible USING ({key})
+        WHERE governed.workspace_id=%(workspace)s AND governed.application_id=%(application)s
+          AND (%(after)s::text IS NULL OR governed.{key}>%(after)s)
+        ORDER BY governed.{key} LIMIT %(limit)s
+    )
+    SELECT v.{key},v.state_token,page.{key} IS NOT NULL AS on_page,
+        page.status,page.definition,page.definition_digest,page.updater_issuer,page.updater_subject_id,page.updated_at,
+        s.metadata_revision,s.policy_revision,s.schema_epoch,s.commit_revision,s.security_revision,{hidden} AS hidden_exists
+    FROM epm.application_state s
+    LEFT JOIN visible v ON TRUE LEFT JOIN page ON page.{key}=v.{key}
+    WHERE s.workspace_id=%(workspace)s AND s.application_id=%(application)s
+    ORDER BY v.{key}''').format(table=sql.Identifier(table), key=sql.Identifier(key),
+        visible=_governance_visible_sql(authority, kind), hidden=hidden),
+        {'workspace': scope.workspace_id, 'application': scope.application_id,
+         'after': after, 'limit': limit + 1, 'status': status}).fetchall()
+    if not rows:
+        raise ValueError('APPLICATION_UNAVAILABLE')
+    observed = rows[0]
+    token = collection_token((row[key], row['state_token']) for row in rows if row[key] is not None)
+    if authority.policy is not None:
+        token = sha256(json.dumps([kind, status, token, scope.workspace_id, scope.application_id,
+            identity.issuer, identity.subject_id, authority.scope_digest,
+            *(observed[key] for key in _GOVERNANCE_SECURITY_REVISIONS)],
+            separators=(',', ':'), ensure_ascii=True).encode('ascii')).hexdigest()
+    elif status is not None:
+        token = sha256(f'openepm-governance-list-v1:{kind}:{status}:{token}'.encode()).hexdigest()
+    _require_current_governance_read(db, scope, identity, kind, function, authority, observed)
+    if observed['hidden_exists']:
+        raise AccessDenied(f'APPLICATION_{kind.upper()}_SCOPE_UNAVAILABLE')
+    page = [row for row in rows if row['on_page']]
+    return page, token, governance_revisions(observed)
 
 
 def owner_kind(row):
@@ -324,6 +468,45 @@ class DefinitionReferenceBlocked(ValueError):
         super().__init__('DEFINITION_REFERENCES_BLOCK_REMOVAL')
 
 
+REFERENCE_CONSUMER_KINDS = ('list', 'rule', 'saved-view', 'schedule', 'workflow')
+
+
+def definition_reference_blockers(db, scope, *, producer_kind, producer_id, after=None, limit=None):
+    parameters = {'workspace': scope.workspace_id, 'application': scope.application_id,
+                  'producer_kind': producer_kind, 'producer_id': producer_id,
+                  'after_kind': after['kind'] if after else None,
+                  'after_id': after['id'] if after else None, 'limit': limit}
+    compiled = '''SELECT consumer_kind AS kind,consumer_id AS id FROM epm.current_definition_reference
+        WHERE workspace_id=%(workspace)s AND application_id=%(application)s
+          AND producer_kind=%(producer_kind)s AND producer_id=%(producer_id)s'''
+    if producer_kind == 'list':
+        # These writers share the application-state lock. A retained schedule
+        # resolves its saved MemberList binding again for each new occurrence.
+        selector = {'kind': 'member_list', 'listId': producer_id}
+        parameters.update(include=Jsonb([{'include': selector}]), exclude=Jsonb([{'exclude': selector}]))
+        compiled += '''
+            UNION ALL
+            SELECT kind,id FROM (
+                SELECT 'saved-view' AS kind,grid_id AS id,definition
+                FROM epm.saved_grid_definition
+                WHERE workspace_id=%(workspace)s AND application_id=%(application)s
+                UNION ALL
+                SELECT 'workflow',flow_id,definition FROM epm.application_workflow_definition
+                WHERE workspace_id=%(workspace)s AND application_id=%(application)s
+            ) consumers
+            WHERE definition->'selection'->'dimensions' @> %(include)s
+               OR definition->'selection'->'dimensions' @> %(exclude)s
+            UNION ALL
+            SELECT 'schedule',schedule_id FROM epm.application_schedule_definition
+            WHERE workspace_id=%(workspace)s AND application_id=%(application)s
+              AND jsonb_path_exists(definition->'bindings',
+                  '$.* ? (@.listId == $listId)',
+                  jsonb_build_object('listId', %(producer_id)s::text))'''
+    return db.execute(f'''SELECT kind,id FROM ({compiled}) blockers
+        WHERE %(after_kind)s::text IS NULL OR (kind,id)>(%(after_kind)s::text,%(after_id)s::text)
+        ORDER BY kind,id LIMIT %(limit)s''', parameters).fetchall()
+
+
 def require_no_active_references(db, scope, source):
     blockers = _active_blockers(db, scope, source)
     if blockers:
@@ -427,11 +610,8 @@ def transition_source_owner(db, scope, *, source, delete, state_token, operation
     table, key = OWNER_TABLES[kind]
     if delete:
         producer = 'list' if kind == 'MemberList' else 'rule'
-        blockers = [{'kind': r['consumer_kind'], 'id': r['consumer_id']} for r in db.execute('''
-            SELECT consumer_kind,consumer_id FROM epm.current_definition_reference
-            WHERE workspace_id=%s AND application_id=%s AND producer_kind=%s AND producer_id=%s
-            ORDER BY consumer_kind,consumer_id''',
-            (scope.workspace_id,scope.application_id,producer,object_id)).fetchall()]
+        blockers = definition_reference_blockers(
+            db, scope, producer_kind=producer, producer_id=object_id)
         for r in db.execute('''SELECT schedule_id FROM epm.python_program_schedule_definition
             WHERE workspace_id=%s AND application_id=%s AND program_id=%s ORDER BY schedule_id''',
             (scope.workspace_id,scope.application_id,source['program_id'])).fetchall():

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   browserLifecycleSnapshot,
   classifyBrowserFailure,
+  installConnectivityLifecycle,
   resetBrowserLifecycleForTests,
   setBrowserLifecycle,
   subscribeBrowserLifecycle,
@@ -23,6 +24,39 @@ describe("application-wide browser lifecycle", () => {
     setBrowserLifecycle("revalidating");
     expect(states).toEqual(["bootstrapping", "authenticated", "expired"]);
     expect(browserLifecycleSnapshot().reason).toBe("ACCESS_TOKEN_EXPIRED");
+    unsubscribe();
+  });
+
+  it("revalidates locally when another tab authenticates", () => {
+    const channel = Object.assign(new EventTarget(), {
+      close: vi.fn(),
+      postMessage: vi.fn(),
+    });
+    vi.stubGlobal(
+      "BroadcastChannel",
+      class {
+        constructor() {
+          return channel;
+        }
+      },
+    );
+    const unsubscribe = subscribeBrowserLifecycle(() => undefined);
+    const revalidate = vi.fn();
+    const uninstall = installConnectivityLifecycle(revalidate);
+    setBrowserLifecycle("offline");
+    channel.dispatchEvent(
+      new MessageEvent("message", {
+        data: { state: "authenticated" },
+      }),
+    );
+    expect(browserLifecycleSnapshot()).toMatchObject({
+      state: "revalidating",
+      reason: "another-tab",
+    });
+    expect(revalidate).toHaveBeenCalledExactlyOnceWith(false);
+    setBrowserLifecycle("authenticated", undefined, false);
+    expect(channel.postMessage).not.toHaveBeenCalled();
+    uninstall();
     unsubscribe();
   });
 

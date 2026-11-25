@@ -26,6 +26,41 @@ _MAX_ROWS = 100000000
 _MAX_BYTES = 1099511627776  # 1 TiB of canonical typed row payloads.
 
 
+def export_type_counts_schema() -> dict:
+    from .postgres_numeric_catalog import obj
+
+    count = {'type': 'integer', 'minimum': 0}
+    return obj(dict.fromkeys(('amount', 'text', 'lineDetail'), count))
+
+
+def sealed_manifest_schema() -> dict:
+    """Describe the complete manifest versions its verifier can read."""
+    from .postgres_numeric_catalog import obj
+
+    count = {'type': 'integer', 'minimum': 0}
+    digest = {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}
+    nullable_digest = {**digest, 'type': ['string', 'null']}
+    ident = {'type': 'string', 'minLength': 1}
+    page = obj({'pageIndex': count, 'requestCursorDigest': nullable_digest,
+        'nextCursorDigest': nullable_digest, 'contentDigest': digest,
+        'rowCount': {**count, 'maximum': 50}, 'rowBytes': count,
+        'typeCounts': export_type_counts_schema(), 'firstKey': nullable_digest,
+        'lastKey': nullable_digest, 'hasMore': {'type': 'boolean'}})
+    limits = obj({'maxPages': {'type': 'integer', 'minimum': 1, 'maximum': _MAX_PAGES},
+        'maxRows': {'type': 'integer', 'minimum': 1, 'maximum': _MAX_ROWS},
+        'maxBytes': {'type': 'integer', 'minimum': 1, 'maximum': _MAX_BYTES}})
+    fields = {'status': {'const': 'complete'}, 'scope': obj({'workspaceId': ident, 'applicationId': ident}),
+        'schema': {'const': _EXPORT_SCHEMA}, 'snapshotRevision': count, 'metadataRevision': count,
+        'expiresAt': {'type': 'integer', 'minimum': 1, 'maximum': 2**63 - 1}, 'limits': limits,
+        'pages': {'type': 'array', 'minItems': 1, 'maxItems': _MAX_PAGES, 'items': page}, 'pageCount': count,
+        'totalRowCount': count, 'totalRowBytes': count, 'typeCounts': export_type_counts_schema(),
+        'cumulativeDigest': digest, 'manifestDigest': digest}
+    return {'oneOf': [
+        obj({'contractVersion': {'const': CONTRACT_VERSION}, **fields, 'securityRevision': count}),
+        obj({'contractVersion': {'const': LEGACY_CONTRACT_VERSION}, **fields}),
+    ]}
+
+
 def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(',', ':'),
                       ensure_ascii=False, allow_nan=False).encode('utf-8')

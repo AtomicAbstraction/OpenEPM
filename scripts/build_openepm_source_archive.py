@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "deploy/release/source-package.manifest.json"
 ARCHIVE_ROOT = "openepm-source"
 RELEASE_CONTRACTS = {
+    ".dockerignore",
     "deploy/release/openepm.env.example",
     "deploy/release/source-package.manifest.json",
     "deploy/release/release-manifest.schema.json",
@@ -114,9 +115,11 @@ def covered(path: str, required: list[str]) -> bool:
     return any(path == item or path.startswith(item + "/") for item in required)
 
 
-def docker_copy_sources(root: Path, required: list[str]) -> set[str]:
+def docker_copy_sources(root: Path, required: list[str], *,
+                        candidate_paths: set[str] | None = None) -> set[str]:
     sources: set[str] = set()
-    tracked = set(git("ls-files", root=root).splitlines())
+    paths = (set(git("ls-files", root=root).splitlines())
+             if candidate_paths is None else candidate_paths)
     for dockerfile in sorted(root.glob("deploy/**/Dockerfile*")):
         relative = dockerfile.relative_to(root).as_posix()
         # A source archive is closed over the build recipes it actually ships.
@@ -141,12 +144,12 @@ def docker_copy_sources(root: Path, required: list[str]) -> set[str]:
             tokens = [token for token in tokens if not token.startswith("--")]
             for source in tokens[:-1]:
                 source = source.rstrip("/")
-                matches = {item for item in tracked
+                matches = {item for item in paths
                            if item == source or item.startswith(source + "/")
                            or fnmatch.fnmatchcase(item, source)}
                 if not matches:
                     raise SourcePackageError(
-                        f"Docker COPY source resolves to no tracked path: {source}")
+                        f"Docker COPY source resolves to no {'tracked' if candidate_paths is None else 'candidate'} path: {source}")
                 sources.update(matches)
     return sources
 
@@ -191,14 +194,16 @@ def selected_git_files(root: Path, required: list[str]) -> list[GitFile]:
     return sorted(files, key=lambda item: item.path.encode("utf-8"))
 
 
-def validate_coverage(root: Path, required: list[str]) -> None:
+def validate_coverage(root: Path, required: list[str], *,
+                      candidate_paths: set[str] | None = None) -> None:
+    """Check build inputs. Release packaging uses the tracked inventory."""
     entrypoints = {path.relative_to(root).as_posix()
                    for path in root.glob("platform_postgres*.py")}
     explicit = set(required)
     omitted = sorted((entrypoints | RELEASE_CONTRACTS) - explicit)
     if omitted:
         raise SourcePackageError(f"required entrypoints/contracts omitted: {omitted}")
-    copied = docker_copy_sources(root, required)
+    copied = docker_copy_sources(root, required, candidate_paths=candidate_paths)
     uncovered = sorted(path for path in copied if not covered(path, required))
     if uncovered:
         raise SourcePackageError(f"Docker COPY source not packaged: {uncovered}")

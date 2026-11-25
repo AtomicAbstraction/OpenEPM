@@ -8,8 +8,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from . import postgres_numeric_sequence as sequence
 from .postgres_numeric_sequence_expression import instructions,COMPILER as BASE_COMPILER,PLAN_DIGEST as BASE_PLAN
-from .postgres_jobs import (_canonical_digest,PostgresJobQueue,_KEY,_JOB_ID,
-    _job_request_descriptor,_verify_job_replay_authorization)
+from .postgres_jobs import _canonical_digest,PostgresJobQueue
 from .postgres_connection import connect_postgres
 from .postgres_access import PostgresAccessChecker
 from .postgres_numeric_store import PostgresNumericFactStore
@@ -30,6 +29,74 @@ PLAN_DIGEST=_canonical_digest({'function':FUNCTION,'compiler':COMPILER,'base':(B
     'iterations':MAX_ITERATIONS,'effects':MAX_EFFECTS,'instructions':MAX_INSTRUCTIONS,
     'expandedBytes':MAX_EXPANDED_BYTES,'executionSeconds':EXECUTION_SECONDS,
     'publication':'all_iteration_statement_events_one_commit_on_convergence_only'})
+
+
+def report_schema(*, converged=None):
+    """Wire report from report(); deltas may be wider than either endpoint."""
+    from .postgres_numeric_catalog import obj
+    convergence = {'type': 'boolean'}
+    if converged is not None:
+        convergence['const'] = converged
+    return obj({
+        'converged': convergence,
+        'iterations': {'type': 'integer', 'minimum': 1, 'maximum': MAX_ITERATIONS},
+        'diagnostics': {'type': 'array', 'minItems': 1, 'maxItems': MAX_ITERATIONS,
+            'items': obj({
+                'iteration': {'type': 'integer', 'minimum': 1, 'maximum': MAX_ITERATIONS},
+                'presenceChanges': {'type': 'integer', 'minimum': 0, 'maximum': 500},
+                'maxAbsoluteDelta': {'type': 'string',
+                    'pattern': r'^(?:0|[1-9][0-9]{0,20})\.[0-9]{8}(?![\s\S])'}})},
+        'executedStatementCount': {'type': 'integer', 'minimum': 1, 'maximum': MAX_EFFECTS},
+        'finalValues': {'type': 'array', 'minItems': 1, 'maxItems': 500,
+            'items': sequence.numeric_result_cell_schema({
+                'seriesKey': {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}})}})
+
+
+def preview_result_schema():
+    from .postgres_numeric_catalog import obj
+    variants = []
+    for converged in (True, False):
+        fields = {
+            'languageVersion': {'type': 'integer', 'const': 2}, 'function': {'const': FUNCTION},
+            'admissionAllowed': {'type': 'boolean', 'const': converged},
+            'revisionVector': obj({key: {'type': 'integer', 'minimum': 0} for key in
+                ('metadata_revision', 'data_revision', 'policy_revision')}),
+            **report_schema(converged=converged)['properties']}
+        if converged:
+            fields.update(previewToken={'type': 'string', 'minLength': 1},
+                programDigest={'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'})
+        else:
+            fields['errorCode'] = {'const': 'NUMERIC_ITERATION_NOT_CONVERGED'}
+        variants.append(obj(fields))
+    return {'$schema': 'https://json-schema.org/draft/2020-12/schema', 'oneOf': variants}
+
+
+def published_result_schema():
+    from .postgres_numeric_catalog import obj
+    base = sequence.published_result_schema(maximum_statements=MAX_EFFECTS)
+    return {'$schema': base['$schema'], **obj({**base['properties'],
+        'convergence': report_schema(converged=True),
+        'iterationStatementCount': {'type': 'integer', 'minimum': 1, 'maximum': 500}})}
+
+
+def output_contract():
+    from .postgres_jobs import job_submission_schema
+    submission = job_submission_schema()
+    return {'resultSchema': submission, 'resultSchemaScope': 'envelope',
+        'outputSchemas': {
+            'preview': {'schema': preview_result_schema(), 'scope': 'envelope',
+                'surface': 'preview_v2_program or browser /api/preview; convergence or nonconvergence is a returned preview, not a published effect'},
+            'submission': {'schema': submission, 'scope': 'envelope',
+                'surface': 'submit_v2_program or browser /api/submit; accepted durable job or matching original job'},
+            'publishedResult': {'schema': published_result_schema(), 'scope': 'result',
+                'surface': 'read_v2_job result when published, also operation receipt result; not the worker wrapper'}},
+        'outputRules': [
+            'Nonconvergent preview has converged=false, admissionAllowed=false and NUMERIC_ITERATION_NOT_CONVERGED, with no previewToken or programDigest. It is inspectable but cannot admit work. Converged preview has both signed-preview fields and no errorCode; publication requires convergence.',
+            'diagnostics has one ordered entry per executed iteration. presenceChanges counts changed presence across distinct final targets; maxAbsoluteDelta compares only targets present before and after. Two valid NUMERIC(28,8) endpoints can have a 21-integer-digit delta; it is not a cell amount.',
+            'Final values are sorted by seriesKey. Missing remains distinct from present zero. executedStatementCount and published statementCount count all iteration effects; iterationStatementCount counts the original program statements. Iteration count times original statement count equals executed count.',
+            'changedCount counts distinct final target coordinates, not changed-value comparisons. Every intermediate event and final projection publishes in one commit; failed or nonconvergent work has no publishedResult.',
+            'Signed previewToken binds the current compiler and execution plan. Old or mismatched plan previews cannot admit new work; accepted old-plan jobs fail before evaluation. Original job/receipt recovery preserves the accepted identity and completed outcome without rerunning convergence.',
+            'Current direct iteration results contain no savedProgram. Existing authorized historical job/receipt inspection preserves the originally stored result without applying these schemas as a decoder.']}
 
 
 def compile_program(raw):
@@ -153,45 +220,30 @@ def preview(language,scope,raw):
     result={'languageVersion':2,'function':FUNCTION,'admissionAllowed':outcome['converged'],
         'revisionVector':revisions,**report(outcome)}
     if outcome['converged']:
-        token,digest=language._sign_preview(scope,FUNCTION,normalized,revisions)
+        token,digest=language._sign_preview(scope,FUNCTION,normalized,revisions,
+            extra={'compilerVersion':COMPILER,'planDigest':PLAN_DIGEST})
         result.update(previewToken=token,programDigest=digest)
     else:result['errorCode']='NUMERIC_ITERATION_NOT_CONVERGED'
     return result
 
 
+def replay(language,scope,raw,key,dependencies,*,execution_authority=None):
+    normalized=compile_program(raw)
+    sequence._validate_replay_key(key,dependencies,'NUMERIC_ITERATION_REQUEST_INVALID')
+    return sequence._replay_request(language,scope,normalized,FUNCTION,'short',key,dependencies,
+        execution_authority=execution_authority,conflict='NUMERIC_ITERATION_IDEMPOTENCY_CONFLICT')
+
+
 def submit(language,scope,raw,token,key,dependencies,*,execution_authority=None):
     normalized=compile_program(raw)
-    if (not isinstance(key,str) or not _KEY.fullmatch(key) or not isinstance(dependencies,tuple) or len(dependencies)>16
-            or any(not isinstance(d,str) or not _JOB_ID.fullmatch(d) for d in dependencies)
-            or len(set(dependencies))!=len(dependencies)):
-        raise ValueError('NUMERIC_ITERATION_REQUEST_INVALID')
-    with connect_postgres(language.dsn,row_factory=dict_row) as db:
-        with db.transaction():
-            PostgresNumericFactStore._set_scope(db,scope)
-            PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-            access=PostgresAccessChecker.check_in_transaction(
-                db,language.identity,scope,'write',function=FUNCTION)
-            prior=db.execute('''SELECT job_id,status,request_digest,expected_metadata_revision,
-                expected_data_revision,expected_policy_revision,verified_groups,
-                authorization_scope_digest FROM epm.job WHERE workspace_id=%s AND application_id=%s
-                AND issuer=%s AND subject_id=%s AND idempotency_key=%s''',
-                (scope.workspace_id,scope.application_id,language.identity.issuer,language.identity.subject_id,key)).fetchone()
-            if prior:
-                auth_scope=_verify_job_replay_authorization(db,scope,
-                    language.identity,prior,access=access,function_name=FUNCTION)
-                descriptor=_job_request_descriptor(scope,language.identity,
-                    function_name=FUNCTION,program_digest=_canonical_digest(normalized),
-                    compiler_version=COMPILER,plan_digest=PLAN_DIGEST,
-                    revisions=(prior['expected_metadata_revision'],
-                        prior['expected_data_revision'],prior['expected_policy_revision']),
-                    resource_class='short',dependencies=dependencies,
-                    authorization_scope_digest=auth_scope,
-                    verified_groups=access.groups,execution_authority=execution_authority)
-                if _canonical_digest(descriptor)!=prior['request_digest']:raise ValueError('NUMERIC_ITERATION_IDEMPOTENCY_CONFLICT')
-                return {'jobId':prior['job_id'],'status':prior['status'],'duplicate':True}
+    sequence._validate_replay_key(key,dependencies,'NUMERIC_ITERATION_REQUEST_INVALID')
+    prior=sequence._replay_request(language,scope,normalized,FUNCTION,'short',key,dependencies,
+        execution_authority=execution_authority,conflict='NUMERIC_ITERATION_IDEMPOTENCY_CONFLICT')
+    if prior is not None:return prior
     payload=language._unpack_preview(scope,FUNCTION,token)
-    if (set(payload)!={'scope','identity','function','programDigest','revisions','expiresAt'}
-            or payload['programDigest']!=_canonical_digest(normalized)):
+    if (set(payload)!={'scope','identity','function','programDigest','revisions','expiresAt','compilerVersion','planDigest'}
+            or payload['programDigest']!=_canonical_digest(normalized)
+            or payload['compilerVersion']!=COMPILER or payload['planDigest']!=PLAN_DIGEST):
         raise ValueError('STALE_OR_MISMATCHED_V2_PREVIEW')
     revisions=payload['revisions']
     return PostgresJobQueue(language.dsn,identity=language.identity).submit(scope,

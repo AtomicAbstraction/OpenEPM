@@ -1,21 +1,57 @@
 import {
   useCallback,
   useEffect,
+  useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type KeyboardEvent,
 } from "react";
 import {
+  ApiError,
+  isApplicationAccessDenied,
   readProgram,
   request,
   requestAdmittedEffect,
-  reviewAndSubmit,
 } from "./api";
+import {
+  canCopyScenario,
+  ScenarioPromotion,
+  type ScenarioPromotionControl,
+} from "./ScenarioPromotion";
+import {
+  isComparisonUnit,
+  SCENARIO_COMPARISON,
+  ScenarioComparison,
+} from "./ScenarioComparison";
+import {
+  ExactMutationOutcome,
+  useExactCellMutation,
+} from "./exact-cell-mutation";
 import type { ApplicationCatalog, ApplicationSummary, Scope } from "./types";
+import type { AnalyticalRead, SavedViewContext } from "./reference-handoff";
 import { useUnsavedWork } from "./unsaved-work";
 import { useStableMutationIntentKey } from "./mutation-intent";
+import { gridCoordinateKey, useGridFocus } from "./grid-focus";
 import { collectAllContinuations } from "./continuation";
+import { activeFactDimensions } from "./metadata-data";
+import { MemberSelectionDialog } from "./member-selection/MemberSelectionDialog";
+import {
+  canonicalCubeSelection,
+  explicitMemberIds,
+  type CubeSelection,
+  type CubeSelector,
+} from "./member-selection/selection-types";
+import { selectorSummary } from "./member-selection/selection-summary";
+import { scalarPovFromCubeSelection } from "./member-selection/selection-adapter";
+import {
+  canonicalGridReadLabel,
+  gridLayoutSummary,
+  gridReadPlan,
+  type GridReadPlan,
+  type GridReadSemantics,
+} from "./grid-read-contract";
 import "./data-workspaces.css";
 
 type Dimension = {
@@ -61,6 +97,73 @@ type ResolvedCubePage = {
 };
 
 type ResolvedReadStatus = "current" | "current-empty";
+type CubeLayerValue = {
+  present: boolean;
+  value: string | null;
+  unit: string | Record<string, unknown> | null;
+  origin: string;
+  currentness: string;
+  resultStateToken: string | null;
+};
+type CubeViewReadPage = {
+  format: "openepm-cube-view-read-v1";
+  dataSource: SavedGridDefinition["dataSource"];
+  readPolicy: { semantics: "stored" | "own" };
+  rows: Array<{
+    members: Record<string, string>;
+    values: Partial<Record<"raw" | "calculated", CubeLayerValue[]>>;
+  }>;
+  snapshot: { commitRevision: number };
+  complete: boolean;
+  presentation: { pageSize: number; rowCount: number };
+  calculation?: {
+    resultKey: string;
+    resultStateToken: string;
+    inputRevisionStatus: { matchesAtRead: boolean };
+  };
+};
+
+export function layerValueText(value: CubeLayerValue) {
+  if (!value.present) return "Missing";
+  const unit =
+    typeof value.unit === "object" && value.unit
+      ? value.unit.memberId || value.unit.type || ""
+      : "";
+  return `${value.unit === "text" && value.value === "" ? "Empty text" : value.value}${unit ? ` ${unit}` : ""}`;
+}
+
+export function cubeViewRowsToCells(page: CubeViewReadPage): CubeCell[] {
+  return page.rows.map((row) => {
+    const layers = Object.entries(row.values) as Array<
+      ["raw" | "calculated", CubeLayerValue[]]
+    >;
+    const single =
+      layers.length === 1 && layers[0][1].length === 1 ? layers[0][1][0] : null;
+    const text = single?.unit === "text" || !single;
+    return {
+      members: row.members,
+      kind: text ? "text" : "numeric",
+      ...(text
+        ? {
+            text: single
+              ? single.value
+              : layers
+                  .map(
+                    ([layer, values]) =>
+                      `${layer === "raw" ? "Raw" : "Calculated"}: ${values.map(layerValueText).join(" / ")}`,
+                  )
+                  .join(" · "),
+          }
+        : { amount: single?.value }),
+      lastRevision: page.snapshot.commitRevision,
+      resultUnit: typeof single?.unit === "string" ? single.unit : undefined,
+      origin: single?.origin,
+      currentness: single?.currentness,
+      resultStateToken: single?.resultStateToken,
+      layerValues: row.values,
+    };
+  });
+}
 
 export function resolvedReadStatus(page: ResolvedCubePage): ResolvedReadStatus {
   const materializedDefinitions = page.stages.flatMap((stage) =>
@@ -90,6 +193,30 @@ export function resolvedRowsToCells(page: ResolvedCubePage): CubeCell[] {
     resultStateToken: row.resultStateToken,
     lineage: row.lineage,
   }));
+}
+
+function gridMemberComparator(
+  dimensions: readonly string[],
+  members: Record<string, Member[]>,
+  selectorFor: (dimensionId: string) => CubeSelector | null,
+) {
+  const ranks = dimensions.map((dimension) => {
+    const selected = explicitMemberIds(selectorFor(dimension));
+    const order = selected.length
+      ? selected
+      : (members[dimension] || []).map((member) => member.member_id);
+    return new Map(order.map((id, index) => [id, index]));
+  });
+  return (left: readonly string[], right: readonly string[]) => {
+    for (let index = 0; index < dimensions.length; index += 1) {
+      const a = ranks[index].get(left[index]) ?? Number.MAX_SAFE_INTEGER;
+      const b = ranks[index].get(right[index]) ?? Number.MAX_SAFE_INTEGER;
+      if (a !== b) return a - b;
+      const fallback = String(left[index]).localeCompare(String(right[index]));
+      if (fallback) return fallback;
+    }
+    return 0;
+  };
 }
 
 export function resolvedPageCells(
@@ -129,6 +256,7 @@ export type CubeCell = {
   currentness?: string;
   resultStateToken?: string | null;
   lineage?: unknown[];
+  layerValues?: Partial<Record<"raw" | "calculated", CubeLayerValue[]>>;
 };
 
 type CubePage = {
@@ -150,24 +278,11 @@ type CellEditability = {
   policy?: unknown;
 };
 
-type CubeSelector =
-  | { kind: "member"; memberId: string }
-  | { kind: "members"; memberIds: string[] }
-  | Record<string, unknown>;
-
 type SavedGridDefinition = {
   format: "openepm-cube-view-v1";
   viewId: string;
   name: string;
-  selection: {
-    format: "openepm-cube-selection-v1";
-    metadataRevision: number;
-    dimensions: Array<{
-      dimensionId: string;
-      include: CubeSelector;
-      exclude: CubeSelector | null;
-    }>;
-  };
+  selection: CubeSelection;
   layout: {
     pages: string[];
     rows: string[];
@@ -181,6 +296,30 @@ type SavedGridDefinition = {
   suppression: { missing: boolean; zero: boolean };
   pageSize: number;
 };
+
+const layoutRoles = ["rows", "columns", "pages", "filters"] as const;
+type LayoutRole = (typeof layoutRoles)[number];
+const layoutRoleLabels: Record<LayoutRole, string> = {
+  rows: "Rows",
+  columns: "Columns",
+  pages: "Pages",
+  filters: "Filters",
+};
+
+function swapPrimaryAxis(
+  layout: SavedGridDefinition["layout"],
+  role: "rows" | "columns",
+  dimensionId: string,
+) {
+  const origin = layoutRoles.find((key) => layout[key].includes(dimensionId));
+  if (!origin || !layout[role].length || layout[role][0] === dimensionId)
+    return layout;
+  const next = structuredClone(layout);
+  const index = next[origin].indexOf(dimensionId);
+  next[origin][index] = next[role][0];
+  next[role][0] = dimensionId;
+  return next;
+}
 
 type SavedGrid = {
   gridId: string;
@@ -208,9 +347,30 @@ type AggregateRow = {
 type AggregateResult = {
   queryId: string;
   status: string;
+  errorCode?: string;
   rows?: AggregateRow[];
   nextCursor?: string | null;
   technicalCertificate?: unknown;
+};
+
+type AggregateQueryState = {
+  owner: string;
+  queryId: string;
+  query: ReturnType<typeof aggregateQueryIntent>;
+  pageSize: number;
+  context: string;
+  status: string;
+  errorCode?: string;
+  rows: AggregateRow[];
+  cursor: string | null;
+  stateRead: boolean;
+};
+
+const aggregateMeasureLabels: Record<AggregateMeasure, string> = {
+  SumAmount: "Sum",
+  CountPresent: "Count present",
+  MinAmount: "Minimum",
+  MaxAmount: "Maximum",
 };
 
 type AnalyzePresentation = "grid" | "kpi" | "chart" | "generic";
@@ -302,33 +462,39 @@ export function resolvedGridProgram(
         bindingStateToken: string;
         hierarchies: never[];
       },
-  savedSelection?: SavedGridDefinition["selection"],
+  savedSelection?: unknown,
   presentation: {
     pageSize: number;
     suppression: { missing: boolean; zero: boolean };
   } = { pageSize: 100, suppression: { missing: false, zero: false } },
+  dimensionSelectors: Record<string, CubeSelector> = {},
 ) {
+  const selection: CubeSelection = savedSelection
+    ? (canonicalCubeSelection(savedSelection), savedSelection as CubeSelection)
+    : {
+        format: "openepm-cube-selection-v1",
+        metadataRevision,
+        dimensions: dimensions.map((dimension) => ({
+          dimensionId: dimension.dimension_id,
+          include:
+            dimensionSelectors[dimension.dimension_id] ||
+            (pov[dimension.dimension_id]
+              ? { kind: "member", memberId: pov[dimension.dimension_id] }
+              : {
+                  kind: "members",
+                  memberIds: (members[dimension.dimension_id] || []).map(
+                    (member) => member.member_id,
+                  ),
+                }),
+          exclude: null,
+        })),
+      };
   return {
     languageVersion: 2,
     function: "facts.cube.resolved.read",
     arguments: {
       format: "openepm-resolved-cube-read-v1",
-      selection: savedSelection || {
-        format: "openepm-cube-selection-v1",
-        metadataRevision,
-        dimensions: dimensions.map((dimension) => ({
-          dimensionId: dimension.dimension_id,
-          include: pov[dimension.dimension_id]
-            ? { kind: "member", memberId: pov[dimension.dimension_id] }
-            : {
-                kind: "members",
-                memberIds: (members[dimension.dimension_id] || []).map(
-                  (member) => member.member_id,
-                ),
-              },
-          exclude: null,
-        })),
-      },
+      selection,
       source,
       outputGrain: dimensions.map((dimension) => dimension.dimension_id),
       freshness: "current",
@@ -505,8 +671,14 @@ export function canOpenSavedGrid(grid: SavedGrid) {
   const selected = definition.selection.dimensions.map(
     (item) => item.dimensionId,
   );
+  try {
+    canonicalCubeSelection(definition.selection, selected);
+  } catch {
+    return false;
+  }
   return Boolean(
     definition.format === "openepm-cube-view-v1" &&
+      ["raw", "calculated", "combined"].includes(definition.dataSource.kind) &&
       definition.viewId === grid.gridId &&
       definition.name === grid.name &&
       definition.selection.format === "openepm-cube-selection-v1" &&
@@ -527,19 +699,10 @@ export function canOpenSavedGrid(grid: SavedGrid) {
 }
 
 function savedGridPointOfView(definition: SavedGridDefinition) {
-  const fixed = new Set([
+  return scalarPovFromCubeSelection(definition.selection, [
     ...definition.layout.pages,
     ...definition.layout.filters,
   ]);
-  return Object.fromEntries(
-    definition.selection.dimensions.flatMap((item) =>
-      fixed.has(item.dimensionId) &&
-      item.include.kind === "member" &&
-      typeof item.include.memberId === "string"
-        ? [[item.dimensionId, item.include.memberId]]
-        : [],
-    ),
-  );
 }
 
 export function currentSavedGridDefinition(
@@ -551,6 +714,7 @@ export function currentSavedGridDefinition(
   rows: string[],
   columns: string[],
   pov: Record<string, string>,
+  dimensionSelectors: Record<string, CubeSelector> = {},
 ): SavedGridDefinition {
   return {
     format: "openepm-cube-view-v1",
@@ -561,14 +725,16 @@ export function currentSavedGridDefinition(
       metadataRevision,
       dimensions: dimensions.map((dimension) => ({
         dimensionId: dimension.dimension_id,
-        include: pov[dimension.dimension_id]
-          ? { kind: "member", memberId: pov[dimension.dimension_id] }
-          : {
-              kind: "members",
-              memberIds: (members[dimension.dimension_id] || []).map(
-                (member) => member.member_id,
-              ),
-            },
+        include:
+          dimensionSelectors[dimension.dimension_id] ||
+          (pov[dimension.dimension_id]
+            ? { kind: "member", memberId: pov[dimension.dimension_id] }
+            : {
+                kind: "members",
+                memberIds: (members[dimension.dimension_id] || []).map(
+                  (member) => member.member_id,
+                ),
+              }),
         exclude: null,
       })),
     },
@@ -724,16 +890,20 @@ function moveGridFocus(
   column: number,
   rowCount: number,
   columnCount: number,
+  announce: (label: string) => void,
 ) {
   const target = gridKeyTarget(event.key, row, column, rowCount, columnCount);
   if (!target) return;
   event.preventDefault();
-  event.currentTarget
+  const next = event.currentTarget
     .closest("table")
     ?.querySelector<HTMLButtonElement>(
       `[data-grid-row="${target.row}"][data-grid-column="${target.column}"]`,
-    )
-    ?.focus();
+    );
+  if (!next || next === event.currentTarget) return;
+  next.focus();
+  const label = next.getAttribute("aria-label");
+  if (label && document.activeElement === next) announce(label);
 }
 
 async function readAllDimensions(scope: Scope, signal: AbortSignal) {
@@ -752,7 +922,7 @@ async function readAllDimensions(scope: Scope, signal: AbortSignal) {
       ),
   );
   return {
-    rows: collected.rows.filter((item) => item.status === "Active"),
+    rows: activeFactDimensions(collected.rows),
     metadataRevision: collected.finalPage.metadataRevision,
   };
 }
@@ -760,21 +930,28 @@ async function readAllDimensions(scope: Scope, signal: AbortSignal) {
 async function readAllMembers(
   scope: Scope,
   dimension: string,
+  revision: number,
   signal?: AbortSignal,
 ) {
   const collected = await collectAnalyzeMembers(
-    (afterMemberId, expectedMetadataRevision) =>
-      readProgram(
+    (afterMemberId, expectedMetadataRevision) => {
+      if (signal?.aborted)
+        throw new DOMException("Member read cancelled", "AbortError");
+      return readProgram(
         scope,
         "metadata.member.list",
         {
           dimension,
           limit: 100,
-          ...(afterMemberId ? { afterMemberId, expectedMetadataRevision } : {}),
+          expectedMetadataRevision: expectedMetadataRevision ?? revision,
+          ...(afterMemberId ? { afterMemberId } : {}),
         },
         signal,
-      ),
+      );
+    },
   );
+  if (collected.finalPage.metadataRevision !== revision)
+    throw new Error("Member metadata changed. Refresh the grid and try again.");
   return collected.rows.filter((item) => item.status === "Active");
 }
 
@@ -794,6 +971,14 @@ export function cellClass(cell?: CubeCell) {
 }
 
 export function cellPresence(cell: CubeCell) {
+  if (
+    cell.layerValues &&
+    (Object.keys(cell.layerValues).length > 1 ||
+      Object.values(cell.layerValues).some(
+        (values) => (values?.length || 0) > 1,
+      ))
+  )
+    return "Separate source values";
   if (cell.kind === "text") {
     if (typeof cell.text !== "string") return "Missing";
     return cell.text === "" ? "Present empty text" : "Present text";
@@ -804,6 +989,21 @@ export function cellPresence(cell: CubeCell) {
     : "Present numeric";
 }
 
+function cellAccessibleName(members: Record<string, string>, cell?: CubeCell) {
+  const coordinate = Object.entries(members)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([dimension, member]) => `${dimension} ${member}`)
+    .join(", ");
+  const presence = cell ? cellPresence(cell) : "Missing";
+  const value =
+    presence === "Missing" || presence === "Present empty text"
+      ? presence
+      : presence === "Present text"
+        ? `Text ${cellValue(cell)}`
+        : cellValue(cell);
+  return `${coordinate}. ${value}`;
+}
+
 export function Analyze({
   app,
   catalog,
@@ -811,6 +1011,10 @@ export function Analyze({
   subject,
   targetViewId,
   targetViewDigest,
+  targetAnalyticalRead,
+  interactionBlocked = false,
+  onViewContextChange,
+  onRefreshCatalog,
   onRequestTransition = (action) => action(),
 }: {
   app?: ApplicationSummary;
@@ -819,19 +1023,73 @@ export function Analyze({
   subject: string;
   targetViewId?: string;
   targetViewDigest?: string;
+  targetAnalyticalRead?: AnalyticalRead;
+  interactionBlocked?: boolean;
+  onViewContextChange?: (context: SavedViewContext | null) => void;
+  onRefreshCatalog?: () => Promise<ApplicationCatalog>;
   onRequestTransition?: (action: () => void) => void;
 }) {
   const scope = app
     ? { workspaceId: app.workspaceId, applicationId: app.applicationId }
     : null;
-  const [dimensions, setDimensions] = useState<Dimension[]>([]);
-  const [metadataRevision, setMetadataRevision] = useState<number | null>(null);
+  const catalogueContext = JSON.stringify([
+    app?.workspaceId,
+    app?.applicationId,
+    subject,
+    catalog?.accessContext,
+    catalog?.applicationAccess,
+    catalog?.revisions.metadata,
+    catalog?.revisions.policy,
+    catalog?.revisions.security,
+    catalog?.revisions.schemaEpoch,
+    Object.keys(catalog?.functions || {}).sort(),
+  ]);
+  const currentCatalogueContext = useRef(catalogueContext);
+  currentCatalogueContext.current = catalogueContext;
+  const scenarioCopyControl = useRef<ScenarioPromotionControl>(null);
+  const [metadataSnapshot, setMetadataSnapshot] = useState<{
+    context: string;
+    rows: Dimension[];
+    metadataRevision: number;
+  } | null>(null);
+  const dimensions =
+    metadataSnapshot?.context === catalogueContext ? metadataSnapshot.rows : [];
+  const metadataRevision =
+    metadataSnapshot?.context === catalogueContext
+      ? metadataSnapshot.metadataRevision
+      : null;
   const [rowDimension, setRowDimension] = useState("");
   const [columnDimension, setColumnDimension] = useState("");
   const [layoutOpen, setLayoutOpen] = useState(false);
   const [pov, setPov] = useState<Record<string, string>>({});
-  const [memberCatalog, setMemberCatalog] = useState<Record<string, Member[]>>(
-    {},
+  const [povDialogDimensionId, setPovDialogDimensionId] = useState("");
+  const [axisDialogDimensionId, setAxisDialogDimensionId] = useState("");
+  const [axisSelections, setAxisSelections] = useState<
+    Record<string, CubeSelector>
+  >({});
+  const [axisSelectionSummaries, setAxisSelectionSummaries] = useState<
+    Record<string, string>
+  >({});
+  const memberContext = JSON.stringify([
+    catalogueContext,
+    app?.workspaceId,
+    app?.applicationId,
+    subject,
+    metadataRevision,
+    catalog?.revisions.metadata,
+    catalog?.revisions.policy,
+    catalog?.revisions.security,
+    catalog?.applicationAccess.role,
+  ]);
+  const memberContextRef = useRef(memberContext);
+  memberContextRef.current = memberContext;
+  const [memberCache, setMemberCache] = useState<{
+    context: string;
+    rows: Record<string, Member[]>;
+  } | null>(null);
+  const memberCatalog = useMemo(
+    () => (memberCache?.context === memberContext ? memberCache.rows : {}),
+    [memberCache, memberContext],
   );
   const [rows, setRows] = useState<CubeCell[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
@@ -840,35 +1098,73 @@ export function Analyze({
     pageSize: number;
     offset: number;
   } | null>(null);
-  const [snapshot, setSnapshot] = useState<number | null>(null);
   const [source, setSource] = useState("");
   const [resolvedStatus, setResolvedStatus] =
     useState<ResolvedReadStatus | null>(null);
-  const [readSemantics, setReadSemantics] = useState<
-    "stored" | "own" | "effective"
-  >("stored");
+  // A loading catalogue is not evidence that the resolved read is unavailable.
+  // Initialize once per application when discovery arrives; later refreshes
+  // must preserve the selected policy, including an explicit unavailable one.
+  const [selectedReadSemantics, setReadSemantics] =
+    useState<GridReadSemantics | null>(null);
+  const defaultReadSemantics: GridReadSemantics = catalog?.functions[
+    "facts.cube.resolved.read"
+  ]
+    ? "own"
+    : "stored";
+  const readSemantics = selectedReadSemantics ?? defaultReadSemantics;
+  const [completedRead, setCompletedRead] = useState<{
+    context: string;
+    plan: GridReadPlan;
+  } | null>(null);
+  const gridReadController = useRef<{
+    context: string;
+    controller: AbortController;
+    pending: boolean;
+  } | null>(null);
+  const gridReadVersion = useRef(0);
+  const layoutSuggestionController = useRef<{
+    context: string;
+    controller: AbortController;
+  } | null>(null);
+  const layoutSuggestionVersion = useRef(0);
   const [resolvedBindingId, setResolvedBindingId] = useState("");
   const [resolvedBindingStateToken, setResolvedBindingStateToken] =
     useState("");
   const [resolvedBindings, setResolvedBindings] = useState<ResolvedBinding[]>(
     [],
   );
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const [otherBusy, setBusy] = useState(false);
+  const [cellReadBusy, setCellReadBusy] = useState(false);
+  const [aggregatePending, setAggregatePending] = useState<{
+    context: string;
+    token: number;
+    controller: AbortController;
+  } | null>(null);
+  const gridBusy = otherBusy || aggregatePending?.context === catalogueContext;
+  const busy = gridBusy || cellReadBusy;
+  const [errorRecord, setErrorRecord] = useState<{
+    context: string;
+    value: string;
+  } | null>(null);
+  const error =
+    errorRecord?.context === catalogueContext ? errorRecord.value : "";
+  const setError = (value: string) =>
+    setErrorRecord({ context: catalogueContext, value });
   const [selectedCell, setSelectedCell] = useState<CubeCell | null>(null);
+  const [cellInspectorOpening, setCellInspectorOpening] = useState(0);
   const cellInspectorHeading = useRef<HTMLHeadingElement | null>(null);
   const cellTrigger = useRef<HTMLButtonElement | null>(null);
+  const cellReturn = useRef<HTMLButtonElement | null>(null);
   const cellReadVersion = useRef(0);
   const cellReadController = useRef<AbortController | null>(null);
   const activeScopeKey = `${app?.workspaceId || ""}:${app?.applicationId || ""}`;
   const activeScope = useRef(activeScopeKey);
   activeScope.current = activeScopeKey;
   useEffect(() => {
-    if (selectedCell)
-      cellInspectorHeading.current?.focus({
-        preventScroll: window.innerWidth > 1240,
-      });
-  }, [selectedCell]);
+    cellInspectorHeading.current?.focus({
+      preventScroll: window.innerWidth > 1240,
+    });
+  }, [cellInspectorOpening]);
   useEffect(
     () => () => {
       cellReadVersion.current += 1;
@@ -882,27 +1178,34 @@ export function Analyze({
   );
   const [writeValue, setWriteValue] = useState("");
   const [writeTouched, setWriteTouched] = useState(false);
-  const [expectedChangeId, setExpectedChangeId] = useState("");
   const [resolvedChangeIds, setResolvedChangeIds] = useState({
     numeric: "",
     text: "",
   });
+  const expectedChangeId = resolvedChangeIds[writeKind];
   const [cellResolved, setCellResolved] = useState(false);
   const [cellEditability, setCellEditability] =
     useState<CellEditability | null>(null);
   const [reviewed, setReviewed] = useState(false);
   const [writeResult, setWriteResult] = useState("");
+  const [inspectorSnapshot, setInspectorSnapshot] = useState<number | null>(
+    null,
+  );
   const [savedGrids, setSavedGrids] = useState<SavedGrid[]>([]);
   const [savedGridsRead, setSavedGridsRead] = useState(false);
   const [savedGridsLoading, setSavedGridsLoading] = useState(false);
   const [savedGridsError, setSavedGridsError] = useState("");
+  const [savedGridsAccessFailed, setSavedGridsAccessFailed] = useState(false);
   const [savedGridsContext, setSavedGridsContext] = useState("");
   const canReadSavedGrids = Boolean(catalog?.functions["grid.definition.list"]);
   const savedGridReadKey = JSON.stringify([
     app?.workspaceId,
     app?.applicationId,
+    catalog?.accessContext,
     catalog?.applicationAccess.issuer,
     subject,
+    catalog?.revisions.metadata,
+    catalog?.revisions.policy,
     catalog?.revisions.security,
     canReadSavedGrids,
   ]);
@@ -924,8 +1227,56 @@ export function Analyze({
   const [savedGridName, setSavedGridName] = useState("");
   const [savedGridTouched, setSavedGridTouched] = useState(false);
   const [savedGridResult, setSavedGridResult] = useState("");
+  const viewMutationSequence = useRef(0);
+  const pendingViewMutation = useRef<number | null>(null);
+  useEffect(() => {
+    // The departed authority's effect can still finish on the server. Release
+    // its presentation lock without letting that callback settle a new request.
+    if (pendingViewMutation.current !== null) {
+      pendingViewMutation.current = null;
+      setBusy(false);
+    }
+  }, [catalogueContext]);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      gridReadController.current?.controller.abort();
+      gridReadController.current = null;
+      layoutSuggestionController.current?.controller.abort();
+      layoutSuggestionController.current = null;
+    };
+  }, []);
   const [openedGridDefinition, setOpenedGridDefinition] =
     useState<SavedGridDefinition | null>(null);
+  const layoutControls = useRef(new Map<string, HTMLSelectElement>());
+  const layoutFocus = useRef<{
+    dimensionId: string;
+    previous: Element | null;
+  } | null>(null);
+  useEffect(() => {
+    const pending = layoutFocus.current;
+    layoutFocus.current = null;
+    if (
+      pending &&
+      (document.activeElement === document.body ||
+        document.activeElement === pending.previous)
+    )
+      layoutControls.current.get(pending.dimensionId)?.focus();
+  }, [openedGridDefinition?.layout]);
+  const requestedViewContext = JSON.stringify({
+    targetViewId,
+    targetViewDigest,
+    targetAnalyticalRead,
+  });
+  const [openedGridReference, setOpenedGridReference] = useState<{
+    viewId: string;
+    viewDigest: string;
+    definition: string;
+    authority: string;
+    requestedContext: string;
+  } | null>(null);
   const [calculationContext, setCalculationContext] = useState<{
     resultKey: string;
     resultStateToken: string;
@@ -936,13 +1287,53 @@ export function Analyze({
     AggregateMeasure[]
   >(["SumAmount", "CountPresent"]);
   const [aggregatePageSize, setAggregatePageSize] = useState(100);
-  const [aggregateReviewed, setAggregateReviewed] = useState(false);
-  const [aggregateQueryId, setAggregateQueryId] = useState("");
-  const [aggregateStatus, setAggregateStatus] = useState("");
-  const [aggregateRows, setAggregateRows] = useState<AggregateRow[]>([]);
-  const [aggregateCursor, setAggregateCursor] = useState<string | null>(null);
+  const [aggregateReviewedIntent, setAggregateReviewed] = useState<
+    string | null
+  >(null);
+  const [aggregateQueryState, setAggregateQueryState] =
+    useState<AggregateQueryState | null>(null);
+  const aggregateOwner = JSON.stringify([
+    app?.workspaceId,
+    app?.applicationId,
+    catalog?.applicationAccess.issuer,
+    subject,
+  ]);
+  const aggregateQuery =
+    aggregateQueryState?.owner === aggregateOwner ? aggregateQueryState : null;
+  const aggregateObservation =
+    aggregateQuery?.context === catalogueContext ? aggregateQuery : null;
+  const aggregateQueryId = aggregateQuery?.queryId || "";
+  const aggregateStatus = aggregateObservation?.status || "";
+  const aggregateRows = aggregateObservation?.rows || [];
+  const aggregateCursor = aggregateObservation?.cursor || null;
+  const aggregateStateRead = aggregateObservation?.stateRead || false;
   const [aggregateCancelReviewed, setAggregateCancelReviewed] = useState(false);
-  const [aggregateStateRead, setAggregateStateRead] = useState(false);
+  const aggregateRequestSequence = useRef(0);
+  const pendingAggregateRequest = useRef<{
+    context: string;
+    token: number;
+    controller: AbortController;
+  } | null>(null);
+  useEffect(() => {
+    // Release only the departed authority's HTTP/presentation owner. This
+    // does not cancel the durable query or issue another request to the server.
+    if (currentCatalogueContext.current !== catalogueContext) return;
+    const pending = pendingAggregateRequest.current;
+    if (pending && pending.context !== catalogueContext) {
+      pending.controller.abort();
+      pendingAggregateRequest.current = null;
+      setAggregatePending((current) => (current === pending ? null : current));
+    }
+    setAggregateReviewed(null);
+    setAggregateCancelReviewed(false);
+  }, [catalogueContext]);
+  useEffect(
+    () => () => {
+      pendingAggregateRequest.current?.controller.abort();
+      pendingAggregateRequest.current = null;
+    },
+    [],
+  );
   const [presentation, setPresentation] = useState<AnalyzePresentation>("grid");
   const densityStorageKey =
     app && subject
@@ -951,11 +1342,60 @@ export function Analyze({
   const [gridDensity, setGridDensity] = useState<"comfortable" | "compact">(
     () => readGridDensity(densityStorageKey),
   );
-  const [genericTables, setGenericTables] = useState<GenericTable[]>([]);
-  const [selectedGenericTable, setSelectedGenericTable] = useState("");
-  const [genericRows, setGenericRows] = useState<GenericFactRow[]>([]);
-  const [genericCursor, setGenericCursor] = useState<string | null>(null);
-  const [genericSnapshot, setGenericSnapshot] = useState<number | null>(null);
+  const [genericState, setGenericState] = useState<{
+    context: string;
+    tables: GenericTable[];
+    tableId: string;
+    rows: GenericFactRow[];
+    cursor: string | null;
+    snapshot: number | null;
+  } | null>(null);
+  const currentGenericState =
+    genericState?.context === catalogueContext ? genericState : null;
+  const genericTables = currentGenericState?.tables || [];
+  const selectedGenericTable = currentGenericState?.tableId || "";
+  const genericRows = currentGenericState?.rows || [];
+  const genericCursor = currentGenericState?.cursor || null;
+  const genericSnapshot = currentGenericState?.snapshot ?? null;
+  const genericReadContext = JSON.stringify([
+    catalogueContext,
+    presentation,
+    selectedGenericTable,
+  ]);
+  const currentGenericReadContext = useRef(genericReadContext);
+  currentGenericReadContext.current = genericReadContext;
+  const genericReadController = useRef<{
+    context: string;
+    controller: AbortController;
+  } | null>(null);
+  const genericReadVersion = useRef(0);
+  function cancelGenericRead(expectedContext?: string) {
+    const pending = genericReadController.current;
+    if (expectedContext !== undefined && pending?.context !== expectedContext)
+      return;
+    genericReadVersion.current += 1;
+    if (pending) {
+      pending.controller.abort();
+      genericReadController.current = null;
+      setBusy(false);
+    }
+  }
+  function choosePresentation(next: AnalyzePresentation) {
+    cancelGenericRead();
+    setPresentation(next);
+  }
+  useEffect(() => {
+    const pending = genericReadController.current;
+    if (
+      currentGenericReadContext.current === genericReadContext &&
+      pending &&
+      pending.context !== genericReadContext
+    )
+      cancelGenericRead(pending.context);
+    // A current read can start as the new table is committed, before the
+    // previous context's passive cleanup. Cancel only that departed owner.
+    return () => cancelGenericRead(genericReadContext);
+  }, [genericReadContext]);
   const mutationIntentKey = useStableMutationIntentKey("grid-ui");
   useUnsavedWork(
     `analyze:${app?.workspaceId || "none"}:${app?.applicationId || "none"}`,
@@ -978,16 +1418,14 @@ export function Analyze({
   }
 
   useEffect(() => {
-    setDimensions([]);
-    setMetadataRevision(null);
+    setMetadataSnapshot(null);
     setRows([]);
     setRowDimension("");
     setColumnDimension("");
-    setMemberCatalog({});
-    setSnapshot(null);
+    setMemberCache(null);
     setSource("");
     setResolvedStatus(null);
-    setReadSemantics("stored");
+    setReadSemantics(null);
     setResolvedBindingId("");
     setResolvedBindingStateToken("");
     setResolvedBindings([]);
@@ -998,18 +1436,18 @@ export function Analyze({
     setWriteTouched(false);
     setReviewed(false);
     setWriteResult("");
-    setExpectedChangeId("");
     setResolvedChangeIds({ numeric: "", text: "" });
     setCellResolved(false);
     setCellEditability(null);
+    setCellReadBusy(false);
     setBusy(false);
     setError("");
     setPov({});
-    setGenericTables([]);
-    setSelectedGenericTable("");
-    setGenericRows([]);
-    setGenericCursor(null);
-    setGenericSnapshot(null);
+    setPovDialogDimensionId("");
+    setAxisDialogDimensionId("");
+    setAxisSelections({});
+    setAxisSelectionSummaries({});
+    setGenericState(null);
     setSavedGrids([]);
     setSavedGridsRead(false);
     setSelectedSavedGrid("");
@@ -1021,34 +1459,43 @@ export function Analyze({
     setCalculationContext(null);
     setAggregateMeasures(["SumAmount", "CountPresent"]);
     setAggregatePageSize(100);
-    setAggregateReviewed(false);
-    setAggregateQueryId("");
-    setAggregateStatus("");
-    setAggregateRows([]);
-    setAggregateCursor(null);
+    setAggregateReviewed(null);
+    setAggregateQueryState(null);
     setAggregateCancelReviewed(false);
-    setAggregateStateRead(false);
-    if (!scope) return;
+  }, [app?.workspaceId, app?.applicationId]);
+
+  useEffect(() => {
+    if (catalog) setReadSemantics((current) => current ?? defaultReadSemantics);
+  }, [app?.workspaceId, app?.applicationId, catalog, defaultReadSemantics]);
+
+  useEffect(() => {
+    if (!scope || !catalog?.functions["metadata.dimension.list"]) return;
     const controller = new AbortController();
     readAllDimensions(scope, controller.signal)
       .then((result) => {
-        if (controller.signal.aborted || activeScope.current !== activeScopeKey)
+        if (
+          controller.signal.aborted ||
+          currentCatalogueContext.current !== catalogueContext
+        )
           return;
-        setDimensions(result.rows);
-        setMetadataRevision(result.metadataRevision);
+        setMetadataSnapshot({ context: catalogueContext, ...result });
       })
       .catch((reason: Error) => {
-        if (controller.signal.aborted || activeScope.current !== activeScopeKey)
+        if (
+          controller.signal.aborted ||
+          currentCatalogueContext.current !== catalogueContext
+        )
           return;
         if (reason.name !== "AbortError") setError(reason.message);
       });
     return () => controller.abort();
-  }, [app?.workspaceId, app?.applicationId]);
+  }, [catalogueContext]);
 
   useEffect(() => {
     if (
       !scope ||
       readSemantics !== "effective" ||
+      openedGridDefinition !== null ||
       !catalog?.functions["facts.cube.resolved.binding.list"]
     )
       return;
@@ -1075,6 +1522,7 @@ export function Analyze({
     app?.workspaceId,
     app?.applicationId,
     readSemantics,
+    Boolean(openedGridDefinition),
     Boolean(catalog?.functions["facts.cube.resolved.binding.list"]),
   ]);
 
@@ -1084,7 +1532,7 @@ export function Analyze({
   );
 
   useEffect(() => {
-    setAggregateReviewed(false);
+    setAggregateReviewed(null);
     setAggregateCancelReviewed(false);
   }, [
     rowDimension,
@@ -1093,11 +1541,6 @@ export function Analyze({
     aggregateMeasures,
     aggregatePageSize,
   ]);
-
-  useEffect(
-    () => setExpectedChangeId(resolvedChangeIds[writeKind]),
-    [resolvedChangeIds, writeKind],
-  );
 
   const activeRowDimensions = openedGridDefinition
     ? openedGridDefinition.layout.rows
@@ -1109,7 +1552,9 @@ export function Analyze({
     : columnDimension
       ? [columnDimension]
       : [];
-  const calculatedGrid = openedGridDefinition?.dataSource.kind === "calculated";
+  const calculatedGrid = Boolean(
+    openedGridDefinition && openedGridDefinition.dataSource.kind !== "raw",
+  );
   const axisIds = useMemo(
     () => new Set([...activeRowDimensions, ...activeColumnDimensions]),
     [activeRowDimensions.join("\u0000"), activeColumnDimensions.join("\u0000")],
@@ -1117,53 +1562,467 @@ export function Analyze({
   const povDimensions = dimensions.filter(
     (item) => !axisIds.has(item.dimension_id),
   );
+  function axisSelectorFor(dimensionId: string): CubeSelector | null {
+    return (
+      openedGridDefinition?.selection.dimensions.find(
+        (dimension) => dimension.dimensionId === dimensionId,
+      )?.include ||
+      axisSelections[dimensionId] ||
+      null
+    );
+  }
+  function semanticAxisSummary(dimensionId: string) {
+    if (axisSelectionSummaries[dimensionId])
+      return axisSelectionSummaries[dimensionId];
+    const selector = axisSelectorFor(dimensionId);
+    if (!selector) return "All current authorized members";
+    if (selector.kind === "member") return "1 selected member";
+    if (selector.kind === "members")
+      return `${selector.memberIds.length} selected ${selector.memberIds.length === 1 ? "member" : "members"}`;
+    if (selector.kind === "hierarchy")
+      return `${selector.operator.replace("_", " ")} hierarchy selection`;
+    if (selector.kind === "member_list") return "Governed member list";
+    if (selector.kind === "attribute") return "Attribute-based selection";
+    return "Dynamic member expression";
+  }
+  const currentAxisSelections = Object.fromEntries(
+    [...axisIds].flatMap((dimensionId) => {
+      const selector = axisSelectorFor(dimensionId);
+      return selector ? [[dimensionId, selector]] : [];
+    }),
+  );
+  const hasCustomAxisSelection = Object.keys(currentAxisSelections).length > 0;
+  // Count every rendered authoring transition, including A -> B -> A. Exact
+  // value equality alone cannot let an earlier acknowledgement settle a later edit.
+  const viewAuthoringContext = JSON.stringify([
+    catalogueContext,
+    requestedViewContext,
+    selectedSavedGrid,
+    savedGridId,
+    savedGridName,
+    openedGridDefinition,
+    rowDimension,
+    columnDimension,
+    pov,
+    currentAxisSelections,
+  ]);
+  const viewAuthoring = useRef({ context: viewAuthoringContext, version: 0 });
+  if (viewAuthoring.current.context !== viewAuthoringContext) {
+    viewAuthoring.current = {
+      context: viewAuthoringContext,
+      version: viewAuthoring.current.version + 1,
+    };
+  }
 
-  async function ensureMembers(dimensionId: string) {
-    if (!scope || memberCatalog[dimensionId])
-      return memberCatalog[dimensionId] || [];
-    const members = await readAllMembers(scope, dimensionId);
-    setMemberCatalog((current) => ({ ...current, [dimensionId]: members }));
+  function applyCanonicalLayout(
+    layout: SavedGridDefinition["layout"],
+    focusDimension?: string,
+  ) {
+    if (!openedGridDefinition || layout === openedGridDefinition.layout) return;
+    const version = viewAuthoring.current.version;
+    const apply = () => {
+      if (
+        !mounted.current ||
+        currentCatalogueContext.current !== catalogueContext ||
+        viewAuthoring.current.version !== version
+      )
+        return;
+      const definition = { ...openedGridDefinition, layout };
+      if (focusDimension)
+        layoutFocus.current = {
+          dimensionId: focusDimension,
+          previous: document.activeElement,
+        };
+      setOpenedGridDefinition(definition);
+      setRowDimension(layout.rows[0]);
+      setColumnDimension(layout.columns[0]);
+      setPov(savedGridPointOfView(definition));
+      setSavedGridTouched(true);
+      setSavedGridResult("");
+      setWriteTouched(false);
+      setReviewed(false);
+    };
+    if (writeTouched) onRequestTransition(apply);
+    else apply();
+  }
+
+  function choosePrimaryAxis(role: "rows" | "columns", dimensionId: string) {
+    if (openedGridDefinition) {
+      applyCanonicalLayout(
+        swapPrimaryAxis(openedGridDefinition.layout, role, dimensionId),
+      );
+      return;
+    }
+    setCalculationContext(null);
+    if (role === "rows") setRowDimension(dimensionId);
+    else setColumnDimension(dimensionId);
+    setPov((current) => {
+      const next = { ...current };
+      delete next[dimensionId];
+      return next;
+    });
+  }
+
+  function moveCanonicalAxis(
+    dimensionId: string,
+    source: LayoutRole,
+    target: LayoutRole,
+  ) {
+    if (!openedGridDefinition || source === target) return;
+    if (!layoutRoles.includes(target)) return;
+    const layout = structuredClone(openedGridDefinition.layout);
+    if (
+      !layout[source].includes(dimensionId) ||
+      ((source === "rows" || source === "columns") &&
+        layout[source].length === 1)
+    )
+      return;
+    layout[source] = layout[source].filter((id) => id !== dimensionId);
+    layout[target].push(dimensionId);
+    applyCanonicalLayout(layout, dimensionId);
+  }
+
+  function reorderCanonicalAxis(
+    role: LayoutRole,
+    index: number,
+    direction: -1 | 1,
+  ) {
+    if (!openedGridDefinition) return;
+    const layout = structuredClone(openedGridDefinition.layout);
+    const destination = index + direction;
+    if (destination < 0 || destination >= layout[role].length) return;
+    [layout[role][index], layout[role][destination]] = [
+      layout[role][destination],
+      layout[role][index],
+    ];
+    applyCanonicalLayout(layout);
+  }
+  const gridReadContext = JSON.stringify([
+    catalogueContext,
+    activeScopeKey,
+    subject,
+    catalog?.applicationAccess.issuer,
+    catalog?.applicationAccess.role,
+    catalog?.revisions.security,
+    catalog?.revisions.metadata,
+    catalog?.revisions.policy,
+    metadataRevision,
+    openedGridDefinition,
+    rowDimension,
+    columnDimension,
+    pov,
+    currentAxisSelections,
+    readSemantics,
+    resolvedBindingId,
+    resolvedBindingStateToken,
+  ]);
+  const activeGridReadContext = useRef(gridReadContext);
+  activeGridReadContext.current = gridReadContext;
+  const layoutSuggestionContext = JSON.stringify([
+    gridReadContext,
+    dimensions.map(({ dimension_id, name, model_role, status }) => [
+      dimension_id,
+      name,
+      model_role,
+      status,
+    ]),
+  ]);
+  const activeLayoutSuggestionContext = useRef(layoutSuggestionContext);
+  activeLayoutSuggestionContext.current = layoutSuggestionContext;
+  const loadedRead =
+    completedRead?.context === gridReadContext ? completedRead : null;
+  const readingGrid =
+    gridReadController.current?.pending &&
+    gridReadController.current.context === gridReadContext;
+  let plannedRead: GridReadPlan | null = null;
+  let readUnavailable = "";
+  try {
+    plannedRead = gridReadPlan({
+      view: openedGridDefinition,
+      semantics: readSemantics,
+      pov,
+      hasNativeSelection: hasCustomAxisSelection,
+      bindingId: resolvedBindingId,
+      bindingStateToken: resolvedBindingStateToken,
+      canonicalViewRead:
+        (
+          catalog?.functions["facts.cube.resolved.read"] as
+            | { canonicalViewRead?: string }
+            | undefined
+        )?.canonicalViewRead === "openepm-cube-view-read-v1",
+    });
+    if (
+      plannedRead.kind !== "stored" &&
+      !catalog?.functions[plannedRead.function]
+    )
+      readUnavailable =
+        "This read is not available in the current application context.";
+  } catch (reason) {
+    readUnavailable =
+      reason instanceof Error
+        ? reason.message
+        : "This view cannot be read exactly.";
+  }
+  if (!catalog) readUnavailable = "Checking grid availability…";
+  else if (!catalog.functions["metadata.dimension.list"])
+    readUnavailable =
+      "Model metadata is not available in the current application context.";
+  function cancelLayoutSuggestion(expectedContext: string) {
+    const pending = layoutSuggestionController.current;
+    if (pending?.context !== expectedContext) return;
+    layoutSuggestionVersion.current += 1;
+    pending.controller.abort();
+    layoutSuggestionController.current = null;
+    if (mounted.current) setBusy(false);
+  }
+  useEffect(() => {
+    const pending = layoutSuggestionController.current;
+    if (
+      activeLayoutSuggestionContext.current === layoutSuggestionContext &&
+      pending &&
+      pending.context !== layoutSuggestionContext
+    )
+      cancelLayoutSuggestion(pending.context);
+    return () => cancelLayoutSuggestion(layoutSuggestionContext);
+  }, [layoutSuggestionContext]);
+  function cancelGridRead(expectedContext: string) {
+    const read = gridReadController.current;
+    if (read?.context !== expectedContext) return;
+    gridReadVersion.current += 1;
+    read.controller.abort();
+    gridReadController.current = null;
+    if (read.pending && mounted.current) setBusy(false);
+  }
+  function cancelCellRead() {
+    cellReadVersion.current += 1;
+    cellReadController.current?.abort();
+    cellReadController.current = null;
+    setCellReadBusy(false);
+  }
+  function clearGridSnapshot() {
+    cancelCellRead();
+    setRows([]);
+    setNextCursor(null);
+    setResolvedPage(null);
+    setSource("");
+    setResolvedStatus(null);
+    setCalculationContext(null);
+    setCompletedRead(null);
+    setSelectedCell(null);
+  }
+  useEffect(() => {
+    // A new-context request may already have started (or completed) at the
+    // first actionable commit. Only a departed owner may be cancelled/reset.
+    const read = gridReadController.current;
+    if (
+      activeGridReadContext.current === gridReadContext &&
+      read?.context !== gridReadContext
+    ) {
+      if (read) cancelGridRead(read.context);
+      clearGridSnapshot();
+    }
+    return () => cancelGridRead(gridReadContext);
+  }, [gridReadContext]);
+  const axisDialogInitialSelection = axisDialogDimensionId
+    ? axisSelectorFor(axisDialogDimensionId)
+    : null;
+  const povDialogSelector = openedGridDefinition?.selection.dimensions.find(
+    (dimension) => dimension.dimensionId === povDialogDimensionId,
+  )?.include;
+  const povDialogInitialMemberId =
+    povDialogSelector?.kind === "member"
+      ? povDialogSelector.memberId
+      : pov[povDialogDimensionId] || "";
+
+  async function ensureMembers(dimensionId: string, signal?: AbortSignal) {
+    if (signal?.aborted)
+      throw new DOMException("Member read cancelled", "AbortError");
+    if (!scope || metadataRevision === null)
+      throw new Error(
+        "Load the current application metadata before choosing members.",
+      );
+    if (memberCatalog[dimensionId]) return memberCatalog[dimensionId];
+    const members = await readAllMembers(
+      scope,
+      dimensionId,
+      metadataRevision,
+      signal,
+    );
+    if (signal?.aborted)
+      throw new DOMException("Member read cancelled", "AbortError");
+    if (memberContextRef.current !== memberContext)
+      throw new Error(
+        "The application or access changed while loading members.",
+      );
+    setMemberCache((current) => ({
+      context: memberContext,
+      rows: {
+        ...(current?.context === memberContext ? current.rows : {}),
+        [dimensionId]: members,
+      },
+    }));
     return members;
   }
 
+  async function openPovSelector(dimensionId: string) {
+    setError("");
+    try {
+      await ensureMembers(dimensionId);
+      setPovDialogDimensionId(dimensionId);
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Unable to read members for this point of view.",
+      );
+    }
+  }
+
+  async function openAxisSelector(dimensionId: string) {
+    setError("");
+    try {
+      const available = await ensureMembers(dimensionId);
+      if (!available.some((member) => member.status === "Active"))
+        throw new Error(
+          "No active authorized members are available for this axis.",
+        );
+      setAxisDialogDimensionId(dimensionId);
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Unable to read members for this axis.",
+      );
+    }
+  }
+
+  function applyAxisSelection(
+    dimensionId: string,
+    selector: CubeSelector,
+    displaySummary: string,
+  ) {
+    setAxisSelections((current) => ({ ...current, [dimensionId]: selector }));
+    setAxisSelectionSummaries((current) => ({
+      ...current,
+      [dimensionId]: displaySummary,
+    }));
+    setOpenedGridDefinition((current) =>
+      current
+        ? {
+            ...current,
+            selection: {
+              ...current.selection,
+              dimensions: current.selection.dimensions.map((dimension) =>
+                dimension.dimensionId === dimensionId
+                  ? { ...dimension, include: selector }
+                  : dimension,
+              ),
+            },
+          }
+        : current,
+    );
+    setCalculationContext(null);
+    if (openedGridDefinition) setSavedGridTouched(true);
+    setRows([]);
+    setResolvedPage(null);
+    setAxisDialogDimensionId("");
+  }
+
+  function applyPovMember(dimensionId: string, memberId: string) {
+    setPov((current) => ({ ...current, [dimensionId]: memberId }));
+    setOpenedGridDefinition((current) =>
+      current
+        ? {
+            ...current,
+            selection: {
+              ...current.selection,
+              dimensions: current.selection.dimensions.map((dimension) =>
+                dimension.dimensionId === dimensionId
+                  ? {
+                      ...dimension,
+                      include: { kind: "member", memberId },
+                      exclude: null,
+                    }
+                  : dimension,
+              ),
+            },
+          }
+        : current,
+    );
+    setCalculationContext(null);
+    if (openedGridDefinition) setSavedGridTouched(true);
+    setPovDialogDimensionId("");
+  }
+
   async function openGenericFacts() {
-    if (!scope) return;
+    if (!scope || !catalog?.functions["facts.generic.table.list"]) return;
+    const version = ++genericReadVersion.current;
+    genericReadController.current?.controller.abort();
+    const controller = new AbortController();
+    genericReadController.current = { context: genericReadContext, controller };
+    const current = () =>
+      !controller.signal.aborted &&
+      genericReadVersion.current === version &&
+      currentGenericReadContext.current === genericReadContext;
     setBusy(true);
     setError("");
     try {
-      const collected = await collectGenericTables((afterTableId) =>
-        readProgram<GenericTablePage>(
+      const collected = await collectGenericTables((afterTableId) => {
+        if (!current())
+          throw new DOMException("Table read cancelled", "AbortError");
+        return readProgram<GenericTablePage>(
           scope,
           "facts.generic.table.list",
           genericTableListArguments(afterTableId),
-        ),
-      );
+          controller.signal,
+        );
+      });
+      if (!current()) return;
       const tables = collected.rows.filter(
         (table) => table.status === "Active",
       );
-      setGenericTables(tables);
-      setSelectedGenericTable((current) =>
-        tables.some((table) => table.table_id === current)
-          ? current
+      setGenericState({
+        context: catalogueContext,
+        tables,
+        tableId: tables.some((table) => table.table_id === selectedGenericTable)
+          ? selectedGenericTable
           : tables[0]?.table_id || "",
-      );
-      setGenericRows([]);
-      setGenericCursor(null);
-      setGenericSnapshot(null);
+        rows: [],
+        cursor: null,
+        snapshot: null,
+      });
       setPresentation("generic");
     } catch (reason) {
+      if (!current()) return;
+      setGenericState(null);
       setError(
         reason instanceof Error
           ? reason.message
           : "Unable to read generic-fact tables",
       );
     } finally {
-      setBusy(false);
+      if (current()) {
+        genericReadController.current = null;
+        setBusy(false);
+      }
     }
   }
 
   async function readGenericFacts(cursor?: string | null) {
-    if (!scope || !selectedGenericTable) return;
+    if (
+      !scope ||
+      !selectedGenericTable ||
+      !catalog?.functions["facts.generic.value.snapshot.scan"]
+    )
+      return;
+    const version = ++genericReadVersion.current;
+    genericReadController.current?.controller.abort();
+    const controller = new AbortController();
+    genericReadController.current = { context: genericReadContext, controller };
+    const current = () =>
+      !controller.signal.aborted &&
+      genericReadVersion.current === version &&
+      currentGenericReadContext.current === genericReadContext;
     setBusy(true);
     setError("");
     try {
@@ -1171,25 +2030,66 @@ export function Analyze({
         scope,
         "facts.generic.value.snapshot.scan",
         genericSnapshotArguments(selectedGenericTable, cursor),
+        controller.signal,
       );
-      setGenericRows((current) =>
-        cursor ? [...current, ...page.rows] : page.rows,
+      if (!current()) return;
+      setGenericState((state) =>
+        state?.context === catalogueContext &&
+        state.tableId === selectedGenericTable
+          ? {
+              ...state,
+              rows: cursor ? [...state.rows, ...page.rows] : page.rows,
+              cursor: page.nextCursor || null,
+              snapshot: page.snapshotRevision,
+            }
+          : state,
       );
-      setGenericCursor(page.nextCursor || null);
-      setGenericSnapshot(page.snapshotRevision);
     } catch (reason) {
+      if (!current()) return;
+      const tableAccessUnconfirmed =
+        reason instanceof ApiError &&
+        (reason.kind === "authorization" ||
+          [
+            "GENERIC_FACT_READ_AUTHORIZATION_STALE",
+            "FACT_TABLE_UNAVAILABLE",
+            "STALE_METADATA_REVISION",
+          ].includes(reason.code));
+      setGenericState((state) => {
+        if (
+          state?.context !== catalogueContext ||
+          state.tableId !== selectedGenericTable
+        )
+          return state;
+        return tableAccessUnconfirmed
+          ? null
+          : { ...state, rows: [], cursor: null, snapshot: null };
+      });
       setError(
         reason instanceof Error
           ? reason.message
           : "Unable to read generic facts",
       );
     } finally {
-      setBusy(false);
+      if (current()) {
+        genericReadController.current = null;
+        setBusy(false);
+      }
     }
   }
 
   async function suggestLayout() {
     if (!scope || dimensions.length < 2) return;
+    const version = ++layoutSuggestionVersion.current;
+    layoutSuggestionController.current?.controller.abort();
+    const controller = new AbortController();
+    const pending = { context: layoutSuggestionContext, controller };
+    layoutSuggestionController.current = pending;
+    const current = () =>
+      mounted.current &&
+      layoutSuggestionController.current === pending &&
+      !controller.signal.aborted &&
+      layoutSuggestionVersion.current === version &&
+      activeLayoutSuggestionContext.current === layoutSuggestionContext;
     setBusy(true);
     setError("");
     try {
@@ -1207,10 +2107,20 @@ export function Analyze({
         ) || dimensions.find((item) => item !== primary);
       if (!column)
         throw new Error("No distinct column dimension is available.");
-      setOpenedGridDefinition(null);
-      setCalculationContext(null);
-      setRowDimension(primary.dimension_id);
-      setColumnDimension(column.dimension_id);
+      if (openedGridDefinition) {
+        applyCanonicalLayout(
+          swapPrimaryAxis(
+            swapPrimaryAxis(
+              openedGridDefinition.layout,
+              "rows",
+              primary.dimension_id,
+            ),
+            "columns",
+            column.dimension_id,
+          ),
+        );
+        return;
+      }
       const fixed: Record<string, string> = {};
       for (const dimension of dimensions) {
         if (
@@ -1219,16 +2129,29 @@ export function Analyze({
           )
         )
           continue;
-        const members = await ensureMembers(dimension.dimension_id);
+        const members = await ensureMembers(
+          dimension.dimension_id,
+          controller.signal,
+        );
+        if (!current()) return;
         if (members[0]) fixed[dimension.dimension_id] = members[0].member_id;
       }
+      if (!current()) return;
+      setOpenedGridDefinition(null);
+      setCalculationContext(null);
+      setRowDimension(primary.dimension_id);
+      setColumnDimension(column.dimension_id);
       setPov(fixed);
     } catch (reason) {
+      if (!current()) return;
       setError(
         reason instanceof Error ? reason.message : "Unable to build layout",
       );
     } finally {
-      setBusy(false);
+      if (current()) {
+        layoutSuggestionController.current = null;
+        setBusy(false);
+      }
     }
   }
 
@@ -1269,6 +2192,7 @@ export function Analyze({
       const grids = collected.rows;
       setSavedGrids(grids);
       setSavedGridsRead(true);
+      setSavedGridsAccessFailed(false);
       setSelectedSavedGrid((current) =>
         grids.some((grid) => grid.gridId === current)
           ? current
@@ -1278,6 +2202,19 @@ export function Analyze({
       );
     } catch (reason) {
       if (!isCurrent()) return;
+      if (
+        reason instanceof ApiError &&
+        (reason.kind === "authorization" ||
+          reason.kind === "authentication" ||
+          ["SAVED_GRID_AUTHORIZATION_STALE", "SAVED_GRID_LIST_STALE"].includes(
+            reason.code,
+          ))
+      ) {
+        setSavedGrids([]);
+        setSavedGridsRead(false);
+        setSelectedSavedGrid("");
+        setSavedGridsAccessFailed(true);
+      }
       setSavedGridsError(
         reason instanceof Error ? reason.message : "Unable to load saved views",
       );
@@ -1297,6 +2234,7 @@ export function Analyze({
     setSelectedSavedGrid("");
     setSavedGridsError("");
     setSavedGridsLoading(false);
+    setSavedGridsAccessFailed(false);
     setSavedGridsContext(savedGridReadKey);
     if (canReadSavedGrids) void readSavedGrids();
     return () => {
@@ -1305,25 +2243,113 @@ export function Analyze({
     };
   }, [readSavedGrids, savedGridReadKey, canReadSavedGrids]);
 
-  function openSavedGrid(grid: SavedGrid) {
+  useEffect(() => {
+    if (!openedGridReference || savedGridsContext !== savedGridReadKey) return;
+    const unavailable =
+      savedGridsAccessFailed ||
+      (savedGridsRead &&
+        !savedGrids.some((grid) => grid.gridId === openedGridReference.viewId));
+    if (!unavailable) return;
+    const read = gridReadController.current;
+    if (read) cancelGridRead(read.context);
+    clearGridSnapshot();
+    setOpenedGridReference(null);
+    setOpenedGridDefinition(null);
+    setReadSemantics(null);
+    setResolvedBindingId("");
+    setResolvedBindingStateToken("");
+    setRowDimension("");
+    setColumnDimension("");
+    setPov({});
+    setAxisSelections({});
+    setAxisSelectionSummaries({});
+    setSavedGridId("");
+    setSavedGridName("");
+    setSavedGridTouched(false);
+    setSavedGridResult("");
+  }, [
+    openedGridReference,
+    savedGrids,
+    savedGridsRead,
+    savedGridsAccessFailed,
+    savedGridsContext,
+    savedGridReadKey,
+  ]);
+
+  function openSavedGrid(grid: SavedGrid, analyticalRead?: AnalyticalRead) {
     if (!canOpenSavedGrid(grid)) {
       setError(
         "This saved definition is invalid or cannot be represented without changing its declared semantics.",
       );
       return;
     }
+    const semantics =
+      analyticalRead?.semantics ||
+      (grid.definition.dataSource.kind === "raw" &&
+      catalog?.functions["facts.cube.resolved.read"]
+        ? "own"
+        : "stored");
+    if (analyticalRead) {
+      if (semantics === "effective")
+        throw new Error(
+          "This saved-view reference cannot restore an effective binding without changing its declared source layer. Request a compatible reference.",
+        );
+      const restored = gridReadPlan({
+        view: grid.definition,
+        semantics,
+        pov: {},
+        hasNativeSelection: true,
+        bindingId: "",
+        bindingStateToken: "",
+        canonicalViewRead:
+          (
+            catalog?.functions["facts.cube.resolved.read"] as
+              | { canonicalViewRead?: string }
+              | undefined
+          )?.canonicalViewRead === "openepm-cube-view-read-v1",
+      });
+      if (!catalog?.functions[restored.function])
+        throw new Error(
+          "The referenced read policy is unavailable in the current application context. Request a supported reference.",
+        );
+    }
     const fixed = savedGridPointOfView(grid.definition);
     setOpenedGridDefinition(structuredClone(grid.definition));
+    setOpenedGridReference({
+      viewId: grid.gridId,
+      viewDigest: grid.canonicalDigest,
+      definition: JSON.stringify(grid.definition),
+      authority: savedGridReadKey,
+      requestedContext: requestedViewContext,
+    });
+    // Read policy is session context, not a field in the saved-view contract.
+    // The visible selector is reset explicitly; no stale binding is restored.
+    setReadSemantics(semantics);
+    setResolvedBindingId("");
+    setResolvedBindingStateToken("");
     setCalculationContext(null);
     setRowDimension(grid.definition.layout.rows[0] || "");
     setColumnDimension(grid.definition.layout.columns[0] || "");
+    const savedAxes = new Set([
+      ...grid.definition.layout.rows,
+      ...grid.definition.layout.columns,
+    ]);
+    setAxisSelections(
+      Object.fromEntries(
+        grid.definition.selection.dimensions.flatMap((dimension) =>
+          savedAxes.has(dimension.dimensionId)
+            ? [[dimension.dimensionId, dimension.include]]
+            : [],
+        ),
+      ),
+    );
+    setAxisSelectionSummaries({});
     setPov(fixed);
     setSavedGridId(grid.gridId);
     setSelectedSavedGrid(grid.gridId);
     setSavedGridName(grid.name);
     setSavedGridTouched(false);
     setRows([]);
-    setSnapshot(null);
     setResolvedStatus(null);
     setNextCursor(null);
     setResolvedPage(null);
@@ -1334,14 +2360,16 @@ export function Analyze({
   }
 
   useEffect(() => {
-    if (
-      !scope ||
-      !targetViewId ||
-      !targetViewDigest ||
-      !catalog?.functions["grid.definition.read"]
-    )
+    if (!scope || !targetViewId || !catalog?.functions["grid.definition.read"])
       return;
     const controller = new AbortController();
+    setOpenedGridReference(null);
+    setOpenedGridDefinition(null);
+    setRowDimension("");
+    setColumnDimension("");
+    setPov({});
+    setAxisSelections({});
+    setError("");
     readProgram<SavedGrid>(
       scope,
       "grid.definition.read",
@@ -1349,14 +2377,16 @@ export function Analyze({
       controller.signal,
     )
       .then((grid) => {
-        if (grid.canonicalDigest !== targetViewDigest)
+        if (controller.signal.aborted) return;
+        if (targetViewDigest && grid.canonicalDigest !== targetViewDigest)
           throw new Error(
             "Workflow destination no longer matches its pinned grid digest.",
           );
-        openSavedGrid(grid);
+        openSavedGrid(grid, targetAnalyticalRead);
       })
       .catch((reason: Error) => {
-        if (reason.name !== "AbortError") setError(reason.message);
+        if (!controller.signal.aborted && reason.name !== "AbortError")
+          setError(reason.message);
       });
     return () => controller.abort();
   }, [
@@ -1364,6 +2394,8 @@ export function Analyze({
     app?.applicationId,
     targetViewId,
     targetViewDigest,
+    JSON.stringify(targetAnalyticalRead),
+    savedGridReadKey,
     Boolean(catalog?.functions["grid.definition.read"]),
   ]);
 
@@ -1388,7 +2420,35 @@ export function Analyze({
         rowDimension ? [rowDimension] : [],
         columnDimension ? [columnDimension] : [],
         pov,
+        currentAxisSelections,
       );
+  const configuredLayout = gridLayoutSummary(
+    savedGridDefinition.layout,
+    dimensions,
+  );
+  const shareableViewContext: SavedViewContext | null =
+    openedGridReference &&
+    openedGridDefinition &&
+    !savedGridTouched &&
+    openedGridReference.authority === savedGridReadKey &&
+    openedGridReference.requestedContext === requestedViewContext &&
+    openedGridReference.definition === JSON.stringify(openedGridDefinition) &&
+    openedGridDefinition.selection.metadataRevision === metadataRevision &&
+    /^[0-9a-f]{64}$/.test(openedGridReference.viewDigest) &&
+    plannedRead &&
+    !readUnavailable &&
+    readSemantics !== "effective"
+      ? {
+          viewId: openedGridReference.viewId,
+          viewDigest: openedGridReference.viewDigest,
+          analyticalRead: { semantics: readSemantics },
+        }
+      : null;
+  const shareableViewContextKey = JSON.stringify(shareableViewContext);
+  useEffect(() => {
+    onViewContextChange?.(JSON.parse(shareableViewContextKey));
+  }, [shareableViewContextKey, onViewContextChange]);
+  useEffect(() => () => onViewContextChange?.(null), [onViewContextChange]);
   const savedGridIdValid = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/.test(
     savedGridId,
   );
@@ -1404,19 +2464,18 @@ export function Analyze({
       savedGridIdValid &&
       savedGridNameValid &&
       savedGridDefinition.layout.rows.length &&
-      savedGridDefinition.layout.columns.length &&
-      canOpenSavedGrid({
-        gridId: savedGridId || "candidate",
-        stateToken: currentGridForSave?.stateToken || "a".repeat(64),
-        name: savedGridName || "candidate",
-        definition: savedGridDefinition,
-        metadataRevision: metadataRevision || 0,
-        canonicalDigest: "candidate",
-      }),
+      savedGridDefinition.layout.columns.length,
   );
 
   async function saveSharedGrid() {
     if (!scope || !metadataRevision || !savedGridReady) return;
+    const version = viewAuthoring.current.version;
+    const requestVersion = ++viewMutationSequence.current;
+    pendingViewMutation.current = requestVersion;
+    const sameContext = () =>
+      mounted.current &&
+      currentCatalogueContext.current === catalogueContext &&
+      pendingViewMutation.current === requestVersion;
     setBusy(true);
     setError("");
     try {
@@ -1438,7 +2497,22 @@ export function Analyze({
             rowDimension ? [rowDimension] : [],
             columnDimension ? [columnDimension] : [],
             pov,
+            currentAxisSelections,
           );
+      if (!sameContext() || viewAuthoring.current.version !== version) return;
+      if (
+        !canOpenSavedGrid({
+          gridId: savedGridId,
+          stateToken: currentGridForSave?.stateToken || "a".repeat(64),
+          name: savedGridName,
+          definition,
+          metadataRevision,
+          canonicalDigest: "candidate",
+        })
+      )
+        throw new Error(
+          "The current grid selection is incomplete or invalid. Choose current members before saving this view.",
+        );
       const response = await requestAdmittedEffect<{ result: SavedGrid }>(
         "/api/metadata-action",
         {
@@ -1460,17 +2534,28 @@ export function Analyze({
           confirmed: true,
         },
       );
-      setSavedGridResult(`Saved ${response.result.name}.`);
-      setSavedGridTouched(false);
+      if (!sameContext()) return;
+      if (viewAuthoring.current.version === version) {
+        setSavedGridResult(`Saved ${response.result.name}.`);
+        setSavedGridTouched(false);
+      } else {
+        setSavedGridResult(
+          `Saved ${response.result.name}. Your newer view edits are still unsaved.`,
+        );
+      }
       await readSavedGrids();
     } catch (reason) {
+      if (!sameContext()) return;
       setError(
         reason instanceof Error
           ? reason.message
           : "Unable to save shared grid definition",
       );
     } finally {
-      setBusy(false);
+      if (sameContext()) {
+        pendingViewMutation.current = null;
+        setBusy(false);
+      }
     }
   }
 
@@ -1481,6 +2566,13 @@ export function Analyze({
       !catalog?.functions["grid.definition.delete"]
     )
       return;
+    const version = viewAuthoring.current.version;
+    const requestVersion = ++viewMutationSequence.current;
+    pendingViewMutation.current = requestVersion;
+    const sameContext = () =>
+      mounted.current &&
+      currentCatalogueContext.current === catalogueContext &&
+      pendingViewMutation.current === requestVersion;
     setBusy(true);
     setError("");
     try {
@@ -1500,9 +2592,16 @@ export function Analyze({
         }),
         confirmed: true,
       });
+      if (!sameContext()) return;
       setSavedGridResult(`Deleted ${selectedGrid.name}`);
-      setSelectedSavedGrid("");
-      if (savedGridId === selectedGrid.gridId) {
+      setOpenedGridReference((current) =>
+        current?.viewId === selectedGrid.gridId ? null : current,
+      );
+      if (
+        viewAuthoring.current.version === version &&
+        savedGridId === selectedGrid.gridId
+      ) {
+        setSelectedSavedGrid("");
         setSavedGridId("");
         setSavedGridName("");
         setOpenedGridDefinition(null);
@@ -1510,19 +2609,27 @@ export function Analyze({
       }
       await readSavedGrids();
     } catch (reason) {
+      if (!sameContext()) return;
       setError(
         reason instanceof Error
           ? reason.message
           : "Unable to delete saved view",
       );
     } finally {
-      setBusy(false);
+      if (sameContext()) {
+        pendingViewMutation.current = null;
+        setBusy(false);
+      }
     }
   }
 
   let aggregateIntent: ReturnType<typeof aggregateQueryIntent> | null = null;
   let aggregateIntentError = "";
   try {
+    if (hasCustomAxisSelection)
+      throw new Error(
+        "Aggregate requests do not support member-restricted axes. Use the resolved grid read for this selection.",
+      );
     if (
       calculatedGrid ||
       activeRowDimensions.length !== 1 ||
@@ -1551,6 +2658,12 @@ export function Analyze({
       aggregatePageSizeValid &&
       catalog?.functions["facts.cube.aggregate.request"],
   );
+  const aggregateReviewKey = JSON.stringify([
+    catalogueContext,
+    aggregateIntent,
+    aggregatePageSize,
+  ]);
+  const aggregateReviewed = aggregateReviewedIntent === aggregateReviewKey;
   const aggregateCanCancel = Boolean(
     aggregateQueryId &&
       aggregateStateRead &&
@@ -1560,83 +2673,173 @@ export function Analyze({
       catalog?.functions["facts.cube.aggregate.cancel"],
   );
 
+  function beginAggregateRequest() {
+    pendingAggregateRequest.current?.controller.abort();
+    const pending = {
+      context: catalogueContext,
+      token: ++aggregateRequestSequence.current,
+      controller: new AbortController(),
+    };
+    pendingAggregateRequest.current = pending;
+    setAggregatePending(pending);
+    setError("");
+    setAggregateCancelReviewed(false);
+    const current = () =>
+      mounted.current &&
+      currentCatalogueContext.current === pending.context &&
+      pendingAggregateRequest.current === pending &&
+      !pending.controller.signal.aborted;
+    return { pending, current };
+  }
+
+  function hideAggregateObservation() {
+    // Retain the known query handle for a later authorized inspection; neither
+    // a refusal nor a context change authorizes displaying its old intent/data.
+    setAggregateQueryState((query) =>
+      query?.owner === aggregateOwner
+        ? {
+            ...query,
+            context: "",
+            status: "",
+            errorCode: undefined,
+            rows: [],
+            cursor: null,
+            stateRead: false,
+          }
+        : query,
+    );
+    setAggregateCancelReviewed(false);
+  }
+
   async function requestAggregate() {
     if (!scope || !aggregateIntent || !aggregateReady || !aggregateReviewed)
       return;
-    setBusy(true);
-    setError("");
+    const query = aggregateIntent;
+    const pageSize = aggregatePageSize;
+    const { pending, current } = beginAggregateRequest();
+    setAggregateReviewed(null);
+    hideAggregateObservation();
     try {
       const response = await request<{ result: AggregateResult }>(
         "/api/aggregate",
         {
           ...scope,
           confirmed: true,
-          program: aggregateRequestProgram(aggregateIntent, aggregatePageSize),
+          program: aggregateRequestProgram(query, pageSize),
         },
+        pending.controller.signal,
       );
-      setAggregateQueryId(response.result.queryId);
-      setAggregateStatus(response.result.status);
-      setAggregateRows([]);
-      setAggregateCursor(null);
-      setAggregateReviewed(false);
-      setAggregateCancelReviewed(false);
-      setAggregateStateRead(false);
+      if (!current()) return;
+      if (
+        typeof response.result.queryId !== "string" ||
+        !response.result.queryId
+      )
+        throw new Error(
+          "The aggregate response did not identify the accepted query.",
+        );
+      setAggregateQueryState({
+        owner: aggregateOwner,
+        queryId: response.result.queryId,
+        query,
+        pageSize,
+        context: catalogueContext,
+        status: response.result.status,
+        rows: [],
+        cursor: null,
+        stateRead: false,
+      });
     } catch (reason) {
+      if (!current()) return;
       setError(
         reason instanceof Error
           ? reason.message
           : "Unable to request aggregate query",
       );
     } finally {
-      setBusy(false);
+      if (current()) {
+        pendingAggregateRequest.current = null;
+        setAggregatePending((current) =>
+          current === pending ? null : current,
+        );
+      }
     }
   }
 
   async function readAggregate(cursor?: string | null) {
     if (
       !scope ||
-      !aggregateQueryId ||
+      !aggregateQuery ||
       !catalog?.functions["facts.cube.aggregate.read"]
     )
       return;
-    setBusy(true);
-    setError("");
+    const query = aggregateQuery;
+    const { pending, current } = beginAggregateRequest();
     try {
       const response = await request<{ result: AggregateResult }>(
         "/api/aggregate",
         {
           ...scope,
-          program: aggregateReadProgram(
-            aggregateQueryId,
-            aggregatePageSize,
-            cursor,
-          ),
+          program: aggregateReadProgram(query.queryId, query.pageSize, cursor),
         },
+        pending.controller.signal,
       );
-      setAggregateStatus(response.result.status);
-      setAggregateRows((current) =>
-        cursor
-          ? [...current, ...(response.result.rows || [])]
-          : response.result.rows || [],
-      );
-      setAggregateCursor(response.result.nextCursor || null);
-      setAggregateCancelReviewed(false);
-      setAggregateStateRead(true);
+      if (!current()) return;
+      if (response.result.queryId !== query.queryId)
+        throw new Error(
+          "The aggregate response does not match the requested query.",
+        );
+      const sealed = response.result.status === "sealed";
+      if (
+        !sealed &&
+        (response.result.rows !== undefined || response.result.nextCursor)
+      )
+        throw new Error(
+          "Aggregate results are unavailable until the query is sealed.",
+        );
+      setAggregateQueryState({
+        ...query,
+        context: catalogueContext,
+        status: response.result.status,
+        errorCode: response.result.errorCode,
+        rows: sealed
+          ? cursor
+            ? [
+                ...(aggregateObservation?.rows || []),
+                ...(response.result.rows || []),
+              ]
+            : response.result.rows || []
+          : [],
+        cursor: sealed ? response.result.nextCursor || null : null,
+        stateRead: true,
+      });
     } catch (reason) {
+      if (!current()) return;
+      hideAggregateObservation();
       setError(
         reason instanceof Error ? reason.message : "Unable to read aggregate",
       );
     } finally {
-      setBusy(false);
+      if (current()) {
+        pendingAggregateRequest.current = null;
+        setAggregatePending((current) =>
+          current === pending ? null : current,
+        );
+      }
     }
   }
 
   async function cancelAggregate() {
-    if (!scope || !aggregateCanCancel || !aggregateCancelReviewed) return;
+    if (
+      !scope ||
+      !aggregateQuery ||
+      !aggregateCanCancel ||
+      !aggregateCancelReviewed
+    )
+      return;
     if (!window.confirm("Request cancellation of this aggregate query?"))
       return;
-    setBusy(true);
-    setError("");
+    const query = aggregateQuery;
+    const { pending, current } = beginAggregateRequest();
     try {
       const response = await request<{ result: AggregateResult }>(
         "/api/aggregate",
@@ -1646,35 +2849,68 @@ export function Analyze({
           program: {
             languageVersion: 2,
             function: "facts.cube.aggregate.cancel",
-            arguments: { queryId: aggregateQueryId },
+            arguments: { queryId: query.queryId },
           },
         },
+        pending.controller.signal,
       );
-      setAggregateStatus(response.result.status);
-      setAggregateCursor(null);
-      setAggregateCancelReviewed(false);
-      setAggregateStateRead(false);
+      if (!current()) return;
+      if (response.result.queryId !== query.queryId)
+        throw new Error(
+          "The aggregate response does not match the requested query.",
+        );
+      setAggregateQueryState({
+        ...query,
+        context: catalogueContext,
+        status: response.result.status,
+        rows: [],
+        cursor: null,
+        stateRead: false,
+      });
     } catch (reason) {
+      if (!current()) return;
+      hideAggregateObservation();
       setError(
         reason instanceof Error
           ? reason.message
           : "Unable to cancel aggregate query",
       );
     } finally {
-      setBusy(false);
+      if (current()) {
+        pendingAggregateRequest.current = null;
+        setAggregatePending((current) =>
+          current === pending ? null : current,
+        );
+      }
     }
   }
 
   async function scan(cursor?: string | null) {
-    if (!scope) return;
+    if (!scope || !plannedRead || readUnavailable) return;
+    const focusRequest = gridFocus.begin();
+    const plan = plannedRead;
+    const context = gridReadContext;
+    const version = ++gridReadVersion.current;
+    const prior = gridReadController.current;
+    prior?.controller.abort();
+    if (prior?.context !== context) clearGridSnapshot();
+    const controller = new AbortController();
+    const pending = { context, controller, pending: true };
+    gridReadController.current = pending;
+    const current = () =>
+      mounted.current &&
+      gridReadController.current === pending &&
+      !controller.signal.aborted &&
+      version === gridReadVersion.current &&
+      activeGridReadContext.current === context;
     setBusy(true);
     setError("");
     try {
       const requiredDimensions = [
         ...new Set(
-          readSemantics === "stored"
-            ? [...activeRowDimensions, ...activeColumnDimensions]
-            : dimensions.map((dimension) => dimension.dimension_id),
+          plan.kind === "resolved"
+            ? dimensions.map((dimension) => dimension.dimension_id)
+            : [...activeRowDimensions, ...activeColumnDimensions],
         ),
       ];
       const resolvedMemberCatalog = { ...memberCatalog };
@@ -1682,27 +2918,80 @@ export function Analyze({
         const loaded = await Promise.all(
           requiredDimensions.map(
             async (dimension) =>
-              [dimension, await ensureMembers(dimension)] as const,
+              [
+                dimension,
+                await ensureMembers(dimension, controller.signal),
+              ] as const,
           ),
         );
         for (const [dimension, members] of loaded)
           resolvedMemberCatalog[dimension] = members;
       }
-      if (
-        !cursor &&
-        !calculatedGrid &&
-        (openedGridDefinition || readSemantics !== "stored")
-      ) {
-        const source =
-          openedGridDefinition?.dataSource.kind === "raw" ||
-          readSemantics === "own"
-            ? { semantics: "own" as const }
-            : {
-                semantics: "effective" as const,
-                bindingId: resolvedBindingId,
-                bindingStateToken: resolvedBindingStateToken,
-                hierarchies: [] as never[],
-              };
+      if (!current()) return;
+      const orderCells = (cells: CubeCell[]) => {
+        const axes = [...activeRowDimensions, ...activeColumnDimensions];
+        if (
+          axes.some(
+            (dimension) => explicitMemberIds(axisSelectorFor(dimension)).length,
+          )
+        ) {
+          const compare = gridMemberComparator(
+            axes,
+            resolvedMemberCatalog,
+            axisSelectorFor,
+          );
+          const members = (cell: CubeCell) =>
+            axes.map((dimension) => cell.members[dimension]);
+          cells.sort((left, right) => compare(members(left), members(right)));
+        }
+        return cells;
+      };
+      if (!cursor && plan.kind === "canonical") {
+        const page = await readProgram<CubeViewReadPage>(
+          scope,
+          plan.function,
+          {
+            format: "openepm-cube-view-read-v1",
+            view: plan.view,
+            readPolicy: plan.readPolicy,
+            limits: { maxRows: 500, maxSourceRows: 100_000, timeoutMs: 30_000 },
+          },
+          controller.signal,
+        );
+        if (!current()) return;
+        if (
+          page.format !== "openepm-cube-view-read-v1" ||
+          !page.complete ||
+          page.dataSource.kind !== plan.view.dataSource.kind ||
+          page.dataSource.resultKey !== plan.view.dataSource.resultKey ||
+          page.readPolicy.semantics !== plan.readPolicy.semantics ||
+          page.presentation.rowCount !== page.rows.length
+        )
+          throw new Error(
+            "The returned read does not match the requested view and read policy.",
+          );
+        const cells = orderCells(cubeViewRowsToCells(page));
+        const pageSize = page.presentation.pageSize;
+        setResolvedPage({ cells, pageSize, offset: 0 });
+        setRows(resolvedPageCells(cells, pageSize, 0));
+        setNextCursor(null);
+        setSource(
+          canonicalGridReadLabel(page.dataSource, page.readPolicy.semantics),
+        );
+        setResolvedStatus(cells.length ? "current" : "current-empty");
+        setCalculationContext(
+          page.calculation
+            ? {
+                resultKey: page.calculation.resultKey,
+                resultStateToken: page.calculation.resultStateToken,
+                inputsMatch: page.calculation.inputRevisionStatus.matchesAtRead,
+              }
+            : null,
+        );
+        setCompletedRead({ context, plan });
+        return;
+      }
+      if (!cursor && plan.kind === "resolved") {
         const page = await readProgram<ResolvedCubePage>(
           scope,
           "facts.cube.resolved.read",
@@ -1711,7 +3000,7 @@ export function Analyze({
             resolvedMemberCatalog,
             pov,
             metadataRevision || 0,
-            source,
+            plan.source,
             openedGridDefinition?.selection,
             {
               pageSize: openedGridDefinition?.pageSize || 100,
@@ -1720,14 +3009,16 @@ export function Analyze({
                 zero: false,
               },
             },
+            currentAxisSelections,
           ).arguments,
+          controller.signal,
         );
-        const cells = resolvedRowsToCells(page);
+        if (!current()) return;
+        const cells = orderCells(resolvedRowsToCells(page));
         const pageSize = page.presentation.pageSize;
         setResolvedPage({ cells, pageSize, offset: 0 });
         setRows(resolvedPageCells(cells, pageSize, 0));
         setNextCursor(null);
-        setSnapshot(page.snapshot.commitRevision);
         const readStatus = resolvedReadStatus(page);
         setResolvedStatus(readStatus);
         const origins = [...new Set(page.rows.map((row) => row.origin))].sort();
@@ -1735,61 +3026,51 @@ export function Analyze({
           ...new Set(page.rows.map((row) => row.currentness)),
         ].sort();
         setSource(
-          `${
-            readSemantics === "own"
-              ? "resolved own input"
-              : `effective binding ${resolvedBindingId}`
-          } · ${origins.join(", ") || "no rows"} · ${
+          `${plan.label} · ${origins.join(", ") || "no rows"} · ${
             currentness.join(", ") || "currentness unavailable"
           }`,
         );
         setCalculationContext(null);
+        setCompletedRead({ context, plan });
         return;
       }
       setResolvedStatus(null);
       setResolvedPage(null);
       const pageSize = openedGridDefinition?.pageSize || 100;
-      const scanFunction = calculatedGrid
-        ? "facts.calculation.scan"
-        : "facts.cube.scan";
+      if (plan.kind === "resolved" || plan.kind === "canonical") return;
       const page = await readProgram<CubePage>(
         scope,
-        scanFunction,
+        plan.function,
         cursor
-          ? calculatedGrid
-            ? { cursor }
-            : { cursor }
-          : calculatedGrid
+          ? { cursor }
+          : plan.kind === "calculated"
             ? {
-                members: pov,
+                members: plan.members,
                 limit: pageSize,
                 includeZero: !(openedGridDefinition?.suppression.zero ?? false),
-                resultKey: openedGridDefinition?.dataSource.resultKey,
+                resultKey: plan.resultKey,
               }
             : buildScanArguments(
-                pov,
+                plan.members,
                 pageSize,
                 undefined,
                 openedGridDefinition?.suppression,
               ),
+        controller.signal,
       );
+      if (!current()) return;
       setRows(
-        calculatedGrid
+        plan.kind === "calculated"
           ? page.rows.map((cell) => ({ ...cell, kind: "numeric" as const }))
           : page.rows,
       );
       setNextCursor(page.nextCursor || null);
-      setSnapshot(calculatedGrid ? null : (page.snapshotRevision ?? null));
-      setSource(
-        calculatedGrid ? "current calculated result" : page.source || "raw",
-      );
+      setSource(plan.label);
+      setCompletedRead({ context, plan });
       setCalculationContext(
-        calculatedGrid
+        plan.kind === "calculated"
           ? {
-              resultKey:
-                page.resultKey ||
-                openedGridDefinition?.dataSource.resultKey ||
-                "",
+              resultKey: page.resultKey || plan.resultKey || "",
               resultStateToken: page.resultStateToken || "",
               inputsMatch: page.inputRevisionStatus?.matchesAtRead === true,
               accountingStatus:
@@ -1799,27 +3080,78 @@ export function Analyze({
           : null,
       );
     } catch (reason) {
+      if (!current()) return;
       // A failed authorization, stale pin or unavailable read invalidates the
       // displayed snapshot. Never leave values from an earlier authority cut
       // visible beside the new failure.
       setRows([]);
       setNextCursor(null);
       setResolvedPage(null);
-      setSnapshot(null);
       setSource("");
       setResolvedStatus(null);
       setCalculationContext(null);
+      setCompletedRead(null);
       setSelectedCell(null);
       setError(
         reason instanceof Error ? reason.message : "Unable to read grid",
       );
     } finally {
-      setBusy(false);
+      if (current()) {
+        pending.pending = false;
+        setBusy(false);
+        gridFocus.finish(focusRequest);
+      }
     }
   }
 
-  async function selectCell(cell: CubeCell) {
-    if (!scope) return;
+  function withdrawGridSnapshot(message: string) {
+    if (!mounted.current || activeGridReadContext.current !== gridReadContext)
+      return;
+    cellReturn.current = cellTrigger.current;
+    cellTrigger.current = null;
+    cancelGridRead(gridReadContext);
+    clearGridSnapshot();
+    setError(message);
+    void onRefreshCatalog?.().catch(() => undefined);
+  }
+
+  function withdrawGridAfterAuthorityFailure(reason: unknown) {
+    const invalidated =
+      isApplicationAccessDenied(reason) ||
+      (reason instanceof ApiError &&
+        [
+          "CUBE_READ_AUTHORIZATION_STALE",
+          "DIMENSIONAL_SECURITY_REVISION_CHANGED",
+          "IDENTITY_INACTIVE",
+          "IDENTITY_SESSION_REVOKED",
+          "STALE_SECURITY_REVISION",
+          "STALE_METADATA_REVISION",
+        ].includes(reason.code));
+    if (invalidated)
+      withdrawGridSnapshot(
+        "Current access to this cell could not be confirmed. Read the grid again to check what is available.",
+      );
+    return invalidated;
+  }
+
+  function reportCellReadFailure(reason: unknown, fallback: string) {
+    if (!withdrawGridAfterAuthorityFailure(reason))
+      setError(reason instanceof Error ? reason.message : fallback);
+  }
+
+  function applyCellEditability(editability: CellEditability) {
+    if (editability.reasonCode === "CELL_UNAVAILABLE") {
+      withdrawGridSnapshot(
+        "The selected cell is unavailable. Read the grid again to check what is available.",
+      );
+      return false;
+    }
+    setCellEditability(editability);
+    return true;
+  }
+
+  async function selectCell(cell: CubeCell, preserveDraft = false) {
+    if (!scope || !loadedRead) return;
     const version = ++cellReadVersion.current;
     const selectionScope = activeScopeKey;
     cellReadController.current?.abort();
@@ -1828,20 +3160,23 @@ export function Analyze({
     const current = () =>
       version === cellReadVersion.current &&
       activeScope.current === selectionScope &&
+      activeGridReadContext.current === gridReadContext &&
       !controller.signal.aborted;
     setSelectedCell(cell);
-    setWriteKind(cell.kind || "numeric");
-    setWriteOperation("set");
-    setWriteValue(
-      cell.kind === "text" ? (cell.text ?? "") : (cell.amount ?? ""),
-    );
-    setWriteTouched(false);
-    setExpectedChangeId("");
+    if (!preserveDraft) {
+      setWriteKind(cell.kind || "numeric");
+      setWriteOperation("set");
+      setWriteValue(
+        cell.kind === "text" ? (cell.text ?? "") : (cell.amount ?? ""),
+      );
+      setWriteTouched(false);
+    }
+    setInspectorSnapshot(null);
     setResolvedChangeIds({ numeric: "", text: "" });
     setCellResolved(false);
     setCellEditability(null);
     setWriteResult("");
-    setBusy(true);
+    setCellReadBusy(true);
     setError("");
     try {
       const page = await readProgram<CubePage>(
@@ -1867,32 +3202,49 @@ export function Analyze({
         numeric: exact?.numericChangeId || "",
         text: exact?.textChangeId || "",
       });
+      const currentCell: CubeCell = {
+        members: cell.members,
+        kind: exact?.kind === "text" ? "text" : "numeric",
+        ...(exact?.kind === "text"
+          ? { text: exact.text ?? null }
+          : { amount: exact?.amount ?? null }),
+        numericChangeId: exact?.numericChangeId,
+        textChangeId: exact?.textChangeId,
+        lastRevision: exact?.lastRevision,
+      };
+      setSelectedCell(currentCell);
+      setInspectorSnapshot(page.snapshotRevision ?? null);
+      if (!preserveDraft) {
+        setWriteKind(currentCell.kind);
+        setWriteValue(
+          currentCell.kind === "text"
+            ? (currentCell.text ?? "")
+            : (currentCell.amount ?? ""),
+        );
+      }
       const editability = await readProgram<CellEditability>(
         scope,
         "facts.cell.editability.read",
         {
           coordinate: cell.members,
           source: "raw",
-          action: "set",
-          kind: cell.kind || "numeric",
+          action: preserveDraft ? writeOperation : "set",
+          kind: preserveDraft ? writeKind : currentCell.kind,
         },
         controller.signal,
       );
       if (!current()) return;
-      setCellEditability(editability);
-      setCellResolved(true);
+      if (applyCellEditability(editability)) setCellResolved(true);
     } catch (reason) {
       if (!current()) return;
-      setError(
-        reason instanceof Error ? reason.message : "Unable to resolve cell",
-      );
+      reportCellReadFailure(reason, "Unable to resolve cell");
     } finally {
-      if (current()) setBusy(false);
+      if (current()) setCellReadBusy(false);
     }
   }
 
   async function inspectCalculatedCell(cell: CubeCell) {
-    if (!scope) return;
+    if (!scope || !loadedRead) return;
     const version = ++cellReadVersion.current;
     const selectionScope = activeScopeKey;
     cellReadController.current?.abort();
@@ -1901,15 +3253,15 @@ export function Analyze({
     const current = () =>
       version === cellReadVersion.current &&
       activeScope.current === selectionScope &&
+      activeGridReadContext.current === gridReadContext &&
       !controller.signal.aborted;
     setSelectedCell(cell);
     setReviewed(false);
     setWriteResult("");
-    setExpectedChangeId("");
     setResolvedChangeIds({ numeric: "", text: "" });
     setCellResolved(false);
     setCellEditability(null);
-    setBusy(true);
+    setCellReadBusy(true);
     setError("");
     try {
       const editability = await readProgram<CellEditability>(
@@ -1923,16 +3275,12 @@ export function Analyze({
         },
         controller.signal,
       );
-      if (current()) setCellEditability(editability);
+      if (current()) applyCellEditability(editability);
     } catch (reason) {
       if (current())
-        setError(
-          reason instanceof Error
-            ? reason.message
-            : "Unable to inspect cell editability",
-        );
+        reportCellReadFailure(reason, "Unable to inspect cell editability");
     } finally {
-      if (current()) setBusy(false);
+      if (current()) setCellReadBusy(false);
     }
   }
 
@@ -1947,8 +3295,13 @@ export function Analyze({
     cellReadController.current?.abort();
     const controller = new AbortController();
     cellReadController.current = controller;
+    const current = () =>
+      version === cellReadVersion.current &&
+      activeScope.current === selectionScope &&
+      activeGridReadContext.current === gridReadContext &&
+      !controller.signal.aborted;
     setCellEditability(null);
-    setBusy(true);
+    setCellReadBusy(true);
     setError("");
     try {
       const editability = await readProgram<CellEditability>(
@@ -1957,30 +3310,12 @@ export function Analyze({
         { coordinate: cell.members, source: "raw", action, kind },
         controller.signal,
       );
-      if (
-        version === cellReadVersion.current &&
-        activeScope.current === selectionScope &&
-        !controller.signal.aborted
-      )
-        setCellEditability(editability);
+      if (current()) applyCellEditability(editability);
     } catch (reason) {
-      if (
-        version === cellReadVersion.current &&
-        activeScope.current === selectionScope &&
-        !controller.signal.aborted
-      )
-        setError(
-          reason instanceof Error
-            ? reason.message
-            : "Unable to inspect cell editability",
-        );
+      if (current())
+        reportCellReadFailure(reason, "Unable to inspect cell editability");
     } finally {
-      if (
-        version === cellReadVersion.current &&
-        activeScope.current === selectionScope &&
-        !controller.signal.aborted
-      )
-        setBusy(false);
+      if (current()) setCellReadBusy(false);
     }
   }
 
@@ -2006,73 +3341,78 @@ export function Analyze({
         writeKind === "text" ||
         exactDecimal.test(writeValue)),
   );
+  const exactWriteProgram =
+    selectedCell && writeReady
+      ? buildWritebackProgram(
+          writeKind,
+          writeOperation,
+          selectedCell.members,
+          writeValue,
+          expectedChangeId,
+        )
+      : null;
+  const cellMutation = useExactCellMutation(
+    scope,
+    JSON.stringify([
+      activeScopeKey,
+      subject,
+      catalog?.applicationAccess.issuer,
+      catalog?.applicationAccess.role,
+      catalog?.applicationAccess.workspaceAdministrator,
+      catalog?.revisions,
+    ]),
+    "grid-cell-mutation",
+    exactWriteProgram,
+    JSON.stringify([catalog?.applicationAccess.issuer, subject]),
+  );
+  useEffect(() => {
+    if (!cellMutation.review) setReviewed(false);
+  }, [cellMutation.review]);
 
   async function submitWriteback() {
-    if (!scope || !selectedCell || !writeReady || !reviewed) return;
-    setBusy(true);
-    setError("");
+    if (!writeReady || !reviewed || !cellMutation.review) return;
+    await runFocusedMutation(cellMutation.submit);
+    setReviewed(false);
+  }
+
+  async function runFocusedMutation(action: () => Promise<void>) {
+    const focusRequest = gridFocus.begin("mutation");
     try {
-      const program = buildWritebackProgram(
-        writeKind,
-        writeOperation,
-        selectedCell.members,
-        writeValue,
-        expectedChangeId,
-      );
-      const result = await reviewAndSubmit<{ jobId?: string }>(
-        {
-          ...scope,
-          program,
-          idempotencyKey: mutationIntentKey({ scope, program }),
-          dependsOnJobIds: [],
-          confirmed: true,
-        },
-        "Review the selected-cell writeback preview.",
-      );
-      if (!result) return;
-      setWriteResult("Writeback request accepted.");
-      setWriteTouched(false);
-      setReviewed(false);
-    } catch (reason) {
-      setError(
-        reason instanceof Error ? reason.message : "Unable to submit writeback",
-      );
+      await action();
     } finally {
-      setBusy(false);
+      gridFocus.finish(focusRequest);
     }
   }
 
+  const visibleRows = loadedRead ? rows : [];
+  const hasMoreGridPages = Boolean(
+    loadedRead &&
+      (resolvedPage
+        ? hasResolvedNextPage(
+            resolvedPage.cells,
+            resolvedPage.pageSize,
+            resolvedPage.offset,
+          )
+        : nextCursor),
+  );
   const matrix = useMemo(() => {
     if (!activeRowDimensions.length || !activeColumnDimensions.length)
       return null;
-    const memberOrder = (dimension: string) =>
-      (memberCatalog[dimension] || []).map((member) => member.member_id);
-    const compareTuple = (
-      left: string[],
-      right: string[],
-      dimensions: string[],
-    ) => {
-      for (let index = 0; index < dimensions.length; index += 1) {
-        const order = memberOrder(dimensions[index]);
-        const leftIndex = order.indexOf(left[index]);
-        const rightIndex = order.indexOf(right[index]);
-        const governedLeft =
-          leftIndex < 0 ? Number.MAX_SAFE_INTEGER : leftIndex;
-        const governedRight =
-          rightIndex < 0 ? Number.MAX_SAFE_INTEGER : rightIndex;
-        if (governedLeft !== governedRight) return governedLeft - governedRight;
-        const fallback = String(left[index]).localeCompare(
-          String(right[index]),
-        );
-        if (fallback) return fallback;
-      }
-      return 0;
-    };
+    const compareRows = gridMemberComparator(
+      activeRowDimensions,
+      memberCatalog,
+      axisSelectorFor,
+    );
+    const compareColumns = gridMemberComparator(
+      activeColumnDimensions,
+      memberCatalog,
+      axisSelectorFor,
+    );
     const key = (values: string[]) => JSON.stringify(values);
     const columnTuples = new Map<string, string[]>();
     const rowTuples = new Map<string, string[]>();
     const cells = new Map<string, CubeCell>();
-    for (const cell of rows) {
+    for (const cell of visibleRows) {
       const row = activeRowDimensions.map(
         (dimension) => cell.members[dimension],
       );
@@ -2092,35 +3432,142 @@ export function Analyze({
     if (!rowTuples.size || !columnTuples.size) return null;
     return {
       rowTuples: [...rowTuples.entries()].sort((left, right) =>
-        compareTuple(left[1], right[1], activeRowDimensions),
+        compareRows(left[1], right[1]),
       ),
       columnTuples: [...columnTuples.entries()].sort((left, right) =>
-        compareTuple(left[1], right[1], activeColumnDimensions),
+        compareColumns(left[1], right[1]),
       ),
       cells,
     };
   }, [
-    rows,
+    visibleRows,
     activeRowDimensions.join("\u0000"),
     activeColumnDimensions.join("\u0000"),
     memberCatalog,
+    axisSelections,
+    openedGridDefinition?.selection,
   ]);
+
+  const matrixCoordinate = (row: string[], column: string[]) => ({
+    ...pov,
+    ...Object.fromEntries(activeRowDimensions.map((id, i) => [id, row[i]])),
+    ...Object.fromEntries(
+      activeColumnDimensions.map((id, i) => [id, column[i]]),
+    ),
+  });
+  const gridFocus = useGridFocus(
+    `${gridReadContext}:${presentation}`,
+    matrix
+      ? matrix.rowTuples.map(([rowKey, row]) =>
+          matrix.columnTuples.map(([columnKey, column]) =>
+            gridCoordinateKey(
+              matrix.cells.get(`${rowKey}\u0000${columnKey}`)?.members ||
+                matrixCoordinate(row, column),
+              matrix.cells.get(`${rowKey}\u0000${columnKey}`)?.kind ||
+                "numeric",
+            ),
+          ),
+        )
+      : visibleRows.map((cell) => [gridCoordinateKey(cell.members, cell.kind)]),
+    busy || cellMutation.busy,
+    Boolean(cellMutation.pending),
+    interactionBlocked,
+  );
+  const gridRoot = gridFocus.root;
+  useLayoutEffect(() => {
+    if (interactionBlocked) cellReturn.current = null;
+    if (selectedCell || busy || !cellReturn.current) return;
+    const origin = cellReturn.current;
+    cellReturn.current = null;
+    const root = gridRoot.current;
+    if (root?.contains(origin) && !origin.disabled) origin.focus();
+    else
+      root
+        ?.querySelector<HTMLElement>(
+          "button[data-grid-row][tabindex='0']:not(:disabled), [data-grid-focus-status]",
+        )
+        ?.focus();
+  }, [selectedCell, busy, interactionBlocked, gridRoot]);
 
   const numericPresentationCells = useMemo(
     () =>
-      rows
-        .filter(
-          (cell): cell is CubeCell & { amount: string } =>
-            cell.kind === "numeric" && typeof cell.amount === "string",
-        )
-        .slice(0, 24),
-    [rows],
+      visibleRows.filter(
+        (cell): cell is CubeCell & { amount: string } =>
+          cell.kind === "numeric" &&
+          typeof cell.amount === "string" &&
+          cell.amount !== "",
+      ),
+    [visibleRows],
   );
+  const presentedNumericCells = numericPresentationCells.slice(0, 24);
+  const hasPresentText = visibleRows.some((cell) =>
+    cell.layerValues
+      ? Object.values(cell.layerValues).some((values) =>
+          values?.some((value) => value.present && value.unit === "text"),
+        )
+      : cell.kind === "text" && typeof cell.text === "string",
+  );
+  const hasSeparateValues = visibleRows.some(
+    (cell) => cellPresence(cell) === "Separate source values",
+  );
+  const presentationUnits = new Set(
+    visibleRows.flatMap((cell) =>
+      cell.layerValues
+        ? Object.values(cell.layerValues).flatMap((values) =>
+            (values || [])
+              .filter((value) => value.present && value.unit !== "text")
+              .map((value) =>
+                typeof value.unit === "object" && value.unit
+                  ? JSON.stringify(
+                      Object.entries(value.unit).sort(([left], [right]) =>
+                        left.localeCompare(right),
+                      ),
+                    )
+                  : JSON.stringify(value.unit),
+              ),
+          )
+        : cell.kind === "numeric" &&
+            typeof cell.amount === "string" &&
+            cell.amount !== ""
+          ? [JSON.stringify(cell.resultUnit || "amount")]
+          : [],
+    ),
+  );
+  const numericPresentationUnavailable =
+    openedGridDefinition?.dataSource.kind === "combined"
+      ? "KPI and chart presentations require a single source layer. Raw and calculated values remain separate in this view."
+      : !loadedRead
+        ? readingGrid
+          ? "Reading the grid. KPI and chart presentations will be available after a successful numeric read."
+          : "Read the grid to enable KPI and chart presentations."
+        : hasPresentText
+          ? "KPI and chart presentations require numeric values. The loaded page contains text, including any present empty text; these values remain in the grid."
+          : presentationUnits.size > 1
+            ? "KPI and chart presentations require compatible units. The loaded page contains different units."
+            : hasSeparateValues
+              ? "KPI and chart presentations require one value per coordinate. Separate source values remain in the grid."
+              : !numericPresentationCells.length
+                ? "KPI and chart presentations require a present numeric value. The loaded page has none; missing values are not treated as zero."
+                : "";
+  const numericPresentationNoteId = useId();
+  useEffect(() => {
+    if (
+      numericPresentationUnavailable &&
+      (presentation === "kpi" || presentation === "chart")
+    )
+      setPresentation("grid");
+  }, [numericPresentationUnavailable, presentation]);
+  const numericPresentationScope = `Showing ${presentedNumericCells.length} of ${numericPresentationCells.length} present numeric values on the loaded page.${visibleRows.length > numericPresentationCells.length ? " Missing values are omitted, not converted to zero." : ""}${hasMoreGridPages ? " More grid pages are available; this is not the complete selection." : ""}`;
+  const numericPresentationNote =
+    numericPresentationUnavailable ||
+    (presentation === "kpi" || presentation === "chart"
+      ? numericPresentationScope
+      : "");
   const chartMaximum = useMemo(
     () =>
       Math.max(
         0,
-        ...numericPresentationCells.map((cell) => {
+        ...numericPresentationCells.slice(0, 24).map((cell) => {
           const value = Math.abs(Number(cell.amount));
           return Number.isFinite(value) ? value : 0;
         }),
@@ -2137,19 +3584,45 @@ export function Analyze({
     );
   }
 
-  function changeGridContext(action: () => void) {
+  function presentationValue(cell: CubeCell & { amount: string }) {
+    const value = cell.layerValues && Object.values(cell.layerValues)[0]?.[0];
+    return value ? layerValueText(value) : cell.amount;
+  }
+
+  function changeGridContext(action: () => void, replaceView = false) {
     const apply = () => {
       setWriteTouched(false);
       setReviewed(false);
-      if (savedGridTouched) {
+      if (replaceView && savedGridTouched) {
         setSavedGridId("");
         setSavedGridName("");
         setSavedGridTouched(false);
       }
       action();
     };
-    if (writeTouched || savedGridTouched) onRequestTransition(apply);
+    if (writeTouched || (replaceView && savedGridTouched))
+      onRequestTransition(apply);
     else apply();
+  }
+
+  function openCellInspector(cell: CubeCell, trigger: HTMLButtonElement) {
+    changeGridContext(() => {
+      cellTrigger.current = trigger;
+      setCellInspectorOpening((opening) => opening + 1);
+      if (calculatedGrid) void inspectCalculatedCell(cell);
+      else void selectCell(cell);
+    });
+  }
+
+  const inspectorCloseBlocked = gridBusy || cellMutation.busy;
+  function closeCellInspector() {
+    if (inspectorCloseBlocked) return;
+    changeGridContext(() => {
+      cancelCellRead();
+      cellReturn.current = cellTrigger.current;
+      cellTrigger.current = null;
+      setSelectedCell(null);
+    });
   }
 
   const selectedCoordinate = selectedCell
@@ -2157,9 +3630,38 @@ export function Analyze({
     : "";
   const isSelected = (cell: CubeCell) =>
     selectedCoordinate === JSON.stringify(Object.entries(cell.members).sort());
+  const scenarioAxis = dimensions.find(
+    (axis) => axis.status === "Active" && axis.model_role === "Scenario",
+  );
+  // Like the other Grid pickers, the modal sits above the sticky cell drawer.
+  const comparisonDialogHost = gridFocus.root.current;
+  const comparisonCapability = catalog?.functions[SCENARIO_COMPARISON] as
+    | { calculatedScenarioComparison?: boolean }
+    | undefined;
+  const comparisonUnits =
+    selectedCell?.layerValues?.calculated?.flatMap((value) =>
+      value.present &&
+      value.currentness === "current" &&
+      value.resultStateToken === calculationContext?.resultStateToken &&
+      isComparisonUnit(value.unit)
+        ? [value.unit]
+        : [],
+    ) ?? [];
+  const publishedComparison =
+    comparisonCapability?.calculatedScenarioComparison === true &&
+    calculationContext?.inputsMatch &&
+    calculationContext.resultKey ===
+      openedGridDefinition?.dataSource.resultKey &&
+    comparisonUnits.length
+      ? {
+          resultKey: calculationContext.resultKey,
+          resultStateToken: calculationContext.resultStateToken,
+          units: comparisonUnits,
+        }
+      : undefined;
 
   return (
-    <div className="page analyze-page">
+    <div className="page analyze-page" ref={gridFocus.root}>
       <div className="page-heading data-workspace-header">
         <div>
           <span>{app?.name || "Application"}</span>
@@ -2170,48 +3672,44 @@ export function Analyze({
           </p>
         </div>
         <div className="data-stage-summary" aria-label="Grid snapshot status">
-          <span
-            className={`task-state ${snapshot === null ? "neutral" : "active"}`}
-          >
-            {snapshot === null
-              ? "Ready to configure"
-              : resolvedStatus === "current-empty"
-                ? "Current · Empty"
-                : `${rows.length} loaded cells`}
+          <span className={`task-state ${loadedRead ? "active" : "neutral"}`}>
+            {readingGrid
+              ? "Reading grid…"
+              : !loadedRead
+                ? "Ready to configure"
+                : resolvedStatus === "current-empty"
+                  ? "Current · Empty"
+                  : `${visibleRows.length} loaded cells`}
           </span>
           {calculatedGrid && (
-            <span className="task-state neutral">Calculated · read only</span>
+            <span className="task-state neutral">
+              {openedGridDefinition?.dataSource.kind === "combined"
+                ? "Combined"
+                : "Calculated"}{" "}
+              · read only
+            </span>
           )}
         </div>
       </div>
 
+      {app && catalog && metadataRevision === catalog.revisions.metadata && (
+        <ScenarioPromotion
+          app={app}
+          catalog={catalog}
+          dimensions={dimensions}
+          memberCatalog={memberCatalog}
+          loadMembers={ensureMembers}
+          onRefreshCatalog={onRefreshCatalog}
+          comparisonControl={scenarioCopyControl}
+        />
+      )}
       <section className="layout-summary" aria-label="Current grid layout">
-        <div>
-          <small>ROWS</small>
-          <strong>
-            {dimensions.find((item) => item.dimension_id === rowDimension)
-              ?.name ||
-              rowDimension ||
-              "Not selected"}
-          </strong>
-        </div>
-        <div>
-          <small>COLUMNS</small>
-          <strong>
-            {dimensions.find((item) => item.dimension_id === columnDimension)
-              ?.name ||
-              columnDimension ||
-              "Not selected"}
-          </strong>
-        </div>
-        <div>
-          <small>PAGES / FILTERS</small>
-          <strong>
-            {Object.keys(pov).length
-              ? `${Object.keys(pov).length} fixed`
-              : "Not fixed"}
-          </strong>
-        </div>
+        {configuredLayout.map((axis) => (
+          <div key={axis.key}>
+            <small>{axis.label.toUpperCase()}</small>
+            <strong>{axis.text}</strong>
+          </div>
+        ))}
         <button
           type="button"
           aria-controls="grid-layout-drawer"
@@ -2221,64 +3719,88 @@ export function Analyze({
           {layoutOpen ? "Close layout" : "Configure layout"}
         </button>
       </section>
-      {!calculatedGrid &&
-        Boolean(catalog?.functions["facts.cube.resolved.read"]) && (
-          <section className="context-note" aria-label="Grid value semantics">
-            <label>
-              Value semantics
-              <select
-                value={readSemantics}
-                onChange={(event) => {
-                  setReadSemantics(
-                    event.target.value as "stored" | "own" | "effective",
-                  );
-                  setRows([]);
-                  setSnapshot(null);
-                }}
-              >
-                <option value="stored">Stored raw values</option>
-                <option value="own">Own input at each member</option>
-                <option value="effective">Effective governed value</option>
-              </select>
-            </label>
-            {readSemantics === "effective" && (
-              <>
-                <label>
-                  Effective binding
-                  <select
-                    value={`${resolvedBindingId}:${resolvedBindingStateToken}`}
-                    onChange={(event) => {
-                      const binding = resolvedBindings.find(
-                        (item) =>
-                          `${item.bindingId}:${item.stateToken}` ===
-                          event.target.value,
-                      );
-                      if (binding) {
-                        setResolvedBindingId(binding.bindingId);
-                        setResolvedBindingStateToken(binding.stateToken);
-                      }
-                    }}
-                  >
-                    <option value=":">Choose an active binding</option>
-                    {resolvedBindings.map((binding) => (
-                      <option
-                        key={`${binding.bindingId}:${binding.stateToken}`}
-                        value={`${binding.bindingId}:${binding.stateToken}`}
-                      >
-                        {binding.bindingId} · {binding.stages.length} stages
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </>
-            )}
-            <p>
-              Own reads preserve direct parent input. Effective reads apply the
-              selected active calculation and hierarchy binding; they never
-              write or silently recalculate data.
-            </p>
-          </section>
-        )}
+      <p className="context-note" aria-label="Configured grid source">
+        Configured source layer: {savedGridDefinition.dataSource.kind}.
+        Configuration does not mean a snapshot has been read.
+      </p>
+      {Boolean(catalog?.functions["facts.cube.resolved.read"]) && (
+        <section className="context-note" aria-label="Grid value semantics">
+          <label>
+            Value semantics
+            <select
+              value={readSemantics}
+              onChange={(event) => {
+                setReadSemantics(event.target.value as GridReadSemantics);
+                setRows([]);
+              }}
+            >
+              <option value="stored">Stored values</option>
+              <option value="own">Own input at each member</option>
+              <option value="effective">Effective governed value</option>
+            </select>
+          </label>
+          {readSemantics === "effective" && (
+            <>
+              <label>
+                Effective binding
+                <select
+                  value={`${resolvedBindingId}:${resolvedBindingStateToken}`}
+                  onChange={(event) => {
+                    const binding = resolvedBindings.find(
+                      (item) =>
+                        `${item.bindingId}:${item.stateToken}` ===
+                        event.target.value,
+                    );
+                    if (binding) {
+                      setResolvedBindingId(binding.bindingId);
+                      setResolvedBindingStateToken(binding.stateToken);
+                    }
+                  }}
+                >
+                  <option value=":">Choose an active binding</option>
+                  {resolvedBindings.map((binding) => (
+                    <option
+                      key={`${binding.bindingId}:${binding.stateToken}`}
+                      value={`${binding.bindingId}:${binding.stateToken}`}
+                    >
+                      {binding.bindingId} · {binding.stages.length} stages
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </>
+          )}
+          <p>
+            Own reads preserve direct parent input. Effective reads apply the
+            selected active calculation and hierarchy binding; they never write
+            or silently recalculate data. Saved definitions store the source
+            layer, not the read policy. Opening a view selects its displayed
+            supported default policy; an explicit view link restores its stated
+            supported read policy or refuses the read. Effective bindings are
+            session-only and are not restored by saved views or view links.
+          </p>
+        </section>
+      )}
+      {plannedRead && !readUnavailable && (
+        <p className="context-note" aria-label="Configured read policy">
+          Next read: {plannedRead.label}
+        </p>
+      )}
+      {readUnavailable && (
+        <p
+          className="context-note"
+          role="status"
+          aria-label="Grid read unavailable"
+        >
+          {readUnavailable}
+        </p>
+      )}
+      {loadedRead && (
+        <p className="context-note" aria-label="Loaded grid read">
+          {source}
+          {hasMoreGridPages && " · More pages available"}
+        </p>
+      )}
       {targetViewId && savedGridResult && (
         <p className="context-note" role="status">
           {savedGridResult}
@@ -2305,66 +3827,95 @@ export function Analyze({
           </button>
         </div>
         <p>
-          Choose the two visible axes here. The persistent point of view below
-          fixes every remaining page and filter dimension.
+          {openedGridDefinition
+            ? "Rows and Columns choose the first axis by swapping its position with the selected dimension. Every dimension keeps its member selection and exclusions. Use the ordered layout below to move or reorder any axis; source layer, suppression and page size stay unchanged."
+            : "Choose the two initial axes here. The point of view below selects members for the remaining dimensions. Open a saved view to arrange all of its ordered axes."}
         </p>
         <section className="layout-builder" aria-label="Grid layout">
           <label>
             Rows
             <select
+              aria-label="Rows"
               value={rowDimension}
-              onChange={(event) => {
-                const dimension = event.target.value;
-                setOpenedGridDefinition(null);
-                setCalculationContext(null);
-                setRowDimension(dimension);
-                setPov((current) => {
-                  const next = { ...current };
-                  delete next[dimension];
-                  return next;
-                });
-              }}
+              onChange={(event) =>
+                choosePrimaryAxis("rows", event.target.value)
+              }
             >
-              <option value="">Choose dimension</option>
+              <option value="" disabled={Boolean(openedGridDefinition)}>
+                Choose dimension
+              </option>
               {dimensions.map((dimension) => (
                 <option
                   key={dimension.dimension_id}
                   value={dimension.dimension_id}
-                  disabled={dimension.dimension_id === columnDimension}
+                  disabled={
+                    !openedGridDefinition &&
+                    dimension.dimension_id === columnDimension
+                  }
                 >
                   {dimension.name}
                 </option>
               ))}
             </select>
           </label>
+          {rowDimension && (
+            <div className="axis-member-selection">
+              <span>Row members</span>
+              <strong>{semanticAxisSummary(rowDimension)}</strong>
+              <button
+                type="button"
+                disabled={
+                  calculatedGrid ||
+                  !catalog?.functions["facts.cube.resolved.read"]
+                }
+                onClick={() => void openAxisSelector(rowDimension)}
+              >
+                Choose row members
+              </button>
+            </div>
+          )}
           <label>
             Columns
             <select
+              aria-label="Columns"
               value={columnDimension}
-              onChange={(event) => {
-                const dimension = event.target.value;
-                setOpenedGridDefinition(null);
-                setCalculationContext(null);
-                setColumnDimension(dimension);
-                setPov((current) => {
-                  const next = { ...current };
-                  delete next[dimension];
-                  return next;
-                });
-              }}
+              onChange={(event) =>
+                choosePrimaryAxis("columns", event.target.value)
+              }
             >
-              <option value="">Choose dimension</option>
+              <option value="" disabled={Boolean(openedGridDefinition)}>
+                Choose dimension
+              </option>
               {dimensions.map((dimension) => (
                 <option
                   key={dimension.dimension_id}
                   value={dimension.dimension_id}
-                  disabled={dimension.dimension_id === rowDimension}
+                  disabled={
+                    !openedGridDefinition &&
+                    dimension.dimension_id === rowDimension
+                  }
                 >
                   {dimension.name}
                 </option>
               ))}
             </select>
           </label>
+          {columnDimension && (
+            <div className="axis-member-selection">
+              <span>Column members</span>
+              <strong>{semanticAxisSummary(columnDimension)}</strong>
+              <button
+                type="button"
+                disabled={
+                  calculatedGrid ||
+                  !catalog?.functions["facts.cube.resolved.read"]
+                }
+                onClick={() => void openAxisSelector(columnDimension)}
+              >
+                Choose column members
+              </button>
+            </div>
+          )}
           <button
             onClick={suggestLayout}
             disabled={busy || dimensions.length < 2}
@@ -2372,24 +3923,114 @@ export function Analyze({
             Suggest layout
           </button>
         </section>
-        <dl className="layout-drawer-summary">
-          <div>
-            <dt>Pages</dt>
-            <dd>
-              {Object.keys(pov).length ? "Point of view" : "Choose axes first"}
-            </dd>
-          </div>
-          <div>
-            <dt>Filters</dt>
-            <dd>
-              {Object.entries(pov).length
-                ? Object.entries(pov)
-                    .map(([dimension, member]) => `${dimension}: ${member}`)
-                    .join(" · ")
-                : "No fixed members"}
-            </dd>
-          </div>
-        </dl>
+        {openedGridDefinition && (
+          <section aria-label="Ordered view layout">
+            <h3>Ordered axes</h3>
+            <p>
+              Rows and Columns each require at least one axis. Moving an axis
+              appends it to its destination; use Earlier and Later to change its
+              order. Pages and Filters retain the exact existing member
+              selections, including sets and exclusions.
+            </p>
+            {layoutRoles.map((role) => (
+              <fieldset key={role}>
+                <legend>{layoutRoleLabels[role]}</legend>
+                {openedGridDefinition.layout[role].length === 0 && (
+                  <p>No axes</p>
+                )}
+                {openedGridDefinition.layout[role].map(
+                  (dimensionId, position) => {
+                    const name =
+                      dimensions.find(
+                        (item) => item.dimension_id === dimensionId,
+                      )?.name || dimensionId;
+                    const requiredLast =
+                      (role === "rows" || role === "columns") &&
+                      openedGridDefinition.layout[role].length === 1;
+                    return (
+                      <div key={dimensionId}>
+                        <label>
+                          {position + 1}. {name}
+                          <select
+                            aria-label={`${name} axis location`}
+                            ref={(node) => {
+                              if (node)
+                                layoutControls.current.set(dimensionId, node);
+                              else layoutControls.current.delete(dimensionId);
+                            }}
+                            value={role}
+                            onChange={(event) =>
+                              moveCanonicalAxis(
+                                dimensionId,
+                                role,
+                                event.target.value as LayoutRole,
+                              )
+                            }
+                          >
+                            {layoutRoles.map((target) => (
+                              <option
+                                key={target}
+                                value={target}
+                                disabled={requiredLast && target !== role}
+                              >
+                                {layoutRoleLabels[target]}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <button
+                          type="button"
+                          aria-label={`Move ${name} earlier in ${layoutRoleLabels[role]}`}
+                          disabled={position === 0}
+                          onClick={() =>
+                            reorderCanonicalAxis(role, position, -1)
+                          }
+                        >
+                          Earlier
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Move ${name} later in ${layoutRoleLabels[role]}`}
+                          disabled={
+                            position ===
+                            openedGridDefinition.layout[role].length - 1
+                          }
+                          onClick={() =>
+                            reorderCanonicalAxis(role, position, 1)
+                          }
+                        >
+                          Later
+                        </button>
+                      </div>
+                    );
+                  },
+                )}
+              </fieldset>
+            ))}
+          </section>
+        )}
+        {!openedGridDefinition && (
+          <dl className="layout-drawer-summary">
+            <div>
+              <dt>Pages</dt>
+              <dd>
+                {Object.keys(pov).length
+                  ? "Point of view"
+                  : "Choose axes first"}
+              </dd>
+            </div>
+            <div>
+              <dt>Filters</dt>
+              <dd>
+                {Object.entries(pov).length
+                  ? Object.entries(pov)
+                      .map(([dimension, member]) => `${dimension}: ${member}`)
+                      .join(" · ")
+                  : "No fixed members"}
+              </dd>
+            </div>
+          </dl>
+        )}
       </aside>
 
       <div className="analysis-tools">
@@ -2445,7 +4086,7 @@ export function Analyze({
                     type="button"
                     onClick={() =>
                       selectedGrid &&
-                      changeGridContext(() => openSavedGrid(selectedGrid))
+                      changeGridContext(() => openSavedGrid(selectedGrid), true)
                     }
                     disabled={
                       busy ||
@@ -2529,14 +4170,12 @@ export function Analyze({
                 className="saved-grid-open-context"
                 aria-label="Opened grid layout"
               >
-                <div>
-                  <dt>Rows</dt>
-                  <dd>{openedGridDefinition.layout.rows.join(" / ")}</dd>
-                </div>
-                <div>
-                  <dt>Columns</dt>
-                  <dd>{openedGridDefinition.layout.columns.join(" / ")}</dd>
-                </div>
+                {configuredLayout.map((axis) => (
+                  <div key={axis.key}>
+                    <dt>{axis.label}</dt>
+                    <dd>{axis.text}</dd>
+                  </div>
+                ))}
                 <div>
                   <dt>Layer</dt>
                   <dd>{openedGridDefinition.dataSource.kind}</dd>
@@ -2554,9 +4193,10 @@ export function Analyze({
             <summary>Aggregate large cube selections</summary>
             <p>
               Reduce authorized raw numeric facts into durable exact result
-              pages. The current rows, columns and point of view define the
-              query; the fixed core owns snapshots, execution, authorization and
-              the technical certificate.
+              pages. The current layout, point of view and measures define a new
+              query draft. An accepted query keeps its original intent when this
+              draft changes. The fixed core owns snapshots, execution,
+              authorization and the technical certificate.
             </p>
             <fieldset>
               <legend>Measures</legend>
@@ -2593,7 +4233,7 @@ export function Analyze({
                   min={1}
                   max={500}
                   value={aggregatePageSize}
-                  disabled={Boolean(aggregateQueryId)}
+                  disabled={busy}
                   onChange={(event) =>
                     setAggregatePageSize(Number(event.target.value))
                   }
@@ -2622,7 +4262,11 @@ export function Analyze({
                 type="checkbox"
                 checked={aggregateReviewed}
                 disabled={!aggregateReady || busy}
-                onChange={(event) => setAggregateReviewed(event.target.checked)}
+                onChange={(event) =>
+                  setAggregateReviewed(
+                    event.target.checked ? aggregateReviewKey : null,
+                  )
+                }
               />
               I reviewed this exact aggregate query
             </label>
@@ -2638,9 +4282,66 @@ export function Analyze({
                 ? `Aggregate request · ${aggregateStatus || "status not read"}`
                 : "No aggregate request has been made."}
             </p>
+            {aggregateObservation?.status === "failed" &&
+              aggregateObservation.errorCode ===
+                "CUBE_AGGREGATE_AMOUNT_MEASURE_REQUIRED" && (
+                <p role="alert">
+                  This query includes ratios. Select Count present alone to
+                  count cells, or calculate the rate from its underlying
+                  quantities.
+                </p>
+              )}
+            {aggregateObservation && (
+              <section aria-label="Accepted aggregate query">
+                <h3>Accepted query</h3>
+                <p>
+                  These results belong to the accepted query below. Later layout
+                  or measure edits apply only to a new reviewed request.
+                </p>
+                <dl>
+                  <dt>Group by</dt>
+                  <dd>
+                    {aggregateObservation.query.grain.groupBy.join(" → ")}
+                  </dd>
+                  <dt>Fixed members</dt>
+                  <dd>
+                    {Object.entries(aggregateObservation.query.selectors)
+                      .map(
+                        ([dimension, selector]) =>
+                          `${dimension}: ${selector.memberIds.join(", ")}`,
+                      )
+                      .join(" · ") || "None"}
+                  </dd>
+                  <dt>Reduced dimensions</dt>
+                  <dd>
+                    {aggregateObservation.query.grain.reduceDimensions.join(
+                      ", ",
+                    ) || "None"}
+                  </dd>
+                  <dt>Measures</dt>
+                  <dd>
+                    {aggregateObservation.query.measures
+                      .map((measure) => aggregateMeasureLabels[measure.kind])
+                      .join(" · ")}
+                  </dd>
+                  <dt>Result page size</dt>
+                  <dd>{aggregateObservation.pageSize}</dd>
+                </dl>
+              </section>
+            )}
+            {aggregateQueryId && !aggregateObservation && (
+              <p>
+                A known aggregate request is retained. Refresh to inspect its
+                currently authorized state. Its prior intent and results are
+                hidden.
+              </p>
+            )}
             {aggregateRows.length > 0 && (
               <div className="react-grid-scroll">
-                <table className="react-cube-grid aggregate-result-grid">
+                <table
+                  className="react-cube-grid aggregate-result-grid"
+                  aria-label="Aggregate results"
+                >
                   <thead>
                     <tr>
                       <th>Grouped members</th>
@@ -2705,29 +4406,44 @@ export function Analyze({
       </div>
 
       <div className="pov-bar" aria-label="Point of view">
-        {povDimensions.map((dimension) => (
-          <label key={dimension.dimension_id}>
-            {dimension.name}
-            <select
-              aria-label={`${dimension.name} point of view`}
-              value={pov[dimension.dimension_id] || ""}
-              onFocus={() => void ensureMembers(dimension.dimension_id)}
-              onChange={(event) =>
-                setPov((current) => ({
-                  ...current,
-                  [dimension.dimension_id]: event.target.value,
-                }))
-              }
-            >
-              <option value="">All permitted members</option>
-              {(memberCatalog[dimension.dimension_id] || []).map((member) => (
-                <option key={member.member_id} value={member.member_id}>
-                  {member.name}
-                </option>
-              ))}
-            </select>
-          </label>
-        ))}
+        {povDimensions.map((dimension) => {
+          const savedSelector = openedGridDefinition?.selection.dimensions.find(
+            (item) => item.dimensionId === dimension.dimension_id,
+          )?.include;
+          const selectedMemberId =
+            savedSelector?.kind === "member"
+              ? savedSelector.memberId
+              : pov[dimension.dimension_id] || "";
+          const memberLabels = Object.fromEntries(
+            (memberCatalog[dimension.dimension_id] || []).map((member) => [
+              member.member_id,
+              member.name,
+            ]),
+          );
+          const summary: CubeSelector | null =
+            savedSelector ||
+            (selectedMemberId
+              ? { kind: "member", memberId: selectedMemberId }
+              : null);
+          return (
+            <div className="pov-selector-control" key={dimension.dimension_id}>
+              <span>{dimension.name}</span>
+              <button
+                type="button"
+                aria-label={`${dimension.name} point of view`}
+                aria-haspopup="dialog"
+                onClick={() => void openPovSelector(dimension.dimension_id)}
+              >
+                <strong>
+                  {summary
+                    ? selectorSummary(summary, { members: memberLabels })
+                    : "Choose member"}
+                </strong>
+                <span aria-hidden="true">▾</span>
+              </button>
+            </div>
+          );
+        })}
         <span className="pov-spacer" />
         <button
           onClick={() => scan()}
@@ -2736,20 +4452,96 @@ export function Analyze({
             !dimensions.length ||
             !activeRowDimensions.length ||
             !activeColumnDimensions.length ||
-            (calculatedGrid && !catalog?.functions["facts.calculation.scan"]) ||
-            (readSemantics !== "stored" &&
-              !catalog?.functions["facts.cube.resolved.read"]) ||
-            (readSemantics === "effective" &&
-              (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(resolvedBindingId) ||
-                !/^[0-9a-f]{64}$/.test(resolvedBindingStateToken)))
+            Boolean(readUnavailable)
           }
         >
           {busy ? "Reading…" : "Read grid"}
         </button>
       </div>
 
+      {axisDialogDimensionId && app && catalog && metadataRevision !== null && (
+        <MemberSelectionDialog
+          app={app}
+          catalog={catalog}
+          request={{
+            dimensionId: axisDialogDimensionId,
+            dimensionName:
+              dimensions.find(
+                (dimension) => dimension.dimension_id === axisDialogDimensionId,
+              )?.name || axisDialogDimensionId,
+            metadataRevision,
+            title: `Choose ${
+              axisDialogDimensionId === rowDimension ? "row" : "column"
+            } members`,
+            cardinality: { kind: "one-or-more", maximum: 10_000 },
+            capability: {
+              allowExplicitMembers: true,
+              allowHierarchySelector: true,
+              allowNamedMemberList: true,
+              allowAttributeSelector: false,
+              allowInlineExpression: true,
+              allowExclusion: false,
+              orderMatters: true,
+            },
+            initial: axisDialogInitialSelection,
+            initialExclude:
+              openedGridDefinition?.selection.dimensions.find(
+                (dimension) => dimension.dimensionId === axisDialogDimensionId,
+              )?.exclude ?? null,
+          }}
+          members={memberCatalog[axisDialogDimensionId] || []}
+          onCancel={() => setAxisDialogDimensionId("")}
+          onApply={(result) =>
+            applyAxisSelection(
+              axisDialogDimensionId,
+              result.include,
+              result.displaySummary,
+            )
+          }
+        />
+      )}
+
+      {povDialogDimensionId && app && catalog && metadataRevision !== null && (
+        <MemberSelectionDialog
+          app={app}
+          catalog={catalog}
+          request={{
+            dimensionId: povDialogDimensionId,
+            dimensionName:
+              dimensions.find(
+                (dimension) => dimension.dimension_id === povDialogDimensionId,
+              )?.name || povDialogDimensionId,
+            metadataRevision,
+            cardinality: { kind: "exactly-one" },
+            capability: {
+              allowExplicitMembers: true,
+              allowHierarchySelector: false,
+              allowNamedMemberList: false,
+              allowAttributeSelector: false,
+              allowInlineExpression: false,
+              allowExclusion: false,
+              orderMatters: false,
+            },
+            initial: povDialogInitialMemberId
+              ? { kind: "member", memberId: povDialogInitialMemberId }
+              : null,
+          }}
+          members={memberCatalog[povDialogDimensionId] || []}
+          onCancel={() => setPovDialogDimensionId("")}
+          onApply={(result) => {
+            if (result.include.kind === "member")
+              applyPovMember(povDialogDimensionId, result.include.memberId);
+          }}
+        />
+      )}
+
       {error && (
-        <div className="inline-error" role="alert">
+        <div
+          className="inline-error"
+          role="alert"
+          tabIndex={-1}
+          data-grid-focus-error="read"
+        >
           {error}
         </div>
       )}
@@ -2760,28 +4552,49 @@ export function Analyze({
           className={`grid-panel grid-density-${gridDensity}`}
           aria-label="Grid results"
         >
+          {presentation === "grid" && (
+            <div className="grid-keyboard-announcement" role="status">
+              {gridFocus.keyboardAnnouncement}
+            </div>
+          )}
           <div className="grid-toolbar">
             <div role="group" aria-label="Analyze presentation">
               <button
                 aria-pressed={presentation === "grid"}
                 className={presentation === "grid" ? "selected" : ""}
-                onClick={() => setPresentation("grid")}
+                onClick={() => choosePresentation("grid")}
               >
                 Grid
               </button>
               <button
                 aria-pressed={presentation === "kpi"}
+                aria-describedby={
+                  numericPresentationNote
+                    ? numericPresentationNoteId
+                    : undefined
+                }
                 className={presentation === "kpi" ? "selected" : ""}
-                disabled={!numericPresentationCells.length}
-                onClick={() => setPresentation("kpi")}
+                disabled={
+                  !numericPresentationCells.length ||
+                  Boolean(numericPresentationUnavailable)
+                }
+                onClick={() => choosePresentation("kpi")}
               >
                 KPI
               </button>
               <button
                 aria-pressed={presentation === "chart"}
+                aria-describedby={
+                  numericPresentationNote
+                    ? numericPresentationNoteId
+                    : undefined
+                }
                 className={presentation === "chart" ? "selected" : ""}
-                disabled={!numericPresentationCells.length}
-                onClick={() => setPresentation("chart")}
+                disabled={
+                  !numericPresentationCells.length ||
+                  Boolean(numericPresentationUnavailable)
+                }
+                onClick={() => choosePresentation("chart")}
               >
                 Chart
               </button>
@@ -2818,6 +4631,15 @@ export function Analyze({
               </button>
             </div>
           </div>
+          {numericPresentationNote && (
+            <p
+              id={numericPresentationNoteId}
+              className="context-note"
+              role="status"
+            >
+              {numericPresentationNote}
+            </p>
+          )}
           {presentation === "generic" ? (
             <div className="snapshot-compare" aria-label="Generic facts">
               <div className="snapshot-compare-controls">
@@ -2827,14 +4649,27 @@ export function Analyze({
                     aria-label="Generic fact table"
                     value={selectedGenericTable}
                     onChange={(event) => {
-                      setSelectedGenericTable(event.target.value);
-                      setGenericRows([]);
-                      setGenericCursor(null);
-                      setGenericSnapshot(null);
+                      cancelGenericRead();
+                      const tableId = event.target.value;
+                      setGenericState((state) =>
+                        state?.context === catalogueContext
+                          ? {
+                              ...state,
+                              tableId,
+                              rows: [],
+                              cursor: null,
+                              snapshot: null,
+                            }
+                          : state,
+                      );
                     }}
                   >
                     {!genericTables.length && (
-                      <option value="">No active tables</option>
+                      <option value="">
+                        {currentGenericState
+                          ? "No active tables"
+                          : "Choose Generic facts to reload tables"}
+                      </option>
                     )}
                     {genericTables.map((table) => (
                       <option key={table.table_id} value={table.table_id}>
@@ -2872,7 +4707,7 @@ export function Analyze({
                     <tbody>
                       {genericRows.map((row) => (
                         <tr key={`${row.series_key}-${row.change_id}`}>
-                          <th>{row.series_key}</th>
+                          <th scope="row">{row.series_key}</th>
                           <td>
                             <code>{genericValueText(row.value)}</code>
                           </td>
@@ -2904,23 +4739,27 @@ export function Analyze({
                 </button>
               </footer>
             </div>
-          ) : presentation === "kpi" && numericPresentationCells.length ? (
+          ) : presentation === "kpi" &&
+            !numericPresentationUnavailable &&
+            numericPresentationCells.length ? (
             <div className="snapshot-kpis" aria-label="Snapshot KPI cards">
-              {numericPresentationCells.map((cell, cellIndex) => (
+              {presentedNumericCells.map((cell, cellIndex) => (
                 <article key={`${cell.changeId || "cell"}-${cellIndex}`}>
                   <span>{presentationLabel(cell)}</span>
-                  <strong>{cell.amount}</strong>
+                  <strong>{presentationValue(cell)}</strong>
                   <small>Exact snapshot value</small>
                 </article>
               ))}
             </div>
-          ) : presentation === "chart" && numericPresentationCells.length ? (
+          ) : presentation === "chart" &&
+            !numericPresentationUnavailable &&
+            numericPresentationCells.length ? (
             <div className="snapshot-chart" aria-label="Snapshot value chart">
               <p>
                 Bar lengths are a visual aid. Labels retain the exact values
                 from the current authorized read.
               </p>
-              {numericPresentationCells.map((cell, cellIndex) => {
+              {presentedNumericCells.map((cell, cellIndex) => {
                 const numeric = Math.abs(Number(cell.amount));
                 const width =
                   chartMaximum && Number.isFinite(numeric)
@@ -2935,22 +4774,30 @@ export function Analyze({
                     <div className="snapshot-chart-track" aria-hidden="true">
                       <i style={{ width: `${width}%` }} />
                     </div>
-                    <strong>{cell.amount}</strong>
+                    <strong>{presentationValue(cell)}</strong>
                   </div>
                 );
               })}
             </div>
           ) : matrix ? (
-            <div className="react-grid-scroll">
-              <table className="react-cube-grid">
+            <div className="react-grid-scroll analytical-grid-scroll">
+              <table
+                className="react-cube-grid"
+                role="grid"
+                aria-label="Pivot results"
+              >
                 <thead>
                   <tr>
                     {activeRowDimensions.map((dimension) => (
-                      <th key={dimension}>{dimension}</th>
+                      <th key={dimension} scope="col">
+                        <span className="grid-axis-label">{dimension}</span>
+                      </th>
                     ))}
                     {matrix.columnTuples.map(([columnKey, values]) => (
-                      <th key={columnKey}>
-                        {values.join(" / ")}
+                      <th key={columnKey} scope="col">
+                        <span className="grid-axis-label">
+                          {values.join(" / ")}
+                        </span>
                         <small>{activeColumnDimensions.join(" / ")}</small>
                       </th>
                     ))}
@@ -2960,8 +4807,11 @@ export function Analyze({
                   {matrix.rowTuples.map(([rowKey, rowValues], rowIndex) => (
                     <tr key={rowKey}>
                       {rowValues.map((value, valueIndex) => (
-                        <th key={`${activeRowDimensions[valueIndex]}:${value}`}>
-                          {value}
+                        <th
+                          scope="row"
+                          key={`${activeRowDimensions[valueIndex]}:${value}`}
+                        >
+                          <span className="grid-axis-label">{value}</span>
                         </th>
                       ))}
                       {matrix.columnTuples.map(
@@ -2969,19 +4819,9 @@ export function Analyze({
                           const cell = matrix.cells.get(
                             `${rowKey}\u0000${columnKey}`,
                           );
-                          const coordinate = {
-                            ...pov,
-                          };
-                          activeRowDimensions.forEach(
-                            (dimension, dimensionIndex) => {
-                              coordinate[dimension] = rowValues[dimensionIndex];
-                            },
-                          );
-                          activeColumnDimensions.forEach(
-                            (dimension, dimensionIndex) => {
-                              coordinate[dimension] =
-                                columnValues[dimensionIndex];
-                            },
+                          const coordinate = matrixCoordinate(
+                            rowValues,
+                            columnValues,
                           );
                           const selectable = cell || {
                             members: coordinate,
@@ -3001,10 +4841,21 @@ export function Analyze({
                                 data-grid-row={rowIndex}
                                 data-grid-column={columnIndex}
                                 aria-pressed={isSelected(selectable)}
-                                tabIndex={
-                                  rowIndex === 0 && columnIndex === 0 ? 0 : -1
+                                tabIndex={gridFocus.tabIndex(
+                                  rowIndex,
+                                  columnIndex,
+                                )}
+                                onFocus={(event) =>
+                                  gridFocus.onCellFocus(
+                                    event.currentTarget,
+                                    rowIndex,
+                                    columnIndex,
+                                  )
                                 }
-                                aria-label={`${rowValues.join(", ")}, ${columnValues.join(", ")}: ${cellValue(cell)}`}
+                                aria-label={cellAccessibleName(
+                                  selectable.members,
+                                  cell,
+                                )}
                                 onKeyDown={(event) =>
                                   moveGridFocus(
                                     event,
@@ -3012,17 +4863,15 @@ export function Analyze({
                                     columnIndex,
                                     matrix.rowTuples.length,
                                     matrix.columnTuples.length,
+                                    gridFocus.announceKeyboardPosition,
                                   )
                                 }
-                                onClick={(event) => {
-                                  const trigger = event.currentTarget;
-                                  changeGridContext(() => {
-                                    cellTrigger.current = trigger;
-                                    if (calculatedGrid)
-                                      void inspectCalculatedCell(selectable);
-                                    else void selectCell(selectable);
-                                  });
-                                }}
+                                onClick={(event) =>
+                                  openCellInspector(
+                                    selectable,
+                                    event.currentTarget,
+                                  )
+                                }
                               >
                                 {cellValue(cell)}
                               </button>
@@ -3035,25 +4884,32 @@ export function Analyze({
                 </tbody>
               </table>
             </div>
-          ) : rows.length ? (
-            <div className="react-grid-scroll">
-              <table className="react-cube-grid flat-grid">
+          ) : visibleRows.length ? (
+            <div className="react-grid-scroll analytical-grid-scroll">
+              <table
+                className="react-cube-grid flat-grid"
+                role="grid"
+                aria-label="Coordinate results"
+              >
                 <thead>
                   <tr>
-                    <th>Coordinate</th>
-                    <th>Type</th>
-                    <th>Value</th>
+                    <th scope="col">Coordinate</th>
+                    <th scope="col">Type</th>
+                    <th scope="col">Value</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((cell, rowIndex) => (
+                  {visibleRows.map((cell, rowIndex) => (
                     <tr key={`${rowIndex}-${cell.changeId || "cell"}`}>
-                      <th>
-                        {Object.entries(cell.members)
-                          .map(
-                            ([dimension, member]) => `${dimension}: ${member}`,
-                          )
-                          .join(" · ")}
+                      <th scope="row">
+                        <span className="grid-axis-label">
+                          {Object.entries(cell.members)
+                            .map(
+                              ([dimension, member]) =>
+                                `${dimension}: ${member}`,
+                            )
+                            .join(" · ")}
+                        </span>
                       </th>
                       <td>{cell.kind}</td>
                       <td
@@ -3064,21 +4920,29 @@ export function Analyze({
                           disabled={busy}
                           data-grid-row={rowIndex}
                           data-grid-column={0}
-                          tabIndex={rowIndex === 0 ? 0 : -1}
-                          aria-label={`${Object.values(cell.members).join(", ")}: ${cellValue(cell)}`}
+                          tabIndex={gridFocus.tabIndex(rowIndex, 0)}
+                          onFocus={(event) =>
+                            gridFocus.onCellFocus(
+                              event.currentTarget,
+                              rowIndex,
+                              0,
+                            )
+                          }
+                          aria-label={cellAccessibleName(cell.members, cell)}
                           onKeyDown={(event) =>
-                            moveGridFocus(event, rowIndex, 0, rows.length, 1)
+                            moveGridFocus(
+                              event,
+                              rowIndex,
+                              0,
+                              visibleRows.length,
+                              1,
+                              gridFocus.announceKeyboardPosition,
+                            )
                           }
                           aria-pressed={isSelected(cell)}
-                          onClick={(event) => {
-                            const trigger = event.currentTarget;
-                            changeGridContext(() => {
-                              cellTrigger.current = trigger;
-                              if (calculatedGrid)
-                                void inspectCalculatedCell(cell);
-                              else void selectCell(cell);
-                            });
-                          }}
+                          onClick={(event) =>
+                            openCellInspector(cell, event.currentTarget)
+                          }
                         >
                           {cellValue(cell)}
                         </button>
@@ -3088,13 +4952,22 @@ export function Analyze({
                 </tbody>
               </table>
             </div>
-          ) : resolvedStatus === "current-empty" ? (
+          ) : resolvedStatus === "current-empty" ||
+            (loadedRead && !visibleRows.length) ? (
             <div className="grid-placeholder" aria-label="Current empty result">
               <span>∅</span>
-              <h2>Current · Empty</h2>
+              <h2>
+                {resolvedStatus === "current-empty"
+                  ? "Current · Empty"
+                  : "Empty loaded page"}
+              </h2>
               <p>
-                The governed calculation completed successfully and certified
-                that this selection currently contains no values.
+                {loadedRead?.plan.kind === "resolved" &&
+                resolvedStatus === "current-empty"
+                  ? "The governed calculation completed successfully and certified that this selection currently contains no values."
+                  : hasMoreGridPages
+                    ? "The loaded page contains no values. More pages are available; continue to inspect the remaining results."
+                    : "The requested view was read successfully and returned no values for this selection."}
               </p>
             </div>
           ) : (
@@ -3112,15 +4985,23 @@ export function Analyze({
             </div>
           )}
           {presentation !== "generic" && (
-            <footer className="grid-status" aria-live="polite">
+            <footer
+              className="grid-status"
+              aria-live="polite"
+              tabIndex={-1}
+              data-grid-focus-status
+            >
               <span>
-                {snapshot === null
-                  ? "No snapshot read"
-                  : `${rows.length} current cells`}
+                {readingGrid
+                  ? "Reading grid…"
+                  : !loadedRead
+                    ? "No snapshot read"
+                    : `${visibleRows.length} loaded cells${hasMoreGridPages ? " · more pages available" : ""}`}
               </span>
               <button
                 onClick={() => {
                   if (resolvedPage) {
+                    const focusRequest = gridFocus.begin();
                     const offset = resolvedPage.offset + resolvedPage.pageSize;
                     setRows(
                       resolvedPageCells(
@@ -3130,10 +5011,12 @@ export function Analyze({
                       ),
                     );
                     setResolvedPage({ ...resolvedPage, offset });
+                    gridFocus.finish(focusRequest);
                   } else void scan(nextCursor);
                 }}
                 disabled={
                   busy ||
+                  !loadedRead ||
                   (resolvedPage
                     ? !hasResolvedNextPage(
                         resolvedPage.cells,
@@ -3147,7 +5030,7 @@ export function Analyze({
               </button>
             </footer>
           )}
-          {calculationContext && (
+          {loadedRead && calculationContext && (
             <dl
               className="calculation-read-context"
               aria-label="Calculated result context"
@@ -3169,29 +5052,62 @@ export function Analyze({
             </dl>
           )}
         </section>
-        {selectedCell && (
+        {cellMutation.error &&
+          (!loadedRead || !selectedCell || calculatedGrid) && (
+            <p role="alert" tabIndex={-1} data-grid-focus-error="mutation">
+              {cellMutation.error}
+            </p>
+          )}
+        {scope && cellMutation.pending && (
+          <div tabIndex={-1} data-grid-focus-outcome>
+            <ExactMutationOutcome
+              mutation={{
+                ...cellMutation,
+                retrySubmission: () =>
+                  runFocusedMutation(cellMutation.retrySubmission),
+                readOutcome: () => runFocusedMutation(cellMutation.readOutcome),
+              }}
+              scope={scope}
+              catalog={catalog}
+              refresh={
+                selectedCell
+                  ? () => void selectCell(selectedCell)
+                  : () => void scan()
+              }
+            />
+          </div>
+        )}
+        {loadedRead && selectedCell && (
           <aside
             className="writeback-drawer"
             aria-label="Cell details and writeback"
+            onKeyDown={(event) => {
+              if (
+                event.key !== "Escape" ||
+                event.defaultPrevented ||
+                event.nativeEvent.isComposing
+              )
+                return;
+              event.preventDefault();
+              event.stopPropagation();
+              closeCellInspector();
+            }}
           >
             <div className="drawer-heading">
               <div>
                 <span>Selected cell</span>
                 <h2 ref={cellInspectorHeading} tabIndex={-1}>
                   {calculatedGrid
-                    ? "Calculated result details"
+                    ? openedGridDefinition?.dataSource.kind === "combined"
+                      ? "Raw and calculated result details"
+                      : "Calculated result details"
                     : "Details and exact writeback"}
                 </h2>
               </div>
               <button
                 aria-label="Close writeback"
-                disabled={busy}
-                onClick={() =>
-                  changeGridContext(() => {
-                    setSelectedCell(null);
-                    cellTrigger.current?.focus();
-                  })
-                }
+                disabled={inspectorCloseBlocked}
+                onClick={closeCellInspector}
               >
                 ×
               </button>
@@ -3214,11 +5130,31 @@ export function Analyze({
                   </div>
                 ))}
             </dl>
+            <details>
+              <summary>Exact coordinate IDs</summary>
+              <dl>
+                {Object.entries(selectedCell.members).map(
+                  ([dimension, member]) => (
+                    <div key={dimension}>
+                      <dt>{dimension}</dt>
+                      <dd>{member}</dd>
+                    </div>
+                  ),
+                )}
+              </dl>
+            </details>
             <section
               className="cell-details"
               aria-label="Authoritative cell details"
             >
               <h3>Current authoritative state</h3>
+              {!calculatedGrid && (
+                <p>
+                  {cellResolved
+                    ? `Raw input reread${inspectorSnapshot === null ? "" : ` at revision ${inspectorSnapshot}`}. This value and its concurrency identity were read together.`
+                    : "Reading the current input and editability policy…"}
+                </p>
+              )}
               <dl>
                 <div>
                   <dt>Presence</dt>
@@ -3236,7 +5172,11 @@ export function Analyze({
                 </div>
                 <div>
                   <dt>Source</dt>
-                  <dd>{source || "Not available"}</dd>
+                  <dd>
+                    {!calculatedGrid && cellResolved
+                      ? "Stored raw input for this edit"
+                      : source || "Not available"}
+                  </dd>
                 </div>
                 {selectedCell.origin && (
                   <div>
@@ -3257,12 +5197,69 @@ export function Analyze({
                   </div>
                 )}
               </dl>
+              {selectedCell.layerValues && (
+                <dl aria-label="Separate source values">
+                  {Object.entries(selectedCell.layerValues).map(
+                    ([layer, values]) => (
+                      <div key={layer}>
+                        <dt>{layer === "raw" ? "Raw" : "Calculated"}</dt>
+                        <dd>{values?.map(layerValueText).join(" / ")}</dd>
+                      </div>
+                    ),
+                  )}
+                </dl>
+              )}
               <p>
                 {calculatedGrid
                   ? "This cell belongs to the governed current calculated result below. The browser displays only provenance supplied by the current result contract."
                   : "This view shows the current authorized value and governed source information. Internal concurrency controls remain enforced without exposing backend identifiers."}
               </p>
             </section>
+            {app &&
+              catalog &&
+              (!calculatedGrid || publishedComparison) &&
+              metadataRevision === catalog.revisions.metadata &&
+              scenarioAxis &&
+              comparisonDialogHost &&
+              selectedCell.members[scenarioAxis.dimension_id] &&
+              Boolean(comparisonCapability) && (
+                <ScenarioComparison
+                  key={JSON.stringify([
+                    app.workspaceId,
+                    app.applicationId,
+                    catalog.applicationAccess,
+                    catalog.revisions,
+                    selectedCoordinate,
+                    publishedComparison,
+                  ])}
+                  app={app}
+                  catalog={catalog}
+                  axis={scenarioAxis}
+                  coordinate={selectedCell.members}
+                  baselineName={
+                    memberCatalog[scenarioAxis.dimension_id]?.find(
+                      (member) =>
+                        member.member_id ===
+                        selectedCell.members[scenarioAxis.dimension_id],
+                    )?.name
+                  }
+                  dialogHost={comparisonDialogHost}
+                  published={publishedComparison}
+                  onGridAuthorityFailure={withdrawGridAfterAuthorityFailure}
+                  onStalePublication={withdrawGridSnapshot}
+                  offerCopySource={
+                    !writeTouched &&
+                    !inspectorCloseBlocked &&
+                    canCopyScenario(catalog) &&
+                    catalog.functions["metadata.member.list"]
+                      ? (source) =>
+                          scenarioCopyControl.current?.offerComparedSource(
+                            source,
+                          ) ?? false
+                      : undefined
+                  }
+                />
+              )}
             {calculatedGrid && calculationContext && (
               <section
                 className="cell-details calculated-details"
@@ -3298,7 +5295,15 @@ export function Analyze({
             )}
             {!calculatedGrid && (
               <>
-                <div className="drawer-fields">
+                <fieldset
+                  className="drawer-fields"
+                  disabled={
+                    busy ||
+                    cellMutation.busy ||
+                    cellMutation.frozen ||
+                    !cellResolved
+                  }
+                >
                   <label>
                     Cell type
                     <select
@@ -3356,14 +5361,60 @@ export function Analyze({
                       }}
                     />
                   </label>
-                </div>
+                </fieldset>
+                <p>
+                  {writeOperation === "clear"
+                    ? "Clear removes presence. It does not set numeric zero or empty text."
+                    : writeOperation === "add"
+                      ? "Add applies this exact decimal to the current numeric input once."
+                      : writeKind === "text"
+                        ? "Set replaces the text. An empty string remains a present text value."
+                        : "Set replaces the numeric input. Zero remains a present value."}
+                </p>
+                {cellMutation.error && (
+                  <p
+                    role="alert"
+                    tabIndex={-1}
+                    data-grid-focus-error="mutation"
+                  >
+                    {cellMutation.error}
+                  </p>
+                )}
+                <button
+                  disabled={busy || cellMutation.busy || cellMutation.frozen}
+                  onClick={() => void selectCell(selectedCell, true)}
+                >
+                  Reread current cell and keep my edit
+                </button>
+                <button
+                  disabled={
+                    !writeReady ||
+                    busy ||
+                    cellMutation.busy ||
+                    cellMutation.frozen
+                  }
+                  onClick={() => {
+                    setReviewed(false);
+                    void cellMutation.preview();
+                  }}
+                >
+                  Preview exact mutation
+                </button>
+                {cellMutation.review && (
+                  <p role="status">
+                    The server preview matches this exact mutation. Review its
+                    coordinate, operation and value before submission.
+                  </p>
+                )}
                 <p
                   className={
                     writeReady ? "drawer-readiness ready" : "drawer-readiness"
                   }
                 >
                   {!writeAuthorized
-                    ? "Your current role cannot write this cell type."
+                    ? !catalog
+                      ? "Checking cell-write availability…"
+                      : "Writing this cell type is not available in the current application context."
                     : !cellEditability
                       ? "Resolve the current server editability policy before review."
                       : !cellEditability.editable
@@ -3382,14 +5433,27 @@ export function Analyze({
                   <input
                     type="checkbox"
                     checked={reviewed}
-                    disabled={!writeReady || busy}
+                    disabled={
+                      !writeReady ||
+                      !cellMutation.review ||
+                      busy ||
+                      cellMutation.busy ||
+                      cellMutation.frozen
+                    }
                     onChange={(event) => setReviewed(event.target.checked)}
                   />
                   I reviewed this exact cell mutation
                 </label>
                 <button
                   className="primary"
-                  disabled={!writeReady || !reviewed || busy}
+                  disabled={
+                    !writeReady ||
+                    !reviewed ||
+                    !cellMutation.review ||
+                    busy ||
+                    cellMutation.busy ||
+                    cellMutation.frozen
+                  }
                   onClick={() => void submitWriteback()}
                 >
                   Submit durable writeback

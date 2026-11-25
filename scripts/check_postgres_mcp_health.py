@@ -10,6 +10,11 @@ from epm_core.postgres_auth import assert_oidc_readiness
 from epm_core.postgres_listener_readiness import assert_listener_database_readiness
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
+
+
 def _listener_status(port: int, path: str) -> int | None:
     request = urllib.request.Request(
         f'http://127.0.0.1:{port}{path}',
@@ -17,7 +22,7 @@ def _listener_status(port: int, path: str) -> int | None:
         headers={'Content-Type': 'application/json'},
         method='POST',
     )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     try:
         with opener.open(request, timeout=3) as response:
             return response.status
@@ -33,20 +38,28 @@ def main(arguments=None) -> int:
                               ('liveness', 'unsigned-denial', 'readiness')):
         return 1
     mode = arguments[0] if arguments else 'readiness'
+
+    def not_ready(reason: str) -> int:
+        if mode == 'readiness':
+            print(reason, file=sys.stderr)
+        return 1
+
     try:
         port = int(os.environ['EPM_PG_HEALTH_PORT'])
     except (KeyError, ValueError):
-        return 1
+        return not_ready('LISTENER_CONFIGURATION_NOT_READY')
     if not 1 <= port <= 65535:
-        return 1
+        return not_ready('LISTENER_CONFIGURATION_NOT_READY')
     path = os.environ.get('EPM_PG_HEALTH_PATH', '/mcp')
     if path not in ('/mcp', '/'):
-        return 1
+        return not_ready('LISTENER_CONFIGURATION_NOT_READY')
     status = _listener_status(port, path)
     if mode == 'liveness':
         return 0 if status is not None else 1
+    if status is None:
+        return not_ready('LISTENER_NOT_REACHABLE')
     if status != 401:
-        return 1
+        return not_ready('UNSIGNED_DENIAL_NOT_CONFIRMED')
     if mode == 'unsigned-denial':
         return 0
     audiences = tuple(
@@ -56,13 +69,12 @@ def main(arguments=None) -> int:
     try:
         assert_oidc_readiness(audiences)
     except Exception:
-        print('OIDC_DEPENDENCY_NOT_READY', file=sys.stderr)
-        return 1
+        return not_ready('OIDC_DEPENDENCY_NOT_READY')
     try:
         assert_listener_database_readiness()
     except Exception:
-        print('DATABASE_DEPENDENCY_NOT_READY', file=sys.stderr)
-        return 1
+        return not_ready('DATABASE_DEPENDENCY_NOT_READY')
+    print('ready')
     return 0
 
 

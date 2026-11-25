@@ -1,4 +1,63 @@
+import { ApiError } from "./api";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
+
+export const STALE_PYTHON_SOURCE_DRAFT =
+  "The saved source changed. This draft is still available to copy.";
+
+export function pythonSourceSaveError(reason: unknown) {
+  if (reason instanceof ApiError) {
+    if (reason.code === "PYTHON_PROGRAM_STATE_CONFLICT")
+      return STALE_PYTHON_SOURCE_DRAFT;
+    if (reason.code === "PYTHON_ENVIRONMENT_NOT_ACTIVE")
+      return "The build environment binding is no longer active. An application administrator can review it. Your draft is preserved.";
+  }
+  return reason instanceof Error
+    ? reason.message
+    : "Unable to save Python source.";
+}
+
+type EnvironmentBinding = {
+  environmentId: string;
+  environmentStateToken: string;
+};
+type ListedEnvironment = {
+  environment_id: string;
+  state_token: string;
+  status: string;
+};
+
+export function pythonEnvironmentSelection(environment: ListedEnvironment) {
+  return JSON.stringify([environment.environment_id, environment.state_token]);
+}
+
+export function pythonSaveEnvironment(
+  selection: string,
+  inventory: readonly ListedEnvironment[] | null,
+  binding: EnvironmentBinding | null,
+): EnvironmentBinding | undefined {
+  // A designer can retain the exact environment already bound to a source.
+  // Only a reviewed inventory choice can select a different environment.
+  if (inventory === null)
+    return binding &&
+      selection ===
+        JSON.stringify([binding.environmentId, binding.environmentStateToken])
+      ? {
+          environmentId: binding.environmentId,
+          environmentStateToken: binding.environmentStateToken,
+        }
+      : undefined;
+  const selected = inventory.find(
+    (item) =>
+      item.status === "Active" &&
+      pythonEnvironmentSelection(item) === selection,
+  );
+  return selected
+    ? {
+        environmentId: selected.environment_id,
+        environmentStateToken: selected.state_token,
+      }
+    : undefined;
+}
 
 export function pythonProgramActionBody(
   app: ApplicationSummary,
@@ -28,6 +87,14 @@ export function pythonProgramActionBody(
       },
     },
   };
+}
+
+export function newAssignedRuleOutput(programId: string) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(programId))
+    throw new Error(
+      "Use 1–100 letters, digits, dots, underscores or hyphens for the rule ID.",
+    );
+  return { kind: "ApplicationRule", definitionId: programId };
 }
 
 export function pythonProgramSaveBody(

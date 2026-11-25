@@ -30,7 +30,8 @@ from .postgres_import_execution import PostgresImportExecutionWorker
 from .postgres_transfer_export_dispatch import PostgresTransferExportDispatch
 from .postgres_transfer_orchestration import PostgresTransferExportWorker
 from .postgres_cube_aggregate_repository import PostgresCubeAggregateRepository
-from .cube_aggregate_lifecycle import AggregateCursorCodec,AggregateQueryStatus
+from .cube_aggregate_lifecycle import (
+    AggregateCursorCodec, AggregateQueryStatus, technical_worker_outcome)
 from .cube_aggregate_native import NativeCubeAggregateStage
 from .cube_aggregate_service import CubeAggregateService
 from .resolved_cube_read_technical import ResolvedCubeReadTechnicalService
@@ -61,6 +62,14 @@ def _python_build_error_code(error: Exception) -> str:
             and value.upper()==value):
         return value
     return 'PYTHON_BUILD_WORKER_FAILED'
+
+
+def _settle_workflow_failure(dispatch, claim, code, stale_code):
+    """Report only the generation-fenced native parent outcome."""
+    status = dispatch.settle_failed(claim, code)
+    if status not in ('failed', 'partially_published', 'cancel_requested', 'needs_inspection'):
+        raise ValueError(stale_code)
+    return {'workflowId': claim['workflow_id'], 'status': status, 'errorCode': code}
 
 
 class PostgresWorkerService:
@@ -128,6 +137,7 @@ class PostgresWorkerService:
         # opens a database connection.
         self.import_execution_worker=None
         self.transfer_export_dispatch=None
+        self.populated_layout_worker=None
         self.next_recovery=0.0
 
     def assert_roles(self, *, stop=None) -> None:
@@ -152,6 +162,8 @@ class PostgresWorkerService:
             if self.application_schedule_worker is not None:
                 self._defer_lock_contention(
                     self.application_schedule_worker.dispatch.recover)
+            if self.populated_layout_worker is not None:
+                self._defer_lock_contention(self.populated_layout_worker.recover)
             if recovered is not None:
                 self.next_recovery=now+self.recovery_interval
         sequence_result=self._defer_lock_contention(self.sequence.advance_once,scope=self.scope)
@@ -163,7 +175,9 @@ class PostgresWorkerService:
                   self._run_application_schedule_once,
                   self._run_import_execution_once,
                   self._run_transfer_export_once,
-                  self._run_python_schedule_once)
+                  self._run_python_schedule_once,
+                  self._run_populated_layout_once,
+                  self._run_calculation_impact_once)
         for offset in range(len(families)):
             index=(self.family_cursor+offset)%len(families)
             family_result=self._defer_lock_contention(families[index])
@@ -171,6 +185,18 @@ class PostgresWorkerService:
                 self.family_cursor=(index+1)%len(families)
                 break
         return family_result or sequence_result or full_sequence_result
+
+    def _run_calculation_impact_once(self):
+        from .postgres_calculation_impact import advance_calculation_impact
+        return advance_calculation_impact(self.worker_dsn, claimant=self.claimant, scope=self.scope)
+
+    def _run_populated_layout_once(self):
+        if self.populated_layout_worker is None:
+            from .postgres_populated_layout_worker import PostgresPopulatedLayoutWorker
+            self.populated_layout_worker=PostgresPopulatedLayoutWorker(
+                worker_dsn=self.worker_dsn,runtime_dsn=self.runtime_dsn,
+                claimant=self.claimant,capacity_limits=self.capacity_limits)
+        return self.populated_layout_worker.advance_once()
 
     def _run_business_job_once(self):
         classes=('short','medium','long')
@@ -207,14 +233,15 @@ class PostgresWorkerService:
         if claim is None:return None
         claim={**claim,'claimant':self.claimant}
         try:
-            return PostgresTransferExportWorker(
+            result = PostgresTransferExportWorker(
                 self.runtime_dsn,
                 identity=durable_execution_identity(claim),
                 preview_secret=self.preview_secret,
                 worker_id=self.claimant).process(
                     ApplicationScope(claim['workspace_id'],
                                      claim['application_id']),
-                    claim['request_id'],chunk_budget=1,page_budget=1)
+                    claim['request_id'],chunk_budget=1,page_budget=1,
+                    preparation_only=claim['status']=='Reading')
         except AccessDenied:
             code='EXPORT_PRODUCER_AUTHORIZATION_REVOKED'
         except ValueError as error:
@@ -229,6 +256,11 @@ class PostgresWorkerService:
             # it cannot repeatedly expire its lease or terminate the shared
             # worker. Exception text may include payload or storage details.
             code='EXPORT_PRODUCER_WORKER_FAILED'
+        else:
+            if (result['status'] == 'checkpoint'
+                    and not self.transfer_export_dispatch.yield_checkpoint(claim)):
+                raise ValueError('EXPORT_PRODUCER_STALE_WORKER_FENCE')
+            return result
         if not self.transfer_export_dispatch.settle_failed(claim,code):
             raise ValueError('EXPORT_PRODUCER_STALE_WORKER_FENCE')
         return {'requestId':claim['request_id'],'status':'failed',
@@ -288,13 +320,20 @@ class PostgresWorkerService:
                 raise ConnectionError('PYTHON_WORKFLOW_LEASE_RENEWAL_FAILED')
             return result
         except AccessDenied:
-            settled=dispatch.settle_failed(owned,
-                'PYTHON_WORKFLOW_AUTHORIZATION_REVOKED')
-            return {'workflowId':claim['workflow_id'],
-                'status':'failed','errorCode':
-                'PYTHON_WORKFLOW_AUTHORIZATION_REVOKED'}
+            result = _settle_workflow_failure(dispatch, owned, 'PYTHON_WORKFLOW_AUTHORIZATION_REVOKED',
+                'PYTHON_WORKFLOW_STALE_WORKER_FENCE')
+            settled = True
+            return result
         except ValueError as error:
             value=str(error)
+            if str(error) in ('WORKFLOW_CANCELLATION_CHILD_PROOF_UNAVAILABLE',
+                    'WORKFLOW_CANCELLATION_CHILD_UNRESOLVED'):
+                outcome = dispatch.settle_unexpected(owned, str(error))
+                if outcome is None:
+                    raise ValueError('PYTHON_WORKFLOW_STALE_WORKER_FENCE')
+                settled = True
+                return {'workflowId': claim['workflow_id'], 'status': outcome,
+                        'errorCode': str(error)}
             if value in ('PYTHON_WORKFLOW_CHILD_CONFLICT',
                     'IDEMPOTENCY_KEY_REUSED'):
                 code='PYTHON_WORKFLOW_CHILD_CONFLICT'
@@ -307,10 +346,10 @@ class PostgresWorkerService:
             if value in ('PYTHON_RUN_STALE_CONTEXT',
                     'STALE_CELL_CHANGE_ID','STALE_DATA_REVISION',
                     'STALE_METADATA_REVISION','STALE_POLICY_REVISION'):
-                settled=dispatch.settle_failed(owned,
-                    'PYTHON_WORKFLOW_STALE_CONTEXT')
-                return {'workflowId':claim['workflow_id'],
-                    'status':'failed','errorCode':'PYTHON_WORKFLOW_STALE_CONTEXT'}
+                result = _settle_workflow_failure(dispatch, owned, 'PYTHON_WORKFLOW_STALE_CONTEXT',
+                    'PYTHON_WORKFLOW_STALE_WORKER_FENCE')
+                settled = True
+                return result
             code='PYTHON_WORKFLOW_WORKER_FAILED'
             outcome=dispatch.settle_unexpected(owned,code)
             if outcome is None:
@@ -385,13 +424,29 @@ class PostgresWorkerService:
                 raise ConnectionError('APPLICATION_RULE_LEASE_RENEWAL_FAILED')
             return result
         except AccessDenied:
-            settled=dispatch.settle_failed(owned,
-                'APPLICATION_RULE_AUTHORIZATION_REVOKED')
-            return {'workflowId':claim['workflow_id'],'status':'failed',
-                    'errorCode':'APPLICATION_RULE_AUTHORIZATION_REVOKED'}
+            result = _settle_workflow_failure(dispatch, owned, 'APPLICATION_RULE_AUTHORIZATION_REVOKED',
+                'APPLICATION_RULE_STALE_WORKER_FENCE')
+            settled = True
+            return result
         except ValueError as error:
-            if str(error) not in ('APPLICATION_RULE_WORKFLOW_PUBLICATION_STALE',
-                    'APPLICATION_RULE_WORKFLOW_CONTEXT_STALE','STALE_CELL_CHANGE_ID',
+            if str(error) in ('WORKFLOW_CANCELLATION_CHILD_PROOF_UNAVAILABLE',
+                    'WORKFLOW_CANCELLATION_CHILD_UNRESOLVED',
+                    'APPLICATION_RULE_EXECUTION_ORIGIN_UNRESOLVED',
+                    'APPLICATION_RULE_EXECUTION_ORIGIN_INVALID'):
+                outcome = dispatch.settle_unexpected(owned, str(error))
+                if outcome is None:
+                    raise ValueError('APPLICATION_RULE_STALE_WORKER_FENCE')
+                settled = True
+                return {'workflowId': claim['workflow_id'], 'status': outcome,
+                        'errorCode': str(error)}
+            # The definition owner includes the stale validation reason after
+            # its fixed code. Retrying the same sealed run cannot refresh it.
+            if str(error).partition(':')[0] not in (
+                    'APPLICATION_RULE_WORKFLOW_PUBLICATION_STALE',
+                    'APPLICATION_RULE_WORKFLOW_OWNER_CERTIFICATE_STALE',
+                    'APPLICATION_RULE_WORKFLOW_CONTEXT_STALE',
+                    'DEFINITION_CURRENT_VALIDATION_REQUIRED',
+                    'DEFINITION_NOT_ACTIVE','PYTHON_DEFINITION_SOURCE_NOT_ACTIVE','STALE_CELL_CHANGE_ID',
                     'STALE_DATA_REVISION','STALE_METADATA_REVISION',
                     'STALE_POLICY_REVISION'):
                 code='APPLICATION_RULE_WORKER_FAILED'
@@ -401,10 +456,10 @@ class PostgresWorkerService:
                 settled=True
                 return {'workflowId':claim['workflow_id'],'status':outcome,
                         'errorCode':code}
-            settled=dispatch.settle_failed(owned,
-                'APPLICATION_RULE_STALE_CONTEXT')
-            return {'workflowId':claim['workflow_id'],'status':'failed',
-                    'errorCode':'APPLICATION_RULE_STALE_CONTEXT'}
+            result = _settle_workflow_failure(dispatch, owned, 'APPLICATION_RULE_STALE_CONTEXT',
+                'APPLICATION_RULE_STALE_WORKER_FENCE')
+            settled = True
+            return result
         except (psycopg.Error,OSError,TimeoutError):
             code='APPLICATION_RULE_INFRASTRUCTURE_FAILURE'
             outcome=dispatch.settle_unexpected(owned,code)
@@ -483,29 +538,20 @@ class PostgresWorkerService:
                 NativeCubeAggregateStage(self.runtime_dsn,identity=identity),
                 AggregateCursorCodec(self.preview_secret),identity=identity)
             certificate_wire=service._certificate_wire
+        read_record = repository.get_resolved if resolved else repository.get
         try:
-            record=(repository.get_resolved(scope,claim['query_id'])
-                    if resolved else repository.get(scope,claim['query_id']))
+            record=read_record(scope,claim['query_id'])
             if record is None:raise AccessDenied('APPLICATION_UNAVAILABLE')
             # Computed rows are deliberately short, lease-free sealing work.
             # Another worker may seal the same row after this worker's claim
             # transaction. Treat that observed terminal state as idempotent
             # replay instead of attempting to compute it again.
-            if record.status is AggregateQueryStatus.SEALED:
-                return {'queryId':record.query_id,'status':'sealed',
-                    'technicalCertificate':certificate_wire(
-                        record.certificate)}
-            if record.status in (AggregateQueryStatus.CANCELLED,
+            if record.status in (AggregateQueryStatus.SEALED, AggregateQueryStatus.CANCELLED,
                     AggregateQueryStatus.FAILED,AggregateQueryStatus.EXPIRED):
-                result={'queryId':record.query_id,
-                        'status':record.status.value}
-                if record.error_code is not None:
-                    result['errorCode']=record.error_code
-                return result
+                return technical_worker_outcome(record, certificate_wire)
             if record.status is AggregateQueryStatus.COMPUTED:
                 sealed=repository.seal(record)
-                return {'queryId':sealed.query_id,'status':sealed.status.value,
-                    'technicalCertificate':certificate_wire(sealed.certificate)}
+                return technical_worker_outcome(sealed, certificate_wire)
             worker_claim={'record':record,
                 'normalizedRequest':claim['normalized_request'],
                 'claimant':self.claimant,
@@ -516,12 +562,28 @@ class PostgresWorkerService:
                 return {'queryId':record.query_id,'status':'cancelled'}
             return service.worker_run_claim(worker_claim)
         except AccessDenied:
-            if claim['status']=='running':
-                dispatch.settle_failed({**claim,'claimant':self.claimant},
-                    'CUBE_AGGREGATE_AUTHORIZATION_REVOKED')
-            return {'queryId':claim['query_id'],'status':'failed',
-                    'errorCode':'CUBE_AGGREGATE_AUTHORIZATION_REVOKED'}
+            owned = {**claim, 'claimant': self.claimant}
+            try:
+                outcome = dispatch.settle_denied(owned)
+            except (ConnectionError, psycopg.OperationalError):
+                # A discarded response may already have committed the refusal.
+                # Reconcile the same generation and scope before reporting it.
+                outcome = dispatch.settle_denied(owned)
+            if outcome['status'] == 'stale':
+                raise ValueError('CUBE_AGGREGATE_STALE_WORKER_FENCE') from None
+            result = {'queryId': claim['query_id'], 'status': outcome['status']}
+            if outcome['errorCode'] is not None:
+                result['errorCode'] = outcome['errorCode']
+            return result
         except Exception:
+            if claim['status'] == 'computed':
+                # Lease-free sealing can run on a different worker from the
+                # original computation. Recover the committed outcome even
+                # when the original claim belongs to someone else.
+                current = read_record(scope, claim['query_id'])
+                if current is None:
+                    raise ValueError('CUBE_AGGREGATE_RECONCILIATION_INVALID') from None
+                return technical_worker_outcome(current, certificate_wire)
             # The private result or final seal may already have committed even
             # though the worker lost its acknowledgement. Reconcile the exact
             # generation and durable last claimant before admitting a retry;
@@ -537,8 +599,7 @@ class PostgresWorkerService:
             elif reconciled.get('errorCode') is not None:
                 result['errorCode']=reconciled['errorCode']
             elif status=='sealed':
-                current=(repository.get_resolved(scope,claim['query_id'])
-                    if resolved else repository.get(scope,claim['query_id']))
+                current=read_record(scope,claim['query_id'])
                 if current is None or current.certificate is None:
                     raise ValueError(
                         'CUBE_AGGREGATE_RECONCILIATION_INVALID') from None
@@ -574,6 +635,8 @@ class PostgresWorkerService:
                     if result is not None:
                         observation['status']=str(result.get('status','completed'))
                         observation['family']=(
+                            'calculation_impact' if result.get('impactEpoch') is not None else
+                            'populated_layout' if result.get('layoutPhase') else
                             'aggregate' if result.get('queryId') else
                             'python_build' if result.get('buildId') else
                             'python_workflow' if result.get('workflowId') else
@@ -581,16 +644,18 @@ class PostgresWorkerService:
                             'sequence' if result.get('sequenceId') else
                             'business')
                 if result is not None:
-                    if result.get('errorCode','').endswith('RETRY_SCHEDULED'):
+                    error_code = result.get('errorCode') or ''
+                    if error_code.endswith('RETRY_SCHEDULED'):
                         record_operational_signal('retry',family=observation['family'])
-                    if 'STALE_WORKER' in result.get('errorCode',''):
+                    if 'STALE_WORKER' in error_code:
                         record_operational_signal('lease_loss',family=observation['family'])
                     if result.get('checkpoint') is True:
                         LOG.debug('Checkpointed work %s: %s',result.get('jobId'),
                                   result.get('result',{}).get('phase'))
                     else:
                         LOG.info('Processed work %s: %s%s',
-                                 result.get('jobId') or result.get('sequenceId'),
+                                 result.get('jobId') or result.get('sequenceId')
+                                 or result.get('activationId') or result.get('requestId'),
                                  result['status'],
                                  (f" ({result['errorCode']})"
                                   if result.get('errorCode') else ''))

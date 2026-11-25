@@ -8,7 +8,7 @@ import re
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .current_object_contract import new_state_token,require_state_token
+from .current_object_contract import STATE_TOKEN_PATTERN,new_state_token,require_state_token
 from .dimensional_security_policy import (
     AdministratorTreatment,AcrossDimensions,DimensionalSecurityPolicy,
     FactSideAuthority,HierarchyTags,MemberTagCardinality,MixedSelection,
@@ -19,34 +19,87 @@ from .postgres_access import PostgresAccessChecker,VerifiedIdentity
 from .postgres_connection import connect_postgres
 
 _SHA256=re.compile(r"[0-9a-f]{64}\Z")
+_POLICY_FIELDS = {
+    'acrossDimensions': ('across_dimensions', AcrossDimensions),
+    'withinDimension': ('within_dimension', WithinDimension),
+    'untaggedMember': ('untagged_member', UntaggedMember),
+    'untaggedDenyPrecedence': ('untagged_deny_precedence', UntaggedDenyPrecedence),
+    'memberTagCardinality': ('member_tag_cardinality', MemberTagCardinality),
+    'hierarchyTags': ('hierarchy_tags', HierarchyTags),
+    'writeReadRelationship': ('write_read_relationship', WriteReadRelationship),
+    'mixedSelection': ('mixed_selection', MixedSelection),
+    'administratorTreatment': ('administrator_treatment', AdministratorTreatment),
+    'factSideAuthority': ('fact_side_authority', FactSideAuthority),
+}
+POLICY_KEYS = frozenset(_POLICY_FIELDS)
+
+
+def assignment_policy_values():
+    """Fixed initial policy shared by new and migrated group-assigned applications."""
+    return {
+        'acrossDimensions':'every_protected','withinDimension':'any_tag',
+        'untaggedMember':'deny','untaggedDenyPrecedence':'absolute',
+        'memberTagCardinality':'multiple','hierarchyTags':'selected_member_only',
+        'writeReadRelationship':'require_read','mixedSelection':'filter_reads_reject_writes',
+        'administratorTreatment':'require_assignment','factSideAuthority':'derived_query_aid_only'}
+
 
 def policy_from_values(values: dict[str,object])->DimensionalSecurityPolicy:
     try:
-        return DimensionalSecurityPolicy(
-            across_dimensions=AcrossDimensions(values["acrossDimensions"]),
-            within_dimension=WithinDimension(values["withinDimension"]),
-            untagged_member=UntaggedMember(values["untaggedMember"]),
-            untagged_deny_precedence=UntaggedDenyPrecedence(values["untaggedDenyPrecedence"]),
-            member_tag_cardinality=MemberTagCardinality(values["memberTagCardinality"]),
-            hierarchy_tags=HierarchyTags(values["hierarchyTags"]),
-            write_read_relationship=WriteReadRelationship(values["writeReadRelationship"]),
-            mixed_selection=MixedSelection(values["mixedSelection"]),
-            administrator_treatment=AdministratorTreatment(values["administratorTreatment"]),
-            fact_side_authority=FactSideAuthority(values["factSideAuthority"]))
+        return DimensionalSecurityPolicy(**{
+            field: kind(values[key]) for key, (field, kind) in _POLICY_FIELDS.items()})
     except (KeyError,TypeError,ValueError) as exc:
         raise ValueError("DIMENSIONAL_SECURITY_POLICY_INVALID") from exc
 
 def policy_values(policy: DimensionalSecurityPolicy)->dict[str,str]:
-    return {"acrossDimensions":policy.across_dimensions.value,
-        "withinDimension":policy.within_dimension.value,
-        "untaggedMember":policy.untagged_member.value,
-        "untaggedDenyPrecedence":policy.untagged_deny_precedence.value,
-        "memberTagCardinality":policy.member_tag_cardinality.value,
-        "hierarchyTags":policy.hierarchy_tags.value,
-        "writeReadRelationship":policy.write_read_relationship.value,
-        "mixedSelection":policy.mixed_selection.value,
-        "administratorTreatment":policy.administrator_treatment.value,
-        "factSideAuthority":policy.fact_side_authority.value}
+    return {key: getattr(policy, field).value for key, (field, _) in _POLICY_FIELDS.items()}
+
+
+def policy_values_schema() -> dict:
+    from .postgres_numeric_catalog import obj
+
+    return obj({key: {'enum': [entry.value for entry in kind]}
+                for key, (_, kind) in _POLICY_FIELDS.items()})
+
+
+def policy_state_token_schema() -> dict:
+    return {'type': 'string',
+            'pattern': '^' + STATE_TOKEN_PATTERN.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+
+
+def _policy_scope_schema() -> dict:
+    text = {'type': 'string', 'minLength': 1}
+    return {'workspaceId': text, 'applicationId': text,
+            'securityRevision': {'type': 'integer', 'minimum': 0}}
+
+
+def _policy_current_schema() -> dict:
+    digest = {'type': 'string', 'pattern': '^' + _SHA256.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    return {**_policy_scope_schema(), 'stateToken': policy_state_token_schema(),
+            'policyDigest': digest}
+
+
+def policy_effect_result_schema(*, active: bool) -> dict:
+    from .postgres_numeric_catalog import obj
+
+    return obj({**_policy_current_schema(), 'status': {'const': 'Active' if active else 'Saved'},
+                'authorizationEffect': {'const': active}})
+
+
+def policy_read_result_schema() -> dict:
+    from .postgres_numeric_catalog import obj
+
+    present = {**_policy_current_schema(), 'policy': policy_values_schema(),
+               'updatedAt': {'type': 'string', 'format': 'date-time'}}
+    absent = {**_policy_scope_schema(), 'stateToken': {'type': 'null'}, 'policyDigest': {'type': 'null'},
+              'policy': {'type': 'null'}}
+    return {'oneOf': [obj({**absent, 'status': {'const': 'Absent'},
+                           'authorizationEffect': {'const': False}}),
+                      obj({**present, 'status': {'const': 'Active'},
+                           'authorizationEffect': {'const': True}}),
+                      obj({**present, 'status': {'const': 'Saved'},
+                           'authorizationEffect': {'const': False}})]}
+
 
 def validate_policy_activation_supported(policy: DimensionalSecurityPolicy)->None:
     if not isinstance(policy,DimensionalSecurityPolicy):
@@ -55,16 +108,7 @@ def validate_policy_activation_supported(policy: DimensionalSecurityPolicy)->Non
         raise ValueError("DIMENSIONAL_SECURITY_HIERARCHY_POLICY_NOT_ACTIVATABLE")
 
 def _row_policy(row: dict)->DimensionalSecurityPolicy:
-    return policy_from_values({"acrossDimensions":row["across_dimensions"],
-        "withinDimension":row["within_dimension"],
-        "untaggedMember":row["untagged_member"],
-        "untaggedDenyPrecedence":row["untagged_deny_precedence"],
-        "memberTagCardinality":row["member_tag_cardinality"],
-        "hierarchyTags":row["hierarchy_tags"],
-        "writeReadRelationship":row["write_read_relationship"],
-        "mixedSelection":row["mixed_selection"],
-        "administratorTreatment":row["administrator_treatment"],
-        "factSideAuthority":row["fact_side_authority"]})
+    return policy_from_values({key: row[field] for key, (field, _) in _POLICY_FIELDS.items()})
 
 class PostgresDimensionalSecurityPolicyStore:
     """Application-admin current-policy lifecycle."""
@@ -149,7 +193,7 @@ class PostgresDimensionalSecurityPolicyStore:
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
           with db.transaction():
             self._scope(db,scope);PostgresAccessChecker.lock_workspace(db,scope.workspace_id,exclusive=True)
-            PostgresAccessChecker.check_in_transaction(db,actor,scope,"admin")
+            access=PostgresAccessChecker.check_in_transaction(db,actor,scope,"admin")
             prior=self._prior(db,scope,operation_id,command_digest,payload_digest)
             if prior is not None:return prior
             state=db.execute("""SELECT security_revision FROM epm.application_state
@@ -162,6 +206,10 @@ class PostgresDimensionalSecurityPolicyStore:
             if ((current is None)!=(expected_state_token is None)
                     or current is not None and current["state_token"]!=expected_state_token):
                 raise ValueError("STALE_DIMENSIONAL_SECURITY_POLICY_STATE_TOKEN")
+            # The save contract replaces the active definition with a saved
+            # draft. Migrated applications require uninterrupted enforcement.
+            if access.authorization_model=="group_assignments" and current is not None and current["status"]=="Active":
+                raise ValueError("GROUP_ASSIGNMENT_ACTIVE_POLICY_REQUIRED")
             next_revision=state["security_revision"]+(1 if current is not None and current["status"]=="Active" else 0)
             token=new_state_token()
             result={"workspaceId":scope.workspace_id,"applicationId":scope.application_id,
@@ -218,7 +266,7 @@ class PostgresDimensionalSecurityPolicyStore:
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
           with db.transaction():
             self._scope(db,scope);PostgresAccessChecker.lock_workspace(db,scope.workspace_id,exclusive=True)
-            PostgresAccessChecker.check_in_transaction(db,actor,scope,"admin")
+            access=PostgresAccessChecker.check_in_transaction(db,actor,scope,"admin")
             prior=self._prior(db,scope,operation_id,command_digest,payload_digest)
             if prior is not None:return prior
             state=db.execute("""SELECT security_revision FROM epm.application_state
@@ -233,6 +281,11 @@ class PostgresDimensionalSecurityPolicyStore:
                 raise ValueError("STALE_DIMENSIONAL_SECURITY_POLICY_STATE_TOKEN")
             wanted="Active" if active else "Saved"
             if row["status"]==wanted:raise ValueError("DIMENSIONAL_SECURITY_POLICY_ALREADY_"+wanted.upper())
+            if access.authorization_model=="group_assignments":
+                if not active:
+                    raise ValueError("GROUP_ASSIGNMENT_ACTIVE_POLICY_REQUIRED")
+                from .dimensional_privileges import require_assignment_policy
+                require_assignment_policy(_row_policy(row))
             if active:validate_policy_activation_supported(_row_policy(row))
             token=new_state_token();revision=expected_security_revision+1
             result={"workspaceId":scope.workspace_id,"applicationId":scope.application_id,
@@ -253,9 +306,7 @@ class PostgresDimensionalSecurityPolicyStore:
         if not isinstance(scope,ApplicationScope) or not isinstance(actor,VerifiedIdentity):
             raise ValueError("DIMENSIONAL_SECURITY_POLICY_READ_INVALID")
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
-          with db.transaction():
-            self._scope(db,scope);PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-            PostgresAccessChecker.check_in_transaction(db,actor,scope,"admin")
+          with PostgresAccessChecker.application_security_read(db, actor, scope):
             state=db.execute("""SELECT security_revision FROM epm.application_state
                 WHERE workspace_id=%s AND application_id=%s""",
                 (scope.workspace_id,scope.application_id)).fetchone()

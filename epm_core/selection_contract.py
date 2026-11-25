@@ -9,11 +9,68 @@ from typing import Any, Iterable
 
 
 FORMAT = "openepm-cube-selection-v1"
+SELECTION_METADATA_STALE = "CUBE_SELECTION_METADATA_STALE"
 INLINE_EXPRESSION_FORMAT = "openepm-member-list-expression-v1"
 MAX_DIMENSIONS = 128
 MAX_EXPLICIT_MEMBERS = 10_000
 MAX_PARAMETERS = 100
+_MAX_ATTRIBUTE_VALUES = 100
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+_HIERARCHY_OPERATORS = frozenset(("children", "parents", "descendants", "ancestors",
+                                  "siblings", "leaves", "base"))
+_ATTRIBUTE_OPERATORS = frozenset(("eq", "ne", "lt", "lte", "gt", "gte", "contains",
+                                  "starts_with", "in", "exists"))
+
+
+def selection_identifier_schema() -> dict:
+    return {"type": "string", "pattern": _ID.pattern.removesuffix("$") + r"(?![\s\S])"}
+
+
+def selection_parameters_schema() -> dict:
+    return {"type": "object", "maxProperties": MAX_PARAMETERS,
+        "propertyNames": selection_identifier_schema(),
+        "additionalProperties": {"type": ["string", "integer", "boolean", "null"]}}
+
+
+def structural_schema_definitions() -> dict:
+    """Describe the canonical selector variants and reuse the native inline expression schema."""
+    from .member_list_contract import structural_schema_definitions as member_list_schemas
+    from .postgres_numeric_catalog import obj
+
+    identifier = selection_identifier_schema()
+    scalar = {"type": ["string", "integer", "boolean", "null"]}
+    hierarchy = obj({"kind": {"const": "hierarchy"},
+        "operator": {"enum": sorted(_HIERARCHY_OPERATORS)}, "hierarchyId": identifier,
+        "memberId": identifier, "includeSelf": {"type": "boolean"}})
+    hierarchy["allOf"] = [{
+        "if": {"properties": {"operator": {"const": "base"}}},
+        "then": {"properties": {"includeSelf": {"const": False}}}}]
+    attribute = obj({"kind": {"const": "attribute"}, "attributeId": identifier,
+        "operator": {"enum": sorted(_ATTRIBUTE_OPERATORS)},
+        "value": {"anyOf": [scalar, {"type": "array", "minItems": 1,
+            "maxItems": _MAX_ATTRIBUTE_VALUES, "items": scalar}]}})
+    attribute["allOf"] = [{
+        "if": {"properties": {"operator": {"const": "in"}}},
+        "then": {"properties": {"value": {"type": "array"}}},
+        "else": {"properties": {"value": scalar}}}]
+    selector = {"oneOf": [
+        obj({"kind": {"const": "member"}, "memberId": identifier}),
+        obj({"kind": {"const": "members"}, "memberIds": {"type": "array",
+            "minItems": 1, "maxItems": MAX_EXPLICIT_MEMBERS, "uniqueItems": True, "items": identifier}}),
+        hierarchy,
+        attribute,
+        obj({"kind": {"const": "member_list"}, "listId": identifier,
+            "parameters": selection_parameters_schema()}),
+        obj({"kind": {"const": "inline_expression"}, "expressionFormat": {"const": INLINE_EXPRESSION_FORMAT},
+            "expression": {"$ref": "#/$defs/memberListExpression"}}),
+    ]}
+    selector_ref = {"$ref": "#/$defs/cubeSelector"}
+    selection = obj({"format": {"const": FORMAT}, "metadataRevision": {"type": "integer", "minimum": 1},
+        "dimensions": {"type": "array", "minItems": 1, "maxItems": MAX_DIMENSIONS,
+            "items": obj({"dimensionId": identifier, "include": selector_ref,
+                "exclude": {"anyOf": [selector_ref, {"type": "null"}]}})}})
+    return {"cubeSelection": selection, "cubeSelector": selector,
+        "memberListExpression": member_list_schemas(parameters=False)["memberListExpression"]}
 
 
 def _id(value: object, code: str) -> str:
@@ -56,8 +113,7 @@ def _selector(value: object, *, allow_member_list: bool = True) -> dict[str, Any
             {"kind", "operator", "hierarchyId", "memberId", "includeSelf"},
             "CUBE_SELECTION_HIERARCHY_INVALID",
         )
-        if (item["operator"] not in {"children", "parents", "descendants", "ancestors",
-                                    "siblings", "leaves", "base"}
+        if (item["operator"] not in _HIERARCHY_OPERATORS
                 or not isinstance(item["includeSelf"], bool)
                 or item["operator"] == "base" and item["includeSelf"]):
             raise ValueError("CUBE_SELECTION_HIERARCHY_INVALID")
@@ -74,11 +130,11 @@ def _selector(value: object, *, allow_member_list: bool = True) -> dict[str, Any
             {"kind", "attributeId", "operator", "value"},
             "CUBE_SELECTION_ATTRIBUTE_INVALID",
         )
-        if item["operator"] not in {"eq", "ne", "lt", "lte", "gt", "gte", "contains", "starts_with", "in", "exists"}:
+        if item["operator"] not in _ATTRIBUTE_OPERATORS:
             raise ValueError("CUBE_SELECTION_ATTRIBUTE_INVALID")
         raw = item["value"]
         if item["operator"] == "in":
-            if not isinstance(raw, list) or not 1 <= len(raw) <= 100:
+            if not isinstance(raw, list) or not 1 <= len(raw) <= _MAX_ATTRIBUTE_VALUES:
                 raise ValueError("CUBE_SELECTION_ATTRIBUTE_INVALID")
             normalized: object = [_parameter_value(entry) for entry in raw]
         else:
@@ -124,7 +180,8 @@ def _selector(value: object, *, allow_member_list: bool = True) -> dict[str, Any
 
 
 def canonical_selection(
-    value: object, *, active_dimensions: Iterable[str] | None = None
+    value: object, *, active_dimensions: Iterable[str] | None = None,
+    expected_metadata_revision: int | None = None,
 ) -> dict[str, Any]:
     item = _exact(
         value,
@@ -135,6 +192,11 @@ def canonical_selection(
         raise ValueError("CUBE_SELECTION_FORMAT_UNSUPPORTED")
     if type(item["metadataRevision"]) is not int or item["metadataRevision"] < 1:
         raise ValueError("CUBE_SELECTION_METADATA_REVISION_INVALID")
+    if expected_metadata_revision is not None:
+        if type(expected_metadata_revision) is not int or expected_metadata_revision < 1:
+            raise ValueError("CUBE_SELECTION_METADATA_REVISION_INVALID")
+        if item["metadataRevision"] != expected_metadata_revision:
+            raise ValueError(SELECTION_METADATA_STALE)
     dimensions = item["dimensions"]
     if not isinstance(dimensions, list) or not 1 <= len(dimensions) <= MAX_DIMENSIONS:
         raise ValueError("CUBE_SELECTION_DIMENSIONS_INVALID")

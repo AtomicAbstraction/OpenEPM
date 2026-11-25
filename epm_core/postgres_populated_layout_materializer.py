@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from contextlib import contextmanager
 from hashlib import sha256
 import json
 
@@ -11,10 +12,13 @@ from psycopg.types.json import Jsonb
 from .persistence_contract import ApplicationScope
 from .populated_layout_generation_validation import MAX_COORDINATES, _expected
 from .populated_layout_mapping import LayoutPins
-from .postgres_access import PostgresAccessChecker, VerifiedIdentity
+from .postgres_access import PostgresAccessChecker, VerifiedIdentity, durable_execution_identity
+from .postgres_execution_scope import remaining_milliseconds
+from .postgres_processing_limits import configure_lock_wait, configure_statement_timeout
 from .postgres_connection import connect_postgres
 from .postgres_dimensional_scope import resolve_effective_dimensional_scope
 from .postgres_numeric_store import PostgresNumericFactStore
+from .postgres_populated_layout_preview import authorize_layout_plan_read
 
 
 CHUNK_SIZE = 500
@@ -35,8 +39,13 @@ class PostgresPopulatedLayoutMaterializer:
         self.runtime_dsn, self.worker_dsn, self.identity = runtime_dsn, worker_dsn, identity
 
     def materialize(self, scope: ApplicationScope, request_id: str, *,
-                    claimant: str, merge_policy: str, lease_seconds: int = 120) -> dict:
-        claim = self._claim(scope, request_id, claimant, lease_seconds)
+                    claimant: str, merge_policy: str, lease_seconds: int = 120, claim: dict | None = None) -> dict:
+        if claim is None:
+            claim = self._claim(scope, request_id, claimant, lease_seconds)
+        elif (claim.get("request_id") != request_id or claim.get("claimant") != claimant
+                or claim.get("phase") != "Materialize"
+                or type(claim.get("claim_generation")) is not int):
+            raise ValueError("LAYOUT_MATERIALIZATION_CLAIM_INVALID")
         if claim is None:
             return self._status(scope, request_id)
         self._assert_authority(scope, request_id, claim)
@@ -46,6 +55,7 @@ class PostgresPopulatedLayoutMaterializer:
         dimensions = [axis["dimensionId"] for axis in request["plan"]["targetAxes"]]
         groups = {}
         for mapping in mappings:
+            remaining_milliseconds()
             source_id = mapping["sourceCoordinateId"]
             if source_id not in by_source:
                 raise ValueError("LAYOUT_MATERIALIZATION_SOURCE_MISSING")
@@ -53,6 +63,7 @@ class PostgresPopulatedLayoutMaterializer:
             groups.setdefault(key, []).append(by_source[source_id])
         rows = []
         for key in sorted(groups):
+            remaining_milliseconds()
             values = _expected(groups[key], merge_policy)
             members = dict(zip(dimensions, key))
             rows.append({"targetDigest": _digest(members), "targetMembers": members,
@@ -67,25 +78,33 @@ class PostgresPopulatedLayoutMaterializer:
                     "items": [{"description": item["description"],
                                "amount": format(item["amount"], "f")}
                               for item in values["detail"]["items"]]}})
+        remaining_milliseconds()
         content_digest = _digest(rows)
+        remaining_milliseconds()
         start = claim["next_chunk"]
         chunks = [rows[index:index + CHUNK_SIZE]
                   for index in range(0, len(rows), CHUNK_SIZE)]
         for index in range(start, len(chunks)):
             chunk = chunks[index]
-            with connect_postgres(self.worker_dsn, row_factory=dict_row) as db:
-                changed = db.execute("""SELECT epm.layout_replacement_materialization_chunk
-                    (%s,%s,%s,%s,%s,%s,%s,%s) AS changed""",
-                    (scope.workspace_id, scope.application_id, request_id, claimant,
-                     claim["claim_generation"], index, _digest(chunk), Jsonb(chunk))).fetchone()["changed"]
+            remaining_milliseconds()
+            with self._authority_window(scope, request_id, claim):
+                with connect_postgres(self.worker_dsn, row_factory=dict_row) as db:
+                    configure_lock_wait(db); configure_statement_timeout(db, 5000)
+                    changed = db.execute("""SELECT epm.layout_replacement_materialization_chunk
+                        (%s,%s,%s,%s,%s,%s,%s,%s) AS changed""",
+                        (scope.workspace_id, scope.application_id, request_id, claimant,
+                         claim["claim_generation"], index, _digest(chunk), Jsonb(chunk))).fetchone()["changed"]
             if not changed:
                 raise ValueError("LAYOUT_MATERIALIZATION_STALE_WORKER")
         self._assert_authority(scope, request_id, claim)
-        with connect_postgres(self.worker_dsn, row_factory=dict_row) as db:
-            settled = db.execute("""SELECT epm.layout_replacement_materialization_settle
-                (%s,%s,%s,%s,%s,%s,%s,NULL) AS changed""",
-                (scope.workspace_id, scope.application_id, request_id, claimant,
-                 claim["claim_generation"], content_digest, len(rows))).fetchone()["changed"]
+        remaining_milliseconds()
+        with self._authority_window(scope, request_id, claim):
+            with connect_postgres(self.worker_dsn, row_factory=dict_row) as db:
+                configure_lock_wait(db); configure_statement_timeout(db, 5000)
+                settled = db.execute("""SELECT epm.layout_replacement_materialization_settle
+                    (%s,%s,%s,%s,%s,%s,%s,NULL) AS changed""",
+                    (scope.workspace_id, scope.application_id, request_id, claimant,
+                     claim["claim_generation"], content_digest, len(rows))).fetchone()["changed"]
         if not settled:
             raise ValueError("LAYOUT_MATERIALIZATION_STALE_WORKER")
         final = self._status(scope, request_id)
@@ -94,14 +113,21 @@ class PostgresPopulatedLayoutMaterializer:
 
     def _claim(self, scope, request_id, claimant, seconds):
         with connect_postgres(self.worker_dsn, row_factory=dict_row) as db:
+            configure_lock_wait(db); configure_statement_timeout(db, 5000)
             row = db.execute("""SELECT * FROM epm.layout_replacement_materialization_authority_claim
                 (%s,%s,%s,%s,%s::integer)""", (scope.workspace_id, scope.application_id,
                 request_id, claimant, seconds)).fetchone()
         return dict(row) if row else None
 
     def _assert_authority(self, scope, request_id, claim=None):
+        with self._authority_window(scope, request_id, claim) as row:
+            return row
+
+    @contextmanager
+    def _authority_window(self, scope, request_id, claim=None):
         with connect_postgres(self.runtime_dsn, row_factory=dict_row) as db:
             with db.transaction():
+                configure_lock_wait(db); configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
                 access = PostgresAccessChecker.check_in_transaction(
                     db, self.identity, scope, "admin")
@@ -109,14 +135,14 @@ class PostgresPopulatedLayoutMaterializer:
                     db, self.identity, scope, access=access,
                     function="metadata.layout.populated.replace.request").scope_digest
                 row = db.execute("""SELECT issuer,subject_id,verified_groups,
-                    authorization_scope_digest FROM epm.layout_replacement_request
+                    authorization_scope_digest,token_issued_at,authority_kind FROM epm.layout_replacement_request
                     WHERE workspace_id=%s AND application_id=%s AND request_id=%s""",
                     (scope.workspace_id, scope.application_id, request_id)).fetchone()
                 if row is None:
                     raise ValueError("LAYOUT_REPLACEMENT_NOT_FOUND")
                 if (row["issuer"] != self.identity.issuer
                         or row["subject_id"] != self.identity.subject_id
-                        or tuple(row["verified_groups"]) != self.identity.groups
+                        or tuple(row["verified_groups"]) != access.groups
                         or row["authorization_scope_digest"] is None
                         or row["authorization_scope_digest"] != current_scope
                         or (claim is not None and (
@@ -128,7 +154,11 @@ class PostgresPopulatedLayoutMaterializer:
                             current_scope))):
                     raise ValueError(
                         "LAYOUT_REPLACEMENT_AUTHORIZATION_SCOPE_CHANGED")
-                return row
+                sealed=durable_execution_identity(row)
+                if sealed.issued_at != self.identity.issued_at:
+                    raise ValueError("LAYOUT_REPLACEMENT_AUTHORIZATION_SCOPE_CHANGED")
+                remaining_milliseconds()
+                yield row
 
     def _status(self, scope, request_id):
         self._assert_authority(scope, request_id)
@@ -147,6 +177,7 @@ class PostgresPopulatedLayoutMaterializer:
     def _load_source(self, scope, request_id):
         with connect_postgres(self.runtime_dsn, row_factory=dict_row) as db:
             db.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY")
+            configure_lock_wait(db); configure_statement_timeout(db, 5000)
             PostgresNumericFactStore._set_scope(db, scope)
             access = PostgresAccessChecker.check_in_transaction(
                 db, self.identity, scope, "admin")
@@ -162,7 +193,7 @@ class PostgresPopulatedLayoutMaterializer:
             if request is None: raise ValueError("LAYOUT_REPLACEMENT_NOT_STAGED")
             if (request["issuer"] != self.identity.issuer
                     or request["subject_id"] != self.identity.subject_id
-                    or tuple(request["verified_groups"]) != self.identity.groups
+                    or tuple(request["verified_groups"]) != access.groups
                     or request["authorization_scope_digest"] is None
                     or request["authorization_scope_digest"] != current_scope):
                 raise ValueError(
@@ -171,7 +202,8 @@ class PostgresPopulatedLayoutMaterializer:
                 request["policy_revision"], request["schema_epoch"], request["source_commit_revision"])
             ids = sorted(item["sourceCoordinateId"] for item in request["plan"]["coordinateMappings"])
             if len(ids) > MAX_COORDINATES: raise ValueError("LAYOUT_MATERIALIZATION_BOUND")
-            rows = db.execute("""SELECT c.coordinate_id,n.present AS numeric_present,n.amount,
+            authorize_layout_plan_read(db, self.identity, scope, access, request["plan"])
+            rows = db.execute("""SELECT c.coordinate_id,c.members,n.present AS numeric_present,n.amount,
                 t.present AS text_present,t.text_value,d.items,d.total FROM epm.coordinate c
                 LEFT JOIN epm.numeric_cell_current n USING(workspace_id,application_id,coordinate_id)
                 LEFT JOIN epm.text_cell_current t USING(workspace_id,application_id,coordinate_id)
@@ -185,6 +217,12 @@ class PostgresPopulatedLayoutMaterializer:
             actual = LayoutPins(state["metadata_revision"],state["data_revision"],state["policy_revision"],
                                 state["schema_epoch"],state["commit_revision"])
             if state["commit_open"] or actual != pins: raise ValueError("LAYOUT_MATERIALIZATION_SOURCE_STALE")
+            expected = {item["sourceCoordinateId"]: item["sourceMembers"]
+                        for item in request["plan"]["coordinateMappings"]}
+            if [row["coordinate_id"] for row in rows] != ids:
+                raise ValueError("LAYOUT_MATERIALIZATION_SOURCE_MISSING")
+            if any(row["members"] != expected[row["coordinate_id"]] for row in rows):
+                raise ValueError("LAYOUT_MATERIALIZATION_SOURCE_STALE")
         result=[]
         for row in rows:
             items=row["items"] or []

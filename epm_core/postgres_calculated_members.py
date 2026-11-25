@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
+
 from .calculated_member_contract import (
-    calculated_member_digest, canonical_calculated_member,
+    FORMAT as DEFINITION_FORMAT, calculated_member_digest, canonical_calculated_member,
     validate_calculated_member_graph)
 from .postgres_expression_rules import PostgresExpressionRules, _ID
 from .postgres_jobs import _canonical_digest
@@ -18,6 +20,244 @@ LIST="calculated.member.list"
 MATERIALIZE="calculated.member.materialize"
 EVALUATE="calculated.member.evaluate"
 STORED_FUNCTION="calculated.member.definition"
+READ_FUNCTIONS = frozenset((LIST, READ, EVALUATE))
+EVALUATION_AUTHORIZATION_STALE = 'CALCULATED_MEMBER_READ_AUTHORIZATION_STALE'
+EVALUATION_SNAPSHOT_STALE = 'CALCULATED_MEMBER_READ_CUT_STALE'
+REVIEW_AUTHORIZATION_STALE = 'CALCULATED_MEMBER_REVIEW_AUTHORIZATION_STALE'
+PREVIEW_SNAPSHOT_STALE = 'CALCULATED_MEMBER_PREVIEW_CUT_STALE'
+_LOOKUP_ID = re.compile(r'[A-Za-z0-9._:-]{1,200}\Z')
+_DIGEST = re.compile(r'[0-9a-f]{64}\Z')
+_LIST_LIMIT = 100
+_LIST_REVISIONS = ('expectedMetadataRevision', 'expectedPolicyRevision')
+
+
+def _identifier_schema():
+    return {'type': 'string', 'pattern': '^' + _LOOKUP_ID.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+
+
+def _digest_schema():
+    return {'type': 'string', 'pattern': '^' + _DIGEST.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+
+
+def _execution_request_schema():
+    from .metadata_read_contract import obj
+
+    arguments = obj({'definitionId': _identifier_schema(), 'expectedStateToken': _digest_schema(),
+                     'expectedProgramDigest': _digest_schema()}, ['definitionId'])
+    arguments['dependentRequired'] = {'expectedStateToken': ['expectedProgramDigest'],
+                                      'expectedProgramDigest': ['expectedStateToken']}
+    return arguments
+
+
+def materialization_program_contract() -> dict:
+    from .metadata_read_contract import DIALECT, obj, read_example
+    from .postgres_jobs import job_submission_schema
+    from .postgres_numeric_catalog import program_schema
+    from .postgres_planning_write_guard import planning_write_evidence_schema
+
+    digest = _digest_schema()
+    revision = {'type': 'integer', 'minimum': 0}
+    result_key = {'type': 'string', 'pattern': r'^[A-Za-z0-9._-]{8,128}(?![\s\S])'}
+    engine = {'const': 'postgres_exact_sql'}
+    member_pin = obj({'definitionId': _identifier_schema(), 'policyRevision': revision,
+        **dict.fromkeys(('stateToken', 'programDigest', 'definitionDigest', 'sourceSelectionDigest',
+                         'selectedDomainDigest', 'resolutionDigest'), digest)})
+    input_pins = {'type': 'array', 'items': obj({'resultKey': result_key, 'resultStateToken': digest})}
+    amount = obj({'type': {'const': 'Amount'}, 'scale': {'const': 8}})
+    ratio = obj({'type': {'const': 'Ratio'}, 'scale': {'const': 12}})
+    preview = {'$schema': DIALECT, **obj({
+        'languageVersion': {'type': 'integer', 'const': 2}, 'function': {'const': MATERIALIZE},
+        'programDigest': digest, 'planDigest': digest, 'compilerVersion': {'type': 'string'},
+        'revisionVector': obj(dict.fromkeys(('metadata_revision', 'data_revision', 'policy_revision'), revision)),
+        'expectedTargetStateToken': {'anyOf': [digest, {'type': 'null'}]},
+        'estimatedRows': revision, 'engine': engine, 'resourceClass': {'const': 'short'},
+        'rounding': {'enum': ['half-even-final-8', 'half-even-final-12']},
+        'previewToken': {'type': 'string', 'minLength': 1}, 'publishedInputs': input_pins,
+        'calculatedMember': member_pin, 'resultKey': result_key, 'resultUnit': {'oneOf': [amount, ratio]},
+    })}
+    preview.update({'if': {'properties': {'resultUnit': ratio}},
+                    'then': {'properties': {'rounding': {'const': 'half-even-final-12'}}},
+                    'else': {'properties': {'rounding': {'const': 'half-even-final-8'}}}})
+    member_map = {'type': 'object', 'additionalProperties': {'type': 'string'}}
+    publication = {
+        'resultKey': result_key, 'resultStateToken': digest, 'resultContentDigest': digest,
+        'rowCount': revision, 'sourceCommitRevision': revision, 'engine': engine,
+        'impactDigest': digest, 'targetMembers': member_map, 'calculatedMember': member_pin,
+    }
+    published = {'$schema': DIALECT, **obj({**publication,
+        'resultUnit': ratio, 'publishedInputs': input_pins,
+        'sourceLookups': {'type': 'array', 'items': member_map},
+        'sourceTextLookups': {'type': 'array', 'items': member_map},
+        'planningPolicy': planning_write_evidence_schema(),
+        'dependencyState': obj(dict.fromkeys(('bindingDigest', 'executionManifestDigest',
+                                               'partitionManifestDigest', 'definitionDigest'), digest)),
+        'outputUnit': {'type': 'object'}, 'rateLineage': {'type': 'object'},
+        'consolidationTranslation': {'const': False},
+    }, list(publication))}
+    submission = job_submission_schema()
+    return {'schemaCoverage': 'program-and-result', 'schemaDialect': DIALECT,
+        'programSchema': program_schema(MATERIALIZE, _execution_request_schema()),
+        'resultSchema': submission, 'resultSchemaScope': 'envelope',
+        'programContract': {
+            'owner': 'PostgresCalculatedMembers and the expression job owner',
+            'examples': [read_example(MATERIALIZE, {'definitionId': 'example-calculated-member',
+                'expectedStateToken': '1' * 64, 'expectedProgramDigest': '2' * 64},
+                name='Preview the inspected materialized definition',
+                binding='Read an executable materialized definition in the authorized application. Copy its definitionId, stateToken and programDigest.')],
+            'outputSchemas': {
+                'preview': {'schema': preview, 'scope': 'envelope',
+                            'surface': 'preview_v2_program or Browser /api/preview'},
+                'submission': {'schema': submission, 'scope': 'envelope',
+                               'surface': 'submit_v2_program or Browser /api/submit'},
+                'publishedResult': {'schema': published, 'scope': 'result',
+                                    'surface': 'result from read_v2_job or Browser /api/job after publication'},
+            },
+            'semanticRules': [
+                'Review the result key, unit, rounding, estimated row count, current definition pins and target state in Preview.',
+                'Submission binds the unchanged program and original preview to an operation admission. Only the worker publishes the resulting generation.',
+                'Use current write and run permissions. Source and target checks are enforced by the fixed core. Historical publication evidence identifies the committed result at its original revision.',
+            ],
+            'recovery': ('Read the original job with its operation ID if the acknowledgement was lost. '
+                'Exact replay uses the same program, preview token, operation ID and ordered job dependencies, including for an accepted expired request. '
+                'After a definitive stale refusal, inspect the current owner and review a new preview before requesting a new admission.'),
+        },
+    }
+
+
+def _dynamic_result_schema(identifier, digest, revision):
+    from .metadata_read_contract import obj
+    from .postgres_expression import MAX_DYNAMIC_MEMBER_ROWS
+
+    string = {'type': 'string'}
+    nullable_string = {'type': ['string', 'null']}
+    members = {'type': 'object', 'minProperties': 1, 'additionalProperties': string}
+    source = {'sourceMembers': members, 'sourceSeriesKey': string,
+              'sourceChangeId': string}
+    lookup = {field: {'anyOf': [shape, {'type': 'null'}]} for field, shape in source.items()}
+    lookup['memberOverrides'] = {'type': 'object', 'additionalProperties': string}
+    lineage = {'oneOf': [
+        obj({**lookup, 'inputKind': {'const': 'RawAmount'}, 'sourceAmount': nullable_string}),
+        obj({**lookup, 'inputKind': {'const': 'RawText'}, 'sourceText': nullable_string}),
+        obj({**source, 'inputKind': {'const': 'RawAmount'}, 'sourceAmount': string,
+             'sourceCoordinateId': {'type': 'integer', 'minimum': 1}, 'calendarChangeId': string,
+             'calendarOrdinal': {'type': 'integer'}}),
+        obj({'inputKind': {'const': 'OpeningAmount'}, 'amount': string,
+             'resetGroupId': nullable_string}),
+        {'type': 'null'},
+    ]}
+    amount = {'type': 'string', 'pattern': r'^-?[0-9]+\.[0-9]{8}(?![\s\S])'}
+    ratio = {'type': 'string', 'pattern': r'^-?[0-9]+\.[0-9]{12}(?![\s\S])'}
+    row = obj({'members': members, 'sourceMembers': members, 'sourceAmount': amount,
+        'sourceChangeId': string, 'sourceLineage': {'type': 'array', 'items': lineage},
+        'value': {'oneOf': [obj({'type': {'const': 'AmountLiteral'}, 'decimal': amount}),
+                            obj({'type': {'const': 'RatioLiteral'}, 'decimal': ratio})]}})
+    return obj({'definitionId': identifier, **dict.fromkeys(
+            ('stateToken', 'programDigest', 'definitionDigest', 'sourceSelectionDigest',
+             'resolutionDigest', 'planDigest'), digest),
+        **dict.fromkeys(('metadataRevision', 'dataRevision', 'policyRevision',
+                         'commitRevision'), revision),
+        'compilerVersion': string, 'dynamic': {'const': True}, 'persisted': {'const': False},
+        'rows': {'type': 'array', 'items': row, 'maxItems': MAX_DYNAMIC_MEMBER_ROWS}})
+
+
+def read_program_contract(function: str) -> dict:
+    from .metadata_read_contract import obj, read_contract, read_example
+    from .selection_contract import structural_schema_definitions
+
+    identifier = _identifier_schema()
+    digest = _digest_schema()
+    nullable_digest = {'anyOf': [digest, {'type': 'null'}]}
+    revision = {'type': 'integer', 'minimum': 0}
+    text = {'type': ['string', 'null']}
+    boolean = {'type': 'boolean'}
+    sample = 'example-calculated-member'
+    definitions = None
+    if function == EVALUATE:
+        arguments = _execution_request_schema()
+        result = _dynamic_result_schema(identifier, digest, revision)
+        examples = [read_example(EVALUATE, {'definitionId': sample, 'expectedStateToken': '1' * 64,
+            'expectedProgramDigest': '2' * 64}, name='Evaluate the inspected dynamic definition',
+            binding='Read an executable dynamic definition in the current application. Copy its definitionId, stateToken and programDigest.')]
+        rules = ['The core evaluates dynamic definitions under current source and target READ authority.',
+                 'Every returned row contains the original source and the exact AmountLiteral or RatioLiteral result. Evaluation produces no stored result or business receipt.']
+    else:
+        state = {**dict.fromkeys(('defined', 'valid', 'active', 'sourceCurrent', 'executable'), boolean),
+                 'resultCurrent': {'type': 'null'}, 'reason': text}
+        status = {'enum': ['Active', 'Inactive', 'Unavailable']}
+        pins = {'definitionId': identifier, 'stateToken': nullable_digest,
+                'programDigest': nullable_digest}
+        target = obj({'dimensionId': identifier, 'memberId': identifier})
+        summary = {'target': target, 'evaluation': {'enum': ['dynamic', 'materialized']},
+                   'resultUnit': {'enum': ['amount', 'ratio']},
+                   'dependencies': {'type': 'array', 'maxItems': 100, 'uniqueItems': True,
+                                    'items': obj({'definitionId': identifier})}}
+        if function == LIST:
+            anchor = {'anyOf': [identifier, {'type': 'null'}]}
+            arguments = obj({'limit': {**revision, 'minimum': 1, 'maximum': _LIST_LIMIT,
+                                       'default': _LIST_LIMIT}, 'afterDefinitionId': anchor,
+                             **dict.fromkeys(_LIST_REVISIONS, revision)}, [])
+            arguments.update({'if': {'required': ['afterDefinitionId'],
+                                     'properties': {'afterDefinitionId': identifier}},
+                              'then': {'required': list(_LIST_REVISIONS)}})
+            required = {**pins, **state, 'status': status, 'definitionMetadataRevision': revision,
+                        'metadataCurrent': boolean, 'sourceBuildId': text}
+            row = obj({**required, 'stateToken': digest, **summary}, list(required))
+            row.update({'if': {'properties': {'programDigest': {'type': 'string'}}},
+                        'then': {'required': list(summary)}})
+            result = obj({'rows': {'type': 'array', 'maxItems': _LIST_LIMIT, 'items': row},
+                          'metadataRevision': revision, 'policyRevision': revision,
+                          'hasMore': boolean, 'nextAfterDefinitionId': anchor})
+            result.update({'if': {'properties': {'hasMore': {'const': True}}},
+                           'then': {'properties': {'rows': {'minItems': 1},
+                                                   'nextAfterDefinitionId': identifier}},
+                           'else': {'properties': {'nextAfterDefinitionId': {'type': 'null'}}}})
+            examples = [read_example(LIST, {'limit': 1}, name='List the first current definition page',
+                                     binding='Select the authorized application.'),
+                        read_example(LIST, {'limit': 1, 'afterDefinitionId': sample,
+                            'expectedMetadataRevision': 1, 'expectedPolicyRevision': 1},
+                            name='Continue the calculated-member inventory',
+                            binding='Use the previous nextAfterDefinitionId, metadataRevision and policyRevision in the same application.')]
+            rules = ['A successful empty page has no nextAfterDefinitionId. A continued page uses the same metadata and policy revisions.',
+                     'Inventory rows can describe inactive or unresolved definitions. Compiled definitions carry their target, evaluation mode, unit and dependencies.']
+        elif function == READ:
+            arguments = obj({'definitionId': identifier})
+            definitions = structural_schema_definitions()
+            body = obj({'format': {'const': DEFINITION_FORMAT}, 'definitionId': identifier,
+                        'name': {'type': 'string', 'minLength': 1, 'maxLength': 200}, **summary,
+                        'sourceSelection': {'$ref': '#/$defs/cubeSelection'}, 'expression': {'type': 'object'},
+                        'resultKey': text, 'maxSourceCells': {**revision, 'minimum': 1, 'maximum': 1_000_000},
+                        'maxOutputCells': {**revision, 'minimum': 1, 'maximum': 100_000}})
+            body.update({'if': {'properties': {'evaluation': {'const': 'dynamic'}}},
+                         'then': {'properties': {'resultKey': {'type': 'null'}}},
+                         'else': {'properties': {'resultKey': {'type': 'string',
+                             'pattern': r'^[A-Za-z0-9._-]{8,128}(?![\s\S])'}}}})
+            stored = obj({'languageVersion': {'const': 2}, 'function': {'const': STORED_FUNCTION},
+                          'arguments': body})
+            source = obj({'programId': {'type': 'string'}, 'programSourceToken': text,
+                          'sourceDigest': text, 'buildId': text, 'active': boolean})
+            required = {**pins, **state, 'program': {'anyOf': [stored, {'type': 'null'}]},
+                        'source': {'anyOf': [source, {'type': 'null'}]},
+                        'currentMetadataRevision': revision, 'policyRevision': revision,
+                        'definitionMetadataRevision': {'anyOf': [revision, {'type': 'null'}]},
+                        'updatedOperationId': text, 'updatedAt': text}
+            result = obj({**required, 'status': status}, list(required))
+            result.update({'if': {'properties': {'defined': {'const': True}}},
+                           'then': {'required': ['status'], 'properties': {'stateToken': digest}},
+                           'else': {'properties': {name: {'type': 'null'} for name in
+                               ('stateToken', 'programDigest', 'program', 'source', 'definitionMetadataRevision',
+                                'updatedOperationId', 'updatedAt')}}})
+            examples = [read_example(READ, {'definitionId': sample}, name='Inspect one current definition',
+                                     binding='Copy definitionId from the current calculated-member inventory.')]
+            rules = ['An unknown definition returns defined=false with null owner pins. Read executable, evaluation and the owner pins before requesting work.',
+                     'The fixed expression compiler owns the stored expression grammar. The response preserves the current compiled program and its source binding.']
+        else:
+            raise ValueError('CALCULATED_MEMBER_FUNCTION_INVALID')
+    contract = read_contract(function, arguments, result, owner='PostgresCalculatedMembers',
+                             examples=examples, semantic_rules=rules, definitions=definitions)
+    contract['programContract']['recovery'] = (
+        'Refresh current access after an access change. Restart the inventory after a stale page. '
+        'Inspect the current definition before retrying an evaluation with new pins.')
+    return contract
 
 
 def catalog() -> dict:
@@ -40,28 +280,32 @@ def catalog() -> dict:
         READ:{**common,"mode":"read","permission":"read",
             "idempotencyRequired":False,
             "arguments":{"definitionId":"definition identity"},
-            "result":"current definition and activation state"},
+            "result":"current definition and activation state",
+            **read_program_contract(READ)},
         LIST:{**common,"mode":"read","permission":"read",
             "idempotencyRequired":False,"arguments":{},
             "optionalArguments":{"limit":"1-100",
                 "afterDefinitionId":"stable keyset cursor",
                 "expectedMetadataRevision":"cursor metadata revision",
                 "expectedPolicyRevision":"cursor policy revision"},
-            "result":"bounded current calculated-member definitions"},
+            "result":"bounded current calculated-member definitions",
+            **read_program_contract(LIST)},
         EVALUATE:{**common,"mode":"read","permission":"read",
             "idempotencyRequired":False,
             "arguments":{"definitionId":
                 "current published dynamic definition"},
             "optionalArguments":{"expectedStateToken":"exact inspected Active definition state",
                 "expectedProgramDigest":"exact inspected compiled digest"},
-            "result":"bounded typed rows evaluated in one read snapshot"},
+            "result":"bounded typed rows evaluated in one read snapshot",
+            **read_program_contract(EVALUATE)},
         MATERIALIZE:{"mode":"durable_calculation","permission":"write",
             "previewRequired":True,"idempotencyRequired":True,
             "workClass":"short",
             "arguments":{"definitionId":"current published materialized definition"},
             "optionalArguments":{"expectedStateToken":"exact inspected Active definition state",
                 "expectedProgramDigest":"exact inspected compiled digest"},
-            "result":"immutable exact generation and atomic result publication"},
+            "result":"immutable exact generation and atomic result publication",
+            **materialization_program_contract()},
     }
 
 
@@ -119,7 +363,7 @@ def _program(raw: object, function: str) -> dict:
         if set(args)!={"definitionId"}:
             raise ValueError("CALCULATED_MEMBER_ARGUMENTS_INVALID")
         rule_id=args["definitionId"]
-        if not isinstance(rule_id,str) or not _ID.fullmatch(rule_id):
+        if not isinstance(rule_id,str) or not _LOOKUP_ID.fullmatch(rule_id):
             raise ValueError("CALCULATED_MEMBER_ARGUMENTS_INVALID")
         return {**args,"ruleId":rule_id}
     if function==LIST:
@@ -130,15 +374,13 @@ def _program(raw: object, function: str) -> dict:
                  "expectedPolicyRevision"}
         if set(mapped)-allowed:
             raise ValueError("CALCULATED_MEMBER_ARGUMENTS_INVALID")
-        limit=mapped.get("limit",100);after=mapped.get("afterRuleId")
-        if (type(limit) is not int or not 1<=limit<=100
+        limit=mapped.get("limit",_LIST_LIMIT);after=mapped.get("afterRuleId")
+        if (type(limit) is not int or not 1<=limit<=_LIST_LIMIT
                 or (after is not None and (not isinstance(after,str)
-                                           or not _ID.fullmatch(after)))
+                                           or not _LOOKUP_ID.fullmatch(after)))
                 or any(type(mapped[key]) is not int or mapped[key]<0
-                       for key in ("expectedMetadataRevision",
-                                   "expectedPolicyRevision") if key in mapped)
-                or (after is not None and not {"expectedMetadataRevision",
-                    "expectedPolicyRevision"}<=set(mapped))):
+                       for key in _LIST_REVISIONS if key in mapped)
+                or (after is not None and not set(_LIST_REVISIONS)<=set(mapped))):
             raise ValueError("CALCULATED_MEMBER_ARGUMENTS_INVALID")
         return mapped
     raise ValueError("CALCULATED_MEMBER_FUNCTION_INVALID")
@@ -159,6 +401,7 @@ def expression_program_for_definition(definition, *, result_key):
 
 
 class PostgresCalculatedMembers(PostgresExpressionRules):
+    LIST_COLLECTION_FORMAT = None
     SAVE,PUBLISH,READ,LIST,EVALUATE,MATERIALIZE=(
         SAVE,PUBLISH,READ,LIST,EVALUATE,MATERIALIZE)
     STORED_FUNCTION=STORED_FUNCTION
@@ -269,24 +512,8 @@ class PostgresCalculatedMembers(PostgresExpressionRules):
         return self._external(super().list_published(scope,raw))
 
     def _prepare(self,scope,raw,*,function,evaluation):
-        if (not isinstance(raw,dict)
-                or set(raw)!={"languageVersion","function","arguments"}
-                or raw.get("languageVersion")!=2
-                or raw.get("function")!=function
-                or not isinstance(raw.get("arguments"),dict)
-                or set(raw["arguments"]) not in ({"definitionId"},
-                    {"definitionId","expectedStateToken","expectedProgramDigest"})
-                or not isinstance(raw["arguments"]["definitionId"],str)
-                or not _ID.fullmatch(raw["arguments"]["definitionId"])):
-            raise ValueError("CALCULATED_MEMBER_EVALUATION_REQUEST_INVALID")
-        definition_id=raw["arguments"]["definitionId"]
-        args=raw['arguments']
-        if 'expectedStateToken' in args and (
-                type(args['expectedStateToken']) is not str
-                or len(args['expectedStateToken'])!=64
-                or type(args['expectedProgramDigest']) is not str
-                or len(args['expectedProgramDigest'])!=64):
-            raise ValueError('CALCULATED_MEMBER_EVALUATION_REQUEST_INVALID')
+        args=parse_evaluation_request(raw,function=function)
+        definition_id=args['definitionId']
         current=self.read(scope,{"languageVersion":2,"function":READ,
             "arguments":{"definitionId":definition_id}})
         if not current.get("executable",False):
@@ -334,25 +561,29 @@ class PostgresCalculatedMembers(PostgresExpressionRules):
         from psycopg.rows import dict_row
         from .postgres_access import PostgresAccessChecker
         from .postgres_connection import connect_postgres
+        from .postgres_dimensional_security import CUBE_READ_AUTHORIZATION_STALE
         from .postgres_expression import (compile_expression_program,
             compiler_for,evaluate_dynamic_expression,resolve_published_inputs)
         from .postgres_numeric_store import PostgresNumericFactStore
         from .postgres_processing_limits import configure_statement_timeout
 
         program,pin=self.prepare_dynamic(scope,raw)
+        state_sql = '''SELECT metadata_revision, data_revision, policy_revision,
+            commit_revision, schema_epoch, security_revision FROM epm.application_state
+            WHERE workspace_id=%s AND application_id=%s'''
+        keys = (scope.workspace_id, scope.application_id)
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
             with db.transaction():
+                create_selected_domain_read_relation(db)
+            with db.transaction():
+                db.execute('SET TRANSACTION READ ONLY')
                 configure_statement_timeout(db,5000)
                 PostgresNumericFactStore._set_scope(db,scope)
-                PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-                state=db.execute('''SELECT metadata_revision,data_revision,
-                    policy_revision,commit_revision FROM epm.application_state
-                    WHERE workspace_id=%s AND application_id=%s FOR SHARE''',(
-                    scope.workspace_id,scope.application_id)).fetchone()
+                authorize = PostgresAccessChecker.check_in_transaction
+                opening_access = authorize(db,self.identity,scope,'read',function=EVALUATE)
+                state = db.execute(state_sql, keys).fetchone()
                 if state is None:
-                    raise ValueError("APPLICATION_UNAVAILABLE")
-                PostgresAccessChecker.check_in_transaction(
-                    db,self.identity,scope,"read",function=EVALUATE)
+                    raise ValueError('APPLICATION_UNAVAILABLE')
                 inputs=resolve_published_inputs(db,scope,
                     program["arguments"]["expression"])
                 plan=compile_expression_program(program,
@@ -360,9 +591,18 @@ class PostgresCalculatedMembers(PostgresExpressionRules):
                     published_inputs=inputs,calculated_member=pin)
                 verify_calculated_member_pin(
                     db,scope,pin,plan,evaluation="dynamic")
-                rows=evaluate_dynamic_expression(
-                    db,scope,self.identity,plan)
+                try:
+                    rows=evaluate_dynamic_expression(
+                        db,scope,self.identity,plan,expected_access=opening_access)
+                except ValueError as reason:
+                    if str(reason) == CUBE_READ_AUTHORIZATION_STALE:
+                        raise ValueError(EVALUATION_AUTHORIZATION_STALE) from None
+                    raise
                 compiler,plan_digest=compiler_for(plan)
+                if authorize(db,self.identity,scope,'read',function=EVALUATE) != opening_access:
+                    raise ValueError(EVALUATION_AUTHORIZATION_STALE)
+                if db.execute(state_sql, keys).fetchone() != state:
+                    raise ValueError(EVALUATION_SNAPSHOT_STALE)
         return {"definitionId":pin["definitionId"],
             "stateToken":pin["stateToken"],"programDigest":pin["programDigest"],
             "definitionDigest":pin["definitionDigest"],
@@ -374,6 +614,35 @@ class PostgresCalculatedMembers(PostgresExpressionRules):
             "commitRevision":state["commit_revision"],
             "compilerVersion":compiler,"planDigest":plan_digest,
             "dynamic":True,"persisted":False,"rows":rows}
+
+
+def parse_evaluation_request(raw,*,function):
+    """One public evaluation grammar, shared by preparation and prior lookup."""
+    if (not isinstance(raw,dict)
+            or set(raw)!={"languageVersion","function","arguments"}
+            or raw.get("languageVersion")!=2
+            or raw.get("function")!=function
+            or not isinstance(raw.get("arguments"),dict)
+            or set(raw["arguments"]) not in ({"definitionId"},
+                {"definitionId","expectedStateToken","expectedProgramDigest"})
+            or not isinstance(raw["arguments"]["definitionId"],str)
+            or not _LOOKUP_ID.fullmatch(raw["arguments"]["definitionId"])):
+        raise ValueError("CALCULATED_MEMBER_EVALUATION_REQUEST_INVALID")
+    args=raw['arguments']
+    if 'expectedStateToken' in args and any(
+            not isinstance(args[key], str) or not _DIGEST.fullmatch(args[key])
+            for key in ('expectedStateToken', 'expectedProgramDigest')):
+        raise ValueError('CALCULATED_MEMBER_EVALUATION_REQUEST_INVALID')
+    return args
+
+
+def recheck_materialization_run_access(db, identity, scope, opening_access):
+    """Require run permission under the same authority used for review or admission."""
+    from .postgres_access import PostgresAccessChecker
+
+    if PostgresAccessChecker.check_in_transaction(
+            db, identity, scope, 'rule_run', function=MATERIALIZE) != opening_access:
+        raise ValueError(REVIEW_AUTHORIZATION_STALE)
 
 
 def verify_calculated_member_pin(db,scope,pin,plan,*,evaluation):
@@ -424,6 +693,13 @@ def verify_calculated_member_pin(db,scope,pin,plan,*,evaluation):
             or dict(plan.target_members)!={definition["target"]["dimensionId"]:
                                            definition["target"]["memberId"]}):
         raise ValueError("CALCULATED_MEMBER_PLAN_MISMATCH")
+
+
+def create_selected_domain_read_relation(db):
+    """Create private membership scratch before the read-only data transaction."""
+    db.execute('''CREATE TEMP TABLE IF NOT EXISTS epm_selected_domain_member(
+        dimension_id text NOT NULL,member_id text NOT NULL,
+        PRIMARY KEY(dimension_id,member_id)) ON COMMIT PRESERVE ROWS''')
 
 
 def _install_selected_domain_members(db,resolved,profile=None):

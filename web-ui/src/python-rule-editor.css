@@ -9,6 +9,29 @@
   min-width: 0;
   min-height: 160px;
 }
+.python-rule-editor__source {
+  background: #18151f;
+  color: #f3eefb;
+  font:
+    13px/1.6 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    "Liberation Mono",
+    "Courier New",
+    monospace;
+  margin: 0;
+  min-height: 160px;
+  overflow: auto;
+  padding: 16px 18px;
+  tab-size: 4;
+  white-space: pre;
+}
+.python-rule-editor__source:focus-visible {
+  outline: 2px solid var(--purple);
+  outline-offset: -2px;
+}
 .python-rule-editor > p,
 .python-rule-editor > [role="alert"],
 .python-rule-editor__diagnostics {

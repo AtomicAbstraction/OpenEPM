@@ -1,9 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
-import { readProgram, requestAdmittedEffect } from "./api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { readProgram } from "./api";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
-import { useUnsavedWork } from "./unsaved-work";
+import { usePreservedDraft } from "./unsaved-work";
 import { useStableMutationIntentKey } from "./mutation-intent";
 import { collectAllContinuations } from "./continuation";
+import { useMetadataMutationRecovery } from "./metadata-mutation-recovery";
+import {
+  focusWhenInteractive,
+  MetadataReceiptRecovery,
+} from "./MetadataReceiptRecovery";
 
 export type SecurityTagRow = {
   dimension_id: string;
@@ -24,6 +29,29 @@ type SecurityTagDraft = Pick<
   SecurityTagRow,
   "display_name" | "short_description" | "semantic_description"
 >;
+
+const emptyDraft: SecurityTagDraft = {
+  display_name: "",
+  short_description: "",
+  semantic_description: "",
+};
+
+const tagWrites = [
+  "metadata.security-tag.create",
+  "metadata.security-tag.update",
+  "metadata.security-tag.status.set",
+] as const;
+
+const tagRefusals = new Set([
+  "SECURITY_TAG_ID_INVALID",
+  "SECURITY_TAG_STATUS_INVALID",
+  "SECURITY_TAG_ALREADY_EXISTS",
+  "SECURITY_TAG_UNAVAILABLE",
+  "SECURITY_TAG_UNCHANGED",
+  "SECURITY_TAG_STATUS_UNCHANGED",
+  "SECURITY_TAG_IN_USE",
+  "ACTIVE_DIMENSION_REQUIRED",
+]);
 
 type ReviewedAction =
   | { kind: "create" }
@@ -66,10 +94,7 @@ export async function collectSecurityTags(
 
 export function securityTagMutationBody(
   app: ApplicationSummary,
-  functionName:
-    | "metadata.security-tag.create"
-    | "metadata.security-tag.update"
-    | "metadata.security-tag.status.set",
+  functionName: (typeof tagWrites)[number],
   args: Record<string, unknown>,
   idempotencyKey: string,
 ) {
@@ -103,33 +128,50 @@ const validDraft = (draft: SecurityTagDraft) =>
   draft.short_description.length <= 500 &&
   draft.semantic_description.length <= 10000;
 
-export function SecurityTagCatalog({
-  app,
-  catalog,
-  dimensionId,
-  metadataRevision,
-  onChanged,
-}: {
+type SecurityTagCatalogProps = {
   app?: ApplicationSummary;
   catalog: ApplicationCatalog | null;
   dimensionId: string;
   metadataRevision: number | null;
   onChanged: () => Promise<void>;
-}) {
+};
+
+export function SecurityTagCatalog(props: SecurityTagCatalogProps) {
+  const { app, catalog, dimensionId } = props;
+  const owner = JSON.stringify([
+    app?.workspaceId,
+    app?.applicationId,
+    catalog?.applicationAccess.issuer,
+    catalog?.applicationAccess.subjectId,
+    dimensionId,
+  ]);
+  return <SecurityTagEditor key={owner} {...props} />;
+}
+
+function SecurityTagEditor({
+  app,
+  catalog,
+  dimensionId,
+  metadataRevision,
+  onChanged,
+}: SecurityTagCatalogProps) {
   const mutationIntentKey = useStableMutationIntentKey("security-tag-ui");
   const [rows, setRows] = useState<SecurityTagRow[]>([]);
-  const [drafts, setDrafts] = useState<Record<string, SecurityTagDraft>>({});
+  const [drafts, setDrafts] = useState<
+    Record<string, Partial<SecurityTagDraft>>
+  >({});
   const [tagId, setTagId] = useState("");
-  const [createDraft, setCreateDraft] = useState<SecurityTagDraft>({
-    display_name: "",
-    short_description: "",
-    semantic_description: "",
-  });
+  const [createDraft, setCreateDraft] = useState(emptyDraft);
   const [readRevision, setReadRevision] = useState<number | null>(null);
   const [reviewedAction, setReviewedAction] = useState<ReviewedAction>(null);
-  const [busy, setBusy] = useState(false);
+  const [reading, setReading] = useState(false);
+  const [reload, setReload] = useState(0);
+  const [recordedAt, setRecordedAt] = useState(0);
   const [error, setError] = useState("");
   const [result, setResult] = useState("");
+  const [refreshError, setRefreshError] = useState(false);
+  const resultStatus = useRef<HTMLParagraphElement>(null);
+  const focusReceipt = useRef(false);
 
   const canRead = Boolean(catalog?.functions["metadata.security-tag.list"]);
   const canCreate = Boolean(catalog?.functions["metadata.security-tag.create"]);
@@ -137,153 +179,208 @@ export function SecurityTagCatalog({
   const canSetStatus = Boolean(
     catalog?.functions["metadata.security-tag.status.set"],
   );
+  const actorId = catalog?.applicationAccess.subjectId;
+  const workspaceId = app?.workspaceId;
+  const applicationId = app?.applicationId;
+  const owner = JSON.stringify([
+    catalog?.applicationAccess.issuer,
+    actorId,
+    dimensionId,
+  ]);
+  const requiredRevision = Math.max(
+    metadataRevision ?? 0,
+    catalog?.revisions.metadata ?? 0,
+    recordedAt,
+  );
+  const context = JSON.stringify([
+    owner,
+    canRead,
+    catalog?.applicationAccess.role,
+    catalog?.revisions.security,
+    catalog?.revisions.capability,
+  ]);
+  const recovery = useMetadataMutationRecovery<{
+    actorId: string;
+    metadataRevision: number;
+    action: Exclude<ReviewedAction, null>;
+  }>(
+    app,
+    catalog,
+    context,
+    {
+      editor: `security-tag-catalog-change:${owner}`,
+      pendingLabel: "Security Tag change with an unconfirmed outcome",
+      functions: tagWrites,
+      subject: "security tag change",
+      closePrompt:
+        "Close this unconfirmed Security Tag change? Read the current catalogue before reviewing a new change.",
+      refuses: (code) => tagRefusals.has(code),
+    },
+    ({ action, metadataRevision: previous }, source) => {
+      if (action.kind === "create") {
+        setTagId("");
+        setCreateDraft(emptyDraft);
+      } else if (action.kind === "update") {
+        setDrafts((current) => {
+          const next = { ...current };
+          delete next[action.tagId];
+          return next;
+        });
+      }
+      setReviewedAction(null);
+      setRecordedAt(previous + 1);
+      setReload((current) => current + 1);
+      focusReceipt.current = source === "receipt";
+      setResult(
+        source === "receipt"
+          ? "The original Security Tag change was recorded."
+          : "The reviewed security-tag change was applied.",
+      );
+      setRefreshError(false);
+      void Promise.resolve()
+        .then(onChanged)
+        .catch(() => setRefreshError(true));
+    },
+  );
+  const busy = reading || recovery.busy || recovery.pending;
+  const canReview = Boolean(
+    actorId &&
+      !busy &&
+      !error &&
+      readRevision !== null &&
+      readRevision >= requiredRevision,
+  );
 
   const rowById = useMemo(
     () => new Map(rows.map((row) => [row.tag_id, row])),
     [rows],
   );
-  const createChanged =
-    Boolean(tagId) ||
-    createDraft.display_name !== "" ||
-    createDraft.short_description !== "" ||
-    createDraft.semantic_description !== "";
-  const existingChanged = rows.some((row) => {
-    const draft = drafts[row.tag_id];
-    return Boolean(
-      draft &&
-        (draft.display_name !== row.display_name ||
-          draft.short_description !== row.short_description ||
-          draft.semantic_description !== row.semantic_description),
-    );
-  });
-  useUnsavedWork(
-    `security-tag-catalog:${app?.workspaceId || "none"}:${app?.applicationId || "none"}:${dimensionId || "none"}`,
+  usePreservedDraft(
+    workspaceId || "",
+    applicationId || "",
+    `security-tag-catalog:${owner}`,
     "Unsaved Security Tag catalogue changes",
-    createChanged || existingChanged,
+    Boolean(tagId) ||
+      Object.values(createDraft).some(Boolean) ||
+      Object.keys(drafts).length > 0,
+    { tagId, createDraft, drafts },
+    (saved) => {
+      setTagId(saved.tagId);
+      setCreateDraft(saved.createDraft);
+      setDrafts(saved.drafts);
+      setReviewedAction(null);
+    },
   );
 
-  async function readTags() {
-    if (!app || !dimensionId || !canRead) return;
-    setBusy(true);
-    setError("");
-    try {
-      const collected = await collectSecurityTags(dimensionId, (arguments_) =>
-        readProgram(
-          { workspaceId: app.workspaceId, applicationId: app.applicationId },
-          "metadata.security-tag.list",
-          arguments_,
-        ),
-      );
-      const found = collected.rows;
-      setRows(found);
-      setDrafts(
-        Object.fromEntries(
-          found.map((row) => [
-            row.tag_id,
-            {
-              display_name: row.display_name,
-              short_description: row.short_description,
-              semantic_description: row.semantic_description,
-            },
-          ]),
-        ),
-      );
-      setReadRevision(collected.finalPage.metadataRevision);
-      setReviewedAction(null);
-    } catch (reason) {
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to read the Security Tag catalogue",
-      );
-    } finally {
-      setBusy(false);
-    }
-  }
-
   useEffect(() => {
-    setRows([]);
-    setDrafts({});
-    setReadRevision(null);
-    setTagId("");
-    setCreateDraft({
-      display_name: "",
-      short_description: "",
-      semantic_description: "",
-    });
+    if (!workspaceId || !applicationId || !dimensionId || !canRead) return;
+    const controller = new AbortController();
+    const scope = { workspaceId, applicationId };
+    setReading(true);
     setReviewedAction(null);
     setError("");
-    setResult("");
-    if (app && dimensionId && canRead) void readTags();
-  }, [app?.workspaceId, app?.applicationId, dimensionId, canRead]);
+    void collectSecurityTags(dimensionId, (arguments_) =>
+      readProgram(
+        scope,
+        "metadata.security-tag.list",
+        arguments_,
+        controller.signal,
+      ),
+    )
+      .then(({ rows, finalPage }) => {
+        if (controller.signal.aborted) return;
+        if (
+          !Number.isSafeInteger(finalPage.metadataRevision) ||
+          finalPage.metadataRevision < requiredRevision ||
+          rows.some((row) => row.dimension_id !== dimensionId)
+        )
+          throw new Error(
+            "Read the current Security Tag catalogue before editing.",
+          );
+        setRows(rows);
+        setReadRevision(finalPage.metadataRevision);
+      })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted)
+          setError(
+            reason instanceof Error
+              ? reason.message
+              : "Unable to read the Security Tag catalogue.",
+          );
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setReading(false);
+      });
+    return () => controller.abort();
+  }, [
+    workspaceId,
+    applicationId,
+    dimensionId,
+    canRead,
+    context,
+    requiredRevision,
+    reload,
+  ]);
 
   useEffect(() => {
-    if (
-      app &&
-      dimensionId &&
-      canRead &&
-      metadataRevision !== null &&
-      readRevision !== null &&
-      metadataRevision !== readRevision
-    )
-      void readTags();
-  }, [metadataRevision]);
+    if (!result || !focusReceipt.current) return;
+    focusReceipt.current = false;
+    return focusWhenInteractive(resultStatus.current);
+  }, [result]);
 
   function invalidate() {
     setReviewedAction(null);
     setResult("");
   }
 
+  function edit(
+    row: SecurityTagRow,
+    field: keyof SecurityTagDraft,
+    value: string,
+  ) {
+    setDrafts((current) => {
+      const patch = { ...current[row.tag_id], [field]: value };
+      if (value === row[field]) delete patch[field];
+      if (Object.keys(patch).length) return { ...current, [row.tag_id]: patch };
+      const next = { ...current };
+      delete next[row.tag_id];
+      return next;
+    });
+    invalidate();
+  }
+
   async function execute(
     action: Exclude<ReviewedAction, null>,
-    functionName:
-      | "metadata.security-tag.create"
-      | "metadata.security-tag.update"
-      | "metadata.security-tag.status.set",
+    functionName: (typeof tagWrites)[number],
     args: Record<string, unknown>,
     confirmation: string,
   ) {
     if (
       !app ||
+      !actorId ||
+      !canReview ||
+      !catalog?.functions[functionName] ||
       readRevision === null ||
-      busy ||
       JSON.stringify(reviewedAction) !== JSON.stringify(action) ||
       !window.confirm(confirmation)
     )
       return;
-    setBusy(true);
-    setError("");
+    setReviewedAction(null);
     setResult("");
-    try {
-      await requestAdmittedEffect<{
-        receiptId?: string;
-        result?: { receiptId?: string };
-      }>(
-        "/api/metadata-action",
-        securityTagMutationBody(
-          app,
+    await recovery.submit(
+      securityTagMutationBody(
+        app,
+        functionName,
+        args,
+        mutationIntentKey({
+          workspaceId: app.workspaceId,
+          applicationId: app.applicationId,
           functionName,
           args,
-          mutationIntentKey({
-            workspaceId: app.workspaceId,
-            applicationId: app.applicationId,
-            functionName,
-            args,
-          }),
-        ),
-      );
-      setReviewedAction(null);
-      setResult("The reviewed security-tag change was applied.");
-      await onChanged();
-    } catch (reason) {
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to apply the Security Tag change",
-      );
-    } finally {
-      setBusy(false);
-    }
+        }),
+      ),
+      { actorId, metadataRevision: readRevision, action },
+    );
   }
 
   if (!canRead) return null;
@@ -293,7 +390,7 @@ export function SecurityTagCatalog({
     validSecurityTagId(tagId) &&
     !rowById.has(tagId) &&
     validDraft(createDraft) &&
-    readRevision !== null;
+    canReview;
 
   return (
     <section
@@ -309,14 +406,46 @@ export function SecurityTagCatalog({
             Strings can reference only active catalogue tags.
           </p>
         </div>
-        <span>{rows.length} current rows</span>
+        <span role="status">
+          {reading
+            ? "Reading Security Tags…"
+            : `${rows.length} ${error ? "previously read" : "current"} rows`}
+        </span>
       </div>
       {error && (
         <div className="inline-error" role="alert">
           {error}
         </div>
       )}
-      {result && <p role="status">{result}</p>}
+      <MetadataReceiptRecovery
+        object="security tag"
+        recovery={recovery}
+        copyReceiptCheck={recovery.copyReceiptCheck}
+        onClose={() => {
+          if (!recovery.closeRecovery()) return;
+          setReadRevision(null);
+          setReviewedAction(null);
+          setReload((current) => current + 1);
+        }}
+      />
+      {result && (
+        <p role="status" tabIndex={-1} ref={resultStatus}>
+          {result}
+        </p>
+      )}
+      {refreshError && (
+        <p role="status">
+          The change was recorded. Refresh the metadata workspace to update
+          related views.
+        </p>
+      )}
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => setReload((current) => current + 1)}
+      >
+        Read current Security Tags
+      </button>
       <div
         className="react-grid-scroll metadata-sheet"
         tabIndex={0}
@@ -341,6 +470,7 @@ export function SecurityTagCatalog({
                     aria-label="New Security Tag stable ID"
                     value={tagId}
                     maxLength={20}
+                    disabled={busy}
                     onChange={(event) => {
                       setTagId(event.target.value);
                       invalidate();
@@ -352,6 +482,7 @@ export function SecurityTagCatalog({
                     aria-label="New Security Tag display name"
                     value={createDraft.display_name}
                     maxLength={200}
+                    disabled={busy}
                     onChange={(event) => {
                       setCreateDraft((current) => ({
                         ...current,
@@ -366,6 +497,7 @@ export function SecurityTagCatalog({
                     aria-label="New Security Tag short description"
                     value={createDraft.short_description}
                     maxLength={500}
+                    disabled={busy}
                     onChange={(event) => {
                       setCreateDraft((current) => ({
                         ...current,
@@ -380,6 +512,7 @@ export function SecurityTagCatalog({
                     aria-label="New Security Tag semantic description"
                     value={createDraft.semantic_description}
                     maxLength={10000}
+                    disabled={busy}
                     onChange={(event) => {
                       setCreateDraft((current) => ({
                         ...current,
@@ -405,7 +538,7 @@ export function SecurityTagCatalog({
                     Review
                   </label>
                   <button
-                    disabled={busy || reviewedAction?.kind !== "create"}
+                    disabled={!createValid || reviewedAction?.kind !== "create"}
                     onClick={() =>
                       void execute(
                         { kind: "create" },
@@ -428,10 +561,11 @@ export function SecurityTagCatalog({
               </tr>
             )}
             {rows.map((row) => {
-              const draft = drafts[row.tag_id] || {
+              const draft = {
                 display_name: row.display_name,
                 short_description: row.short_description,
                 semantic_description: row.semantic_description,
+                ...drafts[row.tag_id],
               };
               const changed =
                 draft.display_name !== row.display_name ||
@@ -456,17 +590,10 @@ export function SecurityTagCatalog({
                       aria-label={`${row.tag_id} display name`}
                       value={draft.display_name}
                       maxLength={200}
-                      disabled={!canUpdate}
-                      onChange={(event) => {
-                        setDrafts((current) => ({
-                          ...current,
-                          [row.tag_id]: {
-                            ...draft,
-                            display_name: event.target.value,
-                          },
-                        }));
-                        invalidate();
-                      }}
+                      disabled={!canUpdate || busy}
+                      onChange={(event) =>
+                        edit(row, "display_name", event.target.value)
+                      }
                     />
                   </td>
                   <td>
@@ -474,17 +601,10 @@ export function SecurityTagCatalog({
                       aria-label={`${row.tag_id} short description`}
                       value={draft.short_description}
                       maxLength={500}
-                      disabled={!canUpdate}
-                      onChange={(event) => {
-                        setDrafts((current) => ({
-                          ...current,
-                          [row.tag_id]: {
-                            ...draft,
-                            short_description: event.target.value,
-                          },
-                        }));
-                        invalidate();
-                      }}
+                      disabled={!canUpdate || busy}
+                      onChange={(event) =>
+                        edit(row, "short_description", event.target.value)
+                      }
                     />
                   </td>
                   <td>
@@ -492,17 +612,10 @@ export function SecurityTagCatalog({
                       aria-label={`${row.tag_id} semantic description`}
                       value={draft.semantic_description}
                       maxLength={10000}
-                      disabled={!canUpdate}
-                      onChange={(event) => {
-                        setDrafts((current) => ({
-                          ...current,
-                          [row.tag_id]: {
-                            ...draft,
-                            semantic_description: event.target.value,
-                          },
-                        }));
-                        invalidate();
-                      }}
+                      disabled={!canUpdate || busy}
+                      onChange={(event) =>
+                        edit(row, "semantic_description", event.target.value)
+                      }
                     />
                   </td>
                   <td>
@@ -512,7 +625,7 @@ export function SecurityTagCatalog({
                     {canSetStatus && (
                       <button
                         className="table-link"
-                        disabled={busy}
+                        disabled={!canReview}
                         onClick={() => setReviewedAction(statusAction)}
                       >
                         {nextStatus === "Active" ? "Reactivate" : "Inactivate"}
@@ -529,6 +642,7 @@ export function SecurityTagCatalog({
                               reviewedAction?.kind === "update" &&
                               reviewedAction.tagId === row.tag_id
                             }
+                            disabled={!canReview}
                             onChange={(event) =>
                               setReviewedAction(
                                 event.target.checked ? updateAction : null,
@@ -539,7 +653,7 @@ export function SecurityTagCatalog({
                         </label>
                         <button
                           disabled={
-                            busy ||
+                            !canReview ||
                             reviewedAction?.kind !== "update" ||
                             reviewedAction.tagId !== row.tag_id
                           }
@@ -568,7 +682,7 @@ export function SecurityTagCatalog({
                         <div className="status-review-action">
                           <span>Review {reviewedAction.status}</span>
                           <button
-                            disabled={busy}
+                            disabled={!canReview || !canSetStatus}
                             onClick={() =>
                               void execute(
                                 statusAction,
@@ -585,7 +699,10 @@ export function SecurityTagCatalog({
                           >
                             Confirm
                           </button>
-                          <button onClick={() => setReviewedAction(null)}>
+                          <button
+                            disabled={busy}
+                            onClick={() => setReviewedAction(null)}
+                          >
                             Cancel
                           </button>
                         </div>

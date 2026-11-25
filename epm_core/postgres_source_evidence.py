@@ -25,7 +25,8 @@ from .persistence_contract import ApplicationScope, Coordinate
 from .postgres_access import PostgresAccessChecker, VerifiedIdentity
 from .postgres_connection import connect_postgres
 from .postgres_dimensional_security_enforcement import (
-    authorize_coordinate, filter_read_rows)
+    authorize_coordinates, authorized_read_page, filter_read_rows)
+from .postgres_dimensional_scope import resolve_effective_dimensional_scope
 from .postgres_jobs import _canonical_digest
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_processing_limits import configure_statement_timeout
@@ -60,6 +61,9 @@ _RESERVED_PROPERTIES = frozenset(('collectionId', 'recordId', 'recordType',
     'documentId', 'observationMembers', 'sourcePointer', 'stateToken'))
 _CURSOR_TTL = 900
 _CURSOR_MAX_BYTES = 32768
+_CURSOR_FORMAT = 'openepm-source-evidence-cursor-v2'
+READ_AUTHORIZATION_STALE = 'SOURCE_EVIDENCE_READ_AUTHORIZATION_STALE'
+WRITE_AUTHORIZATION_STALE = 'SOURCE_EVIDENCE_WRITE_AUTHORIZATION_STALE'
 
 
 def catalog() -> dict:
@@ -77,7 +81,7 @@ def catalog() -> dict:
             'description': 'bounded business purpose',
             'expectedStateToken': 'empty for create; exact token for replacement',
             'expectedMetadataRevision': 'current nonnegative metadata revision'},
-            'result': 'current typed collection and new state token'},
+            'result': 'commit receipt and new collection state token'},
         COLLECTION_DELETE: {**common_write, 'arguments': {
             'collectionId': 'stable application-scoped ID',
             'expectedStateToken': 'exact current state token',
@@ -98,7 +102,7 @@ def catalog() -> dict:
             'contentDigest': 'SHA-256 of exact external source bytes',
             'expectedStateToken': 'empty for create; exact token for replacement',
             'expectedMetadataRevision': 'current nonnegative metadata revision'},
-            'result': 'current typed document and new state token'},
+            'result': 'commit receipt and new document state token'},
         DOCUMENT_DELETE: {**common_write, 'arguments': {
             'collectionId': 'owning collection ID', 'documentId': 'document ID',
             'expectedStateToken': 'exact current state token',
@@ -120,7 +124,7 @@ def catalog() -> dict:
             'properties': 'bounded inert business properties without reserved fields',
             'expectedStateToken': 'empty for create; exact token for replacement',
             'expectedMetadataRevision': 'current nonnegative metadata revision'},
-            'result': 'current typed record and new state token'},
+            'result': 'commit receipt and new record state token'},
         RECORD_DELETE: {**common_write, 'arguments': {
             'collectionId': 'owning collection ID', 'recordId': 'record ID',
             'expectedStateToken': 'exact current state token',
@@ -135,6 +139,190 @@ def catalog() -> dict:
             'cursor': 'opaque signed continuation; the only continuation argument'},
             'result': 'bounded typed records filtered by current dimensional read policy'},
     }
+
+
+def _schema_pattern(pattern: re.Pattern) -> dict:
+    body = pattern.pattern.removesuffix(r'\Z')
+    return {'type': 'string', 'pattern': rf'^{body}(?![\s\S])'}
+
+
+def _record_wire_schema(identifier: dict) -> tuple[dict, dict, dict, dict]:
+    from .metadata_read_contract import obj
+
+    text = {'type': 'string'}
+    positive = {'type': 'integer', 'minimum': 1}
+    pointer = obj({'page': positive, 'line': positive, 'column': {'anyOf': [positive, text]},
+                   'cell': text, 'url': text, 'jsonPointer': text}, [])
+    value = {'$ref': '#/$defs/evidenceValue'}
+    definitions = {'evidenceValue': {'anyOf': [
+        {'type': ['string', 'integer', 'boolean', 'null']},
+        {'type': 'array', 'items': value}, {'type': 'object', 'additionalProperties': value},
+    ]}}
+    members = {'type': 'object', 'maxProperties': 128, 'propertyNames': identifier,
+               'additionalProperties': identifier}
+    properties = {'type': 'object', 'additionalProperties': value}
+    return members, pointer, properties, definitions
+
+
+def read_program_contract(function: str) -> dict:
+    from .metadata_read_contract import obj, read_contract, read_example
+
+    if function not in READ_FUNCTIONS:
+        raise ValueError('SOURCE_EVIDENCE_READ_FUNCTION_INVALID')
+
+    identifier = _schema_pattern(_ID)
+    digest = _schema_pattern(_DIGEST)
+    text = {'type': 'string'}
+    revision = {'type': 'integer', 'minimum': 0}
+    cursor = {'type': 'string', 'minLength': 1, 'maxLength': _CURSOR_MAX_BYTES}
+    collection, document, record = 'source-records', 'report-document', 'observation-1'
+    args = {'collectionId': collection}
+    required = {'collectionId': identifier}
+    fields = {**required, 'stateToken': digest, 'metadataRevision': revision,
+              'updatedAt': {'type': 'string', 'format': 'date-time'}}
+    definitions = None
+
+    if function in (COLLECTION_READ, COLLECTION_LIST):
+        label = 'collection'
+        fields.update(name=text, collectionKind={'enum': sorted(_KINDS)}, description=text)
+    elif function in (DOCUMENT_READ, DOCUMENT_LIST):
+        label = 'document'
+        if function == DOCUMENT_READ:
+            args['documentId'], required['documentId'] = document, identifier
+        fields.update(documentId=identifier, title=text, mediaType=text, sourceUri=text,
+                      sourceRevision=text, contentDigest=digest)
+    else:
+        label = 'record'
+        if function == RECORD_READ:
+            args['recordId'], required['recordId'] = record, identifier
+        members, pointer, properties, definitions = _record_wire_schema(identifier)
+        fields.update(recordId=identifier, recordType=text,
+                      documentId={'anyOf': [identifier, {'type': 'null'}]},
+                      members=members, sourcePointer=pointer, properties=properties,
+                      contentDigest=digest)
+
+    rules = ['Read within the current authorized application. The server rechecks access and metadata before returning the result.']
+    if function.endswith('.list'):
+        first = {} if function == COLLECTION_LIST else required
+        optional = {'limit': {'type': 'integer', 'minimum': 1, 'maximum': 500}}
+        if function == RECORD_LIST:
+            optional['recordType'] = {'anyOf': [_schema_pattern(_TYPE), {'type': 'null'}]}
+        arguments = {'oneOf': [obj({**first, **optional}, list(first)), obj({'cursor': cursor})]}
+        first_example = {} if function == COLLECTION_LIST else args
+        examples = [
+            read_example(function, {**first_example, 'limit': 25},
+                name=f'List current source evidence {label}s',
+                binding='Use the selected application. For documents or records use a collectionId returned by collection discovery.'),
+            read_example(function, {'cursor': 'example-cursor'}, name=f'Continue the {label} list',
+                binding='Pass the exact returned nextCursor as the only argument. A null nextCursor means the list is exhausted.'),
+        ]
+        result = {**obj({'metadataRevision': revision, 'items': {
+            'type': 'array', 'maxItems': 500, 'items': obj(fields)},
+            'nextCursor': {'anyOf': [cursor, {'type': 'null'}]}, 'hasMore': {'type': 'boolean'}}),
+                  'oneOf': [
+                      {'properties': {'hasMore': {'const': True}, 'nextCursor': cursor}},
+                      {'properties': {'hasMore': {'const': False}, 'nextCursor': {'type': 'null'}}},
+                  ]}
+        rules.append('Continue with the last page token. The server binds it to this query, application, caller and current authority.')
+    else:
+        arguments, result = obj(required), obj(fields)
+        examples = [read_example(function, args, name=f'Inspect one current source evidence {label}',
+            binding='Use exact stable IDs from the authorized collection, document or record list.')]
+    if function in (RECORD_READ, RECORD_LIST):
+        rules.append('Records with a cube coordinate follow dimensional read policy. Unbound metadata records follow application read authority.')
+    if function == RECORD_LIST:
+        rules.append('The page and continuation describe visible records. An exhausted list has no further visible records.')
+    contract = read_contract(function, arguments, result, owner='PostgresSourceEvidence.read',
+        definitions=definitions, examples=examples, semantic_rules=rules)
+    contract['programContract']['recovery'] = (
+        'On SOURCE_EVIDENCE_CURSOR_STALE or SOURCE_EVIDENCE_CURSOR_INVALID, restart at the first page. '
+        'If access changed, refresh the application catalogue and repeat the original inspection under current authority.')
+    return contract
+
+
+def write_program_contract(function: str) -> dict:
+    from .metadata_read_contract import obj, read_contract, read_example
+    from .operation_admission_contract import signed_operation_id_schema
+
+    if function not in WRITE_FUNCTIONS:
+        raise ValueError('SOURCE_EVIDENCE_WRITE_FUNCTION_INVALID')
+    identifier = _schema_pattern(_ID)
+    digest = _schema_pattern(_DIGEST)
+    revision = {'type': 'integer', 'minimum': 0}
+    save = function.endswith('.save')
+    label = function.split('.')[2]
+    fields = {'collectionId': identifier, 'expectedMetadataRevision': revision,
+              'expectedStateToken': {'anyOf': [{'const': ''}, digest]} if save else digest}
+    request = {'collectionId': 'source-records', 'expectedMetadataRevision': 1,
+               'expectedStateToken': '' if save else 'a' * 64}
+    if label != 'collection':
+        fields[label + 'Id'] = identifier
+        request[label + 'Id'] = 'report-document' if label == 'document' else 'observation-1'
+
+    def text(maximum, minimum=0):
+        return {'type': 'string', 'minLength': minimum, 'maxLength': maximum,
+                'pattern': r'^[^\x00-\x1f\x7f]*(?![\s\S])'}
+
+    definitions = None
+    if function == COLLECTION_SAVE:
+        fields.update(name=text(200, 1), collectionKind={'enum': sorted(_KINDS)}, description=text(2000))
+        request.update(name='Planning source evidence', collectionKind='SourceRecords', description='Reviewed source context')
+    elif function == DOCUMENT_SAVE:
+        fields.update(title=text(500, 1), mediaType=_schema_pattern(_MEDIA), sourceUri=text(4096),
+                      sourceRevision=text(500, 1), contentDigest=digest)
+        request.update(title='Source report', mediaType='application/pdf', sourceUri='',
+                       sourceRevision='published-report-1', contentDigest='b' * 64)
+    elif function == RECORD_SAVE:
+        members, pointer, properties, definitions = _record_wire_schema(identifier)
+        fields.update(recordType=_schema_pattern(_TYPE),
+                      documentId={'anyOf': [identifier, {'type': 'null'}]},
+                      observationMembers=members, sourcePointer=pointer, properties={
+                          **properties, 'maxProperties': 1000, 'propertyNames': {
+                              'type': 'string', 'minLength': 1, 'maxLength': 200,
+                              'not': {'enum': sorted(_RESERVED_PROPERTIES)}}})
+        request.update(recordType='Observation', documentId='report-document',
+                       observationMembers={}, sourcePointer={'page': 4},
+                       properties={'exactValue': '123.0000', 'unit': 'USD'})
+
+    rules = [
+        'Admit the exact program with issue_v2_operation_admission in the current application. '
+        'Pass the returned operationId as idempotency_key to execute_v2_metadata_program.',
+        'Save and retirement return a receipt with the resulting metadata and commit revisions. Read the object separately for its current content.',
+        'Exact replay under current application write authority returns the original receipt and revisions with duplicate set to true.',
+    ]
+    pins = ('Bind expectedMetadataRevision to the current application revision. '
+            'Read the current object for its exact expectedStateToken.')
+    if save:
+        examples = [
+            read_example(function, request, name=f'Save a new source evidence {label}',
+                binding='Use a new stable ID in the chosen application and an empty expectedStateToken. '
+                        'Bind the current metadata revision and any current owning collection or document IDs.'),
+            read_example(function, {**request, 'expectedStateToken': 'a' * 64},
+                name=f'Replace a reviewed source evidence {label}',
+                binding=pins + ' Preserve its stable ID and supply the complete reviewed replacement.'),
+        ]
+        if function == DOCUMENT_SAVE:
+            rules.append('Supply the immutable external revision and the SHA-256 digest of the exact source bytes.')
+        if function == RECORD_SAVE:
+            rules.append('Supply empty observationMembers for unbound metadata or the complete current cube coordinate. '
+                         'For a bound record, the core checks the old and new coordinates. '
+                         'Record properties are inert JSON with exact decimals represented by strings.')
+    else:
+        examples = [read_example(function, request, name=f'Retire an approved source evidence {label}',
+            binding=pins + ' Review the intended retirement before admission.')]
+        rules.append('The core refuses retirement of a collection or document with current references.')
+
+    result = obj({'function': {'const': function}, 'collectionId': identifier, 'objectId': identifier,
+                  'stateToken': digest if save else {'type': 'null'}, 'metadataRevision': revision,
+                  'committedRevision': revision, 'operationId': signed_operation_id_schema(),
+                  'impactDigest': digest, 'duplicate': {'type': 'boolean'}})
+    contract = read_contract(function, obj(fields), result, owner='PostgresSourceEvidence.execute',
+        definitions=definitions, examples=examples, semantic_rules=rules)
+    contract['programContract']['recovery'] = (
+        'After an uncertain response, check application.operation.receipt.read with the original operationId. '
+        'Replay only the original program and key. On a state conflict or stale revision, read the current source '
+        'object and application state before reviewing a new admission. If write authority changes, refresh the application catalogue.')
+    return contract
 
 
 def _id(value: object, error: str = 'SOURCE_EVIDENCE_ID_INVALID') -> str:
@@ -230,6 +418,14 @@ def _pointer(value: object) -> dict:
     return result
 
 
+def _authority_digest(db, identity, scope, function, access) -> str:
+    dimensional = (resolve_effective_dimensional_scope(
+        db, identity, scope, access=access, function=function).scope_digest
+        if function in (RECORD_READ, RECORD_LIST, RECORD_SAVE, RECORD_DELETE) else None)
+    return _canonical_digest({'role': access.role, 'administrator': access.workspace_administrator,
+                              'groups': access.groups, 'dimensionalScope': dimensional})
+
+
 class PostgresSourceEvidence:
     def __init__(self, dsn: str, *, identity: VerifiedIdentity,
                  cursor_secret: bytes):
@@ -263,9 +459,10 @@ class PostgresSourceEvidence:
                 raise ValueError()
             value = json.loads(raw)
             if (not isinstance(value, dict)
-                    or set(value) != {'function', 'scope', 'identity', 'query',
+                    or set(value) != {'format', 'function', 'scope', 'identity', 'query',
                                      'after', 'metadataRevision',
-                                     'securityRevision', 'expires'}
+                                     'securityRevision', 'authorityDigest', 'expires'}
+                    or value['format'] != _CURSOR_FORMAT
                     or value['function'] != function
                     or value['scope'] != [scope.workspace_id,
                                           scope.application_id]
@@ -275,6 +472,8 @@ class PostgresSourceEvidence:
                     or not isinstance(value['after'], str)
                     or type(value['metadataRevision']) is not int
                     or type(value['securityRevision']) is not int
+                    or not isinstance(value['authorityDigest'], str)
+                    or _DIGEST.fullmatch(value['authorityDigest']) is None
                     or type(value['expires']) is not int
                     or value['expires'] <= time.time()):
                 raise ValueError()
@@ -396,6 +595,17 @@ class PostgresSourceEvidence:
             with db.transaction():
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
+                access = PostgresAccessChecker.check_in_transaction(
+                    db, self.identity, scope, 'write', function=function, arguments=program['arguments'])
+                authority = _authority_digest(db, self.identity, scope, function, access)
+
+                def recheck_authority():
+                    current = PostgresAccessChecker.check_in_transaction(
+                        db, self.identity, scope, 'write', function=function, arguments=program['arguments'])
+                    if (current != access
+                            or _authority_digest(db, self.identity, scope, function, current) != authority):
+                        raise ValueError(WRITE_AUTHORIZATION_STALE)
+
                 state = db.execute('''SELECT a.status,s.processing_mode,
                     s.metadata_revision,s.commit_revision FROM epm.application_state s
                     JOIN epm.application a USING(workspace_id,application_id)
@@ -403,17 +613,16 @@ class PostgresSourceEvidence:
                     keys).fetchone()
                 if state is None:
                     raise ValueError('APPLICATION_UNAVAILABLE')
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'write')
-                prior = db.execute('''SELECT command_digest,committed_revision,result
+                prior = db.execute('''SELECT command_digest,actor_id,committed_revision,result
                     FROM epm.operation_receipt WHERE workspace_id=%s
                     AND application_id=%s AND operation_id=%s''',
                     (*keys, idempotency_key)).fetchone()
                 if prior:
-                    if prior['command_digest'] != digest:
+                    if prior['command_digest'] != digest or prior['actor_id'] != self.identity.subject_id:
                         raise ValueError('SOURCE_EVIDENCE_IDEMPOTENCY_CONFLICT')
                     PostgresNumericFactStore._require_replay_impact(
                         db, scope, idempotency_key, prior)
+                    recheck_authority()
                     return {**prior['result'], 'duplicate': True}
                 if state['status'] != 'Active' or state['processing_mode'] != 'Active':
                     raise ValueError('APPLICATION_NOT_WRITABLE')
@@ -460,11 +669,9 @@ class PostgresSourceEvidence:
                     protected = [new_members]
                     if current is not None and current['members'] != new_members:
                         protected.append(current['members'])
-                    for members in protected:
-                        if members:
-                            authorize_coordinate(db, self.identity, scope,
-                                Coordinate.from_mapping(members),
-                                kind=AccessKind.WRITE)
+                    authorize_coordinates(db, self.identity, scope,
+                        (Coordinate.from_mapping(members) for members in protected if members),
+                        kind=AccessKind.WRITE, expected_access=access)
                 if function.endswith('.save'):
                     if current is None and expected_token != '':
                         raise ValueError('SOURCE_EVIDENCE_OBJECT_UNAVAILABLE')
@@ -595,6 +802,7 @@ class PostgresSourceEvidence:
                 from .postgres_calculation_impact import record_calculation_impact
                 record_calculation_impact(db, scope,
                     operation_id=idempotency_key, impact=impact)
+                recheck_authority()
                 return {**result, 'duplicate': False}
 
     @staticmethod
@@ -604,6 +812,7 @@ class PostgresSourceEvidence:
                   for key, value in row.items()
                   if key not in {'updated_issuer', 'updated_subject_id',
                                  'updated_operation_id'}}
+        result['updatedAt'] = result['updatedAt'].isoformat()
         return result
 
     def read(self, scope: ApplicationScope, program: dict) -> dict:
@@ -658,8 +867,9 @@ class PostgresSourceEvidence:
                 db.execute('SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY')
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
+                access = PostgresAccessChecker.check_in_transaction(
+                    db, self.identity, scope, 'read', function=function, arguments=query)
+                authority = _authority_digest(db, self.identity, scope, function, access)
                 state = db.execute('''SELECT metadata_revision,security_revision
                     FROM epm.application_state
                     WHERE workspace_id=%s AND application_id=%s''', keys).fetchone()
@@ -667,8 +877,10 @@ class PostgresSourceEvidence:
                     raise ValueError('APPLICATION_UNAVAILABLE')
                 if cursor and (
                         cursor['metadataRevision'] != state['metadata_revision']
-                        or cursor['securityRevision'] != state['security_revision']):
+                        or cursor['securityRevision'] != state['security_revision']
+                        or cursor['authorityDigest'] != authority):
                     raise ValueError('SOURCE_EVIDENCE_CURSOR_STALE')
+                has_more, next_after = False, None
                 if function == COLLECTION_READ:
                     rows = db.execute('''SELECT collection_id,name,collection_kind,
                         description,state_token,metadata_revision,updated_at
@@ -700,30 +912,37 @@ class PostgresSourceEvidence:
                 else:
                     record = (_id(args['recordId'])
                               if function == RECORD_READ else None)
-                    rows = db.execute('''SELECT collection_id,record_id,record_type,
-                        document_id,observation_members AS members,source_pointer,
-                        properties,content_digest,state_token,metadata_revision,updated_at
-                        FROM epm.source_evidence_record WHERE workspace_id=%s
-                        AND application_id=%s AND collection_id=%s
-                        AND (%s::text IS NULL OR record_id=%s)
-                        AND record_id>%s AND (%s::text IS NULL OR record_type=%s)
-                        ORDER BY record_id LIMIT %s''',
-                        (*keys, collection, record, record, after,
-                         record_type, record_type, (1 if record else limit + 1))).fetchall()
-                    if record:
-                        rows = filter_read_rows(db, self.identity, scope, rows)
-                raw_has_more = False
-                raw_after = None
-                if list_function:
-                    raw_has_more = len(rows) > limit
-                    raw_page = rows[:limit]
-                    if raw_has_more:
-                        raw_after = raw_page[-1][
-                            'collection_id' if function == COLLECTION_LIST else
-                            'document_id' if function == DOCUMENT_LIST else
-                            'record_id']
-                    rows = (filter_read_rows(db, self.identity, scope, raw_page)
-                            if function == RECORD_LIST else raw_page)
+
+                    def fetch_records(page_after, page_limit):
+                        return db.execute('''SELECT collection_id,record_id,record_type,
+                            document_id,observation_members AS members,source_pointer,
+                            properties,content_digest,state_token,metadata_revision,updated_at
+                            FROM epm.source_evidence_record WHERE workspace_id=%s
+                            AND application_id=%s AND collection_id=%s
+                            AND (%s::text IS NULL OR record_id=%s)
+                            AND record_id COLLATE "C">%s AND (%s::text IS NULL OR record_type=%s)
+                            ORDER BY record_id COLLATE "C" LIMIT %s''',
+                            (*keys, collection, record, record, page_after,
+                             record_type, record_type, page_limit)).fetchall()
+
+                    if list_function:
+                        rows, has_more, next_after = authorized_read_page(
+                            db, self.identity, scope, after=after, limit=limit,
+                            fetch=fetch_records, cursor_key=lambda row: row['record_id'],
+                            expected_access=access, allow_unbound=True)
+                    else:
+                        rows = filter_read_rows(db, self.identity, scope, fetch_records(after, 1),
+                                                expected_access=access, allow_unbound=True)
+                if function in (COLLECTION_LIST, DOCUMENT_LIST):
+                    has_more = len(rows) > limit
+                    rows = rows[:limit]
+                    if has_more:
+                        next_after = rows[-1]['collection_id' if function == COLLECTION_LIST else 'document_id']
+                current_access = PostgresAccessChecker.check_in_transaction(
+                    db, self.identity, scope, 'read', function=function, arguments=query)
+                if (current_access != access
+                        or _authority_digest(db, self.identity, scope, function, current_access) != authority):
+                    raise ValueError(READ_AUTHORIZATION_STALE)
                 end = db.execute('''SELECT metadata_revision,security_revision
                     FROM epm.application_state
                     WHERE workspace_id=%s AND application_id=%s''', keys).fetchone()
@@ -736,15 +955,17 @@ class PostgresSourceEvidence:
                     'metadataRevision': state['metadata_revision']}
         items = [self._public(dict(row)) for row in rows]
         next_cursor = None
-        if raw_has_more:
+        if has_more:
             next_cursor = self._pack_cursor({
+                'format': _CURSOR_FORMAT,
                 'function': function,
                 'scope': [scope.workspace_id, scope.application_id],
                 'identity': [self.identity.issuer, self.identity.subject_id],
-                'query': query, 'after': raw_after,
+                'query': query, 'after': next_after,
                 'metadataRevision': state['metadata_revision'],
                 'securityRevision': state['security_revision'],
+                'authorityDigest': authority,
                 'expires': (cursor['expires'] if cursor
                             else int(time.time()) + _CURSOR_TTL)})
         return {'metadataRevision': state['metadata_revision'], 'items': items,
-                'nextCursor': next_cursor, 'hasMore': next_cursor is not None}
+                'nextCursor': next_cursor, 'hasMore': has_more}

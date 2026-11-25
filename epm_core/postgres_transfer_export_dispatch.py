@@ -56,3 +56,11 @@ class PostgresTransferExportDispatch:
                 claim['application_id'],claim['request_id'],
                 claim['claim_generation'],claim['claimant'],
                 error_code)).fetchone()[0]
+
+    def yield_checkpoint(self, claim: dict) -> bool:
+        with connect_postgres(self.dsn) as db, db.transaction():
+            configure_statement_timeout(db, 5000)
+            configure_lock_wait(db)
+            return db.execute('''SELECT epm.export_producer_worker_yield(
+                %s,%s,%s,%s,%s)''', (claim['workspace_id'], claim['application_id'],
+                claim['request_id'], claim['claim_generation'], claim['claimant'])).fetchone()[0]

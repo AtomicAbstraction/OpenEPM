@@ -253,7 +253,8 @@ class ExportArtifactProducer:
                         expires_at: int, security_revision: int = 0,
                         members: dict[str, str] | None = None,
                         page_limit: int = 50, max_pages: int = 100,
-                        page_budget: int | None = None
+                        page_budget: int | None = None,
+                        resume_admitted: bool = False,
                         ) -> tuple[str, PreparedExport]:
         """Resume a pre-finalization export without rereading saved pages."""
         required=('begin','read','claim','pages','append','seal')
@@ -262,12 +263,24 @@ class ExportArtifactProducer:
         if (page_budget is not None and
                 (type(page_budget) is not int or not 1 <= page_budget <= 100)):
             raise ValueError('EXPORT_PRODUCER_PAGE_BUDGET_INVALID')
-        row=checkpoints.begin(
-            scope,idempotency_key=idempotency_key,origin=origin,
-            snapshot_revision=snapshot_revision,
-            metadata_revision=metadata_revision,expires_at=expires_at,
-            security_revision=security_revision,
-            schema=_EXPORT_SCHEMA,members=members or {})
+        if resume_admitted:
+            row = checkpoints.read(scope, request_identity)
+            pins = {
+                'request_id': request_identity, 'idempotency_key': idempotency_key,
+                'origin': origin, 'snapshot_revision': snapshot_revision,
+                'metadata_revision': metadata_revision, 'security_revision': security_revision,
+                'expires_at_epoch': expires_at, 'schema_identity': _EXPORT_SCHEMA,
+                'members': members or {},
+            }
+            if any(row[name] != value for name, value in pins.items()):
+                raise ValueError('EXPORT_PRODUCER_DURABLE_IDENTITY_DRIFT')
+        else:
+            row=checkpoints.begin(
+                scope,idempotency_key=idempotency_key,origin=origin,
+                snapshot_revision=snapshot_revision,
+                metadata_revision=metadata_revision,expires_at=expires_at,
+                security_revision=security_revision,
+                schema=_EXPORT_SCHEMA,members=members or {})
         request_id=row['request_id']
         saved=checkpoints.pages(scope,request_id)
         builder=ExportArtifactBuilder.begin(

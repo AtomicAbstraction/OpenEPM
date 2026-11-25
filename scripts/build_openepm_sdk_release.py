@@ -7,6 +7,7 @@ this release tool does not add a runtime dependency to the public SDK.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from hashlib import sha256
 import json
 import os
@@ -65,6 +66,27 @@ def openssl_binary() -> str:
 
 def _hash(path: Path) -> str:
     return sha256(path.read_bytes()).hexdigest()
+
+
+@contextmanager
+def _openssl_snapshot(payload: bytes):
+    # Ed25519 needs seekable inputs. Anonymous Linux files work even in the
+    # operations verifier's read-only filesystem.
+    with (os.fdopen(os.memfd_create("openepm-signature"), "w+b")
+          if hasattr(os, "memfd_create") else tempfile.TemporaryFile()) as snapshot:
+        snapshot.write(payload)
+        snapshot.seek(0)
+        yield snapshot
+
+
+def verify_ed25519(payload: bytes, signature: Path, public_key: bytes) -> None:
+    with _openssl_snapshot(payload) as content, _openssl_snapshot(public_key) as key:
+        result = subprocess.run([openssl_binary(), "pkeyutl", "-verify", "-rawin", "-pubin",
+            "-inkey", f"/dev/fd/{key.fileno()}", "-in", "/dev/fd/0", "-sigfile", str(signature)],
+            stdin=content, pass_fds=(key.fileno(),), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False, timeout=30)
+    if result.returncode:
+        raise ValueError("OPEN_EPM_SDK_SIGNATURE_INVALID")
 
 
 def _canonical(value: object) -> bytes:
@@ -142,18 +164,23 @@ def build_release(source_root: Path, destination: Path, *, source_commit: str,
     return manifest
 
 
-def verify_release(directory: Path, *, public_key: Path) -> dict:
-    directory, public_key = directory.resolve(), public_key.resolve()
+def verify_release(directory: Path, *, public_key: Path | bytes) -> dict:
+    directory = directory.resolve()
+    if isinstance(public_key, Path):
+        if not public_key.is_file() or public_key.is_symlink():
+            raise ValueError("OPEN_EPM_SDK_RELEASE_FILES_INVALID")
+        public_key = public_key.read_bytes()
     expected_names = {WHEEL, MANIFEST, SIGNATURE, CHECKSUMS}
     actual_names = {path.name for path in directory.iterdir() if path.is_file()}
-    if actual_names != expected_names or not public_key.is_file() or public_key.is_symlink():
+    if actual_names != expected_names:
         raise ValueError("OPEN_EPM_SDK_RELEASE_FILES_INVALID")
     manifest_path = directory / MANIFEST
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+        payload = manifest_path.read_bytes()
+        manifest = json.loads(payload.decode("ascii"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("OPEN_EPM_SDK_RELEASE_MANIFEST_INVALID") from error
-    if _canonical(manifest) != manifest_path.read_bytes():
+    if _canonical(manifest) != payload:
         raise ValueError("OPEN_EPM_SDK_RELEASE_MANIFEST_NONCANONICAL")
     if (not isinstance(manifest, dict) or set(manifest) !=
             {"format", "package", "source", "build", "signing"}
@@ -165,16 +192,14 @@ def verify_release(directory: Path, *, public_key: Path) -> dict:
             or manifest.get("package", {}).get("sizeBytes") !=
                 (directory / WHEEL).stat().st_size
             or manifest.get("signing", {}).get("algorithm") != "Ed25519"
-            or manifest.get("signing", {}).get("publicKeySha256") != _hash(public_key)):
+            or manifest.get("signing", {}).get("publicKeySha256") != sha256(public_key).hexdigest()):
         raise ValueError("OPEN_EPM_SDK_RELEASE_MANIFEST_INVALID")
-    expected_checksums = "".join(
-        f"{_hash(directory / name)}  {name}\n"
-        for name in (WHEEL, MANIFEST, SIGNATURE))
+    expected_checksums = (f"{_hash(directory / WHEEL)}  {WHEEL}\n"
+                          f"{sha256(payload).hexdigest()}  {MANIFEST}\n"
+                          f"{_hash(directory / SIGNATURE)}  {SIGNATURE}\n")
     if (directory / CHECKSUMS).read_text(encoding="ascii") != expected_checksums:
         raise ValueError("OPEN_EPM_SDK_RELEASE_CHECKSUM_INVALID")
-    _run(openssl_binary(), "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey",
-         str(public_key), "-in", str(manifest_path),
-         "-sigfile", str(directory / SIGNATURE))
+    verify_ed25519(payload, directory / SIGNATURE, public_key)
     return manifest
 
 

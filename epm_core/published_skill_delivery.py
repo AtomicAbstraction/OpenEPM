@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 SKILL_NAME = "multidimensional-cube-harness"
 SKILL_TITLE = "Multidimensional Cube Harness"
-SKILL_SHA256 = "822c998f1762fbd306750af43a542a701fc0d3ef3cb6bcd1ac9053df086123ef"
+SKILL_SHA256 = "8a79ce261e09f2b38719fb3c541c089d4fde41256adb927334896f6e56f0562c"
 SKILL_URI = f"skill://openepm/{SKILL_NAME}"
 MANIFEST_URI = f"skill://openepm/{SKILL_NAME}/manifest"
 CHUNK_SIZE = 16_384

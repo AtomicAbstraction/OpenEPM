@@ -8,6 +8,7 @@ the P08 operation-family review.
 from __future__ import annotations
 
 from collections import Counter
+from openepm.discovery_contract import structural_contract_projection
 from hashlib import sha256
 import json
 
@@ -66,6 +67,11 @@ EXTERNAL_FUNCTIONS={
     'security.workspace.access.set':'security',
     'security.workspace.group-access.set':'security',
     'security.workspace.group-access.list':'security',
+    'security.workspace.people.list':'security',
+    'security.workspace.authorization-migration.review':'security',
+    'security.workspace.authorization-migration.activate':'security',
+    'security.workspace.bootstrap-groups.list':'security',
+    'security.workspace.person-applications.list':'security',
     'workspace.reset.prepare':'reset',
     'workspace.reset.quiesce':'reset',
     'workspace.reset.settle':'reset',
@@ -144,7 +150,7 @@ def application_family(name:str,specification:dict)->str:
         return 'application_policy'
     if name.startswith('cube.write.'):
         return 'application_policy'
-    if name.startswith(('facts.source.','facts.transfer.','facts.export.')):
+    if name.startswith(('facts.source.','facts.transfer.','facts.export.','facts.slice.')):
         return 'bulk_transfer'
     if name.startswith(('facts.cube.aggregate.', 'facts.cube.resolved.')):
         return 'technical_query'
@@ -154,7 +160,7 @@ def application_family(name:str,specification:dict)->str:
         return 'selection'
     if name.startswith('calculation.'):
         return 'calculation'
-    if name.startswith(('python.program.build', 'python.program.test')):
+    if specification['mode'] == 'durable_technical_build':
         return 'python_build'
     if name.startswith('python.'):
         return 'python_program'
@@ -210,13 +216,47 @@ def replay_contract(name:str,specification:dict)->dict:
         return {'idempotency':'not_applicable','uncertainOutcome':'repeat_read',
                 'reconciliation':{'strategy':'repeat_authorized_read'}}
     if specification['idempotencyRequired']:
+        from .expired_operation_replay import expired_admission_recovery
+        expired = expired_admission_recovery(name, specification['permission'])
+        if name == 'rules.expression.sequence.run':
+            reconciliation = {
+                'strategy': 'call_authorized_status_function',
+                'function': 'rules.expression.sequence.read',
+                'mcpTool': 'read_v2_program', 'browserPath': '/api/read',
+                'scopeBinding': 'original_application_and_submitting_identity',
+                'requiredPermission': 'read',
+                'reference': {'selector': 'originalRequest', 'program': 'exact_submitted_program',
+                              'idempotencyKey': 'original_signed_operation_admission'},
+                'knownSequence': {'selector': 'sequenceId'},
+                'missing': {'code': 'RULE_SEQUENCE_UNAVAILABLE', 'outcome': 'unconfirmed'},
+            }
+            uncertain = 'authorized_status_read_before_new_intent'
+        elif expired['supported'] and expired['transports']['mcpTool'] == 'submit_v2_program':
+            reconciliation = {
+                'strategy': 'read_original_job_before_exact_replay',
+                'mcpTool': 'read_v2_job', 'browserPath': '/api/job',
+                'scopeBinding': 'original_application_and_submitting_identity',
+                'requiredPermission': 'read',
+                'reference': {'resultField': 'operationId', 'mcpAdmissionTool': 'issue_v2_operation_admission',
+                    'browserAdmissionPath': '/api/operation-admission',
+                    'mcpArgument': 'operation_id', 'browserArgument': 'operationId'},
+                'knownJob': {'resultField': 'job_id',
+                    'mcpArgument': 'job_id', 'browserArgument': 'jobId'},
+                'published': {'status': 'published', 'receiptRevisionField': 'receipt_revision'},
+                'missing': {'code': 'JOB_UNAVAILABLE', 'outcome': 'unconfirmed'},
+                'changedContent': 'typed_conflict',
+            }
+            uncertain = 'authorized_status_read_before_new_intent'
+        else:
+            reconciliation = {'strategy': 'resubmit_same_key_and_identical_content',
+                              'changedContent': 'typed_conflict'}
+            uncertain = 'exact_replay_before_new_intent'
         return {
             'idempotency':
                 'same_key_same_content_returns_original_changed_content_conflicts',
-            'uncertainOutcome':'exact_replay_before_new_intent',
-            'reconciliation':{
-                'strategy':'resubmit_same_key_and_identical_content',
-                'changedContent':'typed_conflict'}}
+            'uncertainOutcome':uncertain,
+            'expiredAdmission':expired,
+            'reconciliation':reconciliation}
     status_reads={
         'cube.aggregate.request':'cube.aggregate.read',
         'cube.aggregate.cancel':'cube.aggregate.read',
@@ -265,14 +305,16 @@ def _registry_entry(name:str,specification:dict,*,family:str,
         raise ValueError('PROCESSING_OPERATION_FIELDS_MISSING:'+
                          name+':'+','.join(sorted(missing)))
     from .postgres_capability_contract import source_purpose
+    from .application_authorization_actions import describe_assignment_admission
     if family not in PRODUCT_PURPOSES:
         raise ValueError('PROCESSING_OPERATION_PURPOSE_UNCLASSIFIED:'+name)
     return {'function':name,'family':family,'scope':scope,
+            **({'groupAssignmentAdmission':describe_assignment_admission(name)}
+               if scope=='application' else {}),
             'productPurpose':PRODUCT_PURPOSES[family],
             'sourcePurpose':source_purpose(name),
             'mode':specification['mode'],'permission':specification['permission'],
-            'argumentSchema':specification['arguments'],
-            'resultSchema':specification['result'],
+            **structural_contract_projection(specification),
             'previewRequired':specification['previewRequired'],
             'idempotencyRequired':specification['idempotencyRequired'],
             'workClass':specification['workClass'],

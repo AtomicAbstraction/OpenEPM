@@ -81,6 +81,20 @@ class DimensionSelection:
             "expression": expression.to_wire()})
 
     @classmethod
+    def navigation(cls, dimension_id: str, operation: str, *,
+            scope: str = "hierarchy", hierarchy_id: str | None = None,
+            member_id: str | None = None,
+            path_relationship_ids: tuple[str, ...] | None = None,
+            include_self: bool = False, all_parents: bool = False) -> "DimensionSelection":
+        from .member_lists import MemberListExpression
+        if operation == "top":
+            raise ValueError("scope tops are not business coordinates")
+        return cls.expression(dimension_id, MemberListExpression.navigation(
+            operation, scope=scope, hierarchy_id=hierarchy_id,
+            member_id=member_id, path_relationship_ids=path_relationship_ids,
+            include_self=include_self, all_parents=all_parents))
+
+    @classmethod
     def hierarchy(cls, dimension_id: str, hierarchy_id: str, member_id: str, *,
                   operator: str = "descendants", include_self: bool = False) -> "DimensionSelection":
         if operator not in {"children", "parents", "descendants", "ancestors", "siblings", "leaves", "base"}:

@@ -30,10 +30,20 @@ MAX_RECONCILE_MEMBERSHIPS = 1_000_000
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}")
 USERNAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,199}")
 PASSWORD = re.compile(r"(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[^A-Za-z0-9]).{12,256}")
+DIRECTORY_DESCRIPTION_LIMITS = {"displayName": 200, "shortDescription": 500, "semanticDescription": 10000}
 
 
 class KeycloakDirectoryError(RuntimeError):
     """Stable failure boundary; upstream response bodies are never exposed."""
+
+
+def validate_temporary_password(subject_id: object, password: object) -> None:
+    if (not isinstance(subject_id, str)
+            or not IDENTIFIER.fullmatch(subject_id)
+            or not isinstance(password, str)
+            or any(ord(character) < 32 for character in password)
+            or not PASSWORD.fullmatch(password)):
+        raise ValueError("DIRECTORY_USER_PASSWORD_INVALID")
 
 
 def _secret(path: Path) -> str:
@@ -138,6 +148,16 @@ def _text(value: object, maximum: int, code: str, *, empty=False) -> str:
     return value
 
 
+def directory_description_attributes(fields: dict, code: str) -> dict[str, list[str]]:
+    return {
+        "openepm_display_name": [_text(fields["displayName"], DIRECTORY_DESCRIPTION_LIMITS["displayName"], code)],
+        "openepm_short_description": [_text(fields["shortDescription"], DIRECTORY_DESCRIPTION_LIMITS["shortDescription"],
+                                            code, empty=True)],
+        "openepm_semantic_description": [_text(fields["semanticDescription"], DIRECTORY_DESCRIPTION_LIMITS["semanticDescription"],
+                                               code, empty=True)],
+    }
+
+
 def _attributes(value: object) -> dict[str, list[str]]:
     if type(value) is not dict:
         return {}
@@ -225,18 +245,25 @@ class KeycloakDirectory:
         attributes = _attributes(value.get("attributes"))
         if _first(attributes, "openepm_kind") != MANAGED_GROUP:
             raise KeycloakDirectoryError("DIRECTORY_GROUP_NOT_MANAGED")
+        status = _first(attributes, "openepm_status") or "Active"
+        if status not in ("Active", "Inactive"):
+            raise KeycloakDirectoryError("KEYCLOAK_DIRECTORY_RESPONSE_INVALID")
         return {"groupId": value["id"], "groupName": value["name"],
                 "displayName": _first(attributes, "openepm_display_name"),
                 "shortDescription": _first(attributes, "openepm_short_description"),
                 "semanticDescription": _first(attributes, "openepm_semantic_description"),
-                "status": _first(attributes, "openepm_status") or "Active"}
+                "status": status}
+
+    def _read_detail(self, collection: str, identifier: str) -> dict:
+        value = self._request("GET", f"/admin/realms/{REALM}/{collection}/{quote(identifier, safe='')}")
+        if type(value) is not dict or value.get("id") != identifier:
+            raise KeycloakDirectoryError("KEYCLOAK_DIRECTORY_RESPONSE_INVALID")
+        return value
 
     def read_user(self, subject_id: str) -> dict:
         if not isinstance(subject_id, str) or not IDENTIFIER.fullmatch(subject_id):
             raise ValueError("DIRECTORY_SUBJECT_ID_INVALID")
-        value = self._request("GET",
-            f"/admin/realms/{REALM}/users/{quote(subject_id, safe='')}")
-        return self._user(value)
+        return self._user(self._read_detail("users", subject_id))
 
     def list_users(self, *, offset: int, limit: int) -> dict:
         if type(offset) is not int or type(limit) is not int or offset < 0 \
@@ -249,7 +276,9 @@ class KeycloakDirectory:
         if type(value) is not list or len(value) > limit + 1:
             raise KeycloakDirectoryError("KEYCLOAK_DIRECTORY_RESPONSE_INVALID")
         managed = []
-        for item in value:
+        # The extra provider row proves continuation; only this offset's rows
+        # belong to this page, even when some are filtered out as unmanaged.
+        for item in value[:limit]:
             subject_id = (item.get("id") if type(item) is dict else None)
             if not isinstance(subject_id, str) or not subject_id:
                 raise KeycloakDirectoryError(
@@ -261,15 +290,13 @@ class KeycloakDirectory:
             # before deciding whether the user is managed.  Treating an
             # incomplete list row as unmanaged would incorrectly deactivate
             # a current identity during authoritative reconciliation.
-            detail = self._request("GET",
-                f"/admin/realms/{REALM}/users/"
-                f"{quote(subject_id, safe='')}")
+            detail = self._read_detail("users", subject_id)
             try:
                 managed.append(self._user(detail))
             except KeycloakDirectoryError as error:
                 if str(error) != "DIRECTORY_USER_NOT_MANAGED":
                     raise
-        return {"items": managed[:limit],
+        return {"items": managed,
                 "nextOffset": offset + limit if len(value) > limit else None}
 
     def create_user(self, fields: dict, *, operation_marker: str) -> dict:
@@ -284,13 +311,7 @@ class KeycloakDirectory:
             raise ValueError("DIRECTORY_USER_CREATE_INVALID")
         attributes = {
             "openepm_kind": [MANAGED_USER],
-            "openepm_display_name": [_text(fields["displayName"], 200,
-                "DIRECTORY_USER_CREATE_INVALID")],
-            "openepm_short_description": [_text(fields["shortDescription"],
-                500, "DIRECTORY_USER_CREATE_INVALID", empty=True)],
-            "openepm_semantic_description": [_text(
-                fields["semanticDescription"], 10000,
-                "DIRECTORY_USER_CREATE_INVALID", empty=True)],
+            **directory_description_attributes(fields, "DIRECTORY_USER_CREATE_INVALID"),
             "openepm_last_operation": [operation_marker]}
         # Keycloak user search defaults to a brief representation, which omits
         # the protected management attributes needed to prove ownership and
@@ -333,12 +354,7 @@ class KeycloakDirectory:
         return self._user(current)
 
     def set_temporary_password(self, subject_id: str, password: object) -> dict:
-        if (not isinstance(subject_id, str)
-                or not IDENTIFIER.fullmatch(subject_id)
-                or not isinstance(password, str)
-                or any(ord(character) < 32 for character in password)
-                or not PASSWORD.fullmatch(password)):
-            raise ValueError("DIRECTORY_USER_PASSWORD_INVALID")
+        validate_temporary_password(subject_id, password)
         user = self.read_user(subject_id)
         if user["status"] != "Active":
             raise KeycloakDirectoryError("DIRECTORY_USER_INACTIVE")
@@ -365,13 +381,7 @@ class KeycloakDirectory:
         attributes = _attributes(current.get("attributes"))
         attributes.update({
             "openepm_kind": [MANAGED_USER],
-            "openepm_display_name": [_text(fields["displayName"], 200,
-                "DIRECTORY_USER_UPDATE_INVALID")],
-            "openepm_short_description": [_text(fields["shortDescription"],
-                500, "DIRECTORY_USER_UPDATE_INVALID", empty=True)],
-            "openepm_semantic_description": [_text(
-                fields["semanticDescription"], 10000,
-                "DIRECTORY_USER_UPDATE_INVALID", empty=True)],
+            **directory_description_attributes(fields, "DIRECTORY_USER_UPDATE_INVALID"),
             "openepm_last_operation": [operation_marker]})
         body = {**current, "attributes": attributes}
         self._request("PUT",
@@ -429,10 +439,7 @@ class KeycloakDirectory:
     def _group_representation(self, group_id: str) -> dict:
         if not isinstance(group_id, str) or not IDENTIFIER.fullmatch(group_id):
             raise ValueError("DIRECTORY_GROUP_ID_INVALID")
-        value = self._request("GET",
-            f"/admin/realms/{REALM}/groups/{quote(group_id, safe='')}")
-        if type(value) is not dict or value.get("id") != group_id:
-            raise KeycloakDirectoryError("KEYCLOAK_DIRECTORY_RESPONSE_INVALID")
+        value = self._read_detail("groups", group_id)
         self._group(value)
         return value
 
@@ -447,7 +454,7 @@ class KeycloakDirectory:
         if type(value) is not list or len(value) > limit + 1:
             raise KeycloakDirectoryError("KEYCLOAK_DIRECTORY_RESPONSE_INVALID")
         managed = []
-        for item in value:
+        for item in value[:limit]:
             group_id = (item.get("id") if type(item) is dict else None)
             if not isinstance(group_id, str) or not group_id:
                 raise KeycloakDirectoryError(
@@ -455,15 +462,13 @@ class KeycloakDirectory:
             # As with users, managed ownership is asserted only by the
             # canonical detail attributes.  Collection rows are identity
             # candidates, not sufficient authorization evidence.
-            detail = self._request("GET",
-                f"/admin/realms/{REALM}/groups/"
-                f"{quote(group_id, safe='')}")
+            detail = self._read_detail("groups", group_id)
             try:
                 managed.append(self._group(detail))
             except KeycloakDirectoryError as error:
                 if str(error) != "DIRECTORY_GROUP_NOT_MANAGED":
                     raise
-        return {"items": managed[:limit],
+        return {"items": managed,
                 "nextOffset": offset + limit if len(value) > limit else None}
 
     def authorization_snapshot(self) -> dict:
@@ -556,13 +561,7 @@ class KeycloakDirectory:
             raise KeycloakDirectoryError("DIRECTORY_OBJECT_CONFLICT")
         body = {"name": group_id, "attributes": {
             "openepm_kind": [MANAGED_GROUP],
-            "openepm_display_name": [_text(fields["displayName"], 200,
-                "DIRECTORY_GROUP_CREATE_INVALID")],
-            "openepm_short_description": [_text(fields["shortDescription"],
-                500, "DIRECTORY_GROUP_CREATE_INVALID", empty=True)],
-            "openepm_semantic_description": [_text(
-                fields["semanticDescription"], 10000,
-                "DIRECTORY_GROUP_CREATE_INVALID", empty=True)],
+            **directory_description_attributes(fields, "DIRECTORY_GROUP_CREATE_INVALID"),
             "openepm_status": ["Active"],
             "openepm_last_operation": [operation_marker]}}
         self._request("POST", f"/admin/realms/{REALM}/groups", body=body,
@@ -593,13 +592,7 @@ class KeycloakDirectory:
         attributes = _attributes(current.get("attributes"))
         attributes.update({
             "openepm_kind": [MANAGED_GROUP],
-            "openepm_display_name": [_text(fields["displayName"], 200,
-                "DIRECTORY_GROUP_UPDATE_INVALID")],
-            "openepm_short_description": [_text(fields["shortDescription"],
-                500, "DIRECTORY_GROUP_UPDATE_INVALID", empty=True)],
-            "openepm_semantic_description": [_text(
-                fields["semanticDescription"], 10000,
-                "DIRECTORY_GROUP_UPDATE_INVALID", empty=True)],
+            **directory_description_attributes(fields, "DIRECTORY_GROUP_UPDATE_INVALID"),
             "openepm_last_operation": [operation_marker]})
         self._request("PUT",
             f"/admin/realms/{REALM}/groups/{quote(internal, safe='')}",

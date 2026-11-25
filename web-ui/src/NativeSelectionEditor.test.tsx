@@ -91,6 +91,11 @@ function fillIdentity() {
     target: { value: "Product" },
   });
 }
+async function startNewMemberList() {
+  const button = screen.getByRole("button", { name: "New member list" });
+  await waitFor(() => expect(button).toBeEnabled());
+  fireEvent.click(button);
+}
 afterEach(() => {
   resetUnsavedWorkForTests();
   vi.unstubAllGlobals();
@@ -112,12 +117,17 @@ it("saves, activates and evaluates an inert named selection using exact current 
           definition: body.program.arguments.definition,
           stateToken: "b".repeat(64),
         };
-        return response({
-          listId: "review",
-          stateToken: item.stateToken,
-          status: "Saved",
-          metadataRevision: 7,
-          policyRevision: policy,
+        return Response.json({
+          languageVersion: 2,
+          function: fn,
+          result: {
+            operationId: body.idempotencyKey,
+            listId: "review",
+            stateToken: item.stateToken,
+            status: "Saved",
+            metadataRevision: 7,
+            policyRevision: policy,
+          },
         });
       }
       if (fn === "metadata.member_list.activate") {
@@ -130,12 +140,17 @@ it("saves, activates and evaluates an inert named selection using exact current 
           active: true,
           executable: true,
         };
-        return response({
-          listId: "review",
-          stateToken: item.stateToken,
-          status: "Published",
-          metadataRevision: 7,
-          policyRevision: policy,
+        return Response.json({
+          languageVersion: 2,
+          function: fn,
+          result: {
+            operationId: body.idempotencyKey,
+            listId: "review",
+            stateToken: item.stateToken,
+            status: "Published",
+            metadataRevision: 7,
+            policyRevision: policy,
+          },
         });
       }
       if (fn === "metadata.member_list.list")
@@ -177,7 +192,7 @@ it("saves, activates and evaluates an inert named selection using exact current 
     );
   }
   render(<Workspace />);
-  fireEvent.click(screen.getByRole("button", { name: "New member list" }));
+  await startNewMemberList();
   fillIdentity();
   const members = screen.getByLabelText("Member IDs, one per line");
   fireEvent.change(members, { target: { value: "P1\n" } });
@@ -236,7 +251,7 @@ it("saves, activates and evaluates an inert named selection using exact current 
     screen.getByRole("button", { name: "Deactivate member list" }),
   ).toBeDisabled();
   expect(
-    screen.getByRole("button", { name: "Delete member list" }),
+    screen.getByRole("button", { name: "Review member-list deletion" }),
   ).toBeDisabled();
 });
 
@@ -437,7 +452,7 @@ it("rejects inexact advanced expression and parameter numbers before save", asyn
 
 it("retains a same-user draft but fences it when metadata or authority changes", async () => {
   const view = render(<MemberLists app={app} catalog={catalog} />);
-  fireEvent.click(screen.getByRole("button", { name: "New member list" }));
+  await startNewMemberList();
   fillIdentity();
   fireEvent.change(screen.getByLabelText("Member IDs, one per line"), {
     target: { value: "P1" },
@@ -471,18 +486,18 @@ it("retains a same-user draft but fences it when metadata or authority changes",
 });
 
 it("does not expose a late list response to a different identity in the same application", async () => {
-  let resolve!: (value: Response) => void;
+  const resolves: ((value: Response) => void)[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(
       () =>
         new Promise<Response>((done) => {
-          resolve = done;
+          resolves.push(done);
         }),
     ),
   );
   const view = render(<MemberLists app={app} catalog={catalog} />);
-  fireEvent.click(screen.getByRole("button", { name: "Read member lists" }));
+  await waitFor(() => expect(resolves).toHaveLength(1));
   view.rerender(
     <MemberLists
       app={app}
@@ -495,8 +510,9 @@ it("does not expose a late list response to a different identity in the same app
       }}
     />,
   );
+  await waitFor(() => expect(resolves).toHaveLength(2));
   await act(async () =>
-    resolve(
+    resolves[0](
       response({
         memberLists: [selection],
         nextAfterListId: null,
@@ -507,7 +523,18 @@ it("does not expose a late list response to a different identity in the same app
   expect(
     screen.queryByRole("button", { name: "Review scope" }),
   ).not.toBeInTheDocument();
-  expect(screen.queryByText("Working…")).not.toBeInTheDocument();
+  await act(async () =>
+    resolves[1](
+      response({
+        memberLists: [],
+        nextAfterListId: null,
+        collectionToken: "e".repeat(64),
+      }),
+    ),
+  );
+  await waitFor(() =>
+    expect(screen.queryByText("Working…")).not.toBeInTheDocument(),
+  );
 });
 
 it("opens a legacy draft with no compiled payload without enabling native editing or execution", async () => {
@@ -533,14 +560,13 @@ it("opens a legacy draft with no compiled payload without enabling native editin
     ),
   );
   render(<MemberLists app={app} catalog={catalog} />);
-  fireEvent.click(screen.getByRole("button", { name: "Read member lists" }));
   fireEvent.click(await screen.findByRole("button", { name: "Review scope" }));
-  await screen.findByText(/This legacy selection is owned by source/);
+  await screen.findByText(/This selection is managed by its Python source/);
   expect(
     screen.queryByLabelText("Named selection editor"),
   ).not.toBeInTheDocument();
   expect(
-    screen.queryByRole("button", { name: "Delete member list" }),
+    screen.queryByRole("button", { name: "Review member-list deletion" }),
   ).not.toBeInTheDocument();
   expect(
     screen.getByRole("button", { name: "Evaluate member list" }),
@@ -576,7 +602,6 @@ it("rejects an evaluation response for a replaced saved definition", async () =>
     }),
   );
   render(<MemberLists app={app} catalog={catalog} />);
-  fireEvent.click(screen.getByRole("button", { name: "Read member lists" }));
   fireEvent.click(await screen.findByRole("button", { name: "Review scope" }));
   fireEvent.click(
     await screen.findByRole("button", { name: "Evaluate member list" }),
@@ -587,7 +612,7 @@ it("rejects an evaluation response for a replaced saved definition", async () =>
   expect(screen.queryByText("Unexpected")).not.toBeInTheDocument();
 });
 
-it("reuses the same Save intent after a rejected request without losing the draft", async () => {
+it("retains the draft and checks the original before retrying an interrupted Save", async () => {
   const saves: any[] = [];
   vi.stubGlobal(
     "fetch",
@@ -599,12 +624,27 @@ it("reuses the same Save intent after a rejected request without losing the draf
           return new Response(JSON.stringify({ code: "SERVICE_UNAVAILABLE" }), {
             status: 503,
           });
-        return response({
-          listId: "review",
-          stateToken: selection.stateToken,
-          metadataRevision: 7,
-          policyRevision: 3,
+        return Response.json({
+          languageVersion: 2,
+          function: body.program.function,
+          result: {
+            operationId: body.idempotencyKey,
+            listId: "review",
+            stateToken: selection.stateToken,
+            status: "Saved",
+            metadataRevision: 7,
+            policyRevision: 3,
+          },
         });
+      }
+      if (body.program.function === "application.operation.receipt.read") {
+        expect(body.program.arguments.operationId).toBe(
+          saves[0].idempotencyKey,
+        );
+        return Response.json(
+          { code: "OPERATION_RECEIPT_NOT_FOUND" },
+          { status: 404 },
+        );
       }
       if (body.program.function.endsWith(".list"))
         return response({
@@ -616,35 +656,69 @@ it("reuses the same Save intent after a rejected request without losing the draf
     }),
   );
   installOperationAdmissionFixture("4");
-  render(<MemberLists app={app} catalog={catalog} />);
-  fireEvent.click(screen.getByRole("button", { name: "New member list" }));
+  render(
+    <MemberLists
+      app={app}
+      catalog={{
+        ...catalog,
+        functions: {
+          ...catalog.functions,
+          "application.operation.receipt.read": {},
+        },
+      }}
+    />,
+  );
+  await startNewMemberList();
   fillIdentity();
   fireEvent.change(screen.getByLabelText("Member IDs, one per line"), {
     target: { value: "P1" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Save named selection" }));
-  await screen.findByText("SERVICE_UNAVAILABLE");
+  await screen.findByText(
+    "The original member-list change is still unconfirmed.",
+  );
   expect(screen.getByLabelText("Selection name")).toHaveValue("Review scope");
-  expect(unsavedWorkSnapshot()).toHaveLength(1);
-  fireEvent.click(screen.getByRole("button", { name: "Save named selection" }));
+  expect(unsavedWorkSnapshot().map(({ label }) => label)).toEqual(
+    expect.arrayContaining([
+      "Unsaved named selection",
+      "Member-list change with an unconfirmed outcome",
+    ]),
+  );
+  expect(
+    screen.getByRole("button", { name: "Save named selection" }),
+  ).toBeDisabled();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Read original member-list outcome" }),
+  );
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: "Retry original member-list request",
+    }),
+  );
   await screen.findByRole("button", { name: "Activate member list" });
   expect(saves).toHaveLength(2);
   expect(saves[0]).toEqual(saves[1]);
 });
 
 it("keeps a pending Save draft dirty after authority invalidation and allows an explicit fresh draft", async () => {
-  let resolve!: (value: Response) => void;
+  let resolveSave!: (value: Response) => void;
   vi.stubGlobal(
     "fetch",
-    vi.fn(
-      () =>
-        new Promise<Response>((done) => {
-          resolve = done;
-        }),
-    ),
+    vi.fn(async (_url, init) => {
+      const body = JSON.parse(init.body);
+      if (body.program.function.endsWith(".list"))
+        return response({
+          memberLists: [],
+          nextAfterListId: null,
+          collectionToken: "f".repeat(64),
+        });
+      return new Promise<Response>((done) => {
+        resolveSave = done;
+      });
+    }),
   );
   const view = render(<MemberLists app={app} catalog={catalog} />);
-  fireEvent.click(screen.getByRole("button", { name: "New member list" }));
+  await startNewMemberList();
   fillIdentity();
   fireEvent.change(screen.getByLabelText("Member IDs, one per line"), {
     target: { value: "P1" },
@@ -657,7 +731,7 @@ it("keeps a pending Save draft dirty after authority invalidation and allows an 
     />,
   );
   await act(async () =>
-    resolve(
+    resolveSave(
       response({
         listId: "review",
         stateToken: selection.stateToken,
@@ -671,7 +745,7 @@ it("keeps a pending Save draft dirty after authority invalidation and allows an 
     screen.getByRole("button", { name: "Save named selection" }),
   ).toBeDisabled();
   expect(unsavedWorkSnapshot()).toHaveLength(1);
-  fireEvent.click(screen.getByRole("button", { name: "New member list" }));
+  await startNewMemberList();
   expect(screen.getByLabelText("Selection name")).toHaveValue("");
   expect(
     screen.getByRole("button", { name: "Save named selection" }),
@@ -694,7 +768,6 @@ it("refuses to combine a newer definition metadata cut with the displayed applic
     ),
   );
   render(<MemberLists app={app} catalog={catalog} />);
-  fireEvent.click(screen.getByRole("button", { name: "Read member lists" }));
   fireEvent.click(await screen.findByRole("button", { name: "Review scope" }));
   await screen.findByText(
     "The application changed while opening this selection. Refresh the application and try again.",

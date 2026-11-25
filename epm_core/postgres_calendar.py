@@ -108,14 +108,15 @@ class PostgresCalendarPeriods:
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
             with db.transaction():
                 PostgresNumericFactStore._set_scope(db,scope)
+                access=PostgresAccessChecker.check_in_transaction(
+                    db,self.identity,scope,'read',function=READ_FUNCTION,
+                    arguments=query)
                 state=db.execute('''SELECT metadata_revision,commit_revision
                     FROM epm.application_state WHERE workspace_id=%s
                     AND application_id=%s FOR SHARE''',
                     (scope.workspace_id,scope.application_id)).fetchone()
                 if state is None:
                     raise ValueError('APPLICATION_UNAVAILABLE')
-                PostgresAccessChecker.check_in_transaction(
-                    db,self.identity,scope,'read')
                 self._roles(db,scope,query)
                 row=db.execute('''SELECT ordinal,starts_on,ends_before,
                     change_id,last_revision FROM epm.calendar_period_current
@@ -123,6 +124,11 @@ class PostgresCalendarPeriods:
                     AND year_member_id=%s AND period_member_id=%s''',
                     (scope.workspace_id,scope.application_id,
                      query['yearId'],query['periodId'])).fetchone()
+                current=PostgresAccessChecker.check_in_transaction(
+                    db,self.identity,scope,'read',function=READ_FUNCTION,
+                    arguments=query)
+                if current!=access:
+                    raise ValueError('CALENDAR_AUTHORIZATION_STALE')
                 return {'yearId':query['yearId'],
                         'periodId':query['periodId'],
                         'defined':row is not None,
@@ -134,20 +140,59 @@ class PostgresCalendarPeriods:
                         'metadataRevision':state['metadata_revision'],
                         'commitRevision':state['commit_revision']}
 
-    def set(self,scope: ApplicationScope,program: object,*,
-            idempotency_key: str) -> dict:
-        query=_program(program,SET_FUNCTION)
+    def _intent_digest(self,scope: ApplicationScope,query: dict,
+                       idempotency_key: str) -> str:
         if (not isinstance(idempotency_key,str)
                 or not _KEY.fullmatch(idempotency_key)):
             raise ValueError('CALENDAR_IDEMPOTENCY_KEY_INVALID')
-        digest=_canonical_digest({
+        return _canonical_digest({
             'scope':[scope.workspace_id,scope.application_id],
             'identity':[self.identity.issuer,self.identity.subject_id],
             'query':{**query,'startsOn':query['startsOn'].isoformat(),
                      'endsBefore':query['endsBefore'].isoformat()}})
+
+    def _original_receipt(self,db,scope: ApplicationScope,idempotency_key: str,
+                          digest: str) -> dict | None:
+        previous=db.execute('''SELECT command_digest,actor_id,result
+            FROM epm.operation_receipt WHERE workspace_id=%s
+            AND application_id=%s AND operation_id=%s''',
+            (scope.workspace_id,scope.application_id,
+             idempotency_key)).fetchone()
+        if previous is None:
+            return None
+        if (previous['command_digest']!=digest
+                or previous['actor_id']!=self.identity.subject_id):
+            raise ValueError('CALENDAR_IDEMPOTENCY_CONFLICT')
+        PostgresNumericFactStore._require_replay_impact(
+            db,scope,idempotency_key,previous)
+        return previous['result']
+
+    def _authorize_write(self,db,scope: ApplicationScope,query: dict):
+        return PostgresAccessChecker.check_in_transaction(
+            db,self.identity,scope,'admin',function=SET_FUNCTION,arguments=query)
+
+    def replay(self,scope: ApplicationScope,program: object,*,
+               idempotency_key: str) -> dict | None:
+        query=_program(program,SET_FUNCTION)
+        digest=self._intent_digest(scope,query,idempotency_key)
+        with connect_postgres(self.dsn,row_factory=dict_row) as db:
+            with db.transaction():
+                db.execute('SET TRANSACTION READ ONLY')
+                PostgresNumericFactStore._set_scope(db,scope)
+                access=self._authorize_write(db,scope,query)
+                result=self._original_receipt(db,scope,idempotency_key,digest)
+                if self._authorize_write(db,scope,query)!=access:
+                    raise ValueError('CALENDAR_AUTHORIZATION_STALE')
+                return result
+
+    def set(self,scope: ApplicationScope,program: object,*,
+            idempotency_key: str) -> dict:
+        query=_program(program,SET_FUNCTION)
+        digest=self._intent_digest(scope,query,idempotency_key)
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
             with db.transaction():
                 PostgresNumericFactStore._set_scope(db,scope)
+                access=self._authorize_write(db,scope,query)
                 state=db.execute('''SELECT s.metadata_revision,
                     s.commit_revision,s.processing_mode,
                     a.status AS application_status
@@ -158,20 +203,11 @@ class PostgresCalendarPeriods:
                     (scope.workspace_id,scope.application_id)).fetchone()
                 if state is None:
                     raise ValueError('APPLICATION_UNAVAILABLE')
-                PostgresAccessChecker.check_in_transaction(
-                    db,self.identity,scope,'admin')
-                previous=db.execute('''SELECT command_digest,actor_id,result
-                    FROM epm.operation_receipt WHERE workspace_id=%s
-                    AND application_id=%s AND operation_id=%s''',
-                    (scope.workspace_id,scope.application_id,
-                     idempotency_key)).fetchone()
-                if previous:
-                    if (previous['command_digest']!=digest
-                            or previous['actor_id']!=self.identity.subject_id):
-                        raise ValueError('CALENDAR_IDEMPOTENCY_CONFLICT')
-                    PostgresNumericFactStore._require_replay_impact(
-                        db,scope,idempotency_key,previous)
-                    return previous['result']
+                previous=self._original_receipt(db,scope,idempotency_key,digest)
+                if previous is not None:
+                    if self._authorize_write(db,scope,query)!=access:
+                        raise ValueError('CALENDAR_AUTHORIZATION_STALE')
+                    return previous
                 if (state['application_status']!='Active'
                         or state['processing_mode']!='Active'):
                     raise ValueError('APPLICATION_NOT_WRITABLE')
@@ -240,6 +276,8 @@ class PostgresCalendarPeriods:
                         'metadataRevision':metadata_revision,
                         'committedRevision':revision,
                         'impactDigest':impact.digest}
+                if self._authorize_write(db,scope,query)!=access:
+                    raise ValueError('CALENDAR_AUTHORIZATION_STALE')
                 db.execute('''UPDATE epm.application_state SET
                     metadata_revision=%s,commit_revision=%s
                     WHERE workspace_id=%s AND application_id=%s''',
@@ -284,3 +322,71 @@ class PostgresCalendarPeriods:
                 record_calculation_impact(db,scope,
                     operation_id=idempotency_key,impact=impact)
                 return result
+
+
+def set_program_contract() -> dict:
+    from .metadata_read_contract import obj, read_contract, read_example
+
+    identifier = {'type': 'string', 'minLength': 1, 'maxLength': 200}
+    revision = {'type': 'integer', 'minimum': 0}
+    date_text = {'type': 'string', 'pattern': r'^[0-9]{4}-[0-9]{2}-[0-9]{2}(?![\s\S])'}
+    period = {'yearId': identifier, 'periodId': identifier,
+              'ordinal': {'type': 'integer', 'minimum': 1, 'maximum': 366},
+              'startsOn': date_text, 'endsBefore': date_text}
+    arguments = obj({**period, 'expectedChangeId': {'type': 'string', 'maxLength': 200},
+                     'expectedMetadataRevision': revision})
+    result = obj({**period,
+        'operationId': {'type': 'string', 'pattern': r'^[A-Za-z0-9._-]{8,128}(?![\s\S])'},
+        'changeId': {'type': 'string', 'pattern': r'^[0-9a-f]{32}(?![\s\S])'},
+        'metadataRevision': revision, 'committedRevision': revision,
+        'impactDigest': {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}})
+    example = {'yearId': 'FY2026', 'periodId': 'P01', 'ordinal': 1,
+               'startsOn': '2026-04-01', 'endsBefore': '2026-05-01',
+               'expectedChangeId': '', 'expectedMetadataRevision': 7}
+    binding = ('Read metadata.calendar.period.read for the same Year and Period. '
+               'Copy its metadataRevision and exact changeId. Review the dates '
+               'and ordinal before requesting signed admission.')
+    contract = read_contract(SET_FUNCTION, arguments, result,
+        owner='PostgresCalendarPeriods.set', examples=[
+            read_example(SET_FUNCTION, example, name='Define an unmapped fiscal period',
+                         binding=binding + ' An undefined period returns an empty changeId.'),
+            read_example(SET_FUNCTION, {**example, 'endsBefore': '2026-04-29',
+                         'expectedChangeId': 'a' * 32, 'expectedMetadataRevision': 8},
+                         name='Edit the current fiscal period', binding=binding)],
+        semantic_rules=[
+            'Use active members of the application’s unique Year and Period model-role dimensions.',
+            'Ranges start inclusively and end exclusively. Adjacent periods may share a boundary. Overlap across the application and duplicate ordinals within a Year are refused.',
+            'The core checks both current revision pins and atomically records the new mapping, operation receipt and calculation impact.',
+        ])
+    contract['programContract']['recovery'] = (
+        'After an interrupted response, check application.operation.receipt.read for the original operation ID. '
+        'Replay the unchanged program with the same signed ID to retrieve the original result under current '
+        'administrator authority, including after admission expiry. An expired ID without a receipt cannot publish. '
+        'Read metadata.calendar.period.read separately for the current mapping. On stale revision or change ID, '
+        'reread and review the new intent before requesting another admission.')
+    return contract
+
+
+def read_program_contract(function):
+    if function != READ_FUNCTION:
+        return None
+    from .metadata_read_contract import read_contract, read_example, obj
+    identifier = {'type': 'string', 'minLength': 1, 'maxLength': 200}
+    revision = {'type': 'integer', 'minimum': 0}
+    common = {'yearId': identifier, 'periodId': identifier,
+        'metadataRevision': revision, 'commitRevision': revision}
+    defined = obj({**common, 'defined': {'const': True},
+        'ordinal': {'type': 'integer', 'minimum': 1, 'maximum': 366},
+        'startsOn': {'type': 'string', 'pattern': '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'},
+        'endsBefore': {'type': 'string', 'pattern': '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'},
+        'changeId': {'type': 'string'}})
+    missing = obj({**common, 'defined': {'const': False},
+        'ordinal': {'type': 'null'}, 'startsOn': {'type': 'null'},
+        'endsBefore': {'type': 'null'}, 'changeId': {'const': ''}})
+    return read_contract(function, obj({'yearId': identifier, 'periodId': identifier}),
+        {'oneOf': [defined, missing]}, owner='PostgresCalendarPeriods.read',
+        examples=[read_example(function, {'yearId': 'FY2026', 'periodId': 'P01'},
+            name='Read an explicit calendar period',
+            binding='Use existing members from the current unique Year and Period model-role dimensions; a defined calendar row is not required.')],
+        semantic_rules=['Current Year/Period role resolution, active membership and read authority remain native.',
+            'defined=false returns null dates and ordinal with an empty changeId; it does not invent a calendar interval.'])

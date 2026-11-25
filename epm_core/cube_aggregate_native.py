@@ -12,7 +12,9 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .cube_aggregate_ir import compile_cube_aggregate
-from .cube_aggregate_lifecycle import POSTGRES_EXACT_DIMENSIONAL_BACKEND
+from .dimensional_privileges import aggregate_privilege_sql
+from .cube_aggregate_lifecycle import (
+    AggregateAmountMeasureRequired, POSTGRES_EXACT_DIMENSIONAL_BACKEND)
 from .dimensional_security_policy import (
     AcrossDimensions, HierarchyTags,
     MemberTagCardinality, MixedSelection, UntaggedDenyPrecedence,
@@ -23,6 +25,7 @@ from .postgres_access import (AccessDenied, PostgresAccessChecker, VerifiedIdent
 from .postgres_connection import connect_postgres
 from .postgres_cube_query import _ROLE_COLUMNS
 from .postgres_cube_select import PostgresCubeSelect
+from .postgres_aggregate_privileges import authorize_aggregate_selection
 from .postgres_dimensional_scope import resolve_effective_dimensional_scope
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_processing_limits import configure_statement_timeout
@@ -127,6 +130,8 @@ class NativeCubeAggregateStage:
         policy = dimensional_scope.policy
         if policy.hierarchy_tags is not HierarchyTags.SELECTED_MEMBER_ONLY:
             raise ValueError('DIMENSIONAL_HIERARCHY_POLICY_NOT_INTEGRATED')
+        if dimensional_scope.privileges is not None:
+            return {'policy': policy, 'privileges': dimensional_scope.privileges, 'bypass': False}
         return {'policy': policy,
                 'assignments': dimensional_scope.read_assignments,
                 'bypass': dimensional_scope.administrator_bypass}
@@ -137,6 +142,8 @@ class NativeCubeAggregateStage:
         if profile is None or profile['bypass']:
             return sql.SQL(''), sql.SQL(''), [], None
         policy = profile['policy']
+        if 'privileges' in profile:
+            return aggregate_privilege_sql(profile['privileges'], policy, dimension_count)
         match = (sql.SQL('m.read_security_tags && assigned.tags')
                  if policy.within_dimension is WithinDimension.ANY_TAG else
                  sql.SQL('m.read_security_tags <@ assigned.tags'))
@@ -197,8 +204,8 @@ class NativeCubeAggregateStage:
         """Compute current snapshot only; limits are trusted server options.
 
         No snapshot token/generation/engine can be authored. Generic models need
-        no financial configuration. Financial roles can be fixed/grouped, but
-        financial unit/additivity qualification remains a future admission gate.
+        no financial configuration. Amount measures require amount inputs.
+        Broader financial additivity rules remain separately qualified.
         """
         compute_started = time.perf_counter()
         materialization_seconds = 0.0
@@ -225,18 +232,20 @@ class NativeCubeAggregateStage:
                     (scope.workspace_id, scope.application_id)).fetchall()
                 roles = {d['dimension_id']: d['model_role'] for d in dims}
                 plan = compile_cube_aggregate(arguments, input_dimensions=sorted(roles), dimension_roles=roles)
+                authorize_aggregate_selection(db, scope, dimensional_scope, plan.normalized_arguments)
                 if plan.generic_pins:
                     generic_pins=dict(plan.generic_pins)
                     artifact=db.execute('''SELECT 1 FROM epm.sealed_cube_selection
                         WHERE workspace_id=%s AND application_id=%s
                         AND selection_id=%s AND issuer=%s AND subject_id=%s
                         AND resolution_digest=%s AND metadata_revision=%s
-                        AND policy_revision=%s AND expires_at>clock_timestamp()''',(
+                        AND policy_revision=%s AND authorization_scope_digest=%s
+                        AND expires_at>clock_timestamp()''',(
                         scope.workspace_id,scope.application_id,
                         generic_pins['selectionId'],self.identity.issuer,
                         self.identity.subject_id,generic_pins['resolutionDigest'],
                         generic_pins['metadataRevision'],
-                        generic_pins['policyRevision'])).fetchone()
+                        generic_pins['policyRevision'],dimensional_scope.scope_digest)).fetchone()
                     if (artifact is None
                             or pins['metadata_revision']!=generic_pins['metadataRevision']
                             or pins['policy_revision']!=generic_pins['policyRevision']):
@@ -324,6 +333,32 @@ class NativeCubeAggregateStage:
                         else sql.SQL(expression))
                     aggregate_select.append(sql.SQL('{} AS {}').format(
                         projected,sql.Identifier(alias)))
+                check_amount_kind = any(
+                    measure != 'CountPresent' for measure in plan.measures
+                ) and db.execute("""SELECT EXISTS(SELECT 1 FROM epm.member
+                    WHERE workspace_id=%s AND application_id=%s
+                      AND status='Active' AND numeric_value_kind='ratio'
+                      AND dimension_id=ANY(%s::text[])) AS declared_ratio""",
+                    (scope.workspace_id, scope.application_id,
+                     list(plan.input_dimensions))).fetchone()['declared_ratio']
+                if check_amount_kind:
+                    # Inspect the exact authorized contributing coordinates,
+                    # including measure members declared on custom axes.
+                    aggregate_select.append(sql.SQL("""bool_or(EXISTS(
+                        SELECT 1 FROM epm.coordinate typed_coordinate
+                        CROSS JOIN LATERAL jsonb_each_text(typed_coordinate.members)
+                          AS axis(dimension_id,member_id)
+                        JOIN epm.member typed_member
+                          ON typed_member.workspace_id=typed_coordinate.workspace_id
+                          AND typed_member.application_id=typed_coordinate.application_id
+                          AND typed_member.dimension_id=axis.dimension_id
+                          AND typed_member.member_id=axis.member_id
+                        WHERE typed_coordinate.workspace_id=n.workspace_id
+                          AND typed_coordinate.application_id=n.application_id
+                          AND typed_coordinate.coordinate_id=n.coordinate_id
+                          AND typed_member.status='Active'
+                          AND typed_member.numeric_value_kind='ratio'
+                    )) AS has_ratio"""))
                 security_profile = self._security_profile(dimensional_scope)
                 security_join, security_filter, security_params, security_allowed = (
                     self._security_sql(security_profile, len(plan.input_dimensions)))
@@ -408,6 +443,8 @@ class NativeCubeAggregateStage:
                         output.itersize = 16
                         output.execute(query, params)
                         for row in output:
+                            if check_amount_kind and row['has_ratio']:
+                                raise AggregateAmountMeasureRequired()
                             materialization_started = time.perf_counter()
                             if len(result['rows']) == max_groups:
                                 raise ValueError('CUBE_AGGREGATE_GROUP_BUDGET')

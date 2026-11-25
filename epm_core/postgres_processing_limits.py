@@ -7,7 +7,8 @@ from functools import wraps
 
 import psycopg
 from .postgres_connection import connection_policy
-from .postgres_execution_policy import tool_execution_policy, http_admission_policy
+from .postgres_execution_policy import (
+    tool_execution_policy, web_operation_policy, http_admission_policy)
 from .postgres_execution_scope import remaining_milliseconds
 from .postgres_execution_policy import PROCESSES_PER_LISTENER
 from .postgres_runtime_configuration import configured_tool_processes
@@ -55,10 +56,21 @@ def lock_busy_boundary(function):
     return bounded
 
 
-def policy():
+def policy(*, channel='mcp'):
+    """Project this adapter's execution policy alongside shared database rules.
+
+    The fixed adapter selects the channel, never the caller's program. A web
+    process cannot advertise another listener's effective MCP pool size.
+    """
+    if channel == 'mcp':
+        execution = {'mcpTool': tool_execution_policy(
+            configured_tool_processes(PROCESSES_PER_LISTENER))}
+    elif channel == 'browser':
+        execution = {'webOperation': web_operation_policy()}
+    else:
+        raise ValueError('PROCESSING_POLICY_CHANNEL_INVALID')
     return {'connection': connection_policy(),
-        'mcpTool': tool_execution_policy(
-            configured_tool_processes(PROCESSES_PER_LISTENER)),
+        **execution,
         'httpAdmission': http_admission_policy(),
         'lockWaitMilliseconds': LOCK_WAIT_MS,
         'shorterSessionLimitsPreserved': True,

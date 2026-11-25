@@ -14,13 +14,60 @@ from .postgres_dimensional_scope import resolve_effective_dimensional_scope
 from .postgres_jobs import _canonical_digest
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_processing_limits import configure_lock_wait, configure_statement_timeout
-from .postgres_selection_preview import PostgresSelectionPreview, PREVIEW
-from .selection_contract import canonical_selection, selection_digest
+from .postgres_selection_preview import PostgresSelectionPreview, PREVIEW, resolved_selection_schema
+from .selection_contract import (
+    FORMAT, canonical_selection, selection_digest, structural_schema_definitions,
+)
 
 
 SEAL = "cube.selection.seal"
 READ = "cube.selection.read"
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,199}\Z")
+
+
+def selection_artifact_contract(function: str) -> dict | None:
+    from .metadata_read_contract import obj, read_contract, read_example
+
+    if function not in (SEAL, READ):
+        return None
+    identifier = {"type": "string", "pattern": "^" + _ID.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}
+    revision = {"type": "integer", "minimum": 0}
+    digest = {"type": "string", "pattern": r"^[0-9a-f]{64}(?![\s\S])"}
+    timestamp = {"type": "string", "format": "date-time"}
+    authored = {"$ref": "#/$defs/cubeSelection"}
+    result = obj({"selectionId": identifier, "selection": authored,
+        "resolvedSelection": resolved_selection_schema(retained=True),
+        "selectionDigest": digest, "resolutionDigest": digest,
+        "metadataRevision": {**revision, "minimum": 1}, "policyRevision": revision,
+        "commitRevision": revision, "createdAt": timestamp, "expiresAt": timestamp})
+    fields = {"selectionId": identifier}
+    example = {"selectionId": "example-cube-selection"}
+    rules = ["The artifact is scoped to the original verified actor and application. Its identifier and digests convey no authority."]
+    if function == SEAL:
+        fields.update(selection=authored, expectedPolicyRevision=revision,
+                      ttlSeconds={"type": "integer", "minimum": 60, "maximum": 3600})
+        example.update(ttlSeconds=900, expectedPolicyRevision=1, selection={
+            "format": FORMAT, "metadataRevision": 1,
+            "dimensions": [{"dimensionId": "custom-axis",
+                "include": {"kind": "member", "memberId": "member-a"}, "exclude": None}]})
+        name = "Seal the reviewed selection with a bounded lifetime"
+        binding = ("Use the full authorized fact grain from metadata.authoring.context. Review cube.selection.preview "
+                   "and use its input selection and observed policy revision. Choose a stable selectionId for this intent.")
+        rules.extend(["The fixed core resolves the selection again and checks that authority and state still match before storing it.",
+                      "An exact replay returns the original sealed artifact and expiry. Use a new ID for changed intent or a new lifetime."])
+    else:
+        name = "Read one current sealed selection"
+        binding = "Use the exact selectionId returned by cube.selection.seal in the same application and actor scope."
+        rules.append("The read uses current authority and checks metadata, policy and expiry before returning the recorded resolution.")
+    contract = read_contract(function, obj(fields), result, owner="PostgresSealedSelections",
+        examples=[read_example(function, example, name=name, binding=binding)],
+        definitions=structural_schema_definitions(), semantic_rules=rules)
+    if function == READ:
+        contract["programSchema"].pop("$defs")
+    contract["programContract"]["recovery"] = (
+        "If state or authority changed, rediscover current permitted scope and preview again. "
+        "Use a new selectionId to seal revised or expired intent. Read the original ID to reconcile an uncertain outcome.")
+    return contract
 
 
 def catalog() -> dict:
@@ -35,10 +82,10 @@ def catalog() -> dict:
                    "expectedPolicyRevision": "current authorization policy revision",
                    "ttlSeconds": "60-3600",
                },
-               "result": "durable subject-bound resolved selection artifact"},
+               "result": "durable subject-bound resolved selection artifact", **selection_artifact_contract(SEAL)},
         READ: {**common, "mode": "read", "idempotencyRequired": False,
                "arguments": {"selectionId": "sealed selection identity"},
-               "result": "current authorized unexpired sealed selection"},
+               "result": "current authorized unexpired sealed selection", **selection_artifact_contract(READ)},
     }
 
 
@@ -111,8 +158,8 @@ class PostgresSealedSelections:
             "expectedPolicyRevision": args["expectedPolicyRevision"],
             "ttlSeconds": args["ttlSeconds"],
         }
-        preview = PostgresSelectionPreview(
-            self.dsn, identity=self.identity).read(scope, {
+        preview, preview_authority = PostgresSelectionPreview(
+            self.dsn, identity=self.identity).read_with_authority(scope, {
                 "languageVersion": 2, "function": PREVIEW,
                 "arguments": {"selection": canonical,
                     "expectedPolicyRevision": args["expectedPolicyRevision"]}})
@@ -127,13 +174,16 @@ class PostgresSealedSelections:
                 request_digest = _canonical_digest({**request,
                     "authorizationScopeDigest": authorization_scope_digest})
                 state = db.execute("""SELECT metadata_revision,policy_revision,
-                    commit_revision FROM epm.application_state
+                    security_revision,schema_epoch,commit_revision FROM epm.application_state
                     WHERE workspace_id=%s AND application_id=%s FOR UPDATE""",
                     (scope.workspace_id, scope.application_id)).fetchone()
                 if state is None:
                     raise ValueError("APPLICATION_UNAVAILABLE")
-                if (state["metadata_revision"] != preview["metadataRevision"]
+                if (authorization_scope_digest != preview_authority
+                        or state["metadata_revision"] != preview["metadataRevision"]
                         or state["policy_revision"] != preview["policyRevision"]
+                        or state["security_revision"] != preview["securityRevision"]
+                        or state["schema_epoch"] != preview["schemaEpoch"]
                         or state["commit_revision"] != preview["commitRevision"]):
                     raise ValueError("CUBE_SELECTION_STATE_CHANGED_BEFORE_SEAL")
                 prior = db.execute("""SELECT * FROM epm.sealed_cube_selection

@@ -9,18 +9,20 @@ from hashlib import sha256
 from psycopg.rows import dict_row
 
 from .cube_aggregate_lifecycle import (
-    AggregateCursor, AggregateCursorCodec, AggregateQueryBudgets,
+    AUTHORIZATION_REVOKED, AggregateCursor, AggregateCursorCodec, AggregateQueryBudgets,
     AggregateQueryRecord, AggregateQueryStatus, AggregateSourcePins,
-    AggregateTechnicalCertificate, POSTGRES_EXACT_DIMENSIONAL_BACKEND)
+    AggregateTechnicalCertificate, POSTGRES_EXACT_DIMENSIONAL_BACKEND,
+    STALE_CONTEXT, technical_worker_outcome)
 from .persistence_contract import ApplicationScope
 from .postgres_access import PostgresAccessChecker, VerifiedIdentity
 from .postgres_connection import connect_postgres
 from .postgres_cube_aggregate_repository import PostgresCubeAggregateRepository
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_resolved_cube_read import (
-    FUNCTION, PostgresResolvedCubeRead, _dimensions_for_read,
+    FUNCTION, PostgresResolvedCubeRead, load_resolved_read_layout,
     load_resolved_read_snapshot)
 from .resolved_cube_read_contract import compile_resolved_cube_read
+from .selection_contract import SELECTION_METADATA_STALE
 
 
 def _canonical(value: object) -> bytes:
@@ -61,15 +63,13 @@ class ResolvedCubeReadTechnicalService:
                 PostgresNumericFactStore._set_scope(db,scope)
                 PostgresAccessChecker.check_in_transaction(
                     db,self.identity,scope,"read")
-                dimensions=_dimensions_for_read(db,scope)
+                snapshot=load_resolved_read_snapshot(db,scope)
+                layout=load_resolved_read_layout(db,scope,snapshot=snapshot)
                 plan=compile_resolved_cube_read(program["arguments"],
-                    active_dimensions=dimensions)
+                    active_dimensions=layout["dimensions"],
+                    expected_metadata_revision=snapshot["metadataRevision"])
                 if plan.normalized["delivery"]!="technical_query":
                     raise ValueError("RESOLVED_READ_TECHNICAL_QUERY_REQUIRED")
-                snapshot=load_resolved_read_snapshot(db,scope)
-                if plan.normalized["selection"]["metadataRevision"]!=\
-                        snapshot["metadataRevision"]:
-                    raise ValueError("STALE_METADATA_REVISION")
         budget=AggregateQueryBudgets(
             max_groups=plan.normalized["limits"]["maxRows"],
             max_result_bytes=32*1024*1024,page_size=page_size,
@@ -91,9 +91,7 @@ class ResolvedCubeReadTechnicalService:
         computed=self.repository.pending_computed_resolved(scope)
         if computed is not None:
             sealed=self.repository.seal(computed)
-            return {"queryId":sealed.query_id,"status":sealed.status.value,
-                "technicalCertificate":self._certificate(
-                    sealed.certificate)}
+            return technical_worker_outcome(sealed, self._certificate)
         claim=self.repository.claim_resolved(
             scope,claimant,lease_seconds=lease_seconds)
         if claim is None:return None
@@ -106,10 +104,19 @@ class ResolvedCubeReadTechnicalService:
             raise ValueError('RESOLVED_READ_TECHNICAL_CLAIM_INVALID')
         record=claim["record"]
         scope=record.scope
-        result=PostgresResolvedCubeRead(
-            self.dsn,identity=self.identity).read_technical(scope,{
-                "languageVersion":2,"function":FUNCTION,
-                "arguments":claim["normalizedRequest"]})
+        try:
+            result = PostgresResolvedCubeRead(self.dsn, identity=self.identity).read_technical(
+                scope, {"languageVersion": 2, "function": FUNCTION,
+                        "arguments": claim["normalizedRequest"]})
+        except ValueError as error:
+            # The accepted selection pins one metadata revision. Retrying it
+            # cannot make it current, and changing it would change the intent.
+            if str(error) != SELECTION_METADATA_STALE:
+                raise
+            if not self.repository.settle_resolved_stale_selection(claim):
+                raise ValueError("CUBE_AGGREGATE_STALE_WORKER_FENCE") from error
+            return {"queryId": record.query_id, "status": "failed",
+                    "errorCode": SELECTION_METADATA_STALE}
         rows=result["rows"]
         stored=[{"format":"openepm-resolved-cube-read-row-v1",**row}
                 for row in rows]
@@ -127,8 +134,7 @@ class ResolvedCubeReadTechnicalService:
         computed=self.repository.store_resolved_computed(
             record,certificate,rows,claim=claim)
         sealed=self.repository.seal(computed)
-        return {"queryId":sealed.query_id,"status":sealed.status.value,
-            "technicalCertificate":self._certificate(certificate)}
+        return technical_worker_outcome(sealed, self._certificate)
 
     @staticmethod
     def _certificate(value: AggregateTechnicalCertificate)->dict[str,object]:
@@ -153,7 +159,10 @@ class ResolvedCubeReadTechnicalService:
                     record,record.transition(AggregateQueryStatus.EXPIRED))
             raise ValueError("RESOLVED_READ_RESULT_EXPIRED")
         if record.status!=AggregateQueryStatus.SEALED or record.certificate is None:
-            return {"queryId":query_id,"status":record.status.value}
+            result = {"queryId": query_id, "status": record.status.value}
+            if record.error_code in (SELECTION_METADATA_STALE, AUTHORIZATION_REVOKED, STALE_CONTEXT):
+                result["errorCode"] = record.error_code
+            return result
         if cursor is None:
             size,after=page_size or record.budgets.page_size,0
         else:

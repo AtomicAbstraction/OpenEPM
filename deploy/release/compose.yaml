@@ -53,7 +53,11 @@ services:
     read_only: true
     tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=32m"]
     volumes:
-      - ../operations/otel-collector.yaml:/etc/openepm/otel-collector.yaml:ro
+      - type: bind
+        source: ${EPM_RELEASE_ASSETS_DIR:-..}/operations/otel-collector.yaml
+        target: /etc/openepm/otel-collector.yaml
+        read_only: true
+        bind: {create_host_path: false}
       - epm_pgdata:/var/lib/openepm/metrics/epm_pgdata:ro
       - epm_control_pgdata:/var/lib/openepm/metrics/epm_control_pgdata:ro
     networks: [application, database]
@@ -75,14 +79,27 @@ services:
     read_only: true
     tmpfs: ["/tmp:rw,noexec,nosuid,nodev,size=16m"]
     volumes:
-      - ../proxy/traefik.yaml:/etc/traefik/traefik.yaml:ro
-      - ${EPM_PROXY_CONFIG_DIR:?set the rendered proxy configuration directory}:/var/lib/openepm/proxy:ro
+      - type: bind
+        source: ${EPM_RELEASE_ASSETS_DIR:-..}/proxy/traefik.yaml
+        target: /etc/traefik/traefik.yaml
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${EPM_PROXY_CONFIG_DIR:?set the rendered proxy configuration directory}
+        target: /var/lib/openepm/proxy
+        read_only: true
+        bind: {create_host_path: false}
       - ${EPM_TLS_DIR:?set the TLS material directory}:/run/openepm/tls:ro
     networks:
       edge: {}
       application: {}
     mem_limit: ${EPM_PROXY_MEMORY_LIMIT:-256m}
     cpus: ${EPM_PROXY_CPU_LIMIT:-1.0}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/traefik", "healthcheck", "--configFile=/etc/traefik/traefik.yaml"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
 
   browser-session-store:
     <<: *no-privilege
@@ -310,6 +327,11 @@ services:
       sandbox:
         ipv4_address: ${EPM_PYTHON_BUILD_BROKER_IP:-172.30.252.2}
     depends_on: {db: {condition: service_healthy}}
+    healthcheck:
+      test: ["CMD", "python", "-m", "scripts.serve_openepm_python_build_broker", "--healthcheck"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
 
   builder:
     <<: *no-privilege
@@ -348,7 +370,6 @@ services:
       - epm_pgbackups:/var/lib/openepm/backups
       - ${EPM_BACKUP_EXPORT_DIR:?set an independent backup export directory}:/var/lib/openepm/export
       - /etc/openepm:/var/lib/openepm/protected-config/source:ro
-      - /var/lib/openepm/recovered-config:/var/lib/openepm/protected-config/restore
     networks: [database, control]
     depends_on:
       telemetry-collector: {condition: service_healthy}

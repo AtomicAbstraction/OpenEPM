@@ -159,11 +159,49 @@ def _expected(group: list[dict], policy: str) -> dict:
     return {"numeric": numeric, "text": text, "detail": detail}
 
 
+def canonical_dependency_context(value: object) -> dict:
+    """Validate the server-derived certificate binding, never infer its owners."""
+    if (not isinstance(value, dict) or set(value) != {
+            'format', 'dependencies', 'decisions', 'sourceInventoryDigest',
+            'sourceCoordinateCount', 'identityLayout'}
+            or value['format'] != 'openepm-layout-current-dependencies-v1'
+            or type(value['identityLayout']) is not bool
+            or type(value['sourceCoordinateCount']) is not int
+            or not 1 <= value['sourceCoordinateCount'] <= MAX_COORDINATES
+            or not isinstance(value['sourceInventoryDigest'], str)
+            or not _HEX64.fullmatch(value['sourceInventoryDigest'])
+            or not isinstance(value['dependencies'], list)
+            or len(value['dependencies']) > 10000
+            or not isinstance(value['decisions'], list)):
+        raise ValueError('LAYOUT_DEPENDENCY_CONTEXT_INVALID')
+    keys = []
+    for row in value['dependencies']:
+        if (not isinstance(row, dict) or set(row) != {'kind', 'id', 'stateToken', 'contentDigest'}
+                or row['kind'] not in ('rule', 'publication')
+                or not isinstance(row['id'], str) or not 1 <= len(row['id']) <= 256
+                or any(not isinstance(row[key], str) or not _HEX64.fullmatch(row[key])
+                    for key in ('stateToken', 'contentDigest'))):
+            raise ValueError('LAYOUT_DEPENDENCY_CONTEXT_INVALID')
+        keys.append((row['kind'], row['id']))
+    if keys != sorted(set(keys)) or len(value['decisions']) != len(keys):
+        raise ValueError('LAYOUT_DEPENDENCY_CONTEXT_INVALID')
+    for key, decision in zip(keys, value['decisions']):
+        if (not isinstance(decision, dict) or set(decision) != {'kind', 'id', 'decision'}
+                or (decision['kind'], decision['id']) != key
+                or decision['decision'] not in ('Compatible', 'Invalidate', 'Rebuild', 'Incompatible')
+                or decision['decision'] == 'Compatible' and not value['identityLayout']):
+            raise ValueError('LAYOUT_DEPENDENCY_CONTEXT_INVALID')
+    if len(_canonical(value)) > 1048576:
+        raise ValueError('LAYOUT_DEPENDENCY_CERTIFICATE_LIMIT')
+    return json.loads(_canonical(value))
+
+
 def validate_populated_layout_generation(*, request_id: str, plan_digest: str,
         pins: LayoutPins, generation_id: str, target_dimensions: object,
         coordinate_mappings: object, merge_policy: str, source_cells: object,
         staged_cells: object, valid_target_members: object,
-        affected_dependencies: object, compatibility_decisions: object) -> dict:
+        affected_dependencies: object, compatibility_decisions: object,
+        dependency_context: object = None) -> dict:
     """Return a deterministic bounded certificate; never raise for mismatches.
 
     Structural/type errors raise because no trustworthy certificate can be
@@ -288,6 +326,17 @@ def validate_populated_layout_generation(*, request_id: str, plan_digest: str,
         if decision == "Incompatible":
             reject("DEPENDENCY_INCOMPATIBLE", list(dependency))
 
+    bound_context = None
+    if dependency_context is not None:
+        bound_context = canonical_dependency_context(dependency_context)
+        expected = {(row['kind'], row['id']) for row in bound_context['dependencies']}
+        if expected != affected or bound_context['decisions'] != [
+                {'kind': kind, 'id': identity, 'decision': decisions[(kind, identity)]}
+                for kind, identity in sorted(decisions)]:
+            raise ValueError('LAYOUT_DEPENDENCY_CONTEXT_MISMATCH')
+        if bound_context['sourceCoordinateCount'] != len(sources):
+            raise ValueError('LAYOUT_SOURCE_INVENTORY_STALE')
+
     errors.sort(key=lambda item: _canonical(item))
     summary = {"requestId": request_id, "planDigest": plan_digest,
                "pins": pins.to_wire(), "privateGenerationId": generation_id,
@@ -299,7 +348,11 @@ def validate_populated_layout_generation(*, request_id: str, plan_digest: str,
                "diagnostics": errors,
                "diagnosticsTruncated": error_count > len(errors),
                "activationEligible": error_count == 0}
+    if bound_context is not None:
+        summary['dependencyContext'] = bound_context
     # Convert exact decimals only in the internal comparison path; the
     # certificate deliberately contains counts/identities, not cell values.
     summary["validationDigest"] = sha256(_canonical(summary)).hexdigest()
+    if len(_canonical(summary)) > 1048576:
+        raise ValueError('LAYOUT_DEPENDENCY_CERTIFICATE_LIMIT')
     return summary

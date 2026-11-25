@@ -7,10 +7,14 @@ import json
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .keycloak_directory import KeycloakDirectory
+from .keycloak_directory import (
+    DIRECTORY_DESCRIPTION_LIMITS, IDENTIFIER, USERNAME, KeycloakDirectory, directory_description_attributes,
+    validate_temporary_password,
+)
 from .postgres_access import VerifiedIdentity
 from .postgres_connection import connect_postgres
-from .postgres_platform_provision import PostgresPlatformProvisioner
+from .postgres_platform_provision import (
+    PostgresPlatformProvisioner, platform_operation_actor_digest)
 
 
 USER_CREATE = "identity.native-user.create"
@@ -37,10 +41,24 @@ READ_FUNCTIONS = frozenset((USER_READ, USER_LIST, GROUP_READ, GROUP_LIST,
                             MEMBERSHIP_LIST))
 ALL_FUNCTIONS = WRITE_FUNCTIONS | READ_FUNCTIONS
 
+
+class DirectoryPasswordOutcomeUnknown(ValueError):
+    code = "DIRECTORY_PASSWORD_OUTCOME_UNKNOWN"
+
+    def __init__(self):
+        super().__init__(self.code)
+
 _DIRECTORY_GROUP_AUTHORITY_TABLES = (
     ("identity_group_directory_state", ()),
     ("identity_group_membership_state", ("subject_id",)),
 )
+
+_DESCRIPTION_ERROR = {
+    USER_CREATE: "DIRECTORY_USER_CREATE_INVALID",
+    USER_UPDATE: "DIRECTORY_USER_UPDATE_INVALID",
+    GROUP_CREATE: "DIRECTORY_GROUP_CREATE_INVALID",
+    GROUP_UPDATE: "DIRECTORY_GROUP_UPDATE_INVALID",
+}
 
 
 def _legacy_group_mapping(groups: list[dict], observed_ids: set[str]
@@ -69,7 +87,9 @@ def _legacy_group_mapping(groups: list[dict], observed_ids: set[str]
 def _program(program: object) -> tuple[str, dict]:
     if (type(program) is not dict
             or set(program) != {"languageVersion", "function", "arguments"}
+            or type(program.get("languageVersion")) is not int
             or program.get("languageVersion") != 2
+            or type(program.get("function")) is not str
             or program.get("function") not in ALL_FUNCTIONS
             or type(program.get("arguments")) is not dict):
         raise ValueError("V2_FUNCTION_OR_ARGUMENTS_UNSUPPORTED")
@@ -103,6 +123,239 @@ def _program(program: object) -> tuple[str, dict]:
     return function, arguments
 
 
+def _require_identifier(value: object, code: str) -> None:
+    if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
+        raise ValueError(code)
+
+
+def _validate_write_arguments(function: str, arguments: dict) -> None:
+    if function == USER_PASSWORD:
+        validate_temporary_password(arguments["subjectId"], arguments["temporaryPassword"])
+        return
+    if function == SERVER_ADMINISTRATOR_ACCESS:
+        subject_id = arguments["subjectId"]
+        if not isinstance(subject_id, str) or not subject_id or "\0" in subject_id:
+            raise ValueError("SERVER_ADMINISTRATOR_ACCESS_INVALID")
+        return
+    if function == USER_CREATE:
+        username = arguments["username"]
+        if not isinstance(username, str) or not USERNAME.fullmatch(username):
+            raise ValueError("DIRECTORY_USER_CREATE_INVALID")
+    elif "subjectId" in arguments:
+        _require_identifier(arguments["subjectId"], "DIRECTORY_SUBJECT_ID_INVALID")
+    if "groupId" in arguments:
+        _require_identifier(arguments["groupId"], "DIRECTORY_GROUP_CREATE_INVALID"
+                            if function == GROUP_CREATE else "DIRECTORY_GROUP_ID_INVALID")
+    if function in _DESCRIPTION_ERROR:
+        directory_description_attributes(arguments, _DESCRIPTION_ERROR[function])
+    if function in (USER_STATUS, GROUP_STATUS) and arguments["status"] not in ("Active", "Inactive"):
+        raise ValueError("DIRECTORY_USER_STATUS_INVALID" if function == USER_STATUS
+                         else "DIRECTORY_GROUP_STATUS_INVALID")
+    if function == MEMBERSHIP_SET and arguments["action"] not in ("add", "remove"):
+        raise ValueError("DIRECTORY_MEMBERSHIP_ACTION_INVALID")
+
+
+def compile_directory_write(program: object) -> tuple[str, dict]:
+    function, arguments = _program(program)
+    if function not in WRITE_FUNCTIONS:
+        raise ValueError("V2_FUNCTION_MODE_MISMATCH")
+    _validate_write_arguments(function, arguments)
+    return function, arguments
+
+
+def compile_directory_read(program: object) -> tuple[str, dict]:
+    function, arguments = _program(program)
+    if function not in READ_FUNCTIONS:
+        raise ValueError("V2_FUNCTION_MODE_MISMATCH")
+    if function in (USER_READ, GROUP_READ):
+        user = function == USER_READ
+        identifier = arguments["subjectId" if user else "groupId"]
+        _require_identifier(identifier, "DIRECTORY_SUBJECT_ID_INVALID" if user else "DIRECTORY_GROUP_ID_INVALID")
+    elif function in (USER_LIST, GROUP_LIST):
+        offset, limit = arguments["offset"], arguments["limit"]
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("DIRECTORY_PAGE_INVALID")
+    else:
+        after_group, after_subject, limit = (arguments["afterGroupId"], arguments["afterSubjectId"], arguments["limit"])
+        if (type(limit) is not int or not 1 <= limit <= 100
+                or (after_group is None) != (after_subject is None)
+                or (after_group is not None and any(not isinstance(key, str) or not 1 <= len(key) <= 300
+                                                   or "\0" in key for key in (after_group, after_subject)))):
+            raise ValueError("DIRECTORY_MEMBERSHIP_PAGE_INVALID")
+    return function, arguments
+
+
+def _directory_record_fields(*, user: bool) -> dict:
+    text = {"type": "string"}
+    return {("subjectId" if user else "groupId"): text,
+            ("username" if user else "groupName"): text,
+            "displayName": text, "shortDescription": text, "semanticDescription": text,
+            "status": {"enum": ["Active", "Inactive"]}}
+
+
+def directory_read_contract(function: str) -> dict:
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    if function not in READ_FUNCTIONS:
+        raise ValueError("DIRECTORY_READ_FUNCTION_INVALID")
+    identifier = {"type": "string", "pattern": rf"^{IDENTIFIER.pattern}(?![\s\S])"}
+    limit = {"type": "integer", "minimum": 1, "maximum": 100}
+    rules = ["This read requires current platform operator authority on the platform listener."]
+    if function == MEMBERSHIP_LIST:
+        key = {"type": "string", "minLength": 1, "maxLength": 300, "pattern": r"^[^\x00]+(?![\s\S])"}
+        nullable_key = {"anyOf": [key, {"type": "null"}]}
+        arguments = {**obj({"afterGroupId": nullable_key, "afterSubjectId": nullable_key, "limit": limit}),
+                     "oneOf": [{"properties": {"afterGroupId": {"type": kind}, "afterSubjectId": {"type": kind}}}
+                               for kind in ("null", "string")]}
+        keys = {"groupId": key, "subjectId": key}
+        membership = obj({**keys, "directoryRevision": {"type": "integer", "minimum": 1}})
+        result = obj({"items": {"type": "array", "maxItems": 100, "items": membership},
+                      "nextAfter": {"oneOf": [obj(keys), {"type": "null"}]}})
+        examples = [
+            read_example(function, {"afterGroupId": None, "afterSubjectId": None, "limit": 25},
+                         name="List current memberships", binding="Use null for both fields on the first page."),
+            read_example(function, {"afterGroupId": "example-group", "afterSubjectId": "example-subject", "limit": 25},
+                         name="Continue the memberships list", binding="Use both keys from the exact returned nextAfter pair."),
+        ]
+        rules.append("Membership pages list active rows from the current directory projection. Null nextAfter ends the listing.")
+    else:
+        user = function in (USER_READ, USER_LIST)
+        field, label = ("subjectId", "user") if user else ("groupId", "group")
+        record = obj(_directory_record_fields(user=user))
+        if function in (USER_LIST, GROUP_LIST):
+            arguments = obj({"offset": {"type": "integer", "minimum": 0}, "limit": limit})
+            result = obj({"items": {"type": "array", "maxItems": 100, "items": record},
+                          "nextOffset": {"type": ["integer", "null"], "minimum": 1}})
+            examples = [
+                read_example(function, {"offset": 0, "limit": 25}, name=f"List managed {label}s",
+                             binding="Start at offset zero."),
+                read_example(function, {"offset": 25, "limit": 25}, name=f"Continue the {label} list",
+                             binding="Use the returned nextOffset, even after an empty page."),
+            ]
+            rules.append("Offsets count provider entries before filtering. Continue until nextOffset is null.")
+        else:
+            arguments, result = obj({field: identifier}), record
+            examples = [read_example(function, {field: f"example-{label}"}, name=f"Inspect a managed {label}",
+                                     binding=f"Use the exact {field} returned by current directory discovery.")]
+    contract = read_contract(function, arguments, result, owner="PostgresIdentityDirectory",
+                             examples=examples, semantic_rules=rules, result_scope="result")
+    contract["programContract"]["recovery"] = (
+        "Use the current platform catalogue to repair a malformed request. After an interrupted read, "
+        "check current authority and retry the exact read or restart the list.")
+    return contract
+
+
+def directory_write_contract(function: str) -> dict:
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    if function not in WRITE_FUNCTIONS:
+        raise ValueError("DIRECTORY_WRITE_FUNCTION_INVALID")
+    identifier = {"type": "string", "pattern": rf"^{IDENTIFIER.pattern}(?![\s\S])"}
+    subject, group = {"subjectId": identifier}, {"groupId": identifier}
+    count = {"type": "integer", "minimum": 0}
+    boolean = {"type": "boolean"}
+    active = {"enum": ["Active", "Inactive"]}
+    descriptions = {field: {"type": "string", "maxLength": limit}
+                    for field, limit in DIRECTORY_DESCRIPTION_LIMITS.items()}
+    descriptions["displayName"]["minLength"] = 1
+    names = {"displayName": "Planning directory example", "shortDescription": "",
+             "semanticDescription": ""}
+    subject_example = {"subjectId": "example-subject"}
+    group_example = {"groupId": "example-group"}
+    subject_binding = "Bind subjectId to the exact managed ID returned by the current user list."
+    group_binding = "Bind groupId to the immutable ID returned by the current group list or create result."
+    semantic = [
+        "Use this write on the platform listener under current platform operator authority.",
+        "Use execute_v2_platform_program with one unused idempotency_key for the reviewed program. "
+        "Pass the original program and key for exact replay.",
+    ]
+    examples = []
+
+    def example(arguments, name, binding):
+        examples.append(read_example(function, arguments, name=name, binding=binding))
+
+    if function in _DESCRIPTION_ERROR:
+        user = function in (USER_CREATE, USER_UPDATE)
+        identity = ({"username": {"type": "string", "pattern": rf"^{USERNAME.pattern}(?![\s\S])"}}
+                    if function == USER_CREATE else subject if user else group)
+        arguments = {**identity, **descriptions}
+        result = obj(_directory_record_fields(user=user))
+        if function == USER_CREATE:
+            example({"username": "planning.example", **names}, "Create a managed user",
+                    "Choose an unused username. Retain subjectId from the result. Assign any temporary credential separately.")
+        elif function == GROUP_CREATE:
+            example({**group_example, **names}, "Create a managed group",
+                    "Supply the new group name in groupId. Retain the immutable provider groupId returned in the result.")
+        else:
+            example({**(subject_example if user else group_example), **names},
+                    "Update user descriptions" if user else "Update group descriptions",
+                    subject_binding if user else group_binding)
+        semantic.append("Supply descriptive values without leading or trailing whitespace or NUL characters.")
+    elif function in (USER_STATUS, GROUP_STATUS):
+        user = function == USER_STATUS
+        arguments = {**(subject if user else group), "status": active}
+        record = _directory_record_fields(user=user)
+        if user:
+            result = {"oneOf": [
+                obj({**record, "status": {"const": "Active"}, "sessionsRevoked": {"const": False}}),
+                obj({**record, "status": {"const": "Inactive"}, "sessionsRevoked": {"const": True},
+                     "tokensValidAfter": count}),
+            ]}
+        else:
+            result = obj({**record, "membershipsRemoved": count, "sessionsRevoked": count})
+        for status in ("Inactive", "Active"):
+            example({**(subject_example if user else group_example), "status": status},
+                    f"Set {'user' if user else 'group'} status to {status}",
+                    subject_binding if user else group_binding)
+        semantic.append("Deactivation fences existing authority. Reactivation does not restore prior sessions or removed memberships.")
+    elif function == MEMBERSHIP_SET:
+        arguments = {**subject, **group, "action": {"enum": ["add", "remove"]}}
+        result = obj({"subjectId": {"type": "string"}, "groupId": {"type": "string"},
+                      "membership": boolean, "sessionsRevoked": {"const": True}})
+        for action in ("add", "remove"):
+            example({**subject_example, **group_example, "action": action},
+                    f"{action.capitalize()} managed membership", f"{subject_binding} {group_binding}")
+        semantic.append("Both changes fence existing sessions. Addition requires a current active group.")
+    elif function == DIRECTORY_RECONCILE:
+        arguments = {}
+        result = obj({"issuer": {"type": "string"}, "directoryRevision": count, "userCount": count,
+                      "groupCount": count, "membershipCount": count, "legacyGroupAuthorityRowsMigrated": count,
+                      "snapshotDigest": {"type": "string", "pattern": r"^[0-9a-f]{64}(?![\s\S])"}})
+        example({}, "Reconcile the current managed directory",
+                "Review reconciliation for the configured provider. The response contains counts and a snapshot digest.")
+        semantic.append("Reconciliation reads the configured provider and replaces its directory projection. It preserves the cutoff on an unchanged identity.")
+    elif function == SERVER_ADMINISTRATOR_ACCESS:
+        arguments = {"subjectId": {"type": "string", "minLength": 1, "pattern": r"^[^\x00]+(?![\s\S])"},
+                     "access": {"enum": ["Grant", "Revoke"]}}
+        result = obj({"issuer": {"type": "string"}, "subjectId": {"type": "string"},
+                      "access": {"enum": ["Granted", "Revoked"]}, "changed": boolean})
+        for access in ("Grant", "Revoke"):
+            example({**subject_example, "access": access}, f"{access} Server Administrator access", subject_binding)
+        semantic.append("Server Administrator access is separate from application and workspace grants. The core checks target activity and protects the final administrator.")
+    else:
+        arguments = {**subject, "temporaryPassword": {"type": "string", "format": "password", "writeOnly": True}}
+        settled = {"subjectId": {"type": "string"}, "passwordChanged": {"const": True},
+                   "temporary": {"const": True}, "sessionsRevoked": {"const": True}}
+        result = obj({**settled, "tokensValidAfter": count}, list(settled))
+        semantic.extend([
+            "Bind subjectId to the managed ID of an active user. Supply a new private temporary credential at dispatch.",
+            "Use 12 to 256 characters with ASCII lower and upper case letters, a digit and a non-alphanumeric character. "
+            "Characters below U+0020 are refused. Keep the credential out of stored examples and recovery records.",
+        ])
+    contract = read_contract(function, obj(arguments), result, owner="PostgresIdentityDirectory",
+                             examples=examples, semantic_rules=semantic, result_scope="result")
+    recovery = (
+        "After an interrupted response, use platform.operation.receipt.read with operationId set to the original "
+        "idempotency key under current operator authority. A Pending receipt leaves the outcome unconfirmed.")
+    if function == USER_PASSWORD:
+        recovery += (" Inspect the receipt without the credential. An unresolved assignment can return "
+                     "DIRECTORY_PASSWORD_OUTCOME_UNKNOWN and stops before another reset.")
+    contract["programContract"]["recovery"] = recovery
+    return contract
+
+
 def catalog() -> dict:
     descriptions = {
         USER_CREATE: ("atomic_write", "native user without password material"),
@@ -132,6 +385,10 @@ def catalog() -> dict:
                         "previewRequired": False,
                         "idempotencyRequired": mode == "atomic_write",
                         "workClass": "short"}
+        if name in READ_FUNCTIONS:
+            result[name].update(directory_read_contract(name))
+        else:
+            result[name].update(directory_write_contract(name))
     return {"languageVersion": 2, "functions": result}
 
 
@@ -154,9 +411,7 @@ class PostgresIdentityDirectory:
                                     identity=self.identity).check()
 
     def read(self, program: object) -> dict:
-        function, arguments = _program(program)
-        if function not in READ_FUNCTIONS:
-            raise ValueError("V2_FUNCTION_MODE_MISMATCH")
+        function, arguments = compile_directory_read(program)
         if function == MEMBERSHIP_LIST:
             return self._list_memberships(arguments)
         self._check()
@@ -179,12 +434,6 @@ class PostgresIdentityDirectory:
         after_group = arguments["afterGroupId"]
         after_subject = arguments["afterSubjectId"]
         limit = arguments["limit"]
-        if (type(limit) is not int or not 1 <= limit <= 100
-                or (after_group is None) != (after_subject is None)
-                or (after_group is not None and (
-                    not isinstance(after_group, str) or not after_group
-                    or not isinstance(after_subject, str) or not after_subject))):
-            raise ValueError("DIRECTORY_MEMBERSHIP_PAGE_INVALID")
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
                 PostgresPlatformProvisioner._require_operator(db, self.identity)
@@ -218,13 +467,14 @@ class PostgresIdentityDirectory:
                 program, arguments, idempotency_key=idempotency_key)
         digest = sha256(json.dumps(program, sort_keys=True,
             ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
-        actor_digest = sha256((self.identity.issuer + "\0" +
-                               self.identity.subject_id).encode()).hexdigest()
+        actor_digest = platform_operation_actor_digest(self.identity)
         marker = idempotency_key + ":" + digest
         with connect_postgres(self.dsn, row_factory=dict_row,
                               autocommit=True) as db:
             db.execute("SELECT pg_advisory_lock(hashtextextended(%s,0))",
                        ("epm.identity-directory:" + idempotency_key,))
+            password_started = False
+            membership_fence = False
             try:
                 with db.transaction():
                     PostgresPlatformProvisioner._require_operator(
@@ -239,7 +489,36 @@ class PostgresIdentityDirectory:
                             raise ValueError("IDEMPOTENCY_KEY_REUSED")
                         if previous["status"] == "Committed":
                             return previous["result"]
-                    else:
+                        if function == USER_PASSWORD:
+                            # Keycloak's reset endpoint has no operation key that
+                            # can prove the original credential was left untouched.
+                            raise DirectoryPasswordOutcomeUnknown()
+                    # Deterministic input errors must precede receipt creation
+                    # and the local session cutoff for provider-side effects.
+                    _validate_write_arguments(function, arguments)
+                    membership_change = function in (
+                        MEMBERSHIP_SET, USER_STATUS, GROUP_STATUS, DIRECTORY_RECONCILE)
+                    if membership_change:
+                        # Hold through the provider request and its local projection.
+                        # Assignment writers acquire the matching shared xact lock.
+                        membership_fence = db.execute("""SELECT pg_try_advisory_lock(
+                            hashtextextended('epm.authorization.directory-membership',0)) AS held"""
+                        ).fetchone()['held']
+                        if not membership_fence:
+                            raise ValueError('DIRECTORY_AUTHORIZATION_CHANGE_BUSY')
+                        removing = (arguments.get('status') == 'Inactive'
+                                    or arguments.get('action') == 'remove')
+                        if removing:
+                            removal = (self.directory_issuer, arguments.get('subjectId'), arguments.get('groupId'))
+                            continuity = db.execute("""SELECT
+                                epm.directory_removal_preserves_assignment_admins(%s,%s,%s) AS applications,
+                                epm.directory_removal_preserves_workspace_admins(%s,%s,%s) AS workspaces""",
+                                (*removal, *removal)).fetchone()
+                            if not continuity['applications']:
+                                raise ValueError('LAST_REACHABLE_APPLICATION_ADMINISTRATOR')
+                            if not continuity['workspaces']:
+                                raise ValueError('LAST_WORKSPACE_ADMINISTRATOR')
+                    if previous is None:
                         db.execute("""INSERT INTO epm.platform_operation_receipt
                             (operation_id,command_digest,actor_digest,
                              function_name,status,result)
@@ -247,6 +526,7 @@ class PostgresIdentityDirectory:
                             (idempotency_key, digest, actor_digest, function))
                     self._pre_fence_session_authority(
                         db, function=function, arguments=arguments)
+                password_started = function == USER_PASSWORD
                 result = self._apply(function, arguments, marker)
                 with db.transaction():
                     PostgresPlatformProvisioner._require_operator(
@@ -279,7 +559,14 @@ class PostgresIdentityDirectory:
                          sha256(target.encode()).hexdigest(),
                          Jsonb({"directory": "keycloak"})))
                 return committed_result
+            except Exception:
+                if password_started:
+                    raise DirectoryPasswordOutcomeUnknown() from None
+                raise
             finally:
+                if membership_fence:
+                    db.execute("""SELECT pg_advisory_unlock(
+                        hashtextextended('epm.authorization.directory-membership',0))""")
                 db.execute("SELECT pg_advisory_unlock(hashtextextended(%s,0))",
                            ("epm.identity-directory:" + idempotency_key,))
 
@@ -296,8 +583,7 @@ class PostgresIdentityDirectory:
         """
         digest = sha256(json.dumps(program, sort_keys=True,
             ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
-        actor_digest = sha256((self.identity.issuer + "\0" +
-                               self.identity.subject_id).encode()).hexdigest()
+        actor_digest = platform_operation_actor_digest(self.identity)
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
                 PostgresPlatformProvisioner._require_operator(
@@ -315,6 +601,7 @@ class PostgresIdentityDirectory:
                     if previous["status"] != "Committed":
                         raise ValueError("PLATFORM_OPERATION_INCOMPLETE")
                     return previous["result"]
+                _validate_write_arguments(SERVER_ADMINISTRATOR_ACCESS, arguments)
                 result = db.execute("""SELECT
                     epm.set_server_administrator_access(%s,%s,%s,%s,%s)
                     AS result""", (
@@ -494,8 +781,9 @@ class PostgresIdentityDirectory:
         group_ids = [item["groupId"] for item in groups]
         membership_keys = [(item["subjectId"], item["groupId"])
                            for item in memberships]
-        if (len(set(user_ids)) != len(user_ids)
-                or len(set(group_ids)) != len(group_ids)
+        user_id_set, group_id_set = set(user_ids), set(group_ids)
+        if (len(user_id_set) != len(user_ids)
+                or len(group_id_set) != len(group_ids)
                 or len(set(membership_keys)) != len(membership_keys)
                 or any(not isinstance(value, str) or not value
                        for value in user_ids + group_ids
@@ -505,8 +793,9 @@ class PostgresIdentityDirectory:
                        + [item["displayName"] for item in groups])
                 or any(not isinstance(value, str) or not value
                        for pair in membership_keys for value in pair)
-                or any(group_id not in set(group_ids)
-                       for _, group_id in membership_keys)):
+                or any(subject_id not in user_id_set
+                       or group_id not in group_id_set
+                       for subject_id, group_id in membership_keys)):
             raise ValueError("DIRECTORY_SNAPSHOT_INVALID")
         migrated = self._migrate_legacy_group_authority(db, groups)
         digest = sha256(json.dumps(snapshot, sort_keys=True,
@@ -519,17 +808,43 @@ class PostgresIdentityDirectory:
                    (issuer,))
         db.execute("DELETE FROM epm.identity_group_directory_state WHERE issuer=%s",
                    (issuer,))
-        db.execute("DELETE FROM epm.identity_user_directory_state WHERE issuer=%s",
-                   (issuer,))
+        # A missing provider subject loses current authority immediately, but
+        # deleting its session cutoff would revive older bearer/durable authority
+        # if that exact immutable subject returned. Keep only the revocation
+        # identity; missing subjects must not become a historical user catalogue.
+        db.execute("""UPDATE epm.identity_user_directory_state
+            SET status='Inactive',
+                tokens_valid_after=greatest(tokens_valid_after,
+                    CASE WHEN status='Active' THEN
+                        extract(epoch FROM clock_timestamp())::bigint ELSE 0 END),
+                directory_revision=%s,username=NULL,display_name=NULL,
+                principal_digest=NULL,updated_at=transaction_timestamp()
+            WHERE issuer=%s AND NOT (subject_id=ANY(%s::text[]))
+              AND (status<>'Inactive' OR username IS NOT NULL
+                   OR display_name IS NOT NULL OR principal_digest IS NOT NULL)""",
+            (revision, issuer, user_ids))
         if users:
             db.execute("""INSERT INTO epm.identity_user_directory_state
                 (issuer,subject_id,status,directory_revision,username,
-                 display_name,principal_digest)
+                 display_name,principal_digest,tokens_valid_after)
                 SELECT %s,item.subject_id,item.status,%s,item.username,
-                       item.display_name,item.principal_digest
+                       item.display_name,item.principal_digest,
+                       CASE WHEN item.status='Inactive' THEN
+                           extract(epoch FROM clock_timestamp())::bigint ELSE 0 END
                 FROM jsonb_to_recordset(%s::jsonb)
                     AS item(subject_id text,status text,username text,
-                            display_name text,principal_digest text)""",
+                            display_name text,principal_digest text)
+                ON CONFLICT (issuer,subject_id) DO UPDATE SET
+                    status=excluded.status,
+                    directory_revision=excluded.directory_revision,
+                    username=excluded.username,display_name=excluded.display_name,
+                    principal_digest=excluded.principal_digest,
+                    tokens_valid_after=greatest(
+                        epm.identity_user_directory_state.tokens_valid_after,
+                        CASE WHEN epm.identity_user_directory_state.status='Active'
+                            AND excluded.status='Inactive'
+                            THEN excluded.tokens_valid_after ELSE 0 END),
+                    updated_at=transaction_timestamp()""",
                 (issuer, revision, Jsonb([{
                     "subject_id": item["subjectId"],
                     "status": item["status"], "username": item["username"],

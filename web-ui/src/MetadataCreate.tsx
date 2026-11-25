@@ -10,7 +10,7 @@ type Dimension = {
   status: string;
 };
 
-const MODEL_ROLES = [
+export const metadataModelRoles = [
   "Custom",
   "Account",
   "Entity",
@@ -394,7 +394,7 @@ export function MetadataCreate({
                   invalidate("dimension");
                 }}
               >
-                {MODEL_ROLES.map((role) => (
+                {metadataModelRoles.map((role) => (
                   <option key={role}>{role}</option>
                 ))}
               </select>

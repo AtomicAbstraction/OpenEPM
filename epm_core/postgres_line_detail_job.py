@@ -1,14 +1,20 @@
 """Strict V2 admission for atomic supporting detail and its numeric total."""
 from __future__ import annotations
 
+from psycopg.rows import dict_row
+
+from .dimensional_security_policy import AccessKind
 from .persistence_contract import ApplicationScope, Coordinate, LineItem, NumericCell
 from .postgres_access import PostgresAccessChecker
 from .postgres_connection import connect_postgres
-from .postgres_jobs import (PostgresJobQueue, _DETAIL_FUNCTION,
-                            _detail_program)
+from .postgres_cube_query import _FILTER_ID
+from .postgres_dimensional_security import CUBE_READ_AUTHORIZATION_STALE
+from .postgres_dimensional_security_enforcement import authorize_coordinates
+from .postgres_jobs import PostgresJobQueue, _DETAIL_FUNCTION, _detail_program, job_submission_schema
+from .postgres_line_detail import PostgresLineDetailStore, prepare_detail_items
 from .postgres_numeric_store import PostgresNumericFactStore
-from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
+from .postgres_planning_write_guard import enforce_active_planning_policy
+from .postgres_processing_limits import configure_statement_timeout
 
 
 FUNCTION = _DETAIL_FUNCTION
@@ -17,7 +23,8 @@ FUNCTION = _DETAIL_FUNCTION
 def compile_program(program: object):
     if (type(program) is not dict
             or set(program) != {'languageVersion','function','arguments'}
-            or program.get('languageVersion') != 2
+            or type(program.get('languageVersion')) is not int
+            or program['languageVersion'] != 2
             or program.get('function') != FUNCTION
             or type(program.get('arguments')) is not dict
             or set(program['arguments']) != {'coordinate','items',
@@ -34,12 +41,16 @@ def compile_program(program: object):
         coordinate=Coordinate.from_mapping(args['coordinate'])
         items=tuple(LineItem(row['description'],NumericCell.from_wire(
             present=True,amount=row['amount']).amount) for row in args['items']
-            if type(row) is dict and set(row)=={'description','amount'})
+            if type(row) is dict and set(row)=={'description','amount'}
+            and isinstance(row['description'],str) and _FILTER_ID.fullmatch(row['description']))
     except (TypeError,ValueError,KeyError) as error:
         raise ValueError('V2_LINE_DETAIL_INVALID') from error
-    if len(items)!=len(args['items']):
+    if (len(items)!=len(args['items'])
+            or any(not _FILTER_ID.fullmatch(identifier)
+                   for pair in coordinate.members for identifier in pair)):
         raise ValueError('V2_LINE_DETAIL_INVALID')
-    # This also proves the exact total fits the authoritative numeric type.
+    # The publication owner also validates the exact sum before any preview.
+    prepare_detail_items(items)
     _detail_program(coordinate,items,args['expectedCellChangeId'],
                     args['expectedDetailChangeId'])
     return coordinate,items,args['expectedCellChangeId'],args['expectedDetailChangeId']
@@ -55,16 +66,98 @@ def normalized_v2(values) -> dict:
         'expectedDetailChangeId':detail_change}}
 
 
+def detail_preview_evidence(values) -> dict:
+    """Project the existing native total kernel; never infer a parent result."""
+    coordinate, items, _, _ = values
+    total, _ = prepare_detail_items(items)
+    return {'coordinate': dict(coordinate.members), 'replacement': 'complete_set',
+            'itemCount': len(items), 'present': True,
+            'total': {'type': 'AmountLiteral', 'decimal': format(total, 'f')}}
+
+
+def line_detail_program_contract() -> dict:
+    from .metadata_read_contract import DIALECT, obj, read_example
+    from .postgres_numeric_catalog import program_schema
+    from .persistence_contract import AMOUNT_INTEGER_DIGITS, AMOUNT_SCALE
+
+    identifier = {'type': 'string', 'minLength': 1,
+                  'pattern': '^' + _FILTER_ID.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    coordinate = {'type': 'object', 'minProperties': 1,
+                  'propertyNames': identifier, 'additionalProperties': identifier}
+    change_id = {'type': 'string', 'maxLength': 200}
+    amount = {'type': 'string', 'minLength': 1,
+              'description': 'Finite exact NUMERIC(28,8) decimal string. The fixed compiler validates syntax, precision and the complete-set sum.'}
+    arguments = obj({
+        'coordinate': coordinate, 'expectedCellChangeId': change_id, 'expectedDetailChangeId': change_id,
+        'items': {'type': 'array', 'maxItems': 500, 'items': obj({
+            'description': {**identifier, 'maxLength': 80}, 'amount': amount})},
+    })
+    decimal = {'type': 'string', 'pattern':
+               rf'^-?[0-9]{{1,{AMOUNT_INTEGER_DIGITS}}}(?:\.[0-9]{{1,{AMOUNT_SCALE}}})?(?![\s\S])'}
+    revision = {'type': 'integer', 'minimum': 0}
+    detail = obj({'coordinate': coordinate, 'replacement': {'const': 'complete_set'},
+                  'itemCount': {**revision, 'maximum': 500}, 'present': {'const': True},
+                  'total': obj({'type': {'const': 'AmountLiteral'}, 'decimal': decimal})})
+    preview_shape = {'$schema': DIALECT, **obj({
+        'languageVersion': {'type': 'integer', 'const': 2}, 'function': {'const': FUNCTION},
+        'programDigest': {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'},
+        'revisionVector': obj(dict.fromkeys(('metadata_revision', 'data_revision', 'policy_revision'), revision)),
+        'previewToken': {'type': 'string', 'minLength': 1}, 'changedCount': {'const': 1},
+        'detail': detail,
+    })}
+    submission = job_submission_schema()
+    published = {'$schema': DIALECT, **obj({
+        'changedCount': {'const': 1}, 'committedRevision': {'type': 'integer', 'minimum': 1},
+    })}
+    fresh = {'coordinate': {'Metric': 'Input'}, 'expectedCellChangeId': '', 'expectedDetailChangeId': '',
+             'items': [{'description': 'Forecast base', 'amount': '1.25000000'},
+                       {'description': 'Forecast correction', 'amount': '-0.25000000'}]}
+    return {
+        'schemaCoverage': 'program-and-result', 'schemaDialect': DIALECT,
+        'programSchema': program_schema(FUNCTION, arguments),
+        'resultSchema': submission, 'resultSchemaScope': 'envelope',
+        'programContract': {
+            'owner': 'PostgresLineDetailStore and compile_program',
+            'examples': [
+                read_example(FUNCTION, fresh, name='Replace all supporting lines with an exact total',
+                    binding='Use a permitted full coordinate in a disposable application with no prior numeric event or supporting detail. The reviewed total is 1.00000000.'),
+                read_example(FUNCTION, {**fresh, 'items': [], 'expectedCellChangeId': '17:1',
+                    'expectedDetailChangeId': '17:1'}, name='Replace the current detail with an empty set',
+                    binding='Read a current numeric change ID and confirm a LineDetailLiteral at the same authorized snapshot. Replace both sample IDs with that shared current change ID. The empty set leaves a present zero.'),
+            ],
+            'outputSchemas': {
+                'preview': {'schema': preview_shape, 'scope': 'envelope',
+                            'surface': 'preview_v2_program or browser /api/preview'},
+                'submission': {'schema': submission, 'scope': 'envelope',
+                               'surface': 'submit_v2_program or browser /api/submit'},
+                'publishedResult': {'schema': published, 'scope': 'result',
+                                    'surface': 'result from read_v2_job after publication'},
+            },
+            'semanticRules': [
+                'Provide the complete ordered set for one full coordinate. The fixed owner sums the signed decimals and commits detail and numeric total at one change identity.',
+                'Use facts.cube.scan with includeMissing to obtain the current numeric change ID. Use facts.export.page at the same authorized snapshot to confirm whether the value is a LineDetailLiteral. Existing detail shares the numeric change ID.',
+                'The two expected change IDs independently assert current versions. An empty ID means no corresponding current version. An inaccessible coordinate requires fresh authorized selection before review.',
+                'Preview and publication use current dimensional write authority and the same planning ReplaceDetail decision. Review the exact total before submitting the unchanged request and preserve its operation key.',
+            ],
+            'recovery': ('After an uncertain submit, use the original admission operation_id with read_v2_job, '
+                         'or operationId with browser /api/job. Use the returned jobId to read its committed receipt. '
+                         'Refresh supporting lines and both change IDs before a new preview after a conflict.'),
+        },
+    }
+
+
 def preview(language,scope:ApplicationScope,program:dict)->dict:
     values=compile_program(program);coordinate,_,cell_change,detail_change=values
+    normalized=normalized_v2(values)
     with connect_postgres(language.dsn,row_factory=dict_row) as db:
         with db.transaction():
+            db.execute('SET TRANSACTION READ ONLY')
+            configure_statement_timeout(db,5000)
             PostgresNumericFactStore._set_scope(db,scope)
-            PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-            PostgresAccessChecker.check_in_transaction(db,language.identity,scope,
-                'write',function=FUNCTION,arguments=normalized_v2(values))
+            access=PostgresAccessChecker.check_in_transaction(db,language.identity,scope,
+                'write',function=FUNCTION,arguments=normalized['arguments'])
             state=db.execute('''SELECT a.status,s.processing_mode,
-                s.metadata_revision,s.data_revision,s.policy_revision
+                s.metadata_revision,s.data_revision,s.policy_revision,s.security_revision
                 FROM epm.application_state s JOIN epm.application a
                 USING(workspace_id,application_id) WHERE s.workspace_id=%s
                 AND s.application_id=%s''',(scope.workspace_id,
@@ -72,52 +165,29 @@ def preview(language,scope:ApplicationScope,program:dict)->dict:
             if (state is None or state['status']!='Active'
                     or state['processing_mode']!='Active'):
                 raise ValueError('APPLICATION_NOT_WRITABLE')
-            axes={row['dimension_id'] for row in db.execute('''SELECT dimension_id
-                FROM epm.dimension WHERE workspace_id=%s AND application_id=%s
-                AND status='Active' AND model_role IS DISTINCT FROM 'Currency' ''',
-                (scope.workspace_id,scope.application_id)).fetchall()}
-            if set(dict(coordinate.members))!=axes:
-                raise ValueError('COORDINATE_DIMENSIONS_MISMATCH')
-            found=db.execute('''SELECT count(*) AS n FROM jsonb_to_recordset(%s::jsonb)
-                AS x(dimension_id text,member_id text) JOIN epm.member m ON
-                (m.workspace_id,m.application_id,m.dimension_id,m.member_id)=
-                (%s,%s,x.dimension_id,x.member_id) AND m.status='Active' ''',
-                (Jsonb([{'dimension_id':d,'member_id':m}
-                    for d,m in coordinate.members]),scope.workspace_id,
-                 scope.application_id)).fetchone()
-            if found['n']!=len(coordinate.members):
-                raise ValueError('COORDINATE_MEMBER_UNAVAILABLE')
-            current=db.execute('''SELECT c.members,COALESCE(n.change_id,'') cell_change,
-                COALESCE(d.change_id,'') detail_change,COALESCE(t.present,false) text_present
-                FROM epm.coordinate c LEFT JOIN epm.numeric_cell_current n USING
-                (workspace_id,application_id,coordinate_id)
-                LEFT JOIN epm.line_detail_current d USING
-                (workspace_id,application_id,coordinate_id)
-                LEFT JOIN epm.text_cell_current t USING
-                (workspace_id,application_id,coordinate_id)
-                WHERE c.workspace_id=%s AND c.application_id=%s AND c.series_key=%s''',
-                (scope.workspace_id,scope.application_id,
-                 coordinate.series_key)).fetchone()
-            if current is not None and current['members']!=dict(coordinate.members):
-                raise ValueError('COORDINATE_HASH_COLLISION')
-            if cell_change!=(current['cell_change'] if current else ''):
-                raise ValueError('STALE_CELL_CHANGE_ID')
-            if detail_change!=(current['detail_change'] if current else ''):
-                raise ValueError('STALE_DETAIL_CHANGE_ID')
-            if current and current['text_present']:
-                raise ValueError('COORDINATE_HAS_TEXT_VALUE')
-            locked=db.execute('''SELECT 1 FROM epm.cube_write_scope_lock WHERE
-                workspace_id=%s AND application_id=%s AND status='Locked'
-                AND (scope_all OR %s::jsonb @> scope_members) LIMIT 1''',
-                (scope.workspace_id,scope.application_id,
-                 Jsonb(dict(coordinate.members)))).fetchone()
-            if locked:raise ValueError('PLANNING_SLICE_LOCKED')
+            authorize_coordinates(db,language.identity,scope,(coordinate,),
+                                  kind=AccessKind.WRITE,expected_access=access)
+            current=PostgresLineDetailStore._current_inputs(db,scope,coordinate,False)
+            PostgresLineDetailStore._validate_inputs(current,cell_change,detail_change)
+            enforce_active_planning_policy(db,scope,writes=((coordinate,'ReplaceDetail'),),
+                                          workflow_role=access.role)
+            after=db.execute('''SELECT metadata_revision,policy_revision,security_revision
+                FROM epm.application_state WHERE workspace_id=%s AND application_id=%s''',
+                (scope.workspace_id,scope.application_id)).fetchone()
+            if after is None:
+                raise ValueError('APPLICATION_UNAVAILABLE')
+            for revision in ('metadata','policy','security'):
+                if after[f'{revision}_revision']!=state[f'{revision}_revision']:
+                    raise ValueError(f'STALE_{revision.upper()}_REVISION')
+            if PostgresAccessChecker.check_in_transaction(db,language.identity,scope,
+                    'write',function=FUNCTION,arguments=normalized['arguments'])!=access:
+                raise ValueError(CUBE_READ_AUTHORIZATION_STALE)
             revisions={key:state[key] for key in ('metadata_revision',
                 'data_revision','policy_revision')}
-    normalized=normalized_v2(values)
     token,digest=language._sign_preview(scope,FUNCTION,normalized,revisions)
     return {'languageVersion':2,'function':FUNCTION,'programDigest':digest,
-            'revisionVector':revisions,'previewToken':token,'changedCount':1}
+            'revisionVector':revisions,'previewToken':token,'changedCount':1,
+            'detail': detail_preview_evidence(values)}
 
 
 def submit(language,scope,program,*,preview_token,idempotency_key,

@@ -7,15 +7,19 @@
     "Applications.tsx",
     "AttributeCatalog.tsx",
     "AttributeValueEditor.tsx",
+    "AuthorizationAssignments.tsx",
     "BuildRules.tsx",
     "BuildSchedules.tsx",
-    "BuildSequences.tsx",
     "CapabilityArea.tsx",
     "DataExport.tsx",
     "DataLoad.tsx",
     "GenericWorkflow.tsx",
+    "LayoutActivation.tsx",
+    "LayoutCancellation.tsx",
+    "LayoutReplacementRequest.tsx",
     "MemberLists.tsx",
     "MetadataCreate.tsx",
+    "MetadataDimensionCreateRows.tsx",
     "MetadataHierarchyEditor.tsx",
     "MetadataMaintenance.tsx",
     "MetadataMemberGrid.tsx",
@@ -23,15 +27,42 @@
     "MetadataSecurityStringEditor.tsx",
     "Monitor.tsx",
     "NativeSelectionEditor.tsx",
+    "PlanningPolicies.tsx",
     "PythonDefinitionEditor.tsx",
     "PythonProgramTest.tsx",
+    "PythonSourceValidation.tsx",
+    "ScenarioPromotion.tsx",
     "SecurityTagCatalog.tsx",
-    "SemanticAttributes.tsx",
     "ServerAdministration.tsx",
-    "SupportingDetail.tsx"
+    "SupportingDetail.tsx",
+    "WorkedCalendarPeriod.tsx"
   ],
   "remaining": [],
   "nonAuthoritativeControls": [
+    {
+      "file": "EffectiveApplicationAccess.tsx",
+      "reason": "Search and pagination inspect a person's access in one application."
+    },
+    {
+      "file": "ResourceAccessRoster.tsx",
+      "reason": "Resource selection requests an authorized review of people and granting paths."
+    },
+    {
+      "file": "CoordinateAccessExplanation.tsx",
+      "reason": "Subject, action and coordinate select a read-only access explanation."
+    },
+    {
+      "file": "WorkspaceAccessReview.tsx",
+      "reason": "Person search and workspace-administrator filters request authorized reports."
+    },
+    {
+      "file": "SavedViewScopePicker.tsx",
+      "reason": "The picker returns an eligible saved-view reference to the role and scope editor. AuthorizationAssignments owns the reviewed change."
+    },
+    {
+      "file": "StarterRoleTemplates.tsx",
+      "reason": "Selecting a platform template proposes an adoption to the registered authorization editor, which owns the reviewed change and outcome."
+    },
     {
       "file": "GlobalPanels.tsx",
       "reason": "Global search and task filters do not create a business or configuration draft."
@@ -39,6 +70,10 @@
     {
       "file": "MetadataWorkspace.tsx",
       "reason": "Workspace search, status filters and route selection are presentation-only controls. Business edits remain in the registered metadata editors and all transitions use the shared unsaved-work guard."
+    },
+    {
+      "file": "MetadataPopulatedLayoutReview.tsx",
+      "reason": "MetadataDimensionCreateRows owns the dimension and mapping draft. Choices are transient to one server review. LayoutReplacementRequest retains the exact admitted program when the outcome is unconfirmed."
     },
     {
       "file": "MyWork.tsx",
@@ -55,19 +90,52 @@
     {
       "file": "PythonRuleEditor.tsx",
       "reason": "Shared controlled source-code renderer only. Each editable parent owns and registers the authoritative draft; read-only callers cannot create one, and this component never persists a separate business draft."
+    },
+    {
+      "file": "ModelMeaning.tsx",
+      "reason": "Read-only worked-coordinate selection and current persisted descriptions. These inputs only choose an authorized read; no model description, business fact, policy, calculation or draft is authored or persisted."
+    },
+    {
+      "file": "ScenarioComparison.tsx",
+      "reason": "Scenario, coordinate and display selections drive an authorized comparison read. The controls do not author or publish a scenario, a business fact or a saved view."
+    },
+    {
+      "file": "WorkedMemberAttribute.tsx",
+      "reason": "The dimension and member selections request a worked read of the current attribute and its source. No attribute value or member definition is drafted or saved."
     }
   ],
   "sharedControls": [
     {
+      "file": "AuthorizationDefinitions.tsx",
+      "draftOwners": ["AuthorizationAssignments.tsx"],
+      "reason": "Role and scope edits mark the common authorization draft dirty. The parent editor owns review, commit, recovery and the navigation guard."
+    },
+    {
+      "file": "BootstrapGroupPicker.tsx",
+      "draftOwners": ["Applications.tsx"],
+      "reason": "Selects an eligible group from the governed workspace read. The application creator owns and reviews the resulting creation draft."
+    },
+    {
+      "file": "ExactScopeSelector.tsx",
+      "draftOwners": ["BuildSchedules.tsx", "DataExport.tsx", "DataLoad.tsx", "PlanningPolicies.tsx"],
+      "reason": "Shared authorized dimension/member scope editor. Build Schedules, Data Export, Data Load and Planning Policies own the exact submitted scope and register the unsaved workflow; this control only returns a typed scalar member map and never persists or submits independently."
+    },
+    {
       "file": "ParameterFields.tsx",
       "draftOwners": [
         "BuildRules.tsx",
-        "BuildSequences.tsx",
+        "BuildSchedules.tsx",
         "CapabilityArea.tsx",
         "MemberLists.tsx",
-        "PythonProgramTest.tsx"
+        "PythonProgramTest.tsx",
+        "PythonSourceValidation.tsx"
       ],
       "reason": "Shared controlled parameter renderer. The listed parent editors own the submitted values and register unsaved work; transient input text in this renderer never grants server authority or persists a separate business draft."
+    },
+    {
+      "file": "WorkflowStarter.tsx",
+      "draftOwners": ["GenericWorkflow.tsx"],
+      "reason": "Selects a published definition and shows its current review. GenericWorkflow owns confirmation, admission and the registered signed start request, including recovery after interruption."
     }
   ]
 }

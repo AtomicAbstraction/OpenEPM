@@ -1,24 +1,62 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { readSecurityProgram, request, requestAdmittedEffect } from "./api";
+import { ApiError, readSecurityProgram, request } from "./api";
+import {
+  RequesterBenefitAudit,
+  requesterBenefitSummary,
+  requesterBenefitEvidence,
+} from "./RequesterBenefit";
+import type { RequesterBenefit, Configuration } from "./authorization-config";
+import { SecurityChangeOutcome } from "./SecurityChangeOutcome";
+import { useApplicationSecurityChange } from "./application-security-change";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
 import { useUnsavedWork } from "./unsaved-work";
 import { useStableMutationIntentKey } from "./mutation-intent";
 import { collectAllContinuations } from "./continuation";
 import {
   collectSecuritySubjectOptions,
+  readDirectoryGroups,
   type SecuritySubject,
 } from "./security-directory";
 
 type Grant = {
-  subjectId: string;
+  principalId: string;
   displayName: string | null;
   username: string | null;
+  directoryStatus?: "Active" | "Inactive" | null;
   role: string;
   readTags: Record<string, string[]>;
   writeTags: Record<string, string[]>;
   rulePermissions: Record<string, boolean> | null;
   grantedAt: string;
 };
+
+type UserGrant = Omit<Grant, "principalId"> & { subjectId: string };
+type GroupGrant = Omit<Grant, "principalId" | "username"> & {
+  groupId: string;
+  groupName: string | null;
+};
+
+type PrincipalKind = "user" | "group";
+const ACCESS_FUNCTIONS = {
+  user: {
+    list: "security.application.access.list",
+    write: "security.application.access.set",
+    ruleWrite: "security.rule.access.set",
+    dimensionRead: "security.application.dimension-access.read",
+    dimensionWrite: "security.application.dimension-access.set",
+  },
+  group: {
+    list: "security.application.group-access.list",
+    write: "security.application.group-access.set",
+    ruleWrite: "security.rule.group-access.set",
+    dimensionRead: "security.application.group-dimension-access.read",
+    dimensionWrite: "security.application.group-dimension-access.set",
+  },
+} as const;
+
+function principalSelection(kind: PrincipalKind, id: string) {
+  return kind === "group" ? { groupId: id } : { subjectId: id };
+}
 
 type Policy = {
   stateToken: string | null;
@@ -49,13 +87,10 @@ const POLICY_CHOICES = {
 type PolicyKey = keyof typeof POLICY_CHOICES;
 type PolicyAction = "save" | "activate" | "deactivate";
 
-type DimensionAccess = {
-  subjectId: string;
-  displayName: string | null;
-  username: string | null;
-  role: string;
-  readTags: Record<string, string[]>;
-  writeTags: Record<string, string[]>;
+type DimensionAccess = Pick<
+  Grant,
+  "principalId" | "displayName" | "username" | "role" | "readTags" | "writeTags"
+> & {
   securityRevision: number;
 };
 
@@ -76,6 +111,8 @@ type SecurityAuditEvent = {
   targetName: string;
   outcome: "Accepted" | "Rejected" | "Failed";
   detailsKey: string | null;
+  authorizationMode?: Configuration["authorizationMode"];
+  requesterBenefit?: RequesterBenefit;
 };
 
 type SecurityAuditPage = {
@@ -90,14 +127,18 @@ export function accessListArguments(afterSubjectId?: string | null) {
   return afterSubjectId ? { afterSubjectId, limit: 100 } : { limit: 100 };
 }
 
-type AccessPage = { grants: Grant[]; nextAfterSubjectId: string | null };
+type AccessPage = { grants: UserGrant[]; nextAfterSubjectId: string | null };
+type GroupAccessPage = {
+  grants: GroupGrant[];
+  nextAfterGroupId: string | null;
+};
 
 export function collectSecuritySubjects(
   readPage: (
     arguments_: ReturnType<typeof accessListArguments>,
   ) => Promise<AccessPage>,
 ) {
-  return collectAllContinuations<AccessPage, Grant>({
+  return collectAllContinuations<AccessPage, UserGrant>({
     label: "Application security subjects",
     readPage: (cursor) => readPage(accessListArguments(cursor)),
     rows: (page) => page.grants,
@@ -132,6 +173,11 @@ function validatedAuditPage(
       typeof event.targetName !== "string" ||
       !event.targetName ||
       !["Accepted", "Rejected", "Failed"].includes(event.outcome) ||
+      (event.requesterBenefit != null &&
+        !requesterBenefitEvidence(
+          event.authorizationMode,
+          event.requesterBenefit,
+        )) ||
       (event.detailsKey !== null &&
         (typeof event.detailsKey !== "string" ||
           !event.detailsKey ||
@@ -193,7 +239,13 @@ export function securityAuditCsv(events: SecurityAuditEvent[]) {
     [
       event.occurredAt,
       event.actorName,
-      event.action,
+      event.requesterBenefit
+        ? [
+            event.action,
+            event.authorizationMode === "legacy" ? "Staged" : "Applied",
+            requesterBenefitSummary(event.requesterBenefit),
+          ].join(" · ")
+        : event.action,
       event.targetName,
       event.outcome,
     ]
@@ -203,13 +255,23 @@ export function securityAuditCsv(events: SecurityAuditEvent[]) {
   return ["occurredAt,actor,action,target,outcome", ...rows].join("\r\n");
 }
 
-function grantLabel(grant: Pick<Grant, "displayName" | "username">) {
+function grantLabel(
+  grant: Pick<Grant, "displayName" | "username">,
+  kind: PrincipalKind,
+) {
+  if (kind === "group" && grant.displayName && grant.username)
+    return securitySubjectLabel({
+      displayName: grant.displayName,
+      username: grant.username,
+    });
   return (
     grant.displayName || grant.username || "Unavailable directory identity"
   );
 }
 
-function securitySubjectLabel(subject: SecuritySubject) {
+function securitySubjectLabel(
+  subject: Pick<SecuritySubject, "displayName" | "username">,
+) {
   return subject.username && subject.username !== subject.displayName
     ? `${subject.displayName} (${subject.username})`
     : subject.displayName;
@@ -221,6 +283,7 @@ export function accessMutationBody(
   action: "grant" | "revoke",
   role: "Reader" | "Editor" | "Administrator",
   idempotencyKey: string,
+  kind: PrincipalKind = "user",
 ) {
   return {
     workspaceId: app.workspaceId,
@@ -229,9 +292,9 @@ export function accessMutationBody(
     idempotencyKey,
     program: {
       languageVersion: 2,
-      function: "security.application.access.set",
+      function: ACCESS_FUNCTIONS[kind].write,
       arguments: {
-        subjectId,
+        ...principalSelection(kind, subjectId),
         action,
         role: action === "grant" ? role : null,
       },
@@ -245,6 +308,7 @@ export function ruleAccessMutationBody(
   action: "set" | "revoke",
   permissions: { design: boolean; publish: boolean; run: boolean },
   idempotencyKey: string,
+  kind: PrincipalKind = "user",
 ) {
   return {
     workspaceId: app.workspaceId,
@@ -253,9 +317,9 @@ export function ruleAccessMutationBody(
     idempotencyKey,
     program: {
       languageVersion: 2,
-      function: "security.rule.access.set",
+      function: ACCESS_FUNCTIONS[kind].ruleWrite,
       arguments: {
-        subjectId,
+        ...principalSelection(kind, subjectId),
         action,
         permissions: action === "set" ? permissions : null,
       },
@@ -283,6 +347,7 @@ export function dimensionAccessMutationBody(
   writeTags: Record<string, string[]>,
   expectedSecurityRevision: number,
   idempotencyKey: string,
+  kind: PrincipalKind = "user",
 ) {
   return {
     workspaceId: app.workspaceId,
@@ -291,9 +356,9 @@ export function dimensionAccessMutationBody(
     idempotencyKey,
     program: {
       languageVersion: 2,
-      function: "security.application.dimension-access.set",
+      function: ACCESS_FUNCTIONS[kind].dimensionWrite,
       arguments: {
-        subjectId,
+        ...principalSelection(kind, subjectId),
         readTags,
         writeTags,
         expectedSecurityRevision,
@@ -346,18 +411,27 @@ function assignment(tags: Record<string, string[]>, dimensionId: string) {
   return tags[dimensionId]?.join(", ") || "Unassigned";
 }
 
-type SecurityView = "access" | "policy" | "audit";
+type SecurityView = "access" | "groups" | "policy" | "audit";
 type SecurityProps = {
   app?: ApplicationSummary;
   catalog: ApplicationCatalog | null;
   view?: SecurityView;
+  canReadDirectoryGroups?: boolean;
   onRequestTransition?: (action: () => void) => void;
 };
 
 export function AdministrationSecurity(props: SecurityProps) {
+  const view = props.view || "access";
+  const readFunction = {
+    access: ACCESS_FUNCTIONS.user.list,
+    groups: ACCESS_FUNCTIONS.group.list,
+    policy: "security.application.dimension-policy.read",
+    audit: "security.application.audit.list",
+  }[view];
+  if (!props.catalog?.functions[readFunction]) return null;
   return (
     <SecurityWorkspace
-      key={`${props.app?.workspaceId || "none"}:${props.app?.applicationId || "none"}:${props.view || "access"}`}
+      key={`${props.app?.workspaceId || "none"}:${props.app?.applicationId || "none"}:${view}`}
       {...props}
     />
   );
@@ -367,8 +441,12 @@ function SecurityWorkspace({
   app,
   catalog,
   view = "access",
+  canReadDirectoryGroups = false,
   onRequestTransition,
 }: SecurityProps) {
+  const kind = view === "groups" ? "group" : "user";
+  const accessView = view === "access" || view === "groups";
+  const functions = ACCESS_FUNCTIONS[kind];
   const [editor, setEditor] = useState<"grant" | "dimensions" | "rules" | null>(
     null,
   );
@@ -376,9 +454,11 @@ function SecurityWorkspace({
   const [readState, setReadState] = useState<
     "idle" | "loading" | "ready" | "error"
   >("idle");
+  const snapshotReady = readState === "ready";
   const [operationResult, setOperationResult] = useState("");
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(0);
+  const readButton = useRef<HTMLButtonElement | null>(null);
   const editorHeading = useRef<HTMLHeadingElement | null>(null);
   const returnFocus = useRef<HTMLElement | null>(null);
   const scopeGeneration = useRef(0);
@@ -397,7 +477,7 @@ function SecurityWorkspace({
     writeTags: Record<string, string>;
   }>({ readTags: {}, writeTags: {} });
   const [dimensionReviewed, setDimensionReviewed] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [reading, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [accessSubject, setAccessSubject] = useState("");
   const [accessAction, setAccessAction] = useState<"grant" | "revoke">("grant");
@@ -417,34 +497,33 @@ function SecurityWorkspace({
   const [securitySubjects, setSecuritySubjects] = useState<SecuritySubject[]>(
     [],
   );
+  const [directoryGroups, setDirectoryGroups] = useState<SecuritySubject[]>([]);
   const [auditCursor, setAuditCursor] = useState<number | null>(null);
   const [exportingAudit, setExportingAudit] = useState(false);
   const mutationKey = useStableMutationIntentKey("security-ui");
-
-  const canList = Boolean(
-    catalog?.functions["security.application.access.list"],
+  const securityChange = useApplicationSecurityChange(
+    app,
+    catalog,
+    (notice) => {
+      setOperationResult(notice);
+      resetDrafts();
+      void readSecurity();
+    },
   );
+  const busy = reading || securityChange.busy;
+  const changeLocked = busy || securityChange.original;
+
   const canListSubjects = Boolean(
     catalog?.functions["security.application.subject.list"],
   );
-  const canReadPolicy = Boolean(
-    catalog?.functions["security.application.dimension-policy.read"],
-  );
   const canReadAssignments = Boolean(
-    catalog?.functions["security.application.dimension-access.read"] &&
+    catalog?.functions[functions.dimensionRead] &&
       catalog?.functions["security.application.dimension-tags.read"],
   );
-  const canReadAudit = Boolean(
-    catalog?.functions["security.application.audit.list"],
-  );
-  const canWriteAccess = Boolean(
-    catalog?.functions["security.application.access.set"],
-  );
-  const canWriteRuleAccess = Boolean(
-    catalog?.functions["security.rule.access.set"],
-  );
+  const canWriteAccess = Boolean(catalog?.functions[functions.write]);
+  const canWriteRuleAccess = Boolean(catalog?.functions[functions.ruleWrite]);
   const canWriteDimensionAccess = Boolean(
-    catalog?.functions["security.application.dimension-access.set"],
+    catalog?.functions[functions.dimensionWrite],
   );
   const canSavePolicy = Boolean(
     catalog?.functions["security.application.dimension-policy.save"],
@@ -478,9 +557,43 @@ function SecurityWorkspace({
   const dimensionChanged =
     Boolean(selected) &&
     JSON.stringify(dimensionDraft) !== JSON.stringify(dimensionBaseline);
-  const ruleGrant = grants.find((grant) => grant.subjectId === ruleSubject);
-  const accessSubjectOption = securitySubjects.find(
+  const ruleGrant = grants.find((grant) => grant.principalId === ruleSubject);
+  const canSetRule = kind === "user" || ruleGrant?.directoryStatus === "Active";
+  const groupOptions = grants
+    .filter((grant) => grant.displayName && grant.username)
+    .filter(
+      (grant) =>
+        accessAction === "revoke" || grant.directoryStatus === "Active",
+    )
+    .map((grant) => ({
+      selectionKey: grant.principalId,
+      displayName: grant.displayName || "",
+      username: grant.username || "",
+    }));
+  const accessOptions =
+    kind === "user"
+      ? securitySubjects
+      : [
+          ...groupOptions,
+          ...(canReadDirectoryGroups && accessAction === "grant"
+            ? directoryGroups.filter(
+                (group) =>
+                  !groupOptions.some(
+                    (option) => option.selectionKey === group.selectionKey,
+                  ),
+              )
+            : []),
+        ];
+  const accessSubjectOption = accessOptions.find(
     (subject) => subject.selectionKey === accessSubject,
+  );
+  const canChooseAccess =
+    kind === "user"
+      ? canListSubjects
+      : grants.some((grant) => grant.displayName && grant.username) ||
+        canReadDirectoryGroups;
+  const reviewAccessReady = Boolean(
+    accessSubject.trim() && (kind === "user" || accessSubjectOption),
   );
   const ruleBaseline = {
     design: Boolean(ruleGrant?.rulePermissions?.design),
@@ -495,9 +608,13 @@ function SecurityWorkspace({
   useUnsavedWork(
     `application-security:${app?.workspaceId || "none"}:${app?.applicationId || "none"}`,
     "Unsaved application security changes",
-    Boolean(
-      policyChanged || dimensionChanged || accessSubject.trim() || ruleChanged,
-    ),
+    !securityChange.original &&
+      Boolean(
+        policyChanged ||
+          dimensionChanged ||
+          accessSubject.trim() ||
+          ruleChanged,
+      ),
   );
 
   const dirty = Boolean(
@@ -506,11 +623,11 @@ function SecurityWorkspace({
   const filteredGrants = useMemo(
     () =>
       grants.filter((grant) =>
-        `${grantLabel(grant)} ${grant.username || ""} ${grant.role}`
+        `${grantLabel(grant, kind)} ${grant.username || ""} ${grant.role}`
           .toLocaleLowerCase()
           .includes(query.trim().toLocaleLowerCase()),
       ),
-    [grants, query],
+    [grants, kind, query],
   );
   const first = Math.min(
     page * 50,
@@ -528,7 +645,7 @@ function SecurityWorkspace({
   }, []);
   useEffect(() => {
     if (editor || policyOpen) editorHeading.current?.focus();
-  }, [editor, policyOpen, selected?.subjectId, ruleSubject]);
+  }, [editor, policyOpen, selected?.principalId, ruleSubject]);
 
   function resetDrafts() {
     setEditor(null);
@@ -586,14 +703,50 @@ function SecurityWorkspace({
     };
   }
 
+  function reportReadFailure(
+    reason: unknown,
+    fallback: string,
+    replacesSnapshot = false,
+  ) {
+    const signInChanged =
+      reason instanceof ApiError &&
+      (reason.kind === "authentication" ||
+        reason.code === "BROWSER_IDENTITY_CHANGED");
+    const accessDenied =
+      reason instanceof ApiError && reason.kind === "authorization";
+    const accessChanged =
+      reason instanceof ApiError &&
+      reason.code === "SECURITY_READ_AUTHORIZATION_STALE";
+    const discardSnapshot =
+      replacesSnapshot || signInChanged || accessDenied || accessChanged;
+    if (discardSnapshot) {
+      setReadState("error");
+      setGrants([]);
+      setSecuritySubjects([]);
+      setDirectoryGroups([]);
+      setPolicy(null);
+      setPolicyDraft({});
+      setAuditEvents([]);
+      setAuditCursor(null);
+    }
+    if (signInChanged) {
+      setError("Confirm your sign-in, then read security information again.");
+    } else if (accessDenied) {
+      setError(
+        "This security information is unavailable under your current access.",
+      );
+    } else if (accessChanged) {
+      setError(
+        "Security access changed while loading. Read the current information again.",
+      );
+    } else {
+      setError(reason instanceof Error ? reason.message : fallback);
+    }
+    return discardSnapshot;
+  }
+
   async function readSecurity() {
-    const allowed =
-      view === "access"
-        ? canList
-        : view === "policy"
-          ? canReadPolicy
-          : canReadAudit;
-    if (!app || !allowed) return;
+    if (!app) return;
     const owned = beginRead();
     const scope = {
       workspaceId: app.workspaceId,
@@ -603,7 +756,33 @@ function SecurityWorkspace({
     setReadState("loading");
     setError("");
     try {
-      if (view === "access") {
+      if (kind === "group") {
+        const groupResult = await collectAllContinuations<
+          GroupAccessPage,
+          GroupGrant
+        >({
+          label: "Application security groups",
+          readPage: (cursor) =>
+            readSecurityProgram(
+              scope,
+              functions.list,
+              cursor ? { afterGroupId: cursor, limit: 100 } : { limit: 100 },
+              owned.signal,
+            ),
+          rows: (page) => page.grants,
+          nextCursor: (page) => page.nextAfterGroupId,
+          rowIdentity: (grant) => grant.groupId,
+        });
+        if (!owned.current()) return;
+        setGrants(
+          groupResult.rows.map(({ groupId, groupName, ...grant }) => ({
+            ...grant,
+            principalId: groupId,
+            username: groupName,
+          })),
+        );
+        setDirectoryGroups([]);
+      } else if (accessView) {
         const [subjectResult, directoryResult] = await Promise.all([
           collectSecuritySubjects((arguments_) =>
             readSecurityProgram(
@@ -625,7 +804,12 @@ function SecurityWorkspace({
             : Promise.resolve({ rows: [] as SecuritySubject[] }),
         ]);
         if (!owned.current()) return;
-        setGrants(subjectResult.rows);
+        setGrants(
+          subjectResult.rows.map(({ subjectId, ...grant }) => ({
+            ...grant,
+            principalId: subjectId,
+          })),
+        );
         setSecuritySubjects(
           [...directoryResult.rows].sort(
             (left, right) =>
@@ -665,19 +849,14 @@ function SecurityWorkspace({
       setReadState("ready");
     } catch (reason) {
       if (!owned.current()) return;
-      setReadState("error");
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to read application security",
-      );
+      reportReadFailure(reason, "Unable to read application security", true);
     } finally {
       if (owned.current()) setBusy(false);
     }
   }
 
-  async function loadOlderAudit() {
-    if (!app || !canReadAudit || !auditCursor) return;
+  async function loadOlderAudit(trigger: HTMLButtonElement) {
+    if (!app || !auditCursor || busy || exportingAudit) return;
     const owned = beginRead();
     setBusy(true);
     setError("");
@@ -696,18 +875,19 @@ function SecurityWorkspace({
       setAuditCursor(page.nextBeforeAuditId);
     } catch (reason) {
       if (!owned.current()) return;
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to read older security audit events",
+      const discarded = reportReadFailure(
+        reason,
+        "Unable to read older security audit events",
       );
+      if (discarded && document.activeElement === trigger)
+        readButton.current?.focus();
     } finally {
       if (owned.current()) setBusy(false);
     }
   }
 
   async function exportCompleteAudit() {
-    if (!app || !canReadAudit) return;
+    if (!app || busy || exportingAudit) return;
     const controller = new AbortController();
     exportController.current?.abort();
     exportController.current = controller;
@@ -741,11 +921,7 @@ function SecurityWorkspace({
       URL.revokeObjectURL(url);
     } catch (reason) {
       if (!current()) return;
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to export the complete security audit",
-      );
+      reportReadFailure(reason, "Unable to export the complete security audit");
     } finally {
       if (current()) setExportingAudit(false);
     }
@@ -764,7 +940,7 @@ function SecurityWorkspace({
   }
 
   async function applyPolicyMutation(action: PolicyAction) {
-    if (busy || !app || !policy || policyReviewed !== action) return;
+    if (changeLocked || !app || !policy || policyReviewed !== action) return;
     if (
       (action === "save" && (!canSavePolicy || !policyDraftValid())) ||
       (action === "activate" &&
@@ -784,54 +960,30 @@ function SecurityWorkspace({
           ? "Activate the current dimensional policy?"
           : "Deactivate the current dimensional policy?";
     if (!window.confirm(wording)) return;
-    const generation = scopeGeneration.current;
-    setBusy(true);
     setOperationResult("");
     setError("");
-
-    try {
-      const response = await requestAdmittedEffect<{
-        result: { changed?: boolean };
-      }>(
-        "/api/security",
-        dimensionPolicyMutationBody(
-          app,
+    await securityChange.submit(
+      dimensionPolicyMutationBody(
+        app,
+        action,
+        policy.stateToken,
+        action === "save" ? policyDraft : null,
+        policy.securityRevision,
+        mutationKey({
+          operation: "dimension-policy",
           action,
-          policy.stateToken,
-          action === "save" ? policyDraft : null,
-          policy.securityRevision,
-          mutationKey({
-            operation: "dimension-policy",
-            action,
-            stateToken: policy.stateToken,
-            policy: action === "save" ? policyDraft : null,
-            securityRevision: policy.securityRevision,
-          }),
-        ),
-      );
-      if (generation !== scopeGeneration.current) return;
-      setOperationResult(
-        response.result.changed === false
-          ? "The reviewed policy already matched the current state."
-          : "The reviewed policy change was committed.",
-      );
-      resetDrafts();
-      setPolicyReviewed(null);
-      await readSecurity();
-    } catch (reason) {
-      if (generation !== scopeGeneration.current) return;
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to change dimensional policy",
-      );
-    } finally {
-      if (generation === scopeGeneration.current) setBusy(false);
-    }
+          stateToken: policy.stateToken,
+          policy: action === "save" ? policyDraft : null,
+          securityRevision: policy.securityRevision,
+        }),
+      ),
+      "policy",
+    );
   }
 
   async function readAssignments(grant: Grant) {
     if (!app || !canReadAssignments) return;
+    const trigger = returnFocus.current;
     const scope = {
       workspaceId: app.workspaceId,
       applicationId: app.applicationId,
@@ -841,10 +993,15 @@ function SecurityWorkspace({
     setError("");
     try {
       const [access, tags] = await Promise.all([
-        readSecurityProgram<DimensionAccess>(
+        readSecurityProgram<
+          Omit<DimensionAccess, "principalId" | "displayName" | "username"> & {
+            subjectId?: string;
+            groupId?: string;
+          }
+        >(
           scope,
-          "security.application.dimension-access.read",
-          { subjectId: grant.subjectId },
+          functions.dimensionRead,
+          principalSelection(kind, grant.principalId),
           owned.signal,
         ),
         readSecurityProgram<{
@@ -855,8 +1012,16 @@ function SecurityWorkspace({
       if (!owned.current()) return;
       if (access.securityRevision !== tags.securityRevision)
         throw new Error("Security revision changed while reading assignments.");
+      if (
+        (kind === "group" ? access.groupId : access.subjectId) !==
+        grant.principalId
+      )
+        throw new Error(
+          "Dimensional assignments returned a different identity.",
+        );
       setSelected({
         ...access,
+        principalId: grant.principalId,
         displayName: grant.displayName,
         username: grant.username,
       });
@@ -879,11 +1044,12 @@ function SecurityWorkspace({
       setDimensionReviewed(false);
     } catch (reason) {
       if (!owned.current()) return;
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to read dimensional assignments",
+      const discarded = reportReadFailure(
+        reason,
+        "Unable to read dimensional assignments",
       );
+      if (discarded && document.activeElement === trigger)
+        readButton.current?.focus();
     } finally {
       if (owned.current()) setBusy(false);
     }
@@ -932,7 +1098,7 @@ function SecurityWorkspace({
 
   async function applyDimensionMutation() {
     if (
-      busy ||
+      changeLocked ||
       !app ||
       !selected ||
       !canWriteDimensionAccess ||
@@ -941,50 +1107,26 @@ function SecurityWorkspace({
     )
       return;
     if (!window.confirm("Save these exact dimensional assignments?")) return;
-    const generation = scopeGeneration.current;
-    setBusy(true);
     setOperationResult("");
     setError("");
-
-    try {
-      const assignments = collectDimensionDraft();
-      const response = await requestAdmittedEffect<{
-        result: { changed: boolean; securityRevision: number };
-      }>(
-        "/api/security",
-        dimensionAccessMutationBody(
-          app,
-          selected.subjectId,
-          assignments.readTags,
-          assignments.writeTags,
-          selected.securityRevision,
-          mutationKey({
-            operation: "dimension-access",
-            subjectId: selected.subjectId,
-            ...assignments,
-            securityRevision: selected.securityRevision,
-          }),
-        ),
-      );
-      if (generation !== scopeGeneration.current) return;
-      setOperationResult(
-        response.result.changed === false
-          ? "The reviewed dimensional assignments already matched the current state."
-          : "The reviewed dimensional assignments change was committed.",
-      );
-      resetDrafts();
-      setDimensionReviewed(false);
-      await readSecurity();
-    } catch (reason) {
-      if (generation !== scopeGeneration.current) return;
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to change dimensional assignments",
-      );
-    } finally {
-      if (generation === scopeGeneration.current) setBusy(false);
-    }
+    const assignments = collectDimensionDraft();
+    await securityChange.submit(
+      dimensionAccessMutationBody(
+        app,
+        selected.principalId,
+        assignments.readTags,
+        assignments.writeTags,
+        selected.securityRevision,
+        mutationKey({
+          operation: functions.dimensionWrite,
+          ...principalSelection(kind, selected.principalId),
+          ...assignments,
+          securityRevision: selected.securityRevision,
+        }),
+        kind,
+      ),
+      "dimensional assignments",
+    );
   }
 
   function updateAccessSubject(value: string) {
@@ -993,60 +1135,87 @@ function SecurityWorkspace({
     setAccessReviewed(false);
   }
 
-  async function applyAccessMutation() {
-    const subjectId = accessSubject.trim();
-    if (busy || !app || !canWriteAccess || !subjectId || !accessReviewed)
-      return;
-    const wording =
-      accessAction === "grant"
-        ? `Grant or update ${accessRole} access for this exact identity?`
-        : "Revoke application access for this exact identity?";
-    if (!window.confirm(wording)) return;
-    const generation = scopeGeneration.current;
+  async function loadGroupChoices() {
+    if (busy || kind !== "group" || !canReadDirectoryGroups) return;
+    const owned = beginRead();
     setBusy(true);
-    setOperationResult("");
     setError("");
-
+    setDirectoryGroups([]);
+    setAccessReviewed(false);
     try {
-      const response = await requestAdmittedEffect<{
-        result: { changed: boolean };
-      }>(
-        "/api/security",
-        accessMutationBody(
-          app,
-          subjectId,
-          accessAction,
-          accessRole,
-          mutationKey({
-            operation: "application-access",
-            subjectId,
-            action: accessAction,
-            role: accessRole,
-          }),
-        ),
+      const { rows } = await readDirectoryGroups(owned.signal);
+      if (!owned.current()) return;
+      setDirectoryGroups(
+        rows
+          .filter((group) => group.status === "Active" && group.displayName)
+          .map((group) => ({
+            selectionKey: group.groupId,
+            displayName: group.displayName,
+            username: group.groupName,
+          })),
       );
-      if (generation !== scopeGeneration.current) return;
-      setOperationResult(
-        response.result.changed === false
-          ? "The reviewed application access already matched the current state."
-          : "The reviewed application access change was committed.",
-      );
-      resetDrafts();
-      setAccessReviewed(false);
-      await readSecurity();
+      if (!rows.some((group) => group.status === "Active" && group.displayName))
+        setOperationResult("The server directory returned no eligible groups.");
     } catch (reason) {
-      if (generation !== scopeGeneration.current) return;
+      if (!owned.current()) return;
       setError(
-        reason instanceof Error ? reason.message : "Unable to change access",
+        reason instanceof Error
+          ? reason.message
+          : "Unable to read directory groups.",
       );
     } finally {
-      if (generation === scopeGeneration.current) setBusy(false);
+      if (owned.current()) setBusy(false);
     }
   }
 
+  function chooseGroupGrant(grant: Grant) {
+    setAccessSubject(grant.principalId);
+    setAccessAction(grant.directoryStatus === "Active" ? "grant" : "revoke");
+    setAccessRole(grant.role as "Reader" | "Editor" | "Administrator");
+    setEditor("grant");
+  }
+
+  async function applyAccessMutation() {
+    const subjectId = accessSubject.trim();
+    if (
+      changeLocked ||
+      !app ||
+      !canWriteAccess ||
+      !subjectId ||
+      !accessReviewed ||
+      (kind === "group" && !accessSubjectOption)
+    )
+      return;
+    const wording =
+      accessAction === "grant"
+        ? `Grant or update ${accessRole} access for this exact ${kind}?`
+        : `Revoke application access for this exact ${kind}?`;
+    if (!window.confirm(wording)) return;
+    setOperationResult("");
+    setError("");
+    await securityChange.submit(
+      accessMutationBody(
+        app,
+        subjectId,
+        accessAction,
+        accessRole,
+        mutationKey({
+          operation: functions.write,
+          ...principalSelection(kind, subjectId),
+          action: accessAction,
+          role: accessRole,
+        }),
+        kind,
+      ),
+      "application access",
+    );
+  }
+
   function chooseRuleGrant(grant: Grant) {
-    setRuleSubject(grant.subjectId);
-    setRuleAction("set");
+    setRuleSubject(grant.principalId);
+    setRuleAction(
+      kind === "group" && grant.directoryStatus !== "Active" ? "revoke" : "set",
+    );
     setRulePermissions({
       design: Boolean(grant.rulePermissions?.design),
       publish: Boolean(grant.rulePermissions?.publish),
@@ -1067,12 +1236,12 @@ function SecurityWorkspace({
   async function applyRuleMutation() {
     const validSet = Object.values(rulePermissions).some(Boolean);
     if (
-      busy ||
+      changeLocked ||
       !app ||
       !canWriteRuleAccess ||
       !ruleSubject ||
       !ruleReviewed ||
-      (ruleAction === "set" && !validSet)
+      (ruleAction === "set" && (!validSet || !canSetRule))
     )
       return;
     const wording =
@@ -1080,57 +1249,25 @@ function SecurityWorkspace({
         ? "Save these exact rule permissions for the selected identity?"
         : "Revoke all rule permissions for the selected identity?";
     if (!window.confirm(wording)) return;
-    const generation = scopeGeneration.current;
-    setBusy(true);
     setOperationResult("");
     setError("");
-
-    try {
-      const response = await requestAdmittedEffect<{
-        result: { changed: boolean };
-      }>(
-        "/api/security",
-        ruleAccessMutationBody(
-          app,
-          ruleSubject,
-          ruleAction,
-          rulePermissions,
-          mutationKey({
-            operation: "rule-access",
-            subjectId: ruleSubject,
-            action: ruleAction,
-            permissions: rulePermissions,
-          }),
-        ),
-      );
-      if (generation !== scopeGeneration.current) return;
-      setOperationResult(
-        response.result.changed === false
-          ? "The reviewed rule permissions already matched the current state."
-          : "The reviewed rule permissions change was committed.",
-      );
-      resetDrafts();
-      setRuleReviewed(false);
-      await readSecurity();
-    } catch (reason) {
-      if (generation !== scopeGeneration.current) return;
-      setError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to change rule permissions",
-      );
-    } finally {
-      if (generation === scopeGeneration.current) setBusy(false);
-    }
+    await securityChange.submit(
+      ruleAccessMutationBody(
+        app,
+        ruleSubject,
+        ruleAction,
+        rulePermissions,
+        mutationKey({
+          operation: functions.ruleWrite,
+          ...principalSelection(kind, ruleSubject),
+          action: ruleAction,
+          permissions: rulePermissions,
+        }),
+        kind,
+      ),
+      "rule permissions",
+    );
   }
-
-  const allowed =
-    view === "access"
-      ? canList
-      : view === "policy"
-        ? canReadPolicy
-        : canReadAudit;
-  if (!allowed) return null;
 
   return (
     <section
@@ -1140,15 +1277,19 @@ function SecurityWorkspace({
       <div className="section-heading-row">
         <div>
           <h2 id="application-security-heading" tabIndex={-1}>
-            {view === "access"
-              ? "Application users and roles"
+            {accessView
+              ? kind === "group"
+                ? "Application groups and roles"
+                : "Application users and roles"
               : view === "policy"
                 ? "Dimensional policy"
                 : "Security audit"}
           </h2>
           <p>
-            {view === "access"
-              ? "Inspect application access, then choose the user or permission you want to change."
+            {accessView
+              ? kind === "group"
+                ? "Review group roles, rule permissions and dimensional assignments in this application."
+                : "Inspect application access, then choose the user or permission you want to change."
               : view === "policy"
                 ? "Inspect the current policy before making a reviewed change."
                 : "Inspect security events and the receipts for committed changes."}
@@ -1156,30 +1297,30 @@ function SecurityWorkspace({
         </div>
         <div className="security-heading-actions">
           <button
-            disabled={busy || exportingAudit}
+            ref={readButton}
+            aria-disabled={busy || exportingAudit}
             onClick={() => transition(() => void readSecurity())}
           >
-            {readState === "loading"
-              ? "Reading…"
-              : view === "access"
-                ? "Read access"
-                : view === "policy"
-                  ? "Read policy"
-                  : "Read audit"}
+            {accessView
+              ? "Read access"
+              : view === "policy"
+                ? "Read policy"
+                : "Read audit"}
           </button>
-          {view === "access" && canWriteAccess && canListSubjects && (
+          {accessView && canWriteAccess && canChooseAccess && (
             <button
               className="primary"
-              disabled={busy || exportingAudit || readState !== "ready"}
+              disabled={changeLocked || exportingAudit || readState !== "ready"}
               aria-expanded={editor === "grant"}
               aria-controls="application-access-editor"
               onClick={() => transition(() => setEditor("grant"))}
             >
-              Grant access
+              {kind === "group" ? "Review group access" : "Grant access"}
             </button>
           )}
         </div>
       </div>
+      <SecurityChangeOutcome securityChange={securityChange} busy={busy} />
       {operationResult && (
         <p className="operation-notice" role="status">
           {operationResult}
@@ -1188,7 +1329,7 @@ function SecurityWorkspace({
       {readState === "loading" && (
         <p role="status">
           Loading{" "}
-          {view === "access"
+          {accessView
             ? "application access"
             : view === "policy"
               ? "dimensional policy"
@@ -1208,7 +1349,7 @@ function SecurityWorkspace({
             : "Read the dimensional policy to inspect its current state."}
         </p>
       )}
-      {view === "policy" && policy && (
+      {view === "policy" && snapshotReady && policy && (
         <div aria-label="Active policy">
           <div className="security-policy-summary">
             <div>
@@ -1232,7 +1373,7 @@ function SecurityWorkspace({
           </div>
           {(canSavePolicy || canActivatePolicy || canDeactivatePolicy) && (
             <button
-              disabled={busy || readState !== "ready"}
+              disabled={changeLocked || readState !== "ready"}
               aria-expanded={policyOpen}
               aria-controls="dimensional-policy-editor"
               onClick={() =>
@@ -1258,7 +1399,10 @@ function SecurityWorkspace({
                     Close policy editor
                   </button>
                 </div>
-                <fieldset className="security-editor-fields" disabled={busy}>
+                <fieldset
+                  className="security-editor-fields"
+                  disabled={changeLocked}
+                >
                   <p>
                     Save the current definition, activate that exact saved
                     state, or explicitly deactivate it.
@@ -1367,19 +1511,21 @@ function SecurityWorkspace({
             )}
         </div>
       )}
-      {view === "access" && (
+      {accessView && (
         <>
-          {grants.length > 0 && (
+          {snapshotReady && grants.length > 0 && (
             <label className="form-field security-catalog-search">
-              Find an application user
+              Find an application {kind}
               <input
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
-                placeholder="User name or role"
+                placeholder={
+                  kind === "group" ? "Group name or role" : "User name or role"
+                }
               />
             </label>
           )}
-          {grants.length ? (
+          {snapshotReady && grants.length ? (
             <div
               className="react-grid-scroll"
               role="region"
@@ -1388,29 +1534,48 @@ function SecurityWorkspace({
             >
               <table
                 className="react-cube-grid security-grant-grid"
-                aria-label="Application access"
+                aria-label={
+                  kind === "group"
+                    ? "Application group access"
+                    : "Application access"
+                }
               >
                 <thead>
                   <tr>
-                    <th>User</th>
+                    <th>{kind === "group" ? "Group" : "User"}</th>
+                    {kind === "group" && <th>Directory status</th>}
                     <th>Role</th>
                     <th>Rule permissions</th>
                     <th>Granted</th>
                     <th>Dimensional access</th>
                     {canWriteRuleAccess && <th>Rule access</th>}
+                    {kind === "group" && canWriteAccess && (
+                      <th>Application access</th>
+                    )}
                   </tr>
                 </thead>
                 <tbody>
                   {visibleGrants.map((grant) => (
-                    <tr key={grant.subjectId}>
-                      <th>{grantLabel(grant)}</th>
+                    <tr key={grant.principalId}>
+                      <th scope="row">{grantLabel(grant, kind)}</th>
+                      {kind === "group" && (
+                        <td>{grant.directoryStatus || "Unavailable"}</td>
+                      )}
                       <td>{grant.role}</td>
                       <td>{enabledPermissions(grant)}</td>
                       <td>{new Date(grant.grantedAt).toLocaleString()}</td>
                       <td>
                         <button
+                          aria-label={
+                            kind === "group"
+                              ? `Inspect dimensional access for ${grantLabel(grant, kind)}`
+                              : undefined
+                          }
+                          aria-disabled={busy}
                           disabled={
-                            busy || readState !== "ready" || !canReadAssignments
+                            !canReadAssignments ||
+                            (kind === "group" &&
+                              (!grant.displayName || !grant.username))
                           }
                           onClick={() =>
                             transition(() => void readAssignments(grant))
@@ -1422,7 +1587,17 @@ function SecurityWorkspace({
                       {canWriteRuleAccess && (
                         <td>
                           <button
-                            disabled={busy || readState !== "ready"}
+                            aria-label={
+                              kind === "group"
+                                ? `Manage rule permissions for ${grantLabel(grant, kind)}`
+                                : undefined
+                            }
+                            disabled={
+                              busy ||
+                              readState !== "ready" ||
+                              (kind === "group" &&
+                                (!grant.displayName || !grant.username))
+                            }
                             onClick={() =>
                               transition(() => {
                                 chooseRuleGrant(grant);
@@ -1431,6 +1606,24 @@ function SecurityWorkspace({
                             }
                           >
                             Manage
+                          </button>
+                        </td>
+                      )}
+                      {kind === "group" && canWriteAccess && (
+                        <td>
+                          <button
+                            aria-label={`Manage role for ${grantLabel(grant, kind)}`}
+                            disabled={
+                              busy ||
+                              readState !== "ready" ||
+                              !grant.displayName ||
+                              !grant.username
+                            }
+                            onClick={() =>
+                              transition(() => chooseGroupGrant(grant))
+                            }
+                          >
+                            Manage role
                           </button>
                         </td>
                       )}
@@ -1443,37 +1636,46 @@ function SecurityWorkspace({
             readState !== "loading" && (
               <p className="empty-state">
                 {readState === "ready"
-                  ? "No application users were returned."
+                  ? `No application ${kind}s were returned.`
                   : readState === "error"
                     ? "Application access could not be loaded. Use Read access to retry."
                     : "Read current application access to begin."}
               </p>
             )
           )}
-          {grants.length > 0 && (
+          {snapshotReady && grants.length > 0 && (
             <div className="workspace-window-controls">
               <span>
                 {filteredGrants.length
-                  ? `${first + 1}–${first + visibleGrants.length} of ${filteredGrants.length} users`
-                  : "No users match this search"}
+                  ? `${first + 1}–${first + visibleGrants.length} of ${filteredGrants.length} ${kind}s`
+                  : `No ${kind}s match this search`}
               </span>
               <button
                 disabled={first === 0}
                 onClick={() => setPage(first / 50 - 1)}
               >
-                Previous users
+                Previous {kind}s
               </button>
               <button
                 disabled={first + 50 >= filteredGrants.length}
                 onClick={() => setPage(first / 50 + 1)}
               >
-                Next users
+                Next {kind}s
               </button>
             </div>
           )}
+          {kind === "group" &&
+            readState === "ready" &&
+            !canReadDirectoryGroups &&
+            !grants.length && (
+              <p>
+                New groups can be chosen by an administrator with access to both
+                this application and the server directory.
+              </p>
+            )}
         </>
       )}
-      {view === "audit" && canReadAudit && (
+      {view === "audit" && (
         <article className="program-inspector" aria-label="Security audit">
           <div className="section-heading-row">
             <div>
@@ -1485,7 +1687,7 @@ function SecurityWorkspace({
               </p>
             </div>
             <button
-              disabled={busy || exportingAudit}
+              aria-disabled={busy || exportingAudit}
               onClick={() => void exportCompleteAudit()}
             >
               {exportingAudit
@@ -1493,7 +1695,7 @@ function SecurityWorkspace({
                 : "Export complete CSV"}
             </button>
           </div>
-          {auditEvents.length ? (
+          {snapshotReady && auditEvents.length ? (
             <div
               className="react-grid-scroll"
               role="region"
@@ -1517,41 +1719,74 @@ function SecurityWorkspace({
                       <td>{event.actorName}</td>
                       <td>{event.action}</td>
                       <td>{event.targetName}</td>
-                      <td>{event.outcome}</td>
+                      <td>
+                        {event.outcome}
+                        {app &&
+                          event.requesterBenefit &&
+                          event.authorizationMode && (
+                            <RequesterBenefitAudit
+                              key={JSON.stringify([
+                                event.auditId,
+                                event.detailsKey,
+                                catalog?.accessContext,
+                                catalog?.revisions.security,
+                                catalog?.applicationAccess.subjectId,
+                                Boolean(
+                                  catalog?.functions[
+                                    "security.application.receipt.read"
+                                  ],
+                                ),
+                              ])}
+                              scope={app}
+                              receiptKey={
+                                catalog?.functions[
+                                  "security.application.receipt.read"
+                                ]
+                                  ? event.detailsKey
+                                  : null
+                              }
+                              evidence={{
+                                authorizationMode: event.authorizationMode,
+                                requesterBenefit: event.requesterBenefit,
+                              }}
+                            />
+                          )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
-          ) : (
+          ) : readState !== "loading" ? (
             <p>
-              {readState === "ready"
+              {snapshotReady
                 ? "No application security audit events were returned."
                 : readState === "error"
                   ? "Security audit could not be loaded. Use Read audit to retry."
-                  : readState === "loading"
-                    ? "Reading security events…"
-                    : "Read the security audit to inspect events."}
+                  : "Read the security audit to inspect events."}
             </p>
-          )}
-          {auditCursor && (
-            <button disabled={busy} onClick={() => void loadOlderAudit()}>
+          ) : null}
+          {snapshotReady && auditCursor && (
+            <button
+              aria-disabled={busy || exportingAudit}
+              onClick={(event) => void loadOlderAudit(event.currentTarget)}
+            >
               Load older security events
             </button>
           )}
         </article>
       )}
-      {view === "access" && editor === "dimensions" && selected && (
+      {accessView && editor === "dimensions" && selected && (
         <article className="program-inspector" aria-label="Dimensional access">
           <div className="section-heading-row">
             <h3 tabIndex={-1} ref={editorHeading}>
-              {grantLabel(selected)}
+              {grantLabel(selected, kind)}
             </h3>
             <button disabled={busy} onClick={closeEditor}>
               Close dimensional access
             </button>
           </div>
-          <fieldset className="security-editor-fields" disabled={busy}>
+          <fieldset className="security-editor-fields" disabled={changeLocked}>
             <p>{selected.role} · current access</p>
             {dimensions.length ? (
               <div
@@ -1641,7 +1876,7 @@ function SecurityWorkspace({
                       setDimensionReviewed(event.target.checked)
                     }
                   />
-                  I reviewed this exact user and dimensional assignment.
+                  I reviewed this exact {kind} and dimensional assignment.
                 </label>
                 <button
                   disabled={
@@ -1656,10 +1891,10 @@ function SecurityWorkspace({
           </fieldset>
         </article>
       )}
-      {view === "access" &&
+      {accessView &&
         editor === "grant" &&
         canWriteAccess &&
-        canListSubjects && (
+        canChooseAccess && (
           <article
             className="program-inspector access-editor"
             id="application-access-editor"
@@ -1672,19 +1907,36 @@ function SecurityWorkspace({
                 Close access editor
               </button>
             </div>
-            <fieldset className="security-editor-fields" disabled={busy}>
-              <p>Grant, update or revoke access for one verified identity.</p>
+            <fieldset
+              className="security-editor-fields"
+              disabled={changeLocked}
+            >
+              {kind === "group" ? (
+                <p>
+                  A group grant applies to current members. Other grants can
+                  still apply after you revoke it.
+                </p>
+              ) : (
+                <p>Grant, update or revoke access for one verified identity.</p>
+              )}
+              {kind === "group" &&
+                canReadDirectoryGroups &&
+                accessAction === "grant" && (
+                  <button onClick={() => void loadGroupChoices()}>
+                    Read eligible groups
+                  </button>
+                )}
               <div className="form-grid security-access-identity-grid">
                 <label>
-                  Application user
+                  Application {kind}
                   <select
                     value={accessSubject}
                     onChange={(event) =>
                       updateAccessSubject(event.target.value)
                     }
                   >
-                    <option value="">Choose a current user</option>
-                    {securitySubjects.map((subject) => (
+                    <option value="">Choose a current {kind}</option>
+                    {accessOptions.map((subject) => (
                       <option
                         key={subject.selectionKey}
                         value={subject.selectionKey}
@@ -1729,23 +1981,23 @@ function SecurityWorkspace({
                 </label>
               </div>
               <p className="review-intent">
-                {accessSubject.trim()
+                {accessSubject.trim() && reviewAccessReady
                   ? accessAction === "grant"
                     ? `${accessSubjectOption ? securitySubjectLabel(accessSubjectOption) : "Current user"} · ${accessRole}`
-                    : `${accessSubjectOption ? securitySubjectLabel(accessSubjectOption) : "Current user"} · revoke all application access`
-                  : "Choose a current user to review."}
+                    : `${accessSubjectOption ? securitySubjectLabel(accessSubjectOption) : "Current user"} · ${kind === "group" ? "revoke this group grant" : "revoke all application access"}`
+                  : `Choose a current ${kind} to review.`}
               </p>
               <label className="review-check">
                 <input
                   type="checkbox"
                   checked={accessReviewed}
-                  disabled={!accessSubject.trim()}
+                  disabled={!reviewAccessReady}
                   onChange={(event) => setAccessReviewed(event.target.checked)}
                 />
-                I reviewed this user, action and role.
+                I reviewed this {kind}, action and role.
               </label>
               <button
-                disabled={busy || !accessSubject.trim() || !accessReviewed}
+                disabled={busy || !reviewAccessReady || !accessReviewed}
                 onClick={() => void applyAccessMutation()}
               >
                 Apply reviewed access
@@ -1753,7 +2005,7 @@ function SecurityWorkspace({
             </fieldset>
           </article>
         )}
-      {view === "access" &&
+      {accessView &&
         editor === "rules" &&
         ruleSubject &&
         canWriteRuleAccess && (
@@ -1768,16 +2020,19 @@ function SecurityWorkspace({
                 ref={editorHeading}
               >
                 Rule permissions ·{" "}
-                {ruleGrant ? grantLabel(ruleGrant) : "Current user"}
+                {ruleGrant ? grantLabel(ruleGrant, kind) : `Current ${kind}`}
               </h3>
               <button disabled={busy} onClick={closeEditor}>
                 Close rule permissions
               </button>
             </div>
-            <fieldset className="security-editor-fields" disabled={busy}>
+            <fieldset
+              className="security-editor-fields"
+              disabled={changeLocked}
+            >
               <p>
                 Set or revoke design, publish and run permissions for this
-                application user.
+                application {kind}.
               </p>
               <label className="form-field security-rule-action">
                 Action
@@ -1788,7 +2043,9 @@ function SecurityWorkspace({
                     setRuleReviewed(false);
                   }}
                 >
-                  <option value="set">Set permissions</option>
+                  <option value="set" disabled={!canSetRule}>
+                    Set permissions
+                  </option>
                   <option value="revoke">Revoke all</option>
                 </select>
               </label>
@@ -1818,7 +2075,7 @@ function SecurityWorkspace({
                   }
                   onChange={(event) => setRuleReviewed(event.target.checked)}
                 />
-                I reviewed this exact user, action and permission set.
+                I reviewed this exact {kind}, action and permission set.
               </label>
               <button
                 disabled={busy || !ruleSubject || !ruleReviewed}

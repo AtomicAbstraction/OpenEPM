@@ -7,7 +7,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .persistence_contract import ApplicationScope
-from .current_object_contract import collection_token, new_state_token, require_state_token
+from .current_object_contract import STATE_TOKEN_PATTERN, collection_token, new_state_token, require_state_token
 from .postgres_access import PostgresAccessChecker, VerifiedIdentity, assert_nonowner_role
 from .postgres_connection import connect_postgres
 from .postgres_jobs import _canonical_digest
@@ -21,15 +21,90 @@ READ = "application.decision.read"
 LIST = "application.decision.list"
 WRITES = frozenset((CREATE, REPLACE, WITHDRAW))
 READS = frozenset((READ, LIST))
+FUNCTIONS = WRITES | READS
 _ID = re.compile(r"[A-Za-z0-9._-]{1,100}\Z")
 _KEY = re.compile(r"[A-Za-z0-9._-]{8,128}\Z")
 _CONTENT = ("title", "text", "provenance", "rationale", "sourceReference")
+_TEXT_LIMITS = {"title": 200, "text": 8000, "rationale": 2000, "sourceReference": 1000}
+_PROVENANCE = ("UserDecision", "AgentInterpretation")
 _SELECT = """decision_id,title,decision_text,rationale,source_reference,
     provenance,status,state_token,content_digest,updated_issuer,
     updated_subject_id,updated_at,updated_operation_id"""
 
 
-def catalog() -> dict:
+def decision_program_contract(function: str) -> dict:
+    from .metadata_read_contract import DIALECT, read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    identifier = {"type": "string", "pattern": "^" + _ID.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}
+    token = {"type": "string", "pattern": "^" + STATE_TOKEN_PATTERN.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}
+    content = {name: {"type": "string", "minLength": int(name in ("title", "text")),
+        "maxLength": limit, "pattern": r"^[^\u0000]*(?![\s\S])",
+        "description": f"The native policy limits this field to {limit} UTF-8 bytes."}
+        for name, limit in _TEXT_LIMITS.items()}
+    content["provenance"] = {"enum": list(_PROVENANCE)}
+    identity = {"decisionId": identifier, "stateToken": token, "contentDigest": token}
+    summary = {**identity, "status": {"enum": ["Active", "Withdrawn"]},
+        "title": content["title"], "provenance": content["provenance"],
+        "actor": obj({"issuer": {"type": "string"}, "subjectId": {"type": "string"}}),
+        "updatedAt": {"type": "string", "format": "date-time"}, "operationId": {"type": "string"}}
+    sample_id, sample_token = "example-freight-treatment", "a" * 64
+    if function == LIST:
+        arguments = obj({"limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                         "afterDecisionId": identifier, "expectedCollectionToken": token}, [])
+        arguments["allOf"] = [{"if": {"required": ["afterDecisionId"]},
+                                "then": {"required": ["expectedCollectionToken"]}}]
+        result = obj({"items": {"type": "array", "maxItems": 100, "items": obj(summary)},
+                      "collectionToken": token, "nextAfterDecisionId": {"anyOf": [identifier, {"type": "null"}]}})
+        examples = [read_example(function, {"limit": 1}, name="List current decision summaries",
+                        binding="Select the application with current administrator access."),
+                    read_example(function, {"limit": 1, "afterDecisionId": sample_id,
+                        "expectedCollectionToken": sample_token}, name="Continue the same decision collection",
+                        binding="Copy nextAfterDecisionId and collectionToken from the previous page. A null cursor ends the list.")]
+    elif function == READ:
+        arguments = obj({"decisionId": identifier})
+        result = obj({**summary, **content})
+        examples = [read_example(function, {"decisionId": sample_id}, name="Read the current decision and rationale",
+                                 binding="Use a decisionId from a current list in the same application.")]
+    else:
+        fields, sample = {"decisionId": identifier}, {"decisionId": sample_id}
+        required = ["decisionId"]
+        binding = "Choose a new stable decision ID in the selected application."
+        if function != CREATE:
+            fields["expectedStateToken"] = token
+            sample["expectedStateToken"] = sample_token
+            required.append("expectedStateToken")
+            binding = "Copy the decisionId and stateToken from the same current decision read."
+        if function != WITHDRAW:
+            fields.update(content)
+            required.extend(("title", "text", "provenance"))
+            sample.update(title="Freight treatment", text="Keep freight in its own responsibility centre.",
+                          provenance="UserDecision", rationale="The administrator approved separate tracking.")
+        arguments = obj(fields, required)
+        result = obj({**identity, "status": {"const": "Withdrawn" if function == WITHDRAW else "Active"},
+            "operationId": {"type": "string", "pattern": "^" + _KEY.pattern.removesuffix(r"\Z") + r"(?![\s\S])"}})
+        action = {CREATE: "Record", REPLACE: "Replace", WITHDRAW: "Withdraw"}[function]
+        examples = [read_example(function, sample, name=f"{action} a decision",
+                                 binding=binding + " Request signed operation admission for the unchanged program.")]
+    contract = read_contract(function, arguments, result, owner="PostgresApplicationDecisions", examples=examples,
+        semantic_rules=[
+            "Current application administrator authority is required for reads and effects.",
+            "Each stable ID identifies one current decision. Read returns that decision. List returns summaries; withdrawn decisions remain visible with their status.",
+            "UserDecision records an approved decision. AgentInterpretation identifies an inference. Recording either leaves facts and formulas unchanged.",
+            "The fixed owner checks nonblank required text and the declared UTF-8 byte limits.",
+        ])
+    if function in WRITES:
+        contract["resultSchema"] = {"$schema": DIALECT, **obj({
+            "languageVersion": {"type": "integer", "const": 2}, "function": {"const": function},
+            **result["properties"]})}
+    contract["programContract"]["recovery"] = (
+        "Restart a stale list from its first page. Read the current decision after a state conflict before reviewing a new edit. "
+        "Reconcile an interrupted write using the same signed admission and unchanged program. After expiry, "
+        "that request can retrieve only its committed receipt under current administrator authority.")
+    return contract
+
+
+def _descriptors() -> dict:
     common = {"permission": "admin", "previewRequired": False,
               "workClass": "short", "requiredCapabilities": []}
     content = {"title": "1–200 UTF-8 bytes", "text": "1–8000 UTF-8 bytes",
@@ -55,6 +130,11 @@ def catalog() -> dict:
     }
 
 
+def catalog() -> dict:
+    return {function: {**specification, **decision_program_contract(function)}
+            for function, specification in _descriptors().items()}
+
+
 def _integer(value: object, label: str, *, minimum: int = 1, maximum: int = 2**63 - 1) -> int:
     if type(value) is not int or not minimum <= value <= maximum:
         raise ValueError(f"APPLICATION_DECISION_{label}_INVALID")
@@ -75,7 +155,7 @@ def parse(program: object, allowed: frozenset[str]) -> tuple[str, dict]:
             or type(program.get("arguments")) is not dict):
         raise ValueError("APPLICATION_DECISION_PROGRAM_INVALID")
     function, args = program["function"], dict(program["arguments"])
-    spec = catalog()[function]
+    spec = _descriptors()[function]
     required, optional = set(spec["arguments"]), set(spec.get("optionalArguments", {}))
     if not required <= set(args) or set(args) - required - optional:
         raise ValueError("APPLICATION_DECISION_ARGUMENTS_INVALID")
@@ -90,9 +170,9 @@ def parse(program: object, allowed: frozenset[str]) -> tuple[str, dict]:
     if "afterDecisionId" in args and "expectedCollectionToken" not in args:
         raise ValueError("APPLICATION_DECISION_CONTINUATION_PIN_REQUIRED")
     if function in (CREATE, REPLACE):
-        for name, maximum in (("title", 200), ("text", 8000), ("rationale", 2000), ("sourceReference", 1000)):
+        for name, maximum in _TEXT_LIMITS.items():
             args[name] = _text(args.get(name, ""), name.upper(), maximum, required=name in ("title", "text"))
-        if args["provenance"] not in ("UserDecision", "AgentInterpretation"):
+        if args["provenance"] not in _PROVENANCE:
             raise ValueError("APPLICATION_DECISION_PROVENANCE_INVALID")
     return function, args
 
@@ -122,10 +202,7 @@ class PostgresApplicationDecisions:
 
     def execute(self, scope: ApplicationScope, program: dict, *, idempotency_key: str) -> dict:
         function, args = parse(program, WRITES)
-        if type(idempotency_key) is not str or not _KEY.fullmatch(idempotency_key):
-            raise ValueError("APPLICATION_DECISION_IDEMPOTENCY_KEY_INVALID")
-        digest = _canonical_digest({"scope": [scope.workspace_id, scope.application_id],
-            "identity": [self.identity.issuer, self.identity.subject_id], "program": program})
+        digest = self._intent_digest(scope, program, idempotency_key)
         ids = (scope.workspace_id, scope.application_id)
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
@@ -135,12 +212,9 @@ class PostgresApplicationDecisions:
                     WHERE s.workspace_id=%s AND s.application_id=%s FOR UPDATE OF s""", ids).fetchone()
                 if state is None:
                     raise ValueError("APPLICATION_UNAVAILABLE")
-                prior = db.execute("""SELECT command_digest,actor_id,result FROM epm.operation_receipt
-                    WHERE workspace_id=%s AND application_id=%s AND operation_id=%s""", (*ids, idempotency_key)).fetchone()
+                prior = self._original_receipt(db, scope, idempotency_key, digest)
                 if prior is not None:
-                    if prior["command_digest"] != digest or prior["actor_id"] != self.identity.subject_id:
-                        raise ValueError("IDEMPOTENCY_KEY_REUSED")
-                    return prior["result"]
+                    return prior
                 if state["status"] != "Active" or state["processing_mode"] != "Active":
                     raise ValueError("APPLICATION_NOT_ACTIVE")
                 current = db.execute(f"""SELECT {_SELECT} FROM epm.application_decision
@@ -189,6 +263,31 @@ class PostgresApplicationDecisions:
                      idempotency_key, self.identity.issuer, self.identity.subject_id))
                 return result
 
+    def _intent_digest(self, scope: ApplicationScope, program: dict, operation_id: str) -> str:
+        if type(operation_id) is not str or not _KEY.fullmatch(operation_id):
+            raise ValueError("APPLICATION_DECISION_IDEMPOTENCY_KEY_INVALID")
+        return _canonical_digest({"scope": [scope.workspace_id, scope.application_id],
+            "identity": [self.identity.issuer, self.identity.subject_id], "program": program})
+
+    def _original_receipt(self, db, scope: ApplicationScope, operation_id: str, digest: str) -> dict | None:
+        prior = db.execute("""SELECT command_digest,actor_id,result FROM epm.operation_receipt
+            WHERE workspace_id=%s AND application_id=%s AND operation_id=%s""",
+            (scope.workspace_id, scope.application_id, operation_id)).fetchone()
+        if prior is None:
+            return None
+        if prior["command_digest"] != digest or prior["actor_id"] != self.identity.subject_id:
+            raise ValueError("IDEMPOTENCY_KEY_REUSED")
+        return prior["result"]
+
+    def replay(self, scope: ApplicationScope, program: dict, *, idempotency_key: str) -> dict | None:
+        function, _ = parse(program, WRITES)
+        digest = self._intent_digest(scope, program, idempotency_key)
+        with connect_postgres(self.dsn, row_factory=dict_row) as db:
+            with db.transaction():
+                db.execute("SET TRANSACTION READ ONLY")
+                self._authorize(db, scope, function)
+                return self._original_receipt(db, scope, idempotency_key, digest)
+
     def read(self, scope: ApplicationScope, program: dict) -> dict:
         function, args = parse(program, READS)
         ids = (scope.workspace_id, scope.application_id)
@@ -201,14 +300,19 @@ class PostgresApplicationDecisions:
                 if function == READ:
                     row = db.execute(f"SELECT {_SELECT} FROM epm.application_decision WHERE workspace_id=%s AND application_id=%s AND decision_id=%s",
                                      (*ids, args["decisionId"])).fetchone()
-                    if row is None:
+                    result = None if row is None else _record(row)
+                    # The workspace fence does not serialize native identity
+                    # directory updates. Check current authority at publication.
+                    PostgresAccessChecker.check_in_transaction(db, self.identity, scope, "admin", function=function)
+                    if result is None:
                         raise ValueError("APPLICATION_DECISION_NOT_FOUND")
-                    return _record(row)
+                    return result
                 all_rows = db.execute("SELECT decision_id,state_token FROM epm.application_decision WHERE workspace_id=%s AND application_id=%s ORDER BY decision_id", ids).fetchall()
                 current_collection_token = collection_token(
                     (row["decision_id"], row["state_token"]) for row in all_rows)
                 if ("expectedCollectionToken" in args
                         and args["expectedCollectionToken"] != current_collection_token):
+                    PostgresAccessChecker.check_in_transaction(db, self.identity, scope, "admin", function=function)
                     raise ValueError("APPLICATION_DECISION_LIST_STALE")
                 limit = args.get("limit", 25)
                 rows = db.execute(f"""SELECT {_SELECT} FROM epm.application_decision
@@ -216,5 +320,6 @@ class PostgresApplicationDecisions:
                     ORDER BY decision_id LIMIT %s""", (*ids, args.get("afterDecisionId", ""), limit + 1)).fetchall()
                 items = [{key: value for key, value in _record(row).items()
                           if key not in ("text", "rationale", "sourceReference")} for row in rows[:limit]]
+                PostgresAccessChecker.check_in_transaction(db, self.identity, scope, "admin", function=function)
                 return {"items": items, "collectionToken": current_collection_token,
                         "nextAfterDecisionId": rows[limit - 1]["decision_id"] if len(rows) > limit else None}

@@ -16,6 +16,33 @@ _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _RESULT_KEY = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
 
 
+def data_source_schema() -> dict:
+    from .postgres_numeric_catalog import obj
+
+    result_key = {"type": "string", "pattern": _RESULT_KEY.pattern[:-1] + r"(?![\s\S])"}
+    return {"oneOf": [
+        obj({"kind": {"const": "raw"}, "resultKey": {"type": "null"}}),
+        obj({"kind": {"enum": ["calculated", "combined"]}, "resultKey": result_key}),
+    ]}
+
+
+def structural_schema() -> dict:
+    from .postgres_numeric_catalog import obj
+    from .selection_contract import selection_identifier_schema
+
+    identifier = selection_identifier_schema()
+    layout = {name: {"type": "array", "items": identifier, "uniqueItems": True,
+        "minItems": int(name in ("rows", "columns")), "maxItems": MAX_DIMENSIONS}
+        for name in ("rows", "columns", "pages", "filters")}
+    return obj({"format": {"const": FORMAT}, "viewId": identifier,
+        "name": {"type": "string", "minLength": 1,
+                 "description": "The trimmed name has at most 200 characters."},
+        "selection": {"$ref": "#/$defs/cubeSelection"}, "layout": obj(layout),
+        "dataSource": data_source_schema(), "suppression": obj({
+            "missing": {"type": "boolean"}, "zero": {"type": "boolean"}}),
+        "pageSize": {"type": "integer", "minimum": 1, "maximum": 500}})
+
+
 def _id(value: object, code: str) -> str:
     if not isinstance(value, str) or not _ID.fullmatch(value):
         raise ValueError(code)
@@ -32,7 +59,8 @@ def _axis(value: object, name: str, *, required: bool = False) -> list[str]:
 
 
 def canonical_cube_view(
-    value: object, *, active_dimensions: Iterable[str] | None = None
+    value: object, *, active_dimensions: Iterable[str] | None = None,
+    expected_metadata_revision: int | None = None,
 ) -> dict[str, Any]:
     required = {
         "format", "viewId", "name", "selection", "layout",
@@ -45,7 +73,8 @@ def canonical_cube_view(
     view_id = _id(value["viewId"], "CUBE_VIEW_ID_INVALID")
     if not isinstance(value["name"], str) or not 1 <= len(value["name"].strip()) <= 200:
         raise ValueError("CUBE_VIEW_NAME_INVALID")
-    selection = canonical_selection(value["selection"], active_dimensions=active_dimensions)
+    selection = canonical_selection(value["selection"], active_dimensions=active_dimensions,
+        expected_metadata_revision=expected_metadata_revision)
     selected_dimensions = {item["dimensionId"] for item in selection["dimensions"]}
 
     layout = value["layout"]

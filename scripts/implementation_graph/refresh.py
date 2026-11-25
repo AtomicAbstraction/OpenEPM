@@ -10,12 +10,12 @@ import os
 import shutil
 import stat
 import sys
-from build import build
+from build import IMPROVEMENT_PLAN, READINESS_REGISTER, build, graph_document, improvement_documents
 
 project=Path(__file__).resolve().parents[2]
 
-# Only product implementation, infrastructure and executable test source may
-# overlay the archived commit. Review data and local runtime state stay apart.
+# Overlay product and test source plus the explicitly registered improvement
+# evidence. Live annotations and local runtime state stay apart.
 SOURCE_DIRS=('epm_core', 'openepm', 'schema', 'deploy', 'scripts', 'tests', 'web', 'web-ui')
 SOURCE_SUFFIXES={'.py','.sql','.sh','.js','.mjs','.cjs','.ts','.tsx','.jsx','.css',
                  '.html','.yaml','.yml','.toml','.json','.txt','.lock','.template'}
@@ -25,7 +25,13 @@ def freeze_working_source(snapshot, base):
     def paths():
         entries=subprocess.check_output(['git','ls-files','-z','--cached','--others',
                  '--exclude-standard','--',*SOURCE_DIRS,'platform_postgres_*.py'],cwd=project)
-        return sorted({os.fsdecode(item) for item in entries.split(b'\0') if item})
+        selected = {os.fsdecode(item) for item in entries.split(b'\0') if item}
+        readiness = json.loads(graph_document(project, READINESS_REGISTER))
+        improvement, documents = improvement_documents(project, readiness)
+        selected.add(READINESS_REGISTER)
+        if improvement is not None:
+            selected.update((IMPROVEMENT_PLAN, *documents))
+        return sorted(selected)
 
     selected=[]
     inventory=paths()
@@ -96,11 +102,18 @@ with tempfile.TemporaryDirectory(prefix='openepm-graph-refresh-') as directory:
         settings.parent.mkdir(parents=True,exist_ok=True)
         settings.write_text(json.dumps({'enabled':True,'telemetry':False,
             'strategy_options':{'push_sessions':False}})+'\n')
+    command = ['entire','graph','snapshot','--repo',str(snapshot if a.working_tree else project),
+               '--format','ndjson','--profile','full']
+    if a.working_tree:
+        # Review documents are projected from their exact registered bytes,
+        # not from extractor headings or JSON-key symbols.
+        exclude = temp/'graph.ignore'
+        exclude.write_text('/docs/qualifications/\n')
+        command.extend(['--ignore-file', str(exclude)])
     raw=temp/'entire.ndjson'
     print('Reading local Entire Graph export (no setup, upload or business services)',flush=True)
     with raw.open('w') as f:
-        subprocess.run(['entire','graph','snapshot','--repo',str(snapshot if a.working_tree else project),
-                        '--format','ndjson','--profile','full'],stdout=f,check=True)
+        subprocess.run(command,stdout=f,check=True)
     with raw.open() as f:header=json.loads(f.readline())
     if header['commit']!=commit:
         raise SystemExit('HEAD changed during export. Previous artifact preserved; rerun refresh on a stable commit.')

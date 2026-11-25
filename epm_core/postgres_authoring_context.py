@@ -6,8 +6,10 @@ import json
 
 from openepm.metadata_references import BOOTSTRAP_CONTRACT, BOOTSTRAP_CONTRACT_DIGEST
 
-from .dimensional_security_policy import AccessKind, ResolvedMemberSecurity, evaluate_coordinate
-from .postgres_dimensional_scope import resolve_effective_dimensional_scope
+from .dimensional_security_policy import ResolvedMemberSecurity
+from .postgres_dimensional_scope import (
+    metadata_reference_read_allowed, resolve_effective_dimensional_scope,
+)
 from .postgres_processing_limits import configure_statement_timeout
 
 READ = "metadata.authoring.context"
@@ -23,7 +25,7 @@ def authoring_contract() -> dict[str, object]:
     """
     value = {
         "format": "openepm-authoring-contract-v1",
-        "version": 3,
+        "version": 4,
         "objects": {
             "member": "scoped identity; explicit singleton selection",
             "relationship": "scoped immediate edge reference",
@@ -31,10 +33,14 @@ def authoring_contract() -> dict[str, object]:
             "attribute": "typed symbolic predicate; no implicit scalar read",
         },
         "selectors": {
-            "dimension": ["member", "member_list", "hierarchy", "attribute"],
+            "dimension": ["member", "member_list", "hierarchy", "attribute",
+                          "all_members", "roots", "all_base_members", "unplaced_members"],
             "member": ["selection", "attribute", "children", "parents",
                        "descendants", "ancestors", "siblings", "leaves", "base"],
-            "hierarchy": ["children", "parents", "descendants", "ancestors", "siblings", "leaves", "base"],
+            "hierarchy": ["children", "parents", "descendants", "ancestors", "siblings", "leaves", "base",
+                          "navigation", "all_members", "roots", "all_base_members",
+                          "unplaced_members", "leaf_descendants", "is_base", "same_level", "same_generation"],
+            "placement": ["navigation"],
             "set": ["union", "intersection", "difference"],
             "attribute": ["eq", "ne", "in", "exists"],
         },
@@ -51,6 +57,11 @@ def authoring_contract() -> dict[str, object]:
             "evaluation": ["dynamic", "materialized"],
             "construction": "symbolic scoped references; fixed-core binding before sealing",
             "metadataValues": "explicit authorized descriptor reads only",
+            "nativeNavigation": "predefined fixed-core operations; no saved lists or registration",
+            "scopeTop": "typed read object; never a business coordinate",
+            "legacyBase": "anchor only when structurally leaf; legacy leaves are strict descendants",
+            "generation": "scope top 1; roots 2; each relationship increments depth; ambiguous anchors require path",
+            "level": "leaf 0; parent 1 + maximum child level",
             "builderContract": BOOTSTRAP_CONTRACT,
             "builderContractDigest": BOOTSTRAP_CONTRACT_DIGEST,
         },
@@ -178,13 +189,9 @@ def metadata_row_allowed(authority, dimension, row):
     """Use current dimensional policy for dimension and member descriptors."""
     if authority.policy is None:
         return True
-    return evaluate_coordinate((ResolvedMemberSecurity(dimension,
+    return metadata_reference_read_allowed(authority, ResolvedMemberSecurity(dimension,
         row.get("member_id", dimension), tuple(row["read_security_tags"]),
-        tuple(row["write_security_tags"])),), kind=AccessKind.READ,
-        expected_dimensions=(dimension,), policy=authority.policy,
-        read_assignments=authority.read_assignments, write_assignments=authority.write_assignments,
-        application_administrator=authority.access.role == "Administrator",
-        workspace_administrator=authority.access.workspace_administrator).allowed
+        tuple(row["write_security_tags"])))
 
 
 def _dimension_catalog(db, scope, authority):
@@ -212,3 +219,33 @@ def _dimension_catalog(db, scope, authority):
             return [{**row, "nameLookupAllowed": row["name"] not in reserved_ids}
                     for row in visible], complete
         after = page[-1]["dimension_id"]
+
+
+def read_program_contract(function):
+    if function != READ:
+        return None
+    from .metadata_read_contract import read_contract, read_example, obj
+    identifier = {'type': 'string', 'minLength': 1, 'maxLength': 200}
+    revision = {'type': 'integer', 'minimum': 0}
+    digest = {'type': 'string', 'pattern': '^[0-9a-f]{64}$'}
+    metadata = obj({'contract': {'const': BOOTSTRAP_CONTRACT},
+        'contractDigest': {'const': BOOTSTRAP_CONTRACT_DIGEST},
+        'workspaceId': identifier, 'applicationId': identifier,
+        'metadataRevision': revision, 'authorizationScopeDigest': digest,
+        'referenceMode': {'const': 'symbolic'}, 'cubeGrainAvailable': {'type': 'boolean'},
+        'contextDigest': digest, 'dimensions': {'type': 'array', 'maxItems': 128,
+            'items': obj({'dimensionId': identifier, 'name': {'type': 'string'},
+                'nameLookupAllowed': {'type': 'boolean'},
+                'referenceMode': {'const': 'symbolic'}})}})
+    result = obj({'workspaceId': identifier, 'applicationId': identifier,
+        'metadataRevision': revision, 'policyRevision': revision,
+        'schemaEpoch': revision, 'securityRevision': revision,
+        'authority': obj({'issuer': {'type': 'string'}, 'subjectId': {'type': 'string'}}),
+        'references': obj({'metadata': metadata,
+            'authoringContract': {'const': authoring_contract()}})})
+    return read_contract(function, obj({}), result, owner='postgres_authoring_context.read_context',
+        examples=[read_example(function, {}, name='Discover the current symbolic authoring context',
+            binding='Use the granted workspace/application scope; no private identifiers or saved builder are required.')],
+        semantic_rules=['Only current-authorized dimensions are emitted; cubeGrainAvailable=false does not authorize a partial full-coordinate build.',
+            'Member, hierarchy, attribute and named-definition references remain symbolic and are resolved under current fixed-core authority during binding.',
+            'The authoringContract is the exact current owner descriptor. Its digest and the bootstrap context digest are verified by native consumers.'])

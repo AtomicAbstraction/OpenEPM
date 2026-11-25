@@ -35,7 +35,8 @@ function receive(value: unknown) {
   )
     return;
   snapshot = {
-    state: String(value.state) as "expired" | "authenticated",
+    // Another tab can prompt a fresh check, but cannot authenticate this tab.
+    state: value.state === "authenticated" ? "revalidating" : "expired",
     changedAt: Date.now(),
     reason: "another-tab",
   };
@@ -84,7 +85,9 @@ export function classifyBrowserFailure(error: unknown) {
   );
 }
 
-export function installConnectivityLifecycle(revalidate: () => void) {
+export function installConnectivityLifecycle(
+  revalidate: (broadcast?: boolean) => void,
+) {
   if (typeof window === "undefined") return () => undefined;
   const online = () => {
     setBrowserLifecycle("revalidating", "online");
@@ -100,7 +103,12 @@ export function installConnectivityLifecycle(revalidate: () => void) {
   window.addEventListener("online", online);
   window.addEventListener("offline", offline);
   document.addEventListener("visibilitychange", visible);
+  const unsubscribe = subscribeBrowserLifecycle((current) => {
+    if (current.state === "revalidating" && current.reason === "another-tab")
+      revalidate(false);
+  });
   return () => {
+    unsubscribe();
     window.removeEventListener("online", online);
     window.removeEventListener("offline", offline);
     document.removeEventListener("visibilitychange", visible);

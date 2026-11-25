@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal, InvalidOperation
+import json
 from typing import Mapping, Sequence
 
 from .member_list_contract import canonical_member_list_definition
@@ -102,6 +103,191 @@ def _named_graph_indexes(graph, member_ids):
     return nodes, children, parents
 
 
+def _graph_levels(nodes, children, parents):
+    """Validate the complete operative DAG and compute its bottom-up height."""
+    remaining = {member: len(children[member]) for member in nodes}
+    levels = {member: 0 for member in nodes}
+    ready = sorted(member for member in nodes if not remaining[member])
+    visited = 0
+    while ready:
+        member = ready.pop()
+        visited += 1
+        for edge in parents[member]:
+            parent = edge["parentMemberId"]
+            levels[parent] = max(levels[parent], levels[member] + 1)
+            remaining[parent] -= 1
+            if remaining[parent] == 0:
+                ready.append(parent)
+    if visited != len(nodes):
+        raise ValueError("MEMBER_LIST_HIERARCHY_CYCLE")
+    return levels
+
+
+def navigation_graph_key(node):
+    """Bind each topology query to its complete relevant subgraph."""
+    return json.dumps(node, sort_keys=True, separators=(",", ":"))
+
+
+def _navigation_graph(graphs, node):
+    if graphs is None:
+        return None
+    return graphs.get(navigation_graph_key(node), graphs.get(node["hierarchyId"]))
+
+
+def _navigation_result(node, members, graph, *, placements=False, legacy=False):
+    """The shared semantic authority for native navigation and browse projection.
+
+    Browser paths are occurrence metadata, never financial contribution paths.
+    Structural classification precedes every expression's output filters.
+    """
+    operation = node["operation"]
+    if operation == "top":
+        raise ValueError("MEMBER_LIST_SCOPE_TOP_NOT_COORDINATE")
+    if graph is None:
+        if node["scope"] == "dimension" and operation == "all":
+            result = sorted(members)
+            return ([{"memberId": member, "pathRelationshipIds": [],
+                      "pathMemberIds": [member], "generation": None, "level": None}
+                     for member in result] if placements else result)
+        raise ValueError("MEMBER_LIST_HIERARCHY_UNAVAILABLE")
+    nodes, outgoing, incoming = _named_graph_indexes(graph, set(members))
+    levels = _graph_levels(nodes, outgoing, incoming)
+    roots = sorted(member for member in nodes if not incoming[member])
+    children = {member: sorted({edge["childMemberId"] for edge in outgoing[member]})
+                for member in nodes}
+    parents = {member: sorted({edge["parentMemberId"] for edge in incoming[member]})
+               for member in nodes}
+    anchor = node["anchor"]
+    member = anchor["memberId"] if anchor else None
+    if member is not None and member not in nodes:
+        if legacy and operation == "is_base" and member in members:
+            return []
+        raise ValueError("MEMBER_LIST_HIERARCHY_MEMBER_UNAVAILABLE")
+    path = anchor["pathRelationshipIds"] if anchor else None
+    path_members = None
+    if path is not None:
+        by_id = {edge["relationshipId"]: edge for edges in outgoing.values() for edge in edges}
+        path_members = []
+        for key in path:
+            edge = by_id.get(key)
+            if edge is None or (path_members and path_members[-1] != edge["parentMemberId"]):
+                raise ValueError("MEMBER_LIST_NAVIGATION_PATH_STALE")
+            if not path_members:
+                path_members.append(edge["parentMemberId"])
+            path_members.append(edge["childMemberId"])
+        if not path:
+            path_members = [member]
+        if path_members[-1] != member or path_members[0] not in roots:
+            raise ValueError("MEMBER_LIST_NAVIGATION_PATH_STALE")
+
+    def walk(start, index):
+        pending = list(reversed(index[start])); result = []; seen = set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current); result.append(current)
+            pending.extend(reversed(index[current]))
+        return result
+
+    occurrences = None
+    def all_occurrences():
+        nonlocal occurrences
+        if occurrences is not None:
+            return occurrences
+        occurrences = []
+        pending = [(root, [], [root]) for root in reversed(roots)]
+        while pending:
+            current, edges, nodes_path = pending.pop()
+            if len(edges) > MAX_PLACEMENT_DEPTH:
+                raise ValueError("MEMBER_LIST_PLACEMENT_DEPTH_LIMIT")
+            occurrences.append({"memberId": current, "pathRelationshipIds": edges,
+                "pathMemberIds": nodes_path, "generation": len(edges) + 2,
+                "level": levels[current]})
+            if len(occurrences) > MAX_EVALUATED_PLACEMENTS:
+                raise ValueError("MEMBER_LIST_EVALUATION_PLACEMENT_LIMIT_EXCEEDED")
+            for edge in reversed(outgoing[current]):
+                child = edge["childMemberId"]
+                pending.append((child, [*edges, edge["relationshipId"]], [*nodes_path, child]))
+        return occurrences
+
+    generation = None
+    if operation == "all":
+        result = sorted(members if node["scope"] == "dimension" else nodes)
+    elif operation == "unplaced":
+        result = sorted(set(members) - nodes)
+    elif operation == "roots" or operation == "children" and member is None:
+        result = roots
+    elif operation == "leaves" or operation == "leaf_descendants" and member is None:
+        result = sorted(value for value in nodes if not children[value])
+    elif operation == "descendants" and member is None:
+        result = sorted(nodes)
+    elif operation == "self":
+        result = [member]
+    elif operation == "is_base":
+        result = [member] if not children[member] else []
+    elif operation == "children":
+        result = children[member]
+    elif operation == "descendants":
+        result = walk(member, children)
+    elif operation == "leaf_descendants":
+        result = [value for value in walk(member, children) if not children[value]]
+    elif operation in {"parents", "ancestors", "siblings"}:
+        if path_members is not None:
+            if operation == "parents":
+                result = path_members[-2:-1]
+            elif operation == "ancestors":
+                result = list(reversed(path_members[:-1]))
+            else:
+                result = [value for value in (children[path_members[-2]] if len(path_members) > 1 else roots)
+                          if value != member]
+        else:
+            if operation == "siblings" and len(parents[member]) > 1 and not node["allParents"]:
+                raise ValueError("MEMBER_LIST_NAVIGATION_PATH_REQUIRED")
+            if operation == "parents":
+                result = parents[member]
+            elif operation == "ancestors":
+                result = walk(member, parents)
+            else:
+                result = sorted({value for parent in parents[member] for value in children[parent]
+                                 if value != member}) if parents[member] else ([] if legacy else [value for value in roots if value != member])
+    elif operation == "same_level":
+        result = sorted(value for value in nodes if levels[value] == levels[member] and value != member)
+    elif operation == "same_generation":
+        if member is None:
+            result = []  # The structural top is generation 1, not a coordinate.
+            generation = 1
+        else:
+            generations = {row["generation"] for row in all_occurrences() if row["memberId"] == member}
+            if path is None and len(generations) != 1:
+                raise ValueError("MEMBER_LIST_NAVIGATION_PATH_REQUIRED")
+            generation = len(path) + 2 if path is not None else next(iter(generations))
+            result = _unique([row["memberId"] for row in all_occurrences()
+                              if row["generation"] == generation and row["memberId"] != member])
+    else:
+        raise ValueError("MEMBER_LIST_NAVIGATION_INVALID")
+    if node["includeSelf"] and member not in result and (legacy or operation != "leaf_descendants" or not children[member]):
+        result = [member, *result]
+    if not placements:
+        return result
+    selected = set(result)
+    projected = [row for row in all_occurrences() if row["memberId"] in selected
+                 and (generation is None or row["generation"] == generation)]
+    if path is not None and operation in {"self", "is_base", "children", "descendants", "leaf_descendants"}:
+        projected = [row for row in projected if row["pathRelationshipIds"][:len(path)] == path
+                     and (not path or row["pathMemberIds"][:len(path_members)] == path_members)]
+    if path_members is not None and operation in {"parents", "ancestors"}:
+        projected = [row for row in projected if row["pathRelationshipIds"] == path[:len(row["pathRelationshipIds"])]
+                     and row["pathMemberIds"] == path_members[:len(row["pathMemberIds"])]]
+    if path_members is not None and operation == "siblings":
+        projected = [row for row in projected if row["pathRelationshipIds"][:-1] == path[:-1]
+                     and len(row["pathRelationshipIds"]) == len(path)
+                     and row["pathMemberIds"][:-1] == path_members[:-1]]
+    projected.extend({"memberId": value, "pathRelationshipIds": [], "pathMemberIds": [value],
+                      "generation": None, "level": None} for value in result if value not in nodes)
+    return projected
+
+
 def resolve_member_list_parameters(canonical, parameters, *, member_ids=None):
     """Validate parameter values before loading metadata and again against it.
 
@@ -154,34 +340,25 @@ def evaluate_member_list(
     if any(not isinstance(key, str) or not isinstance(value, str)
            for key, value in members.items()):
         raise ValueError("MEMBER_LIST_METADATA_INVALID")
-    children: dict[str, list[str]] = {member: [] for member in member_ids}
-    parents: dict[str, list[str]] = {member: [] for member in member_ids}
+    legacy_edges = set()
     for parent, child in relationships:
         if parent not in member_ids or child not in member_ids or parent == child:
             raise ValueError("MEMBER_LIST_RELATIONSHIP_INVALID")
-        children[parent].append(child)
-        parents[child].append(parent)
-    for index in (children, parents):
-        for values in index.values():
-            values[:] = sorted(set(values))
-
+        legacy_edges.add((parent, child))
+    fallback_graph = {"hierarchyId": hierarchy_id, "members": sorted(member_ids),
+        "relationships": [{"relationshipId": f"legacy-edge-{index}",
+            "parentMemberId": parent, "childMemberId": child}
+            for index, (parent, child) in enumerate(sorted(legacy_edges))]}
     declarations, supplied = resolve_member_list_parameters(
         canonical, parameters, member_ids=member_ids)
-    def walk(start: str, index: Mapping[str, Sequence[str]]) -> list[str]:
-        pending = list(reversed(index[start]))
-        result: list[str] = []
-        seen: set[str] = set()
-        while pending:
-            member = pending.pop()
-            if member in seen:
-                continue
-            seen.add(member)
-            result.append(member)
-            pending.extend(reversed(index[member]))
-        return result
 
     def evaluate(node: Mapping[str, object]) -> list[str]:
         kind = node["kind"]
+        if kind == "navigation":
+            graph = _navigation_graph(hierarchy_graphs, node)
+            if graph is None and hierarchy_graphs is None and node["hierarchyId"] in {hierarchy_id, canonical["dimensionId"]}:
+                graph = fallback_graph
+            return _navigation_result(node, members, graph)
         if kind == "explicit":
             result = list(node["memberIds"])
             if not set(result) <= member_ids:
@@ -193,43 +370,15 @@ def evaluate_member_list(
                 raise ValueError("MEMBER_LIST_PARAMETER_NOT_MEMBER")
             return [] if node["name"] not in supplied else [supplied[node["name"]]]
         if kind in {"children", "parents", "descendants", "ancestors", "siblings", "leaves", "base"}:
-            if hierarchy_graphs is not None:
-                graph = hierarchy_graphs.get(node["hierarchyId"])
-                if graph is None:
-                    raise ValueError("MEMBER_LIST_HIERARCHY_UNAVAILABLE")
-                node_members, edges, incoming = _named_graph_indexes(graph, member_ids)
-                node_children = {key: sorted({edge["childMemberId"] for edge in values})
-                                 for key, values in edges.items()}
-                node_parents = {key: sorted({edge["parentMemberId"] for edge in values})
-                                for key, values in incoming.items()}
-            else:
-                if node["hierarchyId"] not in {hierarchy_id, canonical["dimensionId"]}:
-                    raise ValueError("MEMBER_LIST_HIERARCHY_UNAVAILABLE")
-                node_members, node_children, node_parents = member_ids, children, parents
-            member = node["memberId"]
-            if member not in node_members:
-                if kind == "base" and member in member_ids:
-                    return []
-                raise ValueError("MEMBER_LIST_HIERARCHY_MEMBER_UNAVAILABLE")
-            if kind == "base":
-                return [] if node_children[member] else [member]
-            if kind == "parents":
-                result = list(node_parents[member])
-            elif kind == "children":
-                result = list(node_children[member])
-            elif kind == "descendants":
-                result = walk(member, node_children)
-            elif kind == "ancestors":
-                result = walk(member, node_parents)
-            elif kind == "siblings":
-                result = sorted({sibling for parent in node_parents[member]
-                                 for sibling in node_children[parent] if sibling != member})
-            else:
-                result = [candidate for candidate in walk(member, node_children)
-                          if not node_children[candidate]]
-            if node["includeSelf"] and member not in result:
-                result.insert(0, member)
-            return result
+            graph = (hierarchy_graphs.get(node["hierarchyId"]) if hierarchy_graphs is not None else
+                     fallback_graph if node["hierarchyId"] in {hierarchy_id, canonical["dimensionId"]} else None)
+            operation = {"base": "is_base", "leaves": "leaf_descendants"}.get(kind, kind)
+            # Existing durable expression shape; execute through the native
+            # traversal while retaining its historical scope and include-self.
+            return _navigation_result({"operation": operation, "scope": "hierarchy",
+                "anchor": {"memberId": node["memberId"], "pathRelationshipIds": None},
+                "includeSelf": node["includeSelf"], "allParents": kind == "siblings"},
+                members, graph, legacy=True)
         if kind == "attribute":
             attribute = node["attributeId"]
             if attribute not in attribute_types:
@@ -284,6 +433,7 @@ def evaluate_member_list_placements(
     parameters: Mapping[str, object] | None = None,
     hierarchy_id: str = "primary",
     hierarchy_graphs: Mapping[str, Mapping] | None = None,
+    browsing: bool = False,
 ) -> list[dict]:
     """Evaluate the same member-list IR without erasing hierarchy placements.
 
@@ -382,6 +532,14 @@ def evaluate_member_list_placements(
 
     def evaluate(node: Mapping[str, object]) -> list[dict]:
         kind = node["kind"]
+        if kind == "navigation":
+            if not browsing:
+                raise ValueError("MEMBER_LIST_PLACEMENT_SELECTOR_UNSUPPORTED")
+            graph = _navigation_graph(hierarchy_graphs, node)
+            if graph is None and hierarchy_graphs is None and node["hierarchyId"] in {hierarchy_id, canonical["dimensionId"]}:
+                graph = {"hierarchyId": node["hierarchyId"], "members": sorted(member_ids),
+                         "relationships": list(relationships)}
+            return _navigation_result(node, members, graph, placements=True)
         if kind == "explicit":
             if not set(node["memberIds"]) <= member_ids:
                 raise ValueError("MEMBER_LIST_MEMBER_UNAVAILABLE")

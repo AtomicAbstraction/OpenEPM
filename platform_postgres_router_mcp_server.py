@@ -3,16 +3,22 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Annotated
+from pydantic import StrictBool, WithJsonSchema
+from epm_core.python_execution_contract import historical_read_contract
 from mcp.server import MCPServer
 from epm_core.postgres_mcp_execution import bounded_tool
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from epm_core.mcp_diagnostics import DiagnosticToolError
 from openepm.diagnostics import SourceValidationError
+from epm_core.public_program_diagnostics import ProgramValidationError
+from epm_core.application_catalog_projection import CatalogDiscoveryError
 import psycopg
 from epm_core.postgres_processing_limits import BUSY_CODE
 
 from epm_core.postgres_auth import AuthError,access_token
+from epm_core.postgres_capacity_metrics import CapacityView
 from epm_core.deployment_secrets import configured_hex_bytes, configured_text
 from epm_core.postgres_mcp_router import PostgresMCPRouter
 from epm_core.postgres_python_environment_startup import load_python_environment_profiles
@@ -67,7 +73,7 @@ def _assertion(ctx: Context) -> str:
 def _call(operation):
     try:
         return operation()
-    except SourceValidationError as error:
+    except (SourceValidationError, ProgramValidationError, CatalogDiscoveryError) as error:
         raise DiagnosticToolError(error.diagnostics) from None
     except (AuthError,ValueError) as error:
         raise ToolError(str(error)) from error
@@ -93,35 +99,61 @@ def read_v2_session_identity(ctx: Context) -> dict:
 
 
 @bounded_tool(server)
-def list_v2_applications(ctx: Context,after: dict | None=None,
-                         limit: int=100) -> dict:
-    """Page applications currently granted to your verified identity."""
+def list_v2_applications(ctx: Context,after: dict | str | None=None,
+                         limit: int=100, view: str='applications') -> dict:
+    """Page current application grants, or select view="managedWorkspaces" to find active
+    workspaces you administer even with zero admitted apps. Pass nextAfter back with the
+    same view and limit. Use list_v2_workspace_functions on the selected workspace listener.
+    """
+    if view == 'managedWorkspaces':
+        return _call(lambda:router().managed_workspaces(_assertion(ctx),after=after,limit=limit))
+    if view != 'applications':
+        raise ToolError('DISCOVERY_VIEW_INVALID')
     return _call(lambda:router().list_applications(
         _assertion(ctx),after=after,limit=limit))
 
 
 @bounded_tool(server)
 def list_v2_functions(workspace_id: str,application_id: str,
-                      ctx: Context) -> dict:
-    """Discover currently granted functions in one selected application."""
+                      ctx: Context, discovery: dict | None = None) -> dict:
+    """Discover current grants. Omit discovery for the full catalogue.
+
+    Start with discovery={"view":"summary"}; its firstRead is executable with
+    read_v2_program. Use {"view":"functions","family":family,"limit":20}
+    or an exact "function" for full contracts. Pass discovery.next as "after"
+    with the same query. A stale continuation requires restarting discovery.
+    """
     return _call(lambda:router().catalog(
-        _assertion(ctx),workspace_id,application_id))
+        _assertion(ctx),workspace_id,application_id,discovery=discovery))
 
 
 @bounded_tool(server)
 def read_v2_program(workspace_id: str,application_id: str,
                     program: dict,ctx: Context) -> dict:
-    """Execute a bounded scoped read program."""
+    """Dispatch a catalogued program using its declared function mode.
+
+    This route supports bounded reads, technical query/control and retained
+    layout compatibility calls. Use the catalogued signed metadata tool for
+    current layout request workflows.
+    """
     return _call(lambda:router().read(
         _assertion(ctx),workspace_id,application_id,program))
 
 
 @bounded_tool(server)
 def read_v2_capacity_metrics(workspace_id: str,application_id: str,
-                             ctx: Context) -> dict:
-    """Read bounded administrator-only operational metrics for one application."""
+                             ctx: Context,*,view: CapacityView = 'full') -> dict:
+    """Read administrator-only metrics for one application.
+
+    Use view='queues' for depth, oldest age, leases and calculation impact head
+    status without host readings. A failed head includes a fixed failure code.
+    queueObservedAt records the database time of the queue snapshot in UTC.
+    The default full view includes resource readings and first-claim samples.
+    On CAPACITY_READ_AUTHORIZATION_STALE, refresh application access and
+    repeat the read under current authority.
+    """
     return _call(lambda:router().capacity_metrics(
-        _assertion(ctx),workspace_id,application_id))
+        _assertion(ctx),workspace_id,application_id,view=view))
 
 
 @bounded_tool(server)
@@ -166,7 +198,7 @@ def execute_v2_source_program(workspace_id: str,application_id: str,
 def execute_v2_metadata_program(workspace_id: str,application_id: str,
                                 program: dict,idempotency_key: str,
                                 ctx: Context) -> dict:
-    """Execute a typed metadata or currency-settings program in one application."""
+    """Execute typed metadata, signed layout requests, or currency settings in one application."""
     return _call(lambda:router().metadata(
         _assertion(ctx),workspace_id,application_id,program,
         idempotency_key=idempotency_key))
@@ -192,10 +224,15 @@ def execute_v2_python_program_build(workspace_id: str,application_id: str,
 
 @bounded_tool(server)
 def read_v2_python_program_build(workspace_id: str,application_id: str,
-                                 build_id: str,ctx: Context) -> dict:
-    """Read one caller-owned technical build and sealed-plan digest."""
+        ctx: Context, build_id: str | None = None,
+        original_request: Annotated[dict, WithJsonSchema(historical_read_contract(build=True)['originalRequestSchema'])] | None = None) -> dict:
+    """Read by build_id OR exact original_request (program and idempotencyKey).
+
+    Current READ/owner/scope is required; expired original references never
+    admit, rebuild or resume work.
+    """
     return _call(lambda:router().python_build_read(_assertion(ctx),workspace_id,
-        application_id,build_id))
+        application_id,build_id,original_request=original_request))
 
 
 @bounded_tool(server)
@@ -227,10 +264,14 @@ def execute_v2_python_program_run(workspace_id: str,application_id: str,
 
 @bounded_tool(server)
 def read_v2_python_program_workflow(workspace_id: str,application_id: str,
-                                    workflow_id: str,ctx: Context) -> dict:
-    """Read durable child jobs and committed unit receipts."""
+        ctx: Context, workflow_id: str | None = None,
+        original_request: Annotated[dict, WithJsonSchema(historical_read_contract()['originalRequestSchema'])] | None = None) -> dict:
+    """Read by workflow_id OR exact original_request (program and idempotencyKey).
+
+    Historical READ never reloads source, resumes a plan or grants execution.
+    """
     return _call(lambda:router().python_workflow_read(_assertion(ctx),workspace_id,
-        application_id,workflow_id))
+        application_id,workflow_id,original_request=original_request))
 
 
 @bounded_tool(server)
@@ -532,11 +573,12 @@ def apply_v2_cube_write_scope_transition(
 
 
 @bounded_tool(server)
-def read_v2_job(workspace_id: str,application_id: str,job_id: str,
-                ctx: Context) -> dict:
-    """Read your durable job status in the selected application."""
+def read_v2_job(workspace_id: str,application_id: str,ctx: Context,
+                job_id: str | None = None,
+                operation_id: str | None = None) -> dict:
+    """Read your durable status by exactly one of job_id or the original operation_id."""
     return _call(lambda:router().job(
-        _assertion(ctx),workspace_id,application_id,job_id))
+        _assertion(ctx),workspace_id,application_id,job_id,operation_id=operation_id))
 
 
 @bounded_tool(server)
@@ -558,11 +600,12 @@ def cancel_v2_job(workspace_id: str,application_id: str,job_id: str,
 
 @bounded_tool(server)
 def list_v2_tasks(workspace_id: str,application_id: str,ctx: Context,
-                  after_sequence: int=0,limit: int=100) -> dict:
-    """Page authorized durable tasks in one selected application."""
+                  after_sequence: int=0,limit: int=100,
+                  attention_only: StrictBool=False) -> dict:
+    """Page authorized tasks in one application. Set attention_only to true for tasks needing attention."""
     return _call(lambda:router().tasks(
         _assertion(ctx),workspace_id,application_id,
-        after_sequence=after_sequence,limit=limit))
+        after_sequence=after_sequence,limit=limit,attention_only=attention_only))
 
 
 @bounded_tool(server)

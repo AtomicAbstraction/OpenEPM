@@ -62,6 +62,12 @@ export function MetadataNavigation({
         >
           <UiIcon name="metadata" />
           <b>Metadata</b>
+          <span
+            className="metadata-navigation-compact-label"
+            aria-hidden="true"
+          >
+            Metadata
+          </span>
         </button>
         {!collapsed && (
           <button
@@ -90,6 +96,7 @@ export function MetadataNavigation({
           <li>
             <button
               type="button"
+              aria-label="Dimensions"
               className={active && section === "dimensions" ? "active" : ""}
               aria-current={
                 active && section === "dimensions" ? "page" : undefined
@@ -115,6 +122,7 @@ export function MetadataNavigation({
                   aria-label={`${isExpanded ? "Collapse" : "Expand"} ${dimension.name} metadata`}
                   aria-expanded={isExpanded}
                   aria-controls={id}
+                  disabled={disabled}
                   onClick={() =>
                     setExpandedDimensions((current) => {
                       const next = new Set(current);
@@ -139,6 +147,8 @@ export function MetadataNavigation({
                       <li key={destination}>
                         <button
                           type="button"
+                          aria-label={metadataSectionLabels[destination]}
+                          disabled={disabled}
                           className={
                             selected && section === destination ? "active" : ""
                           }
@@ -166,6 +176,7 @@ export function MetadataNavigation({
           <li>
             <button
               type="button"
+              aria-label="Member Lists"
               className={listsActive ? "active" : ""}
               aria-current={listsActive ? "page" : undefined}
               disabled={disabled}
@@ -177,6 +188,7 @@ export function MetadataNavigation({
           <li>
             <button
               type="button"
+              aria-label="Function reference"
               className={active && section === "reference" ? "active" : ""}
               aria-current={
                 active && section === "reference" ? "page" : undefined

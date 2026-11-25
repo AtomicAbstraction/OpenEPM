@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { request, requestAdmittedEffect } from "./api";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { request } from "./api";
 import {
   ParameterFields,
   definitionParameterSchema,
@@ -8,6 +8,7 @@ import {
 } from "./ParameterFields";
 import { useUnsavedWork } from "./unsaved-work";
 import { useStableMutationIntentKey } from "./mutation-intent";
+import { usePythonEvidenceBuildRequest } from "./python-evidence-build-request";
 import {
   authoringContextKey,
   buildIsPending,
@@ -56,6 +57,18 @@ export function PythonProgramTest({
   definitionContextKey?: string;
 }) {
   const contextKey = authoringContextKey(app, catalog);
+  const testContextKey = JSON.stringify([
+    contextKey,
+    program.programId,
+    program.sourceToken,
+  ]);
+  const ownerKey = JSON.stringify([
+    app.workspaceId,
+    app.applicationId,
+    catalog.applicationAccess.issuer,
+    catalog.applicationAccess.subjectId,
+    program.programId,
+  ]);
   const sourceSchema = parameterObject(program.parameterSchema);
   const typedKind =
     definitionKind ??
@@ -82,12 +95,18 @@ export function PythonProgramTest({
   const [testedDataRevision, setTestedDataRevision] = useState<number | null>(
     null,
   );
-  const [observation, setObservation] = useState<PythonBuildObservation | null>(
-    program.latestImpactTest?.purpose === "ImpactTest"
-      ? { build: program.latestImpactTest, contextKey }
-      : null,
+  const [resolvedInContext, setResolvedInContext] = useState<string | null>(
+    null,
   );
-  const [busy, setBusy] = useState(false);
+  const [observedBuild, setObservation] =
+    useState<PythonBuildObservation | null>(
+      program.latestImpactTest?.purpose === "ImpactTest"
+        ? { build: program.latestImpactTest, contextKey: testContextKey }
+        : null,
+    );
+  const [observedOwner, setObservedOwner] = useState(ownerKey);
+  const observation = observedOwner === ownerKey ? observedBuild : null;
+  const [readingImpact, setReadingImpact] = useState(false);
   const [error, setError] = useState("");
   const [impact, setImpact] = useState("");
   const [cursor, setCursor] = useState<string | null>(null);
@@ -95,15 +114,45 @@ export function PythonProgramTest({
   const seenCursors = useRef(new Set<string>());
   const bytesRead = useRef(0);
   const generation = useRef(0);
+  const contextFocus = useRef<HTMLHeadingElement>(null);
+  const recoveryControls = useRef<HTMLDivElement>(null);
+  const checkOriginal = useRef<HTMLButtonElement>(null);
+  const retryOriginal = useRef<HTMLButtonElement>(null);
   const mutationKey = useStableMutationIntentKey("python-test");
+  const submission = usePythonEvidenceBuildRequest(
+    app,
+    catalog,
+    program.programId,
+    testContextKey,
+    "ImpactTest",
+    (build, baseline) => {
+      if (recoveryControls.current?.contains(document.activeElement))
+        contextFocus.current?.focus();
+      setTestedParameters(baseline.parameterKey);
+      if (baseline.parameterKey === parameterKey) setParametersEdited(false);
+      setTestedDataRevision(baseline.dataRevision);
+      setObservedOwner(ownerKey);
+      setObservation({ build, contextKey: baseline.contextKey });
+      setResolvedInContext(testContextKey);
+    },
+  );
+  const busy = readingImpact || submission.busy;
+  const canTest = Boolean(catalog.functions["python.program.test"]);
+  const showResult =
+    submission.canRead && (canTest || resolvedInContext === testContextKey);
   const observer = usePythonBuildObserver(
     app,
-    contextKey,
-    observation,
+    testContextKey,
+    showResult && !submission.pending ? observation : null,
     "ImpactTest",
     setObservation,
   );
   const current =
+    (catalog.applicationAccess.authorizationModel !== "group_assignments" ||
+      testedDataRevision === null ||
+      testedDataRevision === catalog.revisions.data) &&
+    canTest &&
+    !submission.pending &&
     observer.current &&
     (testedParameters === null
       ? !parametersEdited
@@ -114,13 +163,16 @@ export function PythonProgramTest({
     parametersEdited &&
       parameterKey !== (testedParameters ?? JSON.stringify(["{}", "{}"])),
   );
-  useEffect(() => {
+  useLayoutEffect(() => {
     generation.current += 1;
-    setBusy(false);
+    setReadingImpact(false);
+    setError("");
+    setImpact("");
+    setCursor(null);
     return () => {
       generation.current += 1;
     };
-  }, [contextKey]);
+  }, [testContextKey, canTest]);
   useEffect(() => {
     setSealedDefinition(null);
     if (!typedKind || !current || observation?.build.status !== "sealed")
@@ -218,7 +270,8 @@ export function PythonProgramTest({
   async function test() {
     if (
       busy ||
-      !catalog.functions["python.program.test"] ||
+      submission.pending ||
+      !canTest ||
       catalog.revisions.schemaEpoch === undefined
     )
       return;
@@ -250,7 +303,6 @@ export function PythonProgramTest({
       );
       return;
     }
-    const requestGeneration = ++generation.current;
     const arguments_ = {
       programId: program.programId,
       programSourceToken: program.sourceToken,
@@ -260,52 +312,24 @@ export function PythonProgramTest({
       expectedPolicyRevision: catalog.revisions.policy,
       expectedSchemaEpoch: catalog.revisions.schemaEpoch,
     };
-    setBusy(true);
     setError("");
     setImpact("");
     setCursor(null);
     decoder.current = null;
     seenCursors.current.clear();
     bytesRead.current = 0;
-    try {
-      const response = await requestAdmittedEffect<{
-        result: PythonBuildStatus;
-      }>("/api/python-build", {
-        workspaceId: app.workspaceId,
-        applicationId: app.applicationId,
-        action: "request",
-        confirmed: true,
-        idempotencyKey: mutationKey({
-          arguments: arguments_,
-          dataRevision: catalog.revisions.data,
-          expiredBuildId:
-            observation?.build.status === "expired"
-              ? observation.build.buildId
-              : null,
-        }),
-        program: {
-          languageVersion: 2,
-          function: "python.program.test",
-          arguments: arguments_,
-        },
-      });
-      if (requestGeneration !== generation.current) return;
-      if (response.result.purpose !== "ImpactTest")
-        throw new Error("Test returned a different build purpose.");
-      setTestedParameters(parameterKey);
-      setParametersEdited(false);
-      setTestedDataRevision(catalog.revisions.data);
-      setObservation({ build: response.result, contextKey });
-    } catch (reason) {
-      if (requestGeneration === generation.current)
-        setError(
-          reason instanceof Error
-            ? reason.message
-            : "Unable to test this version.",
-        );
-    } finally {
-      if (requestGeneration === generation.current) setBusy(false);
-    }
+    await submission.submit(
+      arguments_,
+      mutationKey({
+        arguments: arguments_,
+        dataRevision: catalog.revisions.data,
+        expiredBuildId:
+          observation?.build.status === "expired"
+            ? observation.build.buildId
+            : null,
+      }),
+      parameterKey,
+    );
   }
 
   async function readImpact(next: boolean) {
@@ -318,7 +342,7 @@ export function PythonProgramTest({
     )
       return;
     const requestGeneration = ++generation.current;
-    setBusy(true);
+    setReadingImpact(true);
     setError("");
     try {
       const response = await request<{
@@ -370,78 +394,156 @@ export function PythonProgramTest({
         );
       }
     } finally {
-      if (requestGeneration === generation.current) setBusy(false);
+      if (requestGeneration === generation.current) setReadingImpact(false);
     }
   }
+
+  if (!showResult && !submission.canRecover) return null;
 
   return (
     <section
       aria-label="Test saved Python source"
       className="python-program-test"
     >
-      <h4>Test this source</h4>
-      <p>
-        Run the saved source in isolation and inspect its private effects before
-        activation.
-      </p>
-      <ParameterFields
-        label="Source parameters"
-        advancedLabel="Python test parameters"
-        value={parameters}
-        schema={sourceSchema}
-        disabled={busy}
-        onChange={(value) => {
-          onParametersChange(value);
-          setParametersEdited(true);
-        }}
-      />
-      {typedKind && (
+      <h4 ref={contextFocus} tabIndex={-1}>
+        Test this source
+      </h4>
+      {canTest && (
+        <p>
+          Run the saved source in isolation and inspect its private effects
+          before activation.
+        </p>
+      )}
+      {canTest && (
+        <ParameterFields
+          label="Source parameters"
+          advancedLabel="Python test parameters"
+          value={parameters}
+          schema={sourceSchema}
+          disabled={!canTest || busy || submission.pending}
+          onChange={(value) => {
+            onParametersChange(value);
+            setParametersEdited(true);
+          }}
+        />
+      )}
+      {canTest && typedKind && (
         <ParameterFields
           label="Rule parameters"
           advancedLabel="Python rule test parameters"
           value={definitionParameters}
           schema={definitionSchema}
-          disabled={busy}
+          disabled={!canTest || busy || submission.pending}
           onChange={(value) => {
             setDefinitionParameters(value);
             setParametersEdited(true);
           }}
         />
       )}
-      <button
-        disabled={
-          busy ||
-          Boolean(
-            observer.current &&
-              observation &&
-              buildIsPending(observation.build),
-          ) ||
-          catalog.revisions.schemaEpoch === undefined
-        }
-        onClick={() => void test()}
-      >
-        Test source
-      </button>
-      {error && <p role="alert">{error}</p>}
-      {observation && (
+      {canTest && (
+        <button
+          disabled={
+            busy ||
+            submission.pending ||
+            Boolean(
+              observer.current &&
+                observation &&
+                buildIsPending(observation.build),
+            ) ||
+            catalog.revisions.schemaEpoch === undefined
+          }
+          onClick={() => void test()}
+        >
+          Test source
+        </button>
+      )}
+      {submission.busy && !submission.pending && (
+        <p role="status">Waiting for the server to confirm the test request…</p>
+      )}
+      {submission.canRecover && (
+        <div
+          ref={recoveryControls}
+          role="region"
+          aria-label="Original Python impact test"
+        >
+          <p role="status">
+            {submission.status ||
+              (submission.busy
+                ? "Waiting for the server to confirm the original request…"
+                : "The original test request has an unconfirmed outcome.")}
+          </p>
+          <button
+            ref={checkOriginal}
+            aria-disabled={busy}
+            onClick={() => void submission.recover("read")}
+          >
+            Check original test
+          </button>
+          <button
+            disabled={busy}
+            onClick={() => void submission.copyOriginal()}
+          >
+            Copy original test lookup for MCP
+          </button>
+          {submission.canRetry && (
+            <button
+              ref={retryOriginal}
+              aria-disabled={busy}
+              onClick={async () => {
+                await submission.recover("retry");
+                if (document.activeElement === retryOriginal.current)
+                  checkOriginal.current?.focus();
+              }}
+            >
+              Retry original test
+            </button>
+          )}
+          {submission.missing === "expired" && (
+            <button
+              onClick={() => {
+                contextFocus.current?.focus();
+                submission.closeExpired();
+              }}
+            >
+              Close expired request
+            </button>
+          )}
+        </div>
+      )}
+      {!submission.pending && submission.status && (
+        <p role="status">{submission.status}</p>
+      )}
+      {(error || submission.error) && (
+        <p role="alert">{error || submission.error}</p>
+      )}
+      {showResult && !submission.pending && observation && (
         <p role="status">
           Test: {observation.build.status}
-          {!current ? " · source context or parameters changed" : ""}
+          {observation.contextKey !== testContextKey || (canTest && !current)
+            ? " · source context or parameters changed"
+            : ""}
           {observation.build.errorCode
             ? ` · ${observation.build.errorCode}`
             : ""}
         </p>
       )}
-      {observation?.build.status === "expired" && (
-        <p role="status">Test result expired; test again.</p>
-      )}
-      {observation && testedParameters === null && (
-        <p>
-          Latest saved test. Its parameters and data baseline are included in
-          the impact.
-        </p>
-      )}
-      {observation &&
+      {canTest &&
+        !submission.pending &&
+        observation?.build.status === "expired" && (
+          <p role="status">Test result expired; test again.</p>
+        )}
+      {canTest &&
+        !submission.pending &&
+        observation &&
+        testedParameters === null && (
+          <p>
+            Latest saved test. Its parameters and data baseline are included in
+            the impact.
+          </p>
+        )}
+      {showResult &&
+        !submission.pending &&
+        observation &&
         testedDataRevision !== null &&
         testedDataRevision !== catalog.revisions.data && (
           <p role="status">
@@ -449,7 +551,7 @@ export function PythonProgramTest({
             earlier data snapshot.
           </p>
         )}
-      {observer.error && (
+      {showResult && !submission.pending && observer.error && (
         <p role="alert">
           {observer.error}{" "}
           <button onClick={observer.refresh}>Refresh test status</button>

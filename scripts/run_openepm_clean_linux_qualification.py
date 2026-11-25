@@ -23,7 +23,8 @@ from typing import Protocol
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 from qualify_openepm_clean_linux_release import (  # noqa: E402
-    QualificationError, verify as verify_qualification,
+    PHASES, QualificationError, verify as verify_qualification, verify_restored_evidence,
+    verify_host_attestation, verify_mcp_identity_evidence, verify_restart_continuity, verify_serving_release,
 )
 
 
@@ -113,8 +114,13 @@ def run(plan: dict, config: dict, executor: Executor, *, authorized: bool,
             or plan.get("qualificationClaimed") is not False):
         raise RunnerError("invalid clean-Linux qualification plan")
     phases = plan.get("phases")
-    if not isinstance(phases, list) or len(phases) != len(set(phases)):
+    if phases != list(PHASES):
         raise RunnerError("plan phases are invalid")
+    inventory_sha = plan.get("releaseInventorySha256")
+    inventory = plan.get("releaseInventory")
+    if (not isinstance(inventory_sha, str) or not re.fullmatch(r"[a-f0-9]{64}", inventory_sha)
+            or not isinstance(inventory, dict) or not inventory):
+        raise RunnerError("plan release inventory binding is incomplete")
     commands = config.get("commands")
     executables = config.get("phaseExecutables")
     if (config.get("format") != "openepm-clean-linux-runner-config-v2"
@@ -172,35 +178,60 @@ def run(plan: dict, config: dict, executor: Executor, *, authorized: bool,
 
     payloads: dict[str, dict] = {}
     command_evidence: dict[str, dict] = {}
+    expected_bundle = {"releaseManifestSha256": plan["releaseManifestSha256"],
+        "bundleManifestSha256": digest_bytes(bundle_manifest.read_bytes()),
+        "sourceCommit": plan["sourceCommit"], "schemaMigration": plan["schemaMigration"],
+        "releaseInventorySha256": inventory_sha, "releaseInventory": inventory}
+    install_project = None
     for phase in phases:
         argv = phase_commands[phase]
         result = executor.run(argv)
         payloads[phase] = _phase_payload(result, phase)
+        if phase == "host-attestation":
+            try:
+                verify_host_attestation(payloads[phase].get("host"), plan.get("host"))
+            except QualificationError as error:
+                raise RunnerError(str(error)) from error
+        if phase == "bundle-integrity":
+            bundle = payloads[phase].get("bundle")
+            if (not isinstance(bundle, dict)
+                    or any(bundle.get(key) != value for key, value in expected_bundle.items())
+                    or not isinstance(bundle.get("sourceTreeSha256"), str)
+                    or not re.fullmatch(r"[a-f0-9]{64}", bundle["sourceTreeSha256"])):
+                raise RunnerError("bundle/source/schema/release inventory attestation differs from plan")
+        if phase in {"epmctl-install", "service-restart"}:
+            try:
+                project = verify_serving_release(payloads[phase].get("servingRelease"), plan)
+            except QualificationError as error:
+                raise RunnerError(f"{phase}: {error}") from error
+            if phase == "epmctl-install":
+                install_project = project
+            elif project != install_project:
+                raise RunnerError("serving release project changed on restart")
+        if phase in {"authenticated-mcp", "service-restart"}:
+            before = payloads["authenticated-mcp"] if phase == "service-restart" else None
+            try:
+                verify_mcp_identity_evidence(payloads[phase], before=before)
+                if phase == "service-restart":
+                    verify_restart_continuity(payloads[phase].get("restartContinuity"))
+            except QualificationError as error:
+                raise RunnerError(str(error)) from error
+        if phase == "populated-backup":
+            backup = payloads[phase].get("backup")
+            if (not isinstance(backup, dict)
+                    or backup.get("sourceHostIdentity") != payloads["host-attestation"]["host"]["sourceHostIdentity"]):
+                raise RunnerError("backup source differs from the pre-install host attestation")
         command_evidence[phase] = {"argvSha256": digest_bytes(canonical(argv)),
             "executableSha256": digest_bytes(bound_executables[phase].read_bytes()),
             "exitCode": result.returncode,
             "stdoutSha256": digest_bytes(result.stdout),
             "stderrSha256": digest_bytes(result.stderr)}
 
-    host = payloads["host-attestation"].get("host")
-    bundle = payloads["bundle-integrity"].get("bundle")
+    host = payloads["host-attestation"]["host"]
+    bundle = payloads["bundle-integrity"]["bundle"]
     native = payloads["native-architecture-proof"].get("native")
-    if not isinstance(host, dict) or not isinstance(bundle, dict) \
-            or not isinstance(native, dict):
-        raise RunnerError("host, bundle or native attestation is missing")
-    host_identity = host.get("hostIdentity")
-    if (not isinstance(host_identity, str) or len(host_identity) != 64
-            or any(character not in "0123456789abcdef"
-                   for character in host_identity)):
-        raise RunnerError("clean-host identity attestation is missing")
-    expected_bundle = {"releaseManifestSha256": plan["releaseManifestSha256"],
-        "bundleManifestSha256": digest_bytes(bundle_manifest.read_bytes()),
-        "sourceCommit": plan["sourceCommit"],
-        "schemaMigration": plan["schemaMigration"]}
-    if any(bundle.get(key) != value for key, value in expected_bundle.items()) \
-            or not isinstance(bundle.get("sourceTreeSha256"), str) \
-            or len(bundle["sourceTreeSha256"]) != 64:
-        raise RunnerError("bundle/source/schema attestation differs from plan")
+    if not isinstance(native, dict):
+        raise RunnerError("native attestation is missing")
     if (native.get("architecture") != plan["host"]["architecture"]
             or native.get("sourceTreeSha256") != bundle["sourceTreeSha256"]
             or native.get("imageDigests") != plan["nativeImageDigests"]):
@@ -232,26 +263,10 @@ def run(plan: dict, config: dict, executor: Executor, *, authorized: bool,
             or backup["totalBytes"] < 1):
         raise RunnerError("populated encrypted backup attestation is incomplete")
     restore = payloads["independent-host-restore"].get("restore", {})
-    if (restore.get("independentHost") is not True
-            or not restore.get("sourceHostIdentity")
-            or restore.get("sourceHostIdentity") != backup["sourceHostIdentity"]
-            or restore.get("sourceHostIdentity") == restore.get("targetHostIdentity")
-            or restore.get("targetHostIdentity") != host_identity
-            or restore.get("encryptedTransfer") is not True
-            or restore.get("populated") is not True
-            or restore.get("beforeSignature")
-                != backup["preBackupPopulatedSignature"]
-            or restore.get("afterSignature")
-                != backup["preBackupPopulatedSignature"]):
-        raise RunnerError("independent encrypted restore attestation is incomplete")
-    if (restore.get("activationVerified") is not True
-            or restore.get("bundle") != backup["bundle"]
-            or not isinstance(restore.get("targetProject"), str)
-            or not restore["targetProject"]
-            or not isinstance(restore.get("priorProject"), str)
-            or not restore["priorProject"]
-            or restore["targetProject"] == restore["priorProject"]):
-        raise RunnerError("restored-target activation attestation is incomplete")
+    try:
+        verify_restored_evidence(restore, backup, host["hostIdentity"])
+    except QualificationError as error:
+        raise RunnerError(str(error)) from error
     retirement = payloads["storage-retirement"].get("storageRetirement", {})
     if (set(retirement.get("scannedImages", [])) != set(plan["nativeImageDigests"])
             or retirement.get("prohibitedMatches") != 0
@@ -273,23 +288,7 @@ def run(plan: dict, config: dict, executor: Executor, *, authorized: bool,
     workflows = {target: payloads[source].get("verified") is True
                  for source, target in workflow_map.items()}
     authenticated_mcp = payloads["authenticated-mcp"]
-    if (authenticated_mcp.get("verified") is not True
-            or authenticated_mcp.get("unsignedDenied") is not True
-            or not isinstance(authenticated_mcp.get("responseSha256"), str)
-            or len(authenticated_mcp["responseSha256"]) != 64
-            or any(character not in "0123456789abcdef"
-                   for character in authenticated_mcp["responseSha256"])):
-        raise RunnerError("authenticated MCP attestation is incomplete")
     restart = payloads["service-restart"]
-    if (restart.get("verified") is not True
-            or restart.get("authenticatedWorkflowClaimed") is not True
-            or restart.get("unsignedDenied") is not True
-            or not isinstance(restart.get("responseSha256"), str)
-            or len(restart["responseSha256"]) != 64
-            or any(character not in "0123456789abcdef"
-                   for character in restart["responseSha256"])
-            or restart["responseSha256"] != authenticated_mcp["responseSha256"]):
-        raise RunnerError("authenticated post-restart MCP attestation is incomplete")
     headless = payloads["runsc-headless-python"]
     if (headless.get("verified") is not True
             or headless.get("runtime") != "runsc"
@@ -391,6 +390,8 @@ def run(plan: dict, config: dict, executor: Executor, *, authorized: bool,
         "planSha256": plan_sha,
         "releaseManifestSha256": plan["releaseManifestSha256"],
         "resolvedReleasePolicySha256": plan["resolvedReleasePolicySha256"],
+        "releaseInventorySha256": bundle["releaseInventorySha256"],
+        "releaseInventory": bundle["releaseInventory"],
         "sourceCommit": plan["sourceCommit"],
         "schemaMigration": plan["schemaMigration"],
         "sourceTreeSha256": bundle["sourceTreeSha256"],
@@ -401,7 +402,8 @@ def run(plan: dict, config: dict, executor: Executor, *, authorized: bool,
                      "evidence": command_evidence},
         "workflows": workflows, "databaseVersions": database_versions,
         "backup": backup, "restore": restore, "storageRetirement": retirement,
-        "runtimeAttestations": {"authenticatedMcp": authenticated_mcp,
+        "runtimeAttestations": {"installedRelease": payloads["epmctl-install"]["servingRelease"],
+                                "authenticatedMcp": authenticated_mcp,
                                 "restart": restart,
                                 "authenticatedBrowser": browser,
                                 "runscHeadlessPython": headless,

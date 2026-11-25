@@ -19,22 +19,112 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .persistence_contract import ApplicationScope, NumericCell
-from .current_object_contract import require_state_token
+from .current_calculation_result import RESULT_KEY_PATTERN as _RESULT_KEY
+from .current_calculation_result import calculation_output_kind
+from .current_object_contract import STATE_TOKEN_PATTERN, require_state_token
 from .postgres_access import PostgresAccessChecker
-from .postgres_calculation_status import published_result_status
+from .postgres_calculation_status import calculation_read_status_schema, published_result_status
 from .postgres_calculation_visibility import (
     redact_calculation_lineage, redact_expression_lineage)
-from .postgres_dimensional_security_enforcement import filter_read_rows
+from .postgres_dimensional_security_enforcement import authorized_read_page
+from .postgres_dimensional_security import CUBE_READ_AUTHORIZATION_STALE
 from .postgres_capability_contract import producer_capability_status
 from .postgres_connection import connect_postgres
-from .postgres_cube_query import PostgresCubeQuery, _filter_members
+from .postgres_cube_query import (
+    MAX_CURSOR_CHARACTERS, MAX_FILTER_AXES, MAX_FILTER_ID_LENGTH, MAX_PAGE_SIZE,
+    PostgresCubeQuery, _FILTER_ID, _filter_members, _read_authorization_digest,
+)
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_processing_limits import configure_statement_timeout
 
 
 FUNCTION = 'facts.cube.layer-report.scan'
-_RESULT_KEY = re.compile(r'[A-Za-z0-9._-]{8,128}\Z')
 _SERIES_KEY = re.compile(r'[0-9a-f]{64}\Z')
+_CURSOR_FORMAT = 'openepm-layer-report-cursor-v2'
+_LAYERS = ('raw', 'manualJournal', 'adjusted', 'calculated')
+_ARITHMETIC = 'raw_plus_manual_only_calculated_separate'
+
+
+def layer_report_program_contract() -> dict:
+    from .metadata_read_contract import obj, read_contract, read_example
+
+    def identifier(pattern):
+        return {'type': 'string', 'pattern': '^' + pattern.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+
+    key = identifier(_RESULT_KEY)
+    token = identifier(STATE_TOKEN_PATTERN)
+    revision = {'type': 'integer', 'minimum': 0}
+    nullable_revision = {**revision, 'type': ['integer', 'null']}
+    boolean = {'type': 'boolean'}
+    filter_id = {**identifier(_FILTER_ID), 'maxLength': MAX_FILTER_ID_LENGTH, 'minLength': 1}
+    cursor = {'type': 'string', 'minLength': 1, 'maxLength': MAX_CURSOR_CHARACTERS}
+    initial = obj({
+        'resultKey': key, 'resultStateToken': token, 'snapshotRevision': revision,
+        'limit': {'type': 'integer', 'minimum': 1, 'maximum': MAX_PAGE_SIZE},
+        'members': {'type': 'object', 'maxProperties': MAX_FILTER_AXES,
+                    'propertyNames': filter_id, 'additionalProperties': filter_id},
+    }, ['resultKey', 'resultStateToken'])
+    arguments = {'oneOf': [initial, obj({'cursor': cursor})]}
+
+    amount = {'type': 'string', 'pattern': r'^-?[0-9]{1,20}\.[0-9]{8}(?![\s\S])'}
+    nullable_amount = {**amount, 'type': ['string', 'null']}
+    base_value = {'present': boolean, 'amount': nullable_amount}
+    exact_presence = {
+        'if': {'properties': {'present': {'const': True}}},
+        'then': {'properties': {'amount': amount}},
+        'else': {'properties': {'amount': {'type': 'null'}}},
+    }
+    calculated = {
+        **obj({**base_value, 'sourceAmount': nullable_amount,
+            'sourceChangeId': {'type': 'string'}, 'sourcePresent': {'type': ['boolean', 'null']},
+            'sourceLookupLineage': {'type': 'array', 'items': {'type': 'object'}},
+            'sourceLineageRestricted': {'const': True}}, list(base_value)),
+        **exact_presence,
+    }
+    layers = obj({
+        'seriesKey': identifier(_SERIES_KEY),
+        'members': {'type': 'object', 'minProperties': 1, 'additionalProperties': {'type': 'string'}},
+        'raw': {**obj({**base_value, 'changeId': {'type': 'string'}, 'lastRevision': nullable_revision}),
+                **exact_presence},
+        'manualJournal': obj({'contributed': boolean,
+            'netAmount': {'type': 'string', 'pattern': r'^-?[0-9]+\.[0-9]{8}(?![\s\S])'},
+            'lineCount': revision, 'lastRevision': nullable_revision}),
+        'adjusted': {**obj(base_value), **exact_presence},
+        'calculated': calculated, 'sourceLineageRestricted': {'const': True},
+    }, ['seriesKey', 'members', *_LAYERS])
+    calculation_fields = {'resultKey': key, 'resultStateToken': token,
+                          'function': {'type': 'string', 'minLength': 1},
+                          **calculation_read_status_schema()}
+    calculation = obj({**calculation_fields, 'deepSourceStatus': obj({
+        'matchesAtRead': boolean, 'dependencies': {'type': 'object',
+            'additionalProperties': obj({'matchesAtRead': boolean, 'truncated': boolean})}})},
+        list(calculation_fields))
+    result_fields = {
+        'rows': {'type': 'array', 'items': layers, 'maxItems': MAX_PAGE_SIZE},
+        'hasMore': boolean, 'nextCursor': {**cursor, 'type': ['string', 'null']},
+        'snapshotRevision': revision, 'metadataRevision': revision, 'securityRevision': revision,
+        'layers': {'const': list(_LAYERS)}, 'arithmetic': {'const': _ARITHMETIC},
+        'calculation': calculation,
+    }
+    result = {**obj({**result_fields, 'sourceLineageRestricted': {'const': True}}, list(result_fields)),
+        'if': {'properties': {'hasMore': {'const': True}}},
+        'then': {'properties': {'nextCursor': cursor, 'rows': {'minItems': 1}}},
+        'else': {'properties': {'nextCursor': {'type': 'null'}}}}
+    contract = read_contract(FUNCTION, arguments, result, owner='PostgresCubeLayerReport.read', examples=[
+        read_example(FUNCTION, {'resultKey': 'example.scale', 'resultStateToken': 'a' * 64, 'limit': 100},
+            name='Compare the authorized raw and calculated layers',
+            binding='Use the exact current key and token of a scalar calculation from authorized publication discovery. Use an optional committed snapshotRevision for raw facts and journal entries.'),
+        read_example(FUNCTION, {'cursor': 'example-cursor'}, name='Continue the same authorized layer report',
+            binding='Copy nextCursor as the only argument under the same identity and application. A terminal page has a null cursor.'),
+    ], semantic_rules=[
+        'The adjusted column adds raw and manual-journal amounts. A journal contribution can establish a present zero. The calculated column preserves the separate named publication and its currentness.',
+        'Only visible coordinates contribute to the page or continuation. The server refuses a page it cannot prove complete within its authorization budget. Current source authority can withhold lineage on a visible calculated row.',
+        'Use facts.calculation.scan for Currency or Ratio outputs. A layer report is an exact scalar comparison.',
+    ])
+    contract['programContract']['recovery'] = (
+        'Rediscover the current result key and state token after republication. '
+        'Restart after an authorization change, invalid or expired cursor. Retain the pinned raw/journal snapshot only if it is still appropriate to the comparison.')
+    return contract
 
 
 def _program(value: object) -> dict:
@@ -56,7 +146,7 @@ def _program(value: object) -> dict:
             or not isinstance(args['resultKey'], str)
             or not _RESULT_KEY.fullmatch(args['resultKey'])
             or type(args.get('limit', 100)) is not int
-            or not 1 <= args.get('limit', 100) <= 500
+            or not 1 <= args.get('limit', 100) <= MAX_PAGE_SIZE
             or ('snapshotRevision' in args and
                 (type(args['snapshotRevision']) is not int
                  or args['snapshotRevision'] < 0))):
@@ -80,8 +170,11 @@ class PostgresCubeLayerReport(PostgresCubeQuery):
                 db.execute('SET TRANSACTION READ ONLY')
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
+                access = PostgresAccessChecker.check_in_transaction(
                     db, self.identity, scope, 'read')
+                authorization = _read_authorization_digest(access)
+                if 'cursor' in args and authorization != request['authorizationDigest']:
+                    raise ValueError(CUBE_READ_AUTHORIZATION_STALE)
                 state = db.execute('''SELECT metadata_revision,security_revision,data_revision,
                     policy_revision,commit_revision,enabled_capabilities,
                     capability_revision FROM epm.application_state
@@ -119,21 +212,22 @@ class PostgresCubeLayerReport(PostgresCubeQuery):
                     current_result['committed_revision'])
                 self._require_untyped(generation)
                 self._validate_filters(db, scope, request['members'])
-                rows = self._page(db, scope, request['members'],
-                    request['after'], snapshot, request['resultKey'],
-                    request['limit'] + 1)
-                raw_page = rows[:request['limit']]
-                permitted = filter_read_rows(db, self.identity, scope, raw_page)
+                permitted, has_more, next_after = authorized_read_page(
+                    db, self.identity, scope, after=request['after'], limit=request['limit'],
+                    fetch=lambda anchor, limit: self._page(db, scope, request['members'],
+                        anchor, snapshot, request['resultKey'], limit),
+                    cursor_key=lambda row: row['series_key'], expected_access=access)
                 page = [_wire_row(row) for row in permitted]
-                restricted = len(permitted) != len(raw_page)
+                restricted = False
                 for row in page:
                     if not row['calculated']['present']:
                         continue
                     lineage = {'members': row['members'], **row['calculated']}
                     if generation['function_name'] == 'facts.expression.calculate':
                         redact_expression_lineage(db, self.identity, scope,
-                            generation['normalized_program'], [lineage])
-                    redact_calculation_lineage(db, self.identity, scope, [lineage])
+                            generation['normalized_program'], [lineage], expected_access=access)
+                    redact_calculation_lineage(db, self.identity, scope, [lineage],
+                        producer=generation, expected_access=access)
                     row['calculated'] = {key: value for key, value in lineage.items()
                         if key != 'members'}
                     if lineage.get('sourceLineageRestricted'):
@@ -159,6 +253,8 @@ class PostgresCubeLayerReport(PostgresCubeQuery):
                 if (current is None or current['state_token'] !=
                         request['resultStateToken']):
                     raise ValueError('LAYER_REPORT_RESULT_STATE_CHANGED_RESTART')
+                if PostgresAccessChecker.current_groups_in_transaction(db, self.identity) != access.groups:
+                    raise ValueError(CUBE_READ_AUTHORIZATION_STALE)
                 # Full profiles are internal evidence and may describe source
                 # coordinates outside this authorized output page. Only their
                 # verdicts are public; dependency and producer identities stay internal.
@@ -167,15 +263,16 @@ class PostgresCubeLayerReport(PostgresCubeQuery):
                     'dependencies': {name: {'matchesAtRead': item['matchesAtRead'],
                         'truncated': bool(item.get('truncated'))}
                         for name, item in profiles.items()}}
-        has_more = len(rows) > request['limit']
-        next_cursor = (self._pack_layer({
+        next_cursor = (self._pack({
+            'format': _CURSOR_FORMAT,
             'function': FUNCTION,
             'scope': [scope.workspace_id, scope.application_id],
             'identity': [self.identity.issuer, self.identity.subject_id],
-            'members': request['members'], 'after': raw_page[-1]['series_key'],
+            'members': request['members'], 'after': next_after,
             'snapshotRevision': snapshot,
             'metadataRevision': metadata_revision,
             'securityRevision': security_revision,
+            'authorizationDigest': authorization,
             'resultKey': request['resultKey'],
             'resultStateToken': request['resultStateToken'],
             'limit': request['limit'], 'expiresAt': request['expiresAt']})
@@ -185,7 +282,7 @@ class PostgresCubeLayerReport(PostgresCubeQuery):
             'nextCursor': next_cursor, 'snapshotRevision': snapshot,
             'metadataRevision': metadata_revision,
             'securityRevision': security_revision,
-            'layers': ['raw', 'manualJournal', 'adjusted', 'calculated'],
+            'layers': list(_LAYERS),
             'calculation': {'resultKey': request['resultKey'],
                 'resultStateToken': request['resultStateToken'],
                 'function': generation['function_name'],
@@ -197,7 +294,7 @@ class PostgresCubeLayerReport(PostgresCubeQuery):
                     generation['normalized_program'],
                     generation['enabled_capabilities'],
                     generation['capability_revision'])},
-            'arithmetic': 'raw_plus_manual_only_calculated_separate'}
+            'arithmetic': _ARITHMETIC}
         if restricted:
             result['sourceLineageRestricted'] = True
         else:
@@ -236,18 +333,10 @@ class PostgresCubeLayerReport(PostgresCubeQuery):
     @staticmethod
     def _require_untyped(generation):
         program = generation['normalized_program']
-        expression = program.get('expression') if isinstance(program, dict) else None
-        if ((isinstance(program, dict) and program.get('amountUnit') is not None)
-                or generation['compiler_version'] in (
-                'typed-numeric-expression-v22',
-                'typed-numeric-expression-v23',
-                'typed-numeric-expression-v24')
-                or (isinstance(expression, dict)
-                    and expression.get('op') == 'CurrencyConvert')
-                or generation['function_name'] in (
-                    'currency.amount.translate.publish',
-                    'consolidation.equity.contribution.publish',
-                    'consolidation.proportional.contribution.publish')):
+        function = generation['function_name']
+        if (calculation_output_kind(function, generation['compiler_version'], program) != 'amount'
+                or isinstance(program, dict) and program.get('amountUnit') is not None
+                or function == 'currency.amount.translate.publish'):
             raise ValueError(
                 'LAYER_REPORT_TYPED_RESULT_USE_CALCULATION_UNIT_READ')
 
@@ -340,14 +429,8 @@ class PostgresCubeLayerReport(PostgresCubeQuery):
              *params, limit)).fetchall()
         return rows
 
-    def _pack_layer(self, payload):
-        raw = json.dumps(payload, sort_keys=True, separators=(',', ':'),
-                         ensure_ascii=False).encode()
-        return base64.urlsafe_b64encode(raw + hmac.new(
-            self.cursor_secret, raw, sha256).digest()).decode()
-
     def _unpack_layer(self, token, scope):
-        if not isinstance(token, str) or len(token) > 16384:
+        if not isinstance(token, str) or len(token) > MAX_CURSOR_CHARACTERS:
             raise ValueError('LAYER_REPORT_CURSOR_INVALID')
         try:
             packed = base64.b64decode(token, altchars=b'-_', validate=True)
@@ -358,10 +441,11 @@ class PostgresCubeLayerReport(PostgresCubeQuery):
             payload = json.loads(raw)
         except (ValueError, TypeError, binascii.Error) as error:
             raise ValueError('LAYER_REPORT_CURSOR_INVALID') from error
-        expected = {'function', 'scope', 'identity', 'members', 'after',
+        expected = {'format', 'function', 'scope', 'identity', 'members', 'after',
             'snapshotRevision', 'metadataRevision', 'securityRevision', 'resultKey',
-            'resultStateToken', 'limit', 'expiresAt'}
+            'resultStateToken', 'authorizationDigest', 'limit', 'expiresAt'}
         if (not isinstance(payload, dict) or set(payload) != expected
+                or payload['format'] != _CURSOR_FORMAT
                 or payload['function'] != FUNCTION
                 or payload['scope'] != [scope.workspace_id, scope.application_id]
                 or payload['identity'] != [self.identity.issuer,
@@ -374,6 +458,8 @@ class PostgresCubeLayerReport(PostgresCubeQuery):
                 or payload['metadataRevision'] < 0
                 or type(payload['securityRevision']) is not int
                 or payload['securityRevision'] < 0
+                or not isinstance(payload['authorizationDigest'], str)
+                or not _SERIES_KEY.fullmatch(payload['authorizationDigest'])
                 or type(payload['limit']) is not int
                 or not 1 <= payload['limit'] <= 500
                 or type(payload['expiresAt']) is not int

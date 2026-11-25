@@ -125,6 +125,20 @@ RETIRED_PUBLIC_FUNCTIONS = frozenset((
     'facts.generic.value.set',
     'facts.generic.value.delete',
     'facts.generic.value.bulk',
+    # Schema 247 migrated fixed CustomNN semantic slots into the uniform
+    # attribute-definition/value object model.  Keep the old language entries
+    # private so historical receipts remain interpretable, but never advertise
+    # or admit the duplicate editor contract to browser or MCP clients.
+    'metadata.semantic_column.create',
+    'metadata.semantic_column.update',
+    'metadata.semantic_column.list',
+    'metadata.member.attribute.set',
+    'metadata.member.attributes.read',
+    'metadata.relationship.semantic_column.create',
+    'metadata.relationship.semantic_column.update',
+    'metadata.relationship.semantic_column.list',
+    'metadata.relationship.attribute.set',
+    'metadata.relationship.attributes.read',
     # Rolling forecast is now authored from generic time selections, rules and
     # exact application schedules in the client layer.
     # Financial journals, currency translation and financial member policy
@@ -186,6 +200,12 @@ RETIRED_PUBLIC_FUNCTIONS = frozenset((
     'planning.slice.reopen',
     'planning.slice.submit',
     'planning.slice.worklist',
+    # The saved numeric-sequence current owner is absent. Retain private
+    # language definitions for historical jobs and receipts, but close the
+    # advertised list/read/run contract to new Browser and MCP clients.
+    'rules.numeric_sequence.list',
+    'rules.numeric_sequence.read',
+    'rules.numeric_sequence.run',
 ))
 
 
@@ -196,28 +216,29 @@ def is_retired_public_function(function):
 
 
 def assert_public_program_admitted(program):
-    """Reject retired operations at public transport boundaries.
+    """Validate the public envelope and reject unknown or retired operations.
 
     Private catalog definitions may remain so historical receipts can still
     be interpreted. That compatibility never makes them newly callable.
     """
-    if (type(program) is not dict
-            or set(program) != {'languageVersion','function','arguments'}
-            or program.get('languageVersion') != 2
-            or type(program.get('function')) is not str
-            or type(program.get('arguments')) is not dict):
-        raise ValueError('APPLICATION_PROGRAM_INVALID')
+    # The standalone launcher imports the source-purpose policy above, but
+    # never handles public application programs. Keep public schema/diagnostic
+    # dependencies at their owning boundary rather than in that trusted,
+    # standard-library-only launcher package.
+    from .public_program_diagnostics import (
+        ProgramValidationError, validate_program_envelope, validate_program_structure)
+    validate_program_envelope(program)
     stack=[(program['arguments'],0)]
     visited=0
     while stack:
         value,depth=stack.pop();visited+=1
         if visited>100000 or depth>64:
-            raise ValueError('APPLICATION_PROGRAM_INVALID')
+            raise ProgramValidationError('json')
         if value is None or type(value) in (str,bool,int):
             continue
         if type(value) is float:
             if not math.isfinite(value):
-                raise ValueError('APPLICATION_PROGRAM_INVALID')
+                raise ProgramValidationError('json')
             continue
         if type(value) is list:
             stack.extend((item,depth+1) for item in value)
@@ -225,9 +246,19 @@ def assert_public_program_admitted(program):
         if type(value) is dict and all(type(key) is str for key in value):
             stack.extend((item,depth+1) for item in value.values())
             continue
-        raise ValueError('APPLICATION_PROGRAM_INVALID')
+        raise ProgramValidationError('json')
     if is_retired_public_function(program['function']):
         raise ValueError('APPLICATION_FUNCTION_RETIRED')
+    # Reuse the capability owner's complete known vocabulary. Recognition is
+    # not permission: current grants, capability enablement and native semantics
+    # still run at their existing boundaries. Arguments remain their owners' work.
+    try:
+        required_capabilities(program['function'])
+    except ValueError as error:
+        if str(error) != 'APPLICATION_FUNCTION_UNCLASSIFIED':
+            raise
+        raise ProgramValidationError('unknown_function') from None
+    validate_program_structure(program)
     return program
 
 # Fixed-core services may need authorization before their public application-
@@ -250,6 +281,14 @@ CONTROL_PLANE_FUNCTIONS = frozenset((
     'security.application.access.set',
     'security.application.access.list',
     'security.application.subject.list',
+    'security.application.effective-access.list',
+    'security.application.authorization.read',
+    'security.application.authorization.tags.list',
+    'security.application.authorization.objects.list',
+    'security.application.access.explain',
+    'security.application.resource-access.list',
+    'security.application.authorization.preview',
+    'security.application.authorization.apply',
     'security.application.audit.list',
     'security.application.receipt.read',
     'security.application.group-access.set',
@@ -269,6 +308,9 @@ CONTROL_PLANE_FUNCTIONS = frozenset((
     'security.workspace.access.set',
     'security.workspace.group-access.set',
     'security.workspace.group-access.list',
+    'security.workspace.people.list',
+    'security.workspace.bootstrap-groups.list',
+    'security.workspace.person-applications.list',
     'security.rule.access.set',
     'security.rule.group-access.set',
 ))
@@ -287,6 +329,7 @@ CORE_FUNCTIONS = frozenset((
     'application.workflow.occurrence.read',
     'application.workflow.worklist',
     'application.workflow.activity.evidence.list',
+    'application.workflow.activity.evidence.read',
     'application.workflow.activity.complete',
     'application.workflow.activity.return',
     'application.workflow.occurrence.cancel',
@@ -355,6 +398,7 @@ CORE_FUNCTIONS = frozenset((
     'facts.cube.aggregate.cancel',
     'facts.cube.aggregate.request',
     'facts.cube.resolved.read',
+    'facts.cube.scenario.compare.read',
     'facts.cube.resolved.request',
     'facts.cube.resolved.result.read',
     'facts.cube.resolved.cancel',
@@ -416,6 +460,8 @@ CORE_FUNCTIONS = frozenset((
     'calculated.member.evaluate',
     'calculated.member.materialize',
     'facts.numeric.scale',
+    'facts.slice.copy.prepare',
+    'facts.slice.copy.status.read',
     'facts.planning.allocate.weighted',
     'facts.planning.group.sum',
     'facts.planning.group.sum.bulk',
@@ -430,6 +476,7 @@ CORE_FUNCTIONS = frozenset((
     'facts.source.preview',
     'facts.source.publish',
     'facts.source.seal',
+    'facts.source.staging.read',
     'facts.text.batch',
     'financial.account.type.set',
     'financial.entity.currency.set',
@@ -456,6 +503,8 @@ CORE_FUNCTIONS = frozenset((
     'metadata.hierarchy.relationships.preview',
     'metadata.hierarchy.relationships.apply',
     'metadata.layout.populated.preview',
+    'metadata.layout.populated.review',
+    'metadata.layout.populated.source.read',
     'metadata.layout.populated.replace.request',
     'metadata.layout.populated.replace.read',
     'metadata.layout.populated.replace.cancel',
@@ -559,6 +608,7 @@ CORE_FUNCTIONS = frozenset((
     'python.program.delete',
     'python.program.build',
     'python.program.test',
+    'python.program.validate',
     'python.program.run',
     'python.environment.register',
     'python.environment.read',

@@ -18,11 +18,16 @@ from epm_core.postgres_connection import connect_postgres
 from epm_core.postgres_processing_limits import configure_statement_timeout
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+from openepm.public_diagnostics import CATALOG_AUTHORIZATION_STALE
 
+from .application_catalog_projection import CatalogDiscoveryError
+from .application_authorization_actions import APPLICATION_ENTRY
 from .persistence_contract import ApplicationScope
-from .postgres_access import PostgresAccessChecker, VerifiedIdentity
+from .postgres_access import AccessDenied, AccessGroupsChanged, PostgresAccessChecker, VerifiedIdentity
 from .postgres_capability_contract import KNOWN_CAPABILITIES, validate_enabled_capabilities
+from .postgres_dimensional_scope import resolve_effective_dimensional_scope
 from .postgres_numeric_store import PostgresNumericFactStore
+from .postgres_planning_duty_availability import group_workflow_role_unbound
 
 READ = 'application.capabilities.read'
 STATE_READ = 'application.state.read'
@@ -30,6 +35,66 @@ IDENTITY_READ = 'security.identity.current.read'
 CONFIGURE = 'application.capabilities.configure'
 HISTORY = 'application.capabilities.history.read'
 _KEY = re.compile(r'[A-Za-z0-9._-]{8,128}\Z')
+
+
+def state_program_contract():
+    """Structural discovery for the bounded first-read parser and result."""
+    revisions = ('metadataRevision', 'dataRevision', 'schemaEpoch',
+                 'capabilityRevision', 'securityRevision', 'policyRevision',
+                 'commitRevision')
+    return {
+        'schemaCoverage': 'program-and-result',
+        'schemaDialect': 'https://json-schema.org/draft/2020-12/schema',
+        'resultSchemaScope': 'envelope',
+        'programSchema': {
+            '$schema': 'https://json-schema.org/draft/2020-12/schema',
+            'type': 'object', 'additionalProperties': False,
+            'required': ['languageVersion', 'function', 'arguments'],
+            'properties': {
+                'languageVersion': {'type': 'integer', 'const': 2},
+                'function': {'type': 'string', 'const': STATE_READ},
+                'arguments': {'type': 'object', 'additionalProperties': False,
+                              'properties': {}}}},
+        'resultSchema': {
+            '$schema': 'https://json-schema.org/draft/2020-12/schema',
+            'type': 'object', 'additionalProperties': False,
+            'required': ['languageVersion', 'function', 'result'],
+            'properties': {
+                'languageVersion': {'type': 'integer', 'const': 2},
+                'function': {'type': 'string', 'const': STATE_READ},
+                'result': {'type': 'object', 'additionalProperties': False,
+                    'required': ['status', *revisions],
+                    'properties': {'status': {'type': 'string'},
+                        **{name: {'type': 'integer', 'minimum': 0}
+                           for name in revisions}}}}},
+        'programContract': {
+            'examples': [{'name': 'Read the selected application current state',
+                'program': {'languageVersion': 2, 'function': STATE_READ,
+                            'arguments': {}}}],
+            'scope': 'Use workspaceId/applicationId from authorized application discovery.',
+            'completeness': 'One current application state; no fact values or pagination.',
+            'authority': 'Current application read permission is checked for every call.',
+            'recovery': 'On denial, rediscover granted applications. Never substitute another application. A later read may return newer revisions.'}}
+
+
+def identity_program_contract():
+    """The current verified application caller; no directory or bearer data."""
+    from .postgres_numeric_catalog import obj, program_schema
+    return {'schemaCoverage': 'program-and-result',
+        'schemaDialect': 'https://json-schema.org/draft/2020-12/schema',
+        'programSchema': program_schema(IDENTITY_READ, obj({})),
+        'resultSchema': {'$schema': 'https://json-schema.org/draft/2020-12/schema',
+            **obj({'languageVersion': {'type': 'integer', 'const': 2},
+                'function': {'type': 'string', 'const': IDENTITY_READ},
+                'result': obj({'issuer': {'type': 'string', 'minLength': 1},
+                    'subjectId': {'type': 'string', 'minLength': 1},
+                    'verifiedByServer': {'type': 'boolean', 'const': True}})})},
+        'resultSchemaScope': 'envelope',
+        'programContract': {'owner': 'PostgresApplicationCapabilities.identity_current',
+            'examples': [{'name': 'Inspect the current verified actor in this application',
+                'program': {'languageVersion': 2, 'function': IDENTITY_READ, 'arguments': {}}}],
+            'semanticRules': ['The actor is supplied by current authentication and application read permission; clients cannot request a different subject through arguments.'],
+            'recovery': 'On denial, rediscover current grants. An identity result is context, not a transferable grant or execution delegation.'}}
 
 
 def _canonical(value):
@@ -72,6 +137,54 @@ def _state(db,scope,*,write=False):
         (scope.workspace_id,scope.application_id)).fetchone()
 
 
+def catalog_access_state(dsn: str, identity: VerifiedIdentity,
+                         scope: ApplicationScope, *, secret: bytes) -> tuple[set[str], dict]:
+    """Project all permissions from one consistently authorized access context."""
+    with connect_postgres(dsn, row_factory=dict_row) as db:
+        with db.transaction():
+            db.execute('SET TRANSACTION READ ONLY')
+            PostgresNumericFactStore._set_scope(db, scope)
+            checker = PostgresAccessChecker.check_in_transaction
+            opening = checker(db, identity, scope, 'read', action=APPLICATION_ENTRY)
+            allowed = {'read'}
+            try:
+                if opening.authorization_model == 'legacy':
+                    for permission in ('write', 'admin', 'workspace_admin',
+                                       'rule_design', 'rule_publish', 'rule_run', 'rule_validate'):
+                        try:
+                            checker(db, identity, scope, permission, expected_groups=opening.groups)
+                            allowed.add(permission)
+                        except AccessDenied:
+                            pass
+                elif opening.workspace_administrator:
+                    allowed.add('workspace_admin')
+                state = _state(db, scope)
+                if state is None:
+                    raise AccessDenied('APPLICATION_UNAVAILABLE')
+                authority = resolve_effective_dimensional_scope(db, identity, scope, access=opening)
+                if opening.authorization_model == 'group_assignments':
+                    state['group_workflow_role_unbound'] = group_workflow_role_unbound(db, scope, identity, opening)
+                current = checker(db, identity, scope, 'read', action=APPLICATION_ENTRY,
+                                  expected_groups=opening.groups)
+            except AccessGroupsChanged:
+                raise CatalogDiscoveryError(CATALOG_AUTHORIZATION_STALE, '$.discovery') from None
+            if current != opening:
+                raise CatalogDiscoveryError(CATALOG_AUTHORIZATION_STALE, '$.discovery')
+            if opening.authorization_model == 'group_assignments':
+                closing = _state(db, scope)
+                if closing is None or any(closing[key] != state[key] for key in
+                        ('security_revision', 'policy_revision', 'metadata_revision', 'schema_epoch', 'capability_revision')):
+                    raise CatalogDiscoveryError(CATALOG_AUTHORIZATION_STALE, '$.discovery')
+                state['authorization_actions'] = opening.actions
+                state['authorization_roles'] = opening.roles
+            context = json.dumps(['openepm-catalog-access-context-v1',
+                scope.workspace_id, scope.application_id, identity.issuer, identity.subject_id,
+                authority.scope_digest, sorted(allowed), opening.authorization_model,
+                opening.actions, opening.roles], separators=(',', ':'), ensure_ascii=True).encode('ascii')
+            state['access_context'] = hmac.new(secret, context, sha256).hexdigest()
+            return allowed, state
+
+
 def _result(state):
     return {'enabledCapabilities':sorted(validate_enabled_capabilities(state['enabled_capabilities'])),
         'knownCapabilities':sorted(KNOWN_CAPABILITIES),
@@ -109,9 +222,11 @@ class PostgresApplicationCapabilities:
                 'previewRequired':False,'idempotencyRequired':False,'workClass':'short'},
             STATE_READ:{'mode':'read_only','permission':'read','arguments':{},
                 'result':'application status and current metadata/data/policy/security/capability/schema/commit revision pins; no application mode or domain capability semantics',
+                **state_program_contract(),
                 'previewRequired':False,'idempotencyRequired':False,'workClass':'short'},
             IDENTITY_READ:{'mode':'read_only','permission':'read','arguments':{},
                 'result':'server-verified current issuer and subject identity for this authorized application scope',
+                **identity_program_contract(),
                 'previewRequired':False,'idempotencyRequired':False,'workClass':'short'},
             CONFIGURE:{'mode':'atomic_write','permission':'admin','arguments':{
                 'enabledCapabilities':'explicit list of known application capabilities; empty means core only',
@@ -119,19 +234,19 @@ class PostgresApplicationCapabilities:
                 'result':'atomic configuration receipt with before/after state; no business metadata created',
                 'previewRequired':True,'idempotencyRequired':True,'workClass':'short'}}
 
-    def _open(self,db,scope,permission,*,exclusive=False):
+    def _open(self,db,scope,permission,*,exclusive=False,function=None):
         if not isinstance(scope,ApplicationScope): raise ValueError('Application scope required')
         configure_statement_timeout(db, 10000)
         PostgresNumericFactStore._set_scope(db,scope)
         PostgresAccessChecker.lock_workspace(
             db,scope.workspace_id,exclusive=exclusive)
-        PostgresAccessChecker.check_in_transaction(db,self.identity,scope,permission)
+        PostgresAccessChecker.check_in_transaction(db,self.identity,scope,permission,function=function)
 
     def read(self,scope,program):
         parse_program(program,READ)
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
             with db.transaction():
-                self._open(db,scope,'read')
+                self._open(db,scope,'read',function=READ)
                 state=_state(db,scope)
                 if state is None: raise ValueError('APPLICATION_UNAVAILABLE')
                 return _result(state)
@@ -140,7 +255,7 @@ class PostgresApplicationCapabilities:
         parse_program(program,STATE_READ)
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
             with db.transaction():
-                self._open(db,scope,'read')
+                self._open(db,scope,'read',function=STATE_READ)
                 state=_state(db,scope)
                 if state is None: raise ValueError('APPLICATION_UNAVAILABLE')
                 return _state_result(state)
@@ -149,7 +264,7 @@ class PostgresApplicationCapabilities:
         parse_program(program,IDENTITY_READ)
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
             with db.transaction():
-                self._open(db,scope,'read')
+                self._open(db,scope,'read',function=IDENTITY_READ)
                 state=_state(db,scope)
                 if state is None: raise ValueError('APPLICATION_UNAVAILABLE')
                 return {'issuer':self.identity.issuer,

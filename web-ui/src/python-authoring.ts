@@ -9,6 +9,7 @@ export type PythonBuildStatus = {
   status: string;
   purpose: "Validation" | "ImpactTest" | "Plan";
   current?: boolean;
+  ownedByCaller?: boolean;
   diagnostics?: PythonDiagnostics;
   errorCode?: string | null;
   definition?: {
@@ -22,6 +23,7 @@ export function authoringContextKey(scope: Scope, catalog: ApplicationCatalog) {
   return JSON.stringify([
     scope.workspaceId,
     scope.applicationId,
+    catalog.accessContext,
     catalog.applicationAccess.issuer,
     catalog.applicationAccess.subjectId,
     catalog.revisions.metadata,
@@ -80,12 +82,12 @@ export function pythonDiagnostics(
   return envelope as unknown as PythonDiagnostics;
 }
 
-/** Grain names come from the authorized bootstrap; object references bind later. */
-export function authoringCompletions(
+/** Bind the symbolic metadata projection to the current application and actor. */
+export function authorizedAuthoringContext(
   value: unknown,
   scope: Scope,
   catalog: ApplicationCatalog,
-): PythonCompletionDescriptor[] {
+) {
   const context = record(value);
   const authority = record(context?.authority);
   const metadata = record(record(context?.references)?.metadata);
@@ -119,6 +121,35 @@ export function authoringCompletions(
     throw new Error(
       "Metadata suggestions are stale. Refresh the application context.",
     );
+  const dimensions = metadata.dimensions.map((value) => {
+    const dimension = record(value);
+    if (
+      !dimension ||
+      typeof dimension.dimensionId !== "string" ||
+      typeof dimension.name !== "string" ||
+      dimension.referenceMode !== "symbolic"
+    )
+      throw new Error("Invalid authorized metadata context.");
+    return { dimensionId: dimension.dimensionId, name: dimension.name };
+  });
+  return {
+    dimensions,
+    cubeGrainAvailable: metadata.cubeGrainAvailable === true,
+    authoringContract,
+  };
+}
+
+/** Grain names come from the authorized bootstrap; object references bind later. */
+export function authoringCompletions(
+  value: unknown,
+  scope: Scope,
+  catalog: ApplicationCatalog,
+): PythonCompletionDescriptor[] {
+  const { dimensions, authoringContract } = authorizedAuthoringContext(
+    value,
+    scope,
+    catalog,
+  );
   const completions: PythonCompletionDescriptor[] = [];
   const reference =
     record(authoringContract?.references)?.pythonAuthoring ||
@@ -144,15 +175,7 @@ export function authoringCompletions(
       documentation: `Compose a typed ${method} selection against authorized application metadata.`,
       referenceUrl: reference,
     });
-  for (const value of metadata.dimensions) {
-    const dimension = record(value);
-    if (
-      !dimension ||
-      typeof dimension.dimensionId !== "string" ||
-      typeof dimension.name !== "string" ||
-      dimension.referenceMode !== "symbolic"
-    )
-      throw new Error("Invalid authorized metadata context.");
+  for (const dimension of dimensions) {
     const expression = `context.app.dimension(${JSON.stringify(dimension.name)})`;
     completions.push({
       label: dimension.name,

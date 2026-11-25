@@ -4,8 +4,10 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, expect, it, onTestFinished, vi } from "vitest";
+import * as exactCellMutation from "./exact-cell-mutation";
 import {
   Analyze,
   aggregateQueryIntent,
@@ -18,6 +20,7 @@ import {
   collectAnalyzeMembers,
   collectGenericTables,
   collectSavedGrids,
+  cubeViewRowsToCells,
   genericSnapshotArguments,
   genericTableListArguments,
   genericValueText,
@@ -36,6 +39,302 @@ import {
   savedGridSaveProgram,
 } from "./Analyze";
 import { operationAdmissionResponse } from "./test-setup";
+import { unsavedWorkSnapshot } from "./unsaved-work";
+
+it("waits for the catalogue and describes omitted metadata reads without a permission claim", () => {
+  const fetch = vi.fn();
+  vi.stubGlobal("fetch", fetch);
+  const app = {
+    workspaceId: "w",
+    applicationId: "a",
+    name: "Model",
+    status: "Active",
+  };
+  const view = render(
+    <Analyze app={app} catalog={null} index={0} subject="reader" />,
+  );
+  expect(screen.getByLabelText("Grid read unavailable")).toHaveTextContent(
+    "Checking grid availability",
+  );
+  expect(fetch).not.toHaveBeenCalled();
+  view.rerender(
+    <Analyze
+      app={app}
+      catalog={{
+        applicationAccess: {
+          role: "Administrator",
+          workspaceAdministrator: true,
+        },
+        enabledCapabilities: [],
+        functions: {},
+        revisions: { metadata: 1, data: 1, security: 1, policy: 1, commit: 1 },
+      }}
+      index={0}
+      subject="reader"
+    />,
+  );
+  expect(screen.getByLabelText("Grid read unavailable")).toHaveTextContent(
+    "Model metadata is not available in the current application context",
+  );
+  expect(
+    screen.queryByText(/current role cannot|not authorized/),
+  ).not.toBeInTheDocument();
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it.each(["initial mount", "application switch"])(
+  "initializes an exact native read from the loaded catalogue after %s",
+  async (entry) => {
+    const calls: any[] = [];
+    const response = (result: unknown) =>
+      new Response(JSON.stringify({ result }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_path, init) => {
+        const body = JSON.parse(String(init?.body));
+        calls.push(body);
+        if (body.program.function === "metadata.dimension.list")
+          return savedViewDimensions();
+        if (body.program.function === "metadata.member.list")
+          return response({
+            rows: ["Cash", "Receivables"].map((member_id) => ({
+              member_id,
+              name: member_id,
+              status: "Active",
+            })),
+            metadataRevision: 11,
+            nextAfterMemberId: null,
+          });
+        if (body.program.function === "facts.cube.resolved.read")
+          return response({
+            rows: [],
+            snapshot: { commitRevision: 9 },
+            stages: [],
+            presentation: {
+              pageSize: 100,
+              rowCount: 0,
+              suppression: { missing: false, zero: false },
+            },
+          });
+        throw new Error(`Unexpected ${body.program.function}`);
+      }),
+    );
+    const catalog = {
+      ...savedViewCatalog(),
+      functions: {
+        "metadata.dimension.list": {},
+        "metadata.member.list": {},
+        "facts.cube.resolved.read": {},
+      },
+    };
+    const nextApp = { ...savedViewApp, applicationId: "next-app" };
+    const view = render(
+      <Analyze
+        app={savedViewApp}
+        catalog={entry === "initial mount" ? null : catalog}
+        index={0}
+        subject="owner"
+      />,
+    );
+    if (entry === "application switch") {
+      await waitFor(() =>
+        expect(screen.getByLabelText("Value semantics")).toHaveValue("own"),
+      );
+      fireEvent.change(screen.getByLabelText("Value semantics"), {
+        target: { value: "stored" },
+      });
+      view.rerender(
+        <Analyze app={nextApp} catalog={null} index={1} subject="owner" />,
+      );
+    }
+    expect(screen.getByLabelText("Grid read unavailable")).toHaveTextContent(
+      "Checking grid availability",
+    );
+    const currentApp = entry === "application switch" ? nextApp : savedViewApp;
+    view.rerender(
+      <Analyze app={currentApp} catalog={catalog} index={1} subject="owner" />,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Value semantics")).toHaveValue("own"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Configure layout" }));
+    await waitFor(() =>
+      expect(screen.getAllByRole("option", { name: "Account" })).toHaveLength(
+        2,
+      ),
+    );
+    fireEvent.change(screen.getByLabelText("Rows"), {
+      target: { value: "Account" },
+    });
+    fireEvent.change(screen.getByLabelText("Columns"), {
+      target: { value: "Period" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Choose row members" }));
+    const dialog = within(
+      await screen.findByRole("dialog", { name: "Choose row members" }),
+    );
+    fireEvent.click(dialog.getByRole("button", { name: "Search" }));
+    fireEvent.click(
+      dialog.getByRole("checkbox", {
+        name: "Check Receivables · Receivables",
+      }),
+    );
+    fireEvent.click(
+      dialog.getByRole("checkbox", { name: "Check Cash · Cash" }),
+    );
+    fireEvent.click(
+      dialog.getByRole("button", { name: "Add checked members" }),
+    );
+    fireEvent.click(dialog.getByRole("button", { name: "Apply selection" }));
+    expect(screen.getByRole("button", { name: "Read grid" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+    await waitFor(() =>
+      expect(
+        calls.filter(
+          (call) => call.program.function === "facts.cube.resolved.read",
+        ),
+      ).toHaveLength(1),
+    );
+    const read = calls.find(
+      (call) => call.program.function === "facts.cube.resolved.read",
+    );
+    expect(read).toMatchObject({
+      workspaceId: currentApp.workspaceId,
+      applicationId: currentApp.applicationId,
+      program: { arguments: { source: { semantics: "own" } } },
+    });
+    expect(
+      read.program.arguments.selection.dimensions.find(
+        (item: any) => item.dimensionId === "Account",
+      ),
+    ).toMatchObject({
+      include: { kind: "members", memberIds: ["Receivables", "Cash"] },
+      exclude: null,
+    });
+  },
+);
+
+it("preserves an explicit read policy across catalogue loading, grant refresh and capability changes", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => savedViewDimensions()),
+  );
+  const catalog = {
+    ...savedViewCatalog(),
+    functions: {
+      "metadata.dimension.list": {},
+      "facts.cube.resolved.read": {},
+    },
+  };
+  const view = render(
+    <Analyze app={savedViewApp} catalog={catalog} index={0} subject="owner" />,
+  );
+  expect(screen.getByLabelText("Value semantics")).toHaveValue("own");
+  fireEvent.change(screen.getByLabelText("Value semantics"), {
+    target: { value: "stored" },
+  });
+  view.rerender(
+    <Analyze app={savedViewApp} catalog={null} index={0} subject="owner" />,
+  );
+  view.rerender(
+    <Analyze
+      app={savedViewApp}
+      catalog={{ ...catalog, revisions: { ...catalog.revisions, security: 2 } }}
+      index={0}
+      subject="owner"
+    />,
+  );
+  expect(screen.getByLabelText("Value semantics")).toHaveValue("stored");
+  fireEvent.change(screen.getByLabelText("Value semantics"), {
+    target: { value: "effective" },
+  });
+  view.rerender(
+    <Analyze
+      app={savedViewApp}
+      catalog={{ ...catalog, functions: { "metadata.dimension.list": {} } }}
+      index={0}
+      subject="owner"
+    />,
+  );
+  view.rerender(
+    <Analyze app={savedViewApp} catalog={catalog} index={0} subject="owner" />,
+  );
+  expect(screen.getByLabelText("Value semantics")).toHaveValue("effective");
+  expect(screen.getByLabelText("Grid read unavailable")).toHaveTextContent(
+    "Choose a current active binding",
+  );
+});
+
+it("discards old dimension evidence after an in-place grant change", async () => {
+  let finish!: (value: Response) => void;
+  let oldSignal: AbortSignal | undefined;
+  let reads = 0;
+  const response = (name: string) =>
+    new Response(
+      JSON.stringify({
+        result: {
+          rows: [
+            {
+              dimension_id: "Account",
+              name,
+              model_role: "Account",
+              status: "Active",
+            },
+          ],
+          nextAfterDimensionId: null,
+          metadataRevision: 1,
+        },
+      }),
+    );
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_path, init) => {
+      if (++reads === 1) {
+        oldSignal = init.signal;
+        return new Promise<Response>((done) => {
+          finish = done;
+        });
+      }
+      return response("Current dimension");
+    }),
+  );
+  const app = {
+    workspaceId: "w",
+    applicationId: "a",
+    name: "Model",
+    status: "Active",
+  };
+  const catalog = {
+    applicationAccess: { role: "Reader", workspaceAdministrator: false },
+    enabledCapabilities: [],
+    functions: { "metadata.dimension.list": {} },
+    revisions: { metadata: 1, data: 1, security: 1, policy: 1, commit: 1 },
+  };
+  const view = render(
+    <Analyze app={app} catalog={catalog} index={0} subject="reader" />,
+  );
+  await waitFor(() => expect(finish).toBeDefined());
+  view.rerender(
+    <Analyze
+      app={app}
+      catalog={{ ...catalog, revisions: { ...catalog.revisions, security: 2 } }}
+      index={0}
+      subject="reader"
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Configure layout" }));
+  await waitFor(() =>
+    expect(
+      screen.getAllByRole("option", { name: "Current dimension" }),
+    ).toHaveLength(2),
+  );
+  expect(oldSignal?.aborted).toBe(true);
+  await act(async () => finish(response("Old private dimension")));
+  expect(
+    screen.queryByRole("option", { name: "Old private dimension" }),
+  ).not.toBeInTheDocument();
+  expect(reads).toBe(2);
+});
 
 function viewDefinition({
   id = "grid-a",
@@ -43,6 +342,7 @@ function viewDefinition({
   rows = ["Account"],
   columns = ["Period"],
   pov = {} as Record<string, string>,
+  selectedMembers = {} as Record<string, string>,
   kind = "raw" as "raw" | "calculated" | "combined",
   resultKey = null as string | null,
   metadataRevision = 11,
@@ -57,17 +357,21 @@ function viewDefinition({
       metadataRevision,
       dimensions: placed.map((dimensionId) => ({
         dimensionId,
-        include: pov[dimensionId]
-          ? ({ kind: "member", memberId: pov[dimensionId] } as const)
-          : ({
-              kind: "members",
-              memberIds: [`${dimensionId}-member`],
-            } as const),
+        include:
+          pov[dimensionId] || selectedMembers[dimensionId]
+            ? ({
+                kind: "member",
+                memberId: pov[dimensionId] || selectedMembers[dimensionId],
+              } as const)
+            : ({
+                kind: "members",
+                memberIds: [`${dimensionId}-member`] as string[],
+              } as const),
         exclude: null,
       })),
     },
     layout: {
-      pages: [],
+      pages: [] as string[],
       rows,
       columns,
       filters: Object.keys(pov),
@@ -179,6 +483,232 @@ it("builds complete pinned own and effective resolved-grid reads", () => {
     pageSize: 100,
     suppression: { missing: false, zero: false },
   });
+  const editedAxis = resolvedGridProgram(
+    dimensions,
+    members,
+    { Scenario: "Actual" },
+    19,
+    { semantics: "own" },
+    undefined,
+    undefined,
+    {
+      Account: {
+        kind: "hierarchy",
+        operator: "descendants",
+        hierarchyId: "accounts",
+        memberId: "OperatingAccounts",
+        includeSelf: false,
+      },
+    },
+  );
+  expect(editedAxis.arguments.selection.dimensions).toEqual([
+    {
+      dimensionId: "Scenario",
+      include: { kind: "member", memberId: "Actual" },
+      exclude: null,
+    },
+    {
+      dimensionId: "Account",
+      include: {
+        kind: "hierarchy",
+        operator: "descendants",
+        hierarchyId: "accounts",
+        memberId: "OperatingAccounts",
+        includeSelf: false,
+      },
+      exclude: null,
+    },
+  ]);
+});
+
+it("applies an ordered axis member selection to the canonical resolved read", async () => {
+  const calls: Array<{ function: string; arguments: Record<string, unknown> }> =
+    [];
+  const response = (result: unknown) =>
+    new Response(JSON.stringify({ result }), {
+      headers: { "Content-Type": "application/json" },
+    });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      calls.push(body.program);
+      if (body.program.function === "metadata.dimension.list")
+        return response({
+          rows: [
+            {
+              dimension_id: "Account",
+              name: "Account",
+              model_role: "Account",
+              status: "Active",
+            },
+            {
+              dimension_id: "Period",
+              name: "Period",
+              model_role: "Period",
+              status: "Active",
+            },
+            {
+              dimension_id: "Scenario",
+              name: "Scenario",
+              model_role: "Scenario",
+              status: "Active",
+            },
+          ],
+          nextAfterDimensionId: null,
+          metadataRevision: 11,
+        });
+      if (body.program.function === "metadata.member.list") {
+        const dimensionId = body.program.arguments.dimension;
+        return response({
+          rows:
+            dimensionId === "Account"
+              ? [
+                  { member_id: "Revenue", name: "Revenue", status: "Active" },
+                  { member_id: "Cost", name: "Cost", status: "Active" },
+                ]
+              : dimensionId === "Period"
+                ? [
+                    { member_id: "Jan", name: "January", status: "Active" },
+                    { member_id: "Feb", name: "February", status: "Active" },
+                  ]
+                : [{ member_id: "Plan", name: "Plan", status: "Active" }],
+          nextAfterMemberId: null,
+          metadataRevision: 11,
+        });
+      }
+      if (body.program.function === "facts.cube.resolved.read")
+        return response({
+          rows: ["Revenue", "Cost"].map((Account) => ({
+            members: { Account, Period: "Jan", Scenario: "Plan" },
+            present: true,
+            value: "1",
+            resultUnit: "numeric",
+          })),
+          snapshot: { commitRevision: 3 },
+          stages: [],
+          presentation: {
+            pageSize: 1,
+            suppression: { missing: false, zero: false },
+            rowCount: 2,
+          },
+        });
+      throw new Error(`Unexpected function ${body.program.function}`);
+    }),
+  );
+
+  render(
+    <Analyze
+      app={{
+        workspaceId: "ws",
+        applicationId: "app",
+        name: "Cube",
+        status: "Active",
+      }}
+      catalog={{
+        applicationAccess: {
+          role: "Administrator",
+          workspaceAdministrator: true,
+        },
+        enabledCapabilities: [],
+        functions: {
+          "metadata.dimension.list": {},
+          "metadata.member.list": {},
+          "facts.cube.resolved.read": {},
+        },
+        revisions: {
+          metadata: 11,
+          data: 3,
+          policy: 2,
+          security: 1,
+          commit: 3,
+        },
+      }}
+      index={0}
+      subject="owner"
+    />,
+  );
+
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Configure layout" }),
+    ).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Configure layout" }));
+  await waitFor(() => expect(screen.getByLabelText("Rows")).toBeEnabled());
+  fireEvent.change(screen.getByLabelText("Rows"), {
+    target: { value: "Account" },
+  });
+  fireEvent.change(screen.getByLabelText("Columns"), {
+    target: { value: "Period" },
+  });
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Choose row members" }),
+  );
+  const chooser = await screen.findByRole("dialog", {
+    name: "Choose row members",
+  });
+  expect(
+    within(chooser).getByRole("button", { name: "Apply selection" }),
+  ).toBeDisabled();
+  fireEvent.click(
+    within(chooser).getByRole("checkbox", { name: /^Check Cost ·/ }),
+  );
+  fireEvent.click(
+    within(chooser).getByRole("checkbox", { name: /^Check Revenue ·/ }),
+  );
+  fireEvent.click(
+    within(chooser).getByRole("button", { name: "Add checked members" }),
+  );
+  fireEvent.click(
+    within(chooser).getByRole("button", { name: "Apply selection" }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  await waitFor(() =>
+    expect(
+      calls.some((call) => call.function === "facts.cube.resolved.read"),
+    ).toBe(true),
+  );
+  const read = calls.find(
+    (call) => call.function === "facts.cube.resolved.read",
+  )!;
+  expect(read.arguments).toMatchObject({
+    selection: {
+      format: "openepm-cube-selection-v1",
+      metadataRevision: 11,
+      dimensions: [
+        {
+          dimensionId: "Account",
+          include: { kind: "members", memberIds: ["Cost", "Revenue"] },
+          exclude: null,
+        },
+        {
+          dimensionId: "Period",
+          include: { kind: "members", memberIds: ["Jan", "Feb"] },
+          exclude: null,
+        },
+        {
+          dimensionId: "Scenario",
+          include: { kind: "members", memberIds: ["Plan"] },
+          exclude: null,
+        },
+      ],
+    },
+    source: { semantics: "own" },
+  });
+  await waitFor(() =>
+    expect(
+      within(screen.getByRole("region", { name: "Grid results" }))
+        .getAllByRole("rowheader")
+        .map((row) => row.textContent),
+    ).toEqual(["Cost"]),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+  expect(
+    within(screen.getByRole("region", { name: "Grid results" }))
+      .getAllByRole("rowheader")
+      .map((row) => row.textContent),
+  ).toEqual(["Revenue"]);
 });
 
 it("pages one fixed resolved snapshot without refetching or overlap", () => {
@@ -453,7 +983,10 @@ it("scopes grid density to identity and application without changing data", asyn
           workspaceAdministrator: true,
         },
         enabledCapabilities: [],
-        functions: {},
+        functions: {
+          "metadata.dimension.list": {},
+          "metadata.member.list": {},
+        },
         revisions: {
           metadata: 11,
           data: 12,
@@ -506,7 +1039,18 @@ it("defers effective binding discovery until effective semantics are selected", 
       if (body.program.function === "facts.cube.resolved.binding.list")
         return new Response(
           JSON.stringify({
-            result: { bindings: [], nextAfterBindingId: null },
+            result: {
+              bindings: [
+                {
+                  bindingId: "active-binding",
+                  stateToken: "a".repeat(64),
+                  bindingDigest: "b".repeat(64),
+                  metadataRevision: 11,
+                  stages: [{ stageId: "total", kind: "hierarchy_node" }],
+                },
+              ],
+              nextAfterBindingId: null,
+            },
           }),
         );
       throw new Error(`Unexpected function ${body.program.function}`);
@@ -527,6 +1071,8 @@ it("defers effective binding discovery until effective semantics are selected", 
         },
         enabledCapabilities: [],
         functions: {
+          "metadata.dimension.list": {},
+          "metadata.member.list": {},
           "facts.cube.resolved.read": {},
           "facts.cube.resolved.binding.list": {},
         },
@@ -552,6 +1098,12 @@ it("defers effective binding discovery until effective semantics are selected", 
   await waitFor(() =>
     expect(functionsCalled).toContain("facts.cube.resolved.binding.list"),
   );
+  await waitFor(() =>
+    expect(screen.getByLabelText("Effective binding")).toHaveValue(
+      `active-binding:${"a".repeat(64)}`,
+    ),
+  );
+  expect(screen.getByLabelText("Value semantics")).toHaveValue("effective");
 });
 
 it("preserves shared saved-grid list and current-save contracts", () => {
@@ -879,6 +1431,8 @@ it("reads generic facts through unchanged authorized V2 programs", async () => {
         },
         enabledCapabilities: [],
         functions: {
+          "metadata.dimension.list": {},
+          "metadata.member.list": {},
           "facts.generic.table.list": {},
           "facts.generic.value.snapshot.scan": {},
         },
@@ -895,6 +1449,12 @@ it("reads generic facts through unchanged authorized V2 programs", async () => {
     />,
   );
   fireEvent.click(screen.getByRole("button", { name: "Generic facts" }));
+  expect(
+    screen.getByRole("button", { name: "KPI" }),
+  ).toHaveAccessibleDescription(/Read the grid/);
+  expect(
+    screen.getByRole("button", { name: "Chart" }),
+  ).toHaveAccessibleDescription(/Read the grid/);
   await waitFor(() =>
     expect(screen.getByLabelText("Generic fact table")).toHaveValue("rates"),
   );
@@ -1076,6 +1636,8 @@ it("reads and saves shared grid definitions through unchanged governed contracts
         },
         enabledCapabilities: [],
         functions: {
+          "metadata.dimension.list": {},
+          "metadata.member.list": {},
           "grid.definition.list": {},
           "grid.definition.save": {},
         },
@@ -1111,8 +1673,9 @@ it("reads and saves shared grid definitions through unchanged governed contracts
   });
   fireEvent.click(screen.getByRole("button", { name: "Save view" }));
   await waitFor(() =>
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Saved Actual by period.",
+    expect(screen.getByText("Saved Actual by period.")).toHaveAttribute(
+      "role",
+      "status",
     ),
   );
   expect(calls).toEqual(
@@ -1150,10 +1713,128 @@ it("reads and saves shared grid definitions through unchanged governed contracts
   );
 });
 
+it("uses the shared two-pane chooser instead of a native POV member dropdown", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.program.function === "metadata.dimension.list")
+        return new Response(
+          JSON.stringify({
+            result: {
+              rows: [
+                {
+                  dimension_id: "Account",
+                  name: "Account",
+                  model_role: "Account",
+                  status: "Active",
+                },
+                {
+                  dimension_id: "Period",
+                  name: "Period",
+                  model_role: "Period",
+                  status: "Active",
+                },
+                {
+                  dimension_id: "Entity",
+                  name: "Entity",
+                  model_role: "Entity",
+                  status: "Active",
+                },
+              ],
+              nextAfterDimensionId: null,
+              metadataRevision: 11,
+            },
+          }),
+        );
+      if (body.program.function === "metadata.member.list")
+        return new Response(
+          JSON.stringify({
+            result: {
+              rows:
+                body.program.arguments.dimension === "Entity"
+                  ? [
+                      {
+                        member_id: "CH",
+                        name: "Switzerland",
+                        status: "Active",
+                      },
+                      { member_id: "DE", name: "Germany", status: "Active" },
+                    ]
+                  : [],
+              nextAfterMemberId: null,
+              metadataRevision: 11,
+            },
+          }),
+        );
+      throw new Error(`Unexpected function ${body.program.function}`);
+    }),
+  );
+
+  render(
+    <Analyze
+      app={{
+        workspaceId: "ws",
+        applicationId: "app",
+        name: "Plan",
+        status: "active",
+      }}
+      catalog={{
+        applicationAccess: {
+          role: "Planner",
+          workspaceAdministrator: false,
+        },
+        enabledCapabilities: [],
+        functions: {
+          "metadata.dimension.list": {},
+          "metadata.member.list": {},
+        },
+        revisions: {
+          metadata: 11,
+          data: 9,
+          policy: 1,
+          security: 1,
+          commit: 9,
+        },
+      }}
+      index={0}
+      subject="planner"
+    />,
+  );
+  await waitFor(() => expect(screen.getByLabelText("Rows")).toHaveValue(""));
+  fireEvent.change(screen.getByLabelText("Rows"), {
+    target: { value: "Account" },
+  });
+  fireEvent.change(screen.getByLabelText("Columns"), {
+    target: { value: "Period" },
+  });
+  expect(
+    screen.queryByRole("combobox", { name: "Entity point of view" }),
+  ).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Entity point of view" }));
+  const dialog = await screen.findByRole("dialog", {
+    name: "Choose one Entity member",
+  });
+  fireEvent.click(within(dialog).getByRole("button", { name: /Germany/ }));
+  fireEvent.click(
+    within(dialog).getByRole("button", { name: "Add selected member" }),
+  );
+  fireEvent.click(
+    within(dialog).getByRole("button", { name: "Apply selection" }),
+  );
+  expect(
+    screen.getByRole("button", { name: "Entity point of view" }),
+  ).toHaveTextContent("Germany");
+});
+
 it("opens an exact multi-axis calculated grid through the existing scan contract", async () => {
   const calls: Array<{
     program: { function: string; arguments: Record<string, unknown> };
   }> = [];
+  let canInspect = true;
+  const refreshCatalogue = vi
+    .fn()
+    .mockRejectedValue(new Error("Application access not confirmed"));
   vi.stubGlobal(
     "fetch",
     vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
@@ -1208,6 +1889,11 @@ it("opens an exact multi-axis calculated grid through the existing scan contract
                     name: "Forecast calculation",
                     rows: ["Account", "Entity"],
                     pov: { Scenario: "Forecast" },
+                    selectedMembers: {
+                      Account: "Revenue",
+                      Entity: "CH",
+                      Period: "P1",
+                    },
                     kind: "calculated",
                     resultKey: "forecast.calculated",
                   }),
@@ -1231,16 +1917,23 @@ it("opens an exact multi-axis calculated grid through the existing scan contract
           }),
         );
       if (body.program.function === "facts.cell.editability.read")
-        return new Response(
-          JSON.stringify({
-            result: {
-              editable: false,
-              reasonCode: "CALCULATED_RESULT_READ_ONLY",
-              message:
-                "Calculated result cells are read-only; update an authorized raw input cell or run its governing rule.",
-            },
-          }),
-        );
+        return canInspect
+          ? new Response(
+              JSON.stringify({
+                result: {
+                  editable: false,
+                  reasonCode: "CALCULATED_RESULT_READ_ONLY",
+                  message:
+                    "Calculated result cells are read-only; update an authorized raw input cell or run its governing rule.",
+                },
+              }),
+            )
+          : new Response(
+              JSON.stringify({ code: "APPLICATION_GRANT_REQUIRED" }),
+              {
+                status: 403,
+              },
+            );
       return new Response(
         JSON.stringify({
           result: {
@@ -1281,6 +1974,8 @@ it("opens an exact multi-axis calculated grid through the existing scan contract
         },
         enabledCapabilities: [],
         functions: {
+          "metadata.dimension.list": {},
+          "metadata.member.list": {},
           "grid.definition.list": {},
           "facts.calculation.scan": {},
           "facts.cell.editability.read": {},
@@ -1295,6 +1990,7 @@ it("opens an exact multi-axis calculated grid through the existing scan contract
       }}
       index={0}
       subject="owner"
+      onRefreshCatalog={refreshCatalogue}
     />,
   );
   fireEvent.click(screen.getByRole("button", { name: "Refresh views" }));
@@ -1318,7 +2014,18 @@ it("opens an exact multi-axis calculated grid through the existing scan contract
   expect(screen.getByLabelText("Calculated result context")).toHaveTextContent(
     "Match",
   );
-  fireEvent.click(screen.getByRole("button", { name: /Revenue, CH, P1/ }));
+  expect(screen.getByLabelText("Loaded grid read")).toHaveTextContent(
+    "Stored calculated result",
+  );
+  expect(screen.getByLabelText("Grid snapshot status")).toHaveTextContent(
+    "1 loaded cells",
+  );
+  expect(screen.queryByText("No snapshot read")).not.toBeInTheDocument();
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: /Account Revenue, Entity CH, Period P1, Scenario Forecast/,
+    }),
+  );
   expect(
     screen.getByRole("complementary", {
       name: "Cell details and writeback",
@@ -1338,6 +2045,36 @@ it("opens an exact multi-axis calculated grid through the existing scan contract
       screen.getByLabelText("Authoritative editability decision"),
     ).not.toHaveTextContent("CALCULATED_RESULT_READ_ONLY"),
   );
+  fireEvent.click(screen.getByRole("button", { name: "Close writeback" }));
+  canInspect = false;
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: /Account Revenue, Entity CH, Period P1, Scenario Forecast/,
+    }),
+  );
+  expect(await screen.findByRole("alert")).toHaveTextContent(/access|grant/i);
+  expect(screen.queryAllByText("125.00000000")).toHaveLength(0);
+  expect(
+    screen.queryByLabelText("Calculated result context"),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByLabelText("Calculated result provenance"),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByLabelText("Cell details and writeback"),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Loaded grid read")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("Grid snapshot status")).not.toHaveTextContent(
+    "1 loaded cells",
+  );
+  expect(refreshCatalogue).toHaveBeenCalledTimes(1);
+  expect(
+    calls.filter(({ program }) => program.function === "facts.cube.scan"),
+  ).toEqual([]);
+  canInspect = true;
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  expect(await screen.findByText("125.00000000")).toBeVisible();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   expect(calls).toEqual(
     expect.arrayContaining([
       expect.objectContaining({
@@ -1345,7 +2082,12 @@ it("opens an exact multi-axis calculated grid through the existing scan contract
           languageVersion: 2,
           function: "facts.calculation.scan",
           arguments: {
-            members: { Scenario: "Forecast" },
+            members: {
+              Account: "Revenue",
+              Entity: "CH",
+              Period: "P1",
+              Scenario: "Forecast",
+            },
             limit: 100,
             includeZero: true,
             resultKey: "forecast.calculated",
@@ -1405,7 +2147,11 @@ it("opens the exact digest-pinned grid supplied by a workflow destination", asyn
           workspaceAdministrator: false,
         },
         enabledCapabilities: [],
-        functions: { "grid.definition.read": {} },
+        functions: {
+          "metadata.dimension.list": {},
+          "metadata.member.list": {},
+          "grid.definition.read": {},
+        },
         revisions: {
           metadata: 11,
           data: 19,
@@ -1429,184 +2175,228 @@ it("opens the exact digest-pinned grid supplied by a workflow destination", asyn
   );
 });
 
-it("requests, reads and cancels an aggregate through unchanged contracts", async () => {
-  const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
-  vi.stubGlobal(
-    "confirm",
-    vi.fn(() => true),
-  );
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const path = String(input);
-      const body = JSON.parse(String(init?.body)) as Record<string, unknown> & {
-        program: { function: string; arguments: Record<string, unknown> };
-      };
-      calls.push({ path, body });
-      if (body.program.function === "metadata.dimension.list")
+it.each(["cancellation", "incompatible amount measure"])(
+  "reports durable aggregate %s through the native contract",
+  async (outcome) => {
+    const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    let ratioRefused = false;
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        const body = JSON.parse(String(init?.body)) as Record<
+          string,
+          unknown
+        > & {
+          program: { function: string; arguments: Record<string, unknown> };
+        };
+        calls.push({ path, body });
+        if (body.program.function === "metadata.dimension.list")
+          return new Response(
+            JSON.stringify({
+              result: {
+                rows: [
+                  {
+                    dimension_id: "Account",
+                    name: "Account",
+                    model_role: "Account",
+                    status: "Active",
+                  },
+                  {
+                    dimension_id: "Period",
+                    name: "Period",
+                    model_role: "Period",
+                    status: "Active",
+                  },
+                ],
+                nextAfterDimensionId: null,
+                metadataRevision: 11,
+              },
+            }),
+          );
+        if (body.program.function === "facts.cube.aggregate.request")
+          return new Response(
+            JSON.stringify({ result: { queryId: "query-1", status: "ready" } }),
+          );
+        if (body.program.function === "facts.cube.aggregate.read")
+          return new Response(
+            JSON.stringify({
+              result: {
+                queryId: "query-1",
+                status: ratioRefused ? "failed" : "running",
+                ...(ratioRefused
+                  ? { errorCode: "CUBE_AGGREGATE_AMOUNT_MEASURE_REQUIRED" }
+                  : {}),
+              },
+            }),
+          );
         return new Response(
           JSON.stringify({
-            result: {
-              rows: [
-                {
-                  dimension_id: "Account",
-                  name: "Account",
-                  model_role: "Account",
-                  status: "Active",
-                },
-                {
-                  dimension_id: "Period",
-                  name: "Period",
-                  model_role: "Period",
-                  status: "Active",
-                },
-              ],
-              nextAfterDimensionId: null,
-              metadataRevision: 11,
-            },
+            result: { queryId: "query-1", status: "cancel_requested" },
           }),
         );
-      if (body.program.function === "facts.cube.aggregate.request")
-        return new Response(
-          JSON.stringify({ result: { queryId: "query-1", status: "ready" } }),
-        );
-      if (body.program.function === "facts.cube.aggregate.read")
-        return new Response(
-          JSON.stringify({
-            result: {
-              queryId: "query-1",
-              status: "computed",
-              rows: [
-                {
-                  members: { Account: "Revenue", Period: "P1" },
-                  sumAmount: "12.50000000",
-                  countPresent: "2",
-                },
-              ],
-              nextCursor: "cursor-2",
-              technicalCertificate: { kind: "CubeAggregateTechnical" },
-            },
-          }),
-        );
-      return new Response(
-        JSON.stringify({ result: { queryId: "query-1", status: "cancelled" } }),
-      );
-    }),
-  );
+      }),
+    );
 
-  render(
-    <Analyze
-      app={{
-        workspaceId: "ws",
-        applicationId: "app",
-        name: "Plan",
-        status: "active",
-      }}
-      catalog={{
-        applicationAccess: {
-          role: "Administrator",
-          workspaceAdministrator: true,
-        },
-        enabledCapabilities: [],
-        functions: {
-          "facts.cube.aggregate.request": {},
-          "facts.cube.aggregate.read": {},
-          "facts.cube.aggregate.cancel": {},
-        },
-        revisions: {
-          metadata: 11,
-          data: 9,
-          policy: 1,
-          security: 1,
-          commit: 9,
-        },
-      }}
-      index={0}
-      subject="owner"
-    />,
-  );
-  await waitFor(() =>
-    expect(screen.getByLabelText("Rows")).toHaveTextContent("Account"),
-  );
-  fireEvent.change(screen.getByLabelText("Rows"), {
-    target: { value: "Account" },
-  });
-  fireEvent.change(screen.getByLabelText("Columns"), {
-    target: { value: "Period" },
-  });
-  fireEvent.click(screen.getByText("Aggregate large cube selections"));
-  fireEvent.click(
-    screen.getByLabelText("I reviewed this exact aggregate query"),
-  );
-  const aggregateRequest = screen.getByRole("button", {
-    name: "Request durable aggregate",
-  });
-  await waitFor(() => expect(aggregateRequest).toBeEnabled());
-  fireEvent.click(aggregateRequest);
-  await waitFor(() =>
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Aggregate request · ready",
-    ),
-  );
-  expect(screen.queryByText("query-1")).not.toBeInTheDocument();
-  expect(screen.queryByLabelText("Aggregate query ID")).not.toBeInTheDocument();
-  fireEvent.click(
-    screen.getByRole("button", { name: "Refresh status and results" }),
-  );
-  await waitFor(() =>
-    expect(screen.getByText("12.50000000")).toBeInTheDocument(),
-  );
-  expect(screen.queryByText(/CubeAggregateTechnical/)).not.toBeInTheDocument();
-  fireEvent.click(
-    screen.getByLabelText("I reviewed cancellation of this exact query state"),
-  );
-  fireEvent.click(screen.getByRole("button", { name: "Request cancellation" }));
-  await waitFor(() =>
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Aggregate request · cancelled",
-    ),
-  );
-  expect(calls).toEqual(
-    expect.arrayContaining([
-      expect.objectContaining({
-        path: "/api/aggregate",
-        body: expect.objectContaining({
-          confirmed: true,
-          program: expect.objectContaining({
-            function: "facts.cube.aggregate.request",
-            arguments: expect.objectContaining({ limits: { pageSize: 100 } }),
+    render(
+      <Analyze
+        app={{
+          workspaceId: "ws",
+          applicationId: "app",
+          name: "Plan",
+          status: "active",
+        }}
+        catalog={{
+          applicationAccess: {
+            role: "Administrator",
+            workspaceAdministrator: true,
+          },
+          enabledCapabilities: [],
+          functions: {
+            "metadata.dimension.list": {},
+            "metadata.member.list": {},
+            "facts.cube.aggregate.request": {},
+            "facts.cube.aggregate.read": {},
+            "facts.cube.aggregate.cancel": {},
+          },
+          revisions: {
+            metadata: 11,
+            data: 9,
+            policy: 1,
+            security: 1,
+            commit: 9,
+          },
+        }}
+        index={0}
+        subject="owner"
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Rows")).toHaveTextContent("Account"),
+    );
+    fireEvent.change(screen.getByLabelText("Rows"), {
+      target: { value: "Account" },
+    });
+    fireEvent.change(screen.getByLabelText("Columns"), {
+      target: { value: "Period" },
+    });
+    fireEvent.click(screen.getByText("Aggregate large cube selections"));
+    fireEvent.click(
+      screen.getByLabelText("I reviewed this exact aggregate query"),
+    );
+    const aggregateRequest = screen.getByRole("button", {
+      name: "Request durable aggregate",
+    });
+    await waitFor(() => expect(aggregateRequest).toBeEnabled());
+    fireEvent.click(aggregateRequest);
+    await waitFor(() =>
+      expect(screen.getByText(/Aggregate request · ready/)).toHaveAttribute(
+        "role",
+        "status",
+      ),
+    );
+    expect(screen.queryByText("query-1")).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Aggregate query ID"),
+    ).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh status and results" }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Aggregate request · running/),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByLabelText("Aggregate results"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/CubeAggregateTechnical/),
+    ).not.toBeInTheDocument();
+    if (outcome === "incompatible amount measure") {
+      ratioRefused = true;
+      fireEvent.click(
+        screen.getByRole("button", { name: "Refresh status and results" }),
+      );
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "This query includes ratios. Select Count present alone to count cells, or calculate the rate from its underlying quantities.",
+      );
+      expect(screen.getByText("Aggregate request · failed")).toHaveAttribute(
+        "role",
+        "status",
+      );
+      expect(
+        screen.queryByLabelText("Aggregate results"),
+      ).not.toBeInTheDocument();
+      expect(
+        calls.filter(
+          ({ body }) =>
+            (body.program as { function?: string })?.function ===
+            "facts.cube.aggregate.request",
+        ),
+      ).toHaveLength(1);
+      return;
+    }
+    fireEvent.click(
+      screen.getByLabelText(
+        "I reviewed cancellation of this exact query state",
+      ),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Request cancellation" }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Aggregate request · cancel_requested/),
+      ).toHaveAttribute("role", "status"),
+    );
+    expect(calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "/api/aggregate",
+          body: expect.objectContaining({
+            confirmed: true,
+            program: expect.objectContaining({
+              function: "facts.cube.aggregate.request",
+              arguments: expect.objectContaining({ limits: { pageSize: 100 } }),
+            }),
           }),
         }),
-      }),
-      expect.objectContaining({
-        path: "/api/aggregate",
-        body: expect.objectContaining({
-          program: {
-            languageVersion: 2,
-            function: "facts.cube.aggregate.read",
-            arguments: { queryId: "query-1", pageSize: 100 },
-          },
+        expect.objectContaining({
+          path: "/api/aggregate",
+          body: expect.objectContaining({
+            program: {
+              languageVersion: 2,
+              function: "facts.cube.aggregate.read",
+              arguments: { queryId: "query-1", pageSize: 100 },
+            },
+          }),
         }),
-      }),
-      expect.objectContaining({
-        path: "/api/aggregate",
-        body: expect.objectContaining({
-          confirmed: true,
-          program: {
-            languageVersion: 2,
-            function: "facts.cube.aggregate.cancel",
-            arguments: { queryId: "query-1" },
-          },
+        expect.objectContaining({
+          path: "/api/aggregate",
+          body: expect.objectContaining({
+            confirmed: true,
+            program: {
+              languageVersion: 2,
+              function: "facts.cube.aggregate.cancel",
+              arguments: { queryId: "query-1" },
+            },
+          }),
         }),
-      }),
-    ]),
-  );
-});
+      ]),
+    );
+  },
+);
 
 it("reads the authorized metadata and cube through unchanged V2 programs", async () => {
   const calls: Array<Record<string, unknown>> = [];
   let acceptTransition: (() => void) | undefined;
   let denyGrid = false;
+  let cellUnavailable = false;
   vi.stubGlobal(
     "fetch",
     vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
@@ -1661,8 +2451,12 @@ it("reads the authorized metadata and cube through unchanged V2 programs", async
           JSON.stringify({
             result: {
               editable: false,
-              reasonCode: "PLANNING_INTERSECTION_LOCKED",
-              message: "This cell is locked by the current planning workflow.",
+              reasonCode: cellUnavailable
+                ? "CELL_UNAVAILABLE"
+                : "PLANNING_INTERSECTION_LOCKED",
+              message: cellUnavailable
+                ? "The selected cell is unavailable."
+                : "This cell is locked by the current planning workflow.",
             },
           }),
         );
@@ -1711,6 +2505,8 @@ it("reads the authorized metadata and cube through unchanged V2 programs", async
         },
         enabledCapabilities: [],
         functions: {
+          "metadata.dimension.list": {},
+          "metadata.member.list": {},
           "facts.numeric.batch": {},
           "facts.text.batch": {},
           "facts.cell.editability.read": {},
@@ -1755,7 +2551,9 @@ it("reads the authorized metadata and cube through unchanged V2 programs", async
     expect(screen.getByText("0.00000000")).toBeInTheDocument(),
   );
   fireEvent.click(
-    screen.getByRole("button", { name: "Revenue, P1: 0.00000000" }),
+    screen.getByRole("button", {
+      name: "Account Revenue, Period P1, Scenario Actual. 0.00000000",
+    }),
   );
   await waitFor(() =>
     expect(
@@ -1789,7 +2587,9 @@ it("reads the authorized metadata and cube through unchanged V2 programs", async
   fireEvent.click(screen.getByRole("button", { name: "Close writeback" }));
   expect(screen.getByLabelText("Value")).toHaveValue("12.50000000");
   expect(
-    screen.getByRole("button", { name: "Revenue, P1: 0.00000000" }),
+    screen.getByRole("button", {
+      name: "Account Revenue, Period P1, Scenario Actual. 0.00000000",
+    }),
   ).toHaveAttribute("aria-pressed", "true");
   expect(acceptTransition).toBeTypeOf("function");
   act(() => acceptTransition?.());
@@ -1837,11 +2637,29 @@ it("reads the authorized metadata and cube through unchanged V2 programs", async
   );
   expect(screen.queryByText("0.00000000")).not.toBeInTheDocument();
   expect(screen.getByText("No snapshot read")).toBeInTheDocument();
+  denyGrid = false;
+  cellUnavailable = true;
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  const zeroCell = await screen.findByRole("button", {
+    name: "Account Revenue, Period P1, Scenario Actual. 0.00000000",
+  });
+  fireEvent.click(zeroCell);
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "The selected cell is unavailable.",
+  );
+  expect(zeroCell).not.toBeInTheDocument();
+  expect(
+    screen.queryByLabelText("Cell details and writeback"),
+  ).not.toBeInTheDocument();
 });
 
 it("clears cell context on application change and ignores its late identity read", async () => {
   let resolveCell: ((response: Response) => void) | undefined;
-  const functions = { "facts.numeric.batch": {} };
+  const functions = {
+    "metadata.dimension.list": {},
+    "metadata.member.list": {},
+    "facts.numeric.batch": {},
+  };
   const catalog = {
     applicationAccess: { role: "Editor", workspaceAdministrator: false },
     enabledCapabilities: [],
@@ -1909,12 +2727,12 @@ it("clears cell context on application change and ignores its late identity read
     expect(screen.getByRole("button", { name: "Read grid" })).toBeEnabled(),
   );
   fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
-  fireEvent.click(
-    await screen.findByRole("button", { name: "Revenue, Jan: 12.50" }),
-  );
-  expect(
-    screen.getByRole("button", { name: "Close writeback" }),
-  ).toBeDisabled();
+  const trigger = await screen.findByRole("button", {
+    name: "Account Revenue, Period Jan. 12.50",
+  });
+  fireEvent.click(trigger);
+  expect(screen.getByRole("button", { name: "Close writeback" })).toBeEnabled();
+  expect(trigger).toBeDisabled();
   expect(resolveCell).toBeTypeOf("function");
   rendered.rerender(
     <Analyze
@@ -1942,6 +2760,197 @@ it("clears cell context on application change and ignores its late identity read
   expect(screen.getByRole("button", { name: "Read grid" })).toBeDisabled();
 });
 
+it("reviews the reread value with its identity and preserves an exact proposal across conflict recovery", async () => {
+  const readyPrograms: Record<string, any>[] = [];
+  const useActualMutation = exactCellMutation.useExactCellMutation;
+  const mutationProbe = vi
+    .spyOn(exactCellMutation, "useExactCellMutation")
+    .mockImplementation((...args) => {
+      if (args[3]) readyPrograms.push(structuredClone(args[3]));
+      return useActualMutation(...args);
+    });
+  onTestFinished(() => mutationProbe.mockRestore());
+  const calls: any[] = [];
+  let currentAmount = "120.00000001";
+  let currentIdentity = "current-1";
+  const response = (result: unknown) =>
+    new Response(JSON.stringify({ result }));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input, init) => {
+      const body = JSON.parse(String(init?.body));
+      calls.push({ path: String(input), ...body });
+      if (String(input) === "/api/preview")
+        return new Response(
+          JSON.stringify({
+            previewToken: "exact-cell-preview",
+            programDigest: "a".repeat(64),
+            revisionVector: { data_revision: 2 },
+          }),
+        );
+      if (String(input) === "/api/operation-admission")
+        return operationAdmissionResponse();
+      if (String(input) === "/api/submit")
+        return new Response(
+          JSON.stringify({ jobId: "c".repeat(32), status: "ready" }),
+        );
+      if (body.program.function === "metadata.dimension.list")
+        return response({
+          rows: ["Account", "Period"].map((id) => ({
+            dimension_id: id,
+            name: id,
+            model_role: id,
+            status: "Active",
+          })),
+          metadataRevision: 2,
+          nextAfterDimensionId: null,
+        });
+      if (body.program.function === "metadata.member.list")
+        return response({
+          rows: [],
+          metadataRevision: 2,
+          nextAfterMemberId: null,
+        });
+      if (body.program.function === "facts.cell.editability.read")
+        return response({
+          editable: true,
+          reasonCode: "RAW_INPUT_EDITABLE",
+          message: "Current raw input is editable.",
+        });
+      return response({
+        rows: [
+          {
+            members: { Account: "Revenue", Period: "Jan" },
+            kind: "numeric",
+            amount: body.program.arguments.includeMissing
+              ? currentAmount
+              : "100.00000000",
+            numericChangeId: currentIdentity,
+          },
+        ],
+        snapshotRevision: 2,
+        nextCursor: null,
+        source: "raw",
+      });
+    }),
+  );
+  render(
+    <Analyze
+      app={{
+        workspaceId: "ws",
+        applicationId: "edit",
+        name: "Edit",
+        status: "Active",
+      }}
+      catalog={{
+        applicationAccess: { role: "Editor", workspaceAdministrator: false },
+        enabledCapabilities: [],
+        functions: {
+          "metadata.dimension.list": {},
+          "metadata.member.list": {},
+          "facts.numeric.batch": {},
+          "facts.cell.editability.read": {},
+        },
+        revisions: { metadata: 2, data: 2, policy: 1, security: 1, commit: 2 },
+      }}
+      index={0}
+      subject="editor"
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Configure layout" }));
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Suggest layout" }),
+    ).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Suggest layout" }));
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  fireEvent.click(
+    await screen.findByRole("button", {
+      name: "Account Revenue, Period Jan. 100.00000000",
+    }),
+  );
+  await waitFor(() => expect(screen.getByLabelText("Value")).toBeEnabled());
+  expect(screen.getByLabelText("Authoritative cell details")).toHaveTextContent(
+    "120.00000001",
+  );
+  expect(screen.getByLabelText("Value")).toHaveValue("120.00000001");
+  fireEvent.change(screen.getByLabelText("Operation"), {
+    target: { value: "add" },
+  });
+  await waitFor(() => expect(screen.getByLabelText("Value")).toBeEnabled());
+  fireEvent.change(screen.getByLabelText("Value"), {
+    target: { value: "5.00000001" },
+  });
+  currentAmount = "130.00000001";
+  currentIdentity = "current-2";
+  readyPrograms.length = 0;
+  await act(async () => {
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Reread current cell and keep my edit",
+      }),
+    );
+  });
+  await waitFor(() => expect(screen.getByLabelText("Value")).toBeEnabled());
+  expect(screen.getByLabelText("Value")).toHaveValue("5.00000001");
+  expect(screen.getByLabelText("Operation")).toHaveValue("add");
+  expect(screen.getByLabelText("Authoritative cell details")).toHaveTextContent(
+    "130.00000001",
+  );
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Preview exact mutation" }),
+    ).toBeEnabled(),
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Preview exact mutation" }),
+  );
+  await waitFor(() => {
+    const previews = calls.filter((call) => call.path === "/api/preview");
+    expect(previews).toHaveLength(1);
+    expect(previews[0].program).toEqual(
+      buildWritebackProgram(
+        "numeric",
+        "add",
+        { Account: "Revenue", Period: "Jan" },
+        "5.00000001",
+        "current-2",
+      ),
+    );
+  });
+  expect(readyPrograms.length).toBeGreaterThan(0);
+  expect(readyPrograms).toEqual(
+    readyPrograms.map(() =>
+      buildWritebackProgram(
+        "numeric",
+        "add",
+        { Account: "Revenue", Period: "Jan" },
+        "5.00000001",
+        "current-2",
+      ),
+    ),
+  );
+  const reviewed = screen.getByLabelText("I reviewed this exact cell mutation");
+  await waitFor(() => expect(reviewed).toBeEnabled());
+  fireEvent.click(reviewed);
+  fireEvent.click(
+    screen.getByRole("button", { name: "Submit durable writeback" }),
+  );
+  expect(await screen.findByText(/Request status: ready/)).toBeInTheDocument();
+  const submitted = calls.find((call) => call.path === "/api/submit");
+  expect(submitted.program).toEqual(
+    buildWritebackProgram(
+      "numeric",
+      "add",
+      { Account: "Revenue", Period: "Jan" },
+      "5.00000001",
+      "current-2",
+    ),
+  );
+  expect(screen.getByLabelText("Value")).toBeDisabled();
+});
+
 const savedViewApp = {
   workspaceId: "ws",
   applicationId: "app",
@@ -1957,6 +2966,8 @@ function savedViewCatalog(security = 1, canRead = true, issuer = "issuer") {
     },
     enabledCapabilities: [],
     functions: {
+      "metadata.dimension.list": {},
+      "metadata.member.list": {},
       ...(canRead ? { "grid.definition.list": {} } : {}),
       "grid.definition.save": {},
     },
@@ -2012,6 +3023,658 @@ function savedViewDimensions() {
     }),
   );
 }
+
+function canonicalReshapeFixture(
+  kind: "raw" | "calculated" | "combined" = "combined",
+  withPovSets = false,
+) {
+  const base = viewDefinition({
+    id: "complete-view",
+    rows: ["Company", "Region", "Product", "Channel", "Measure", "Currency"],
+    columns: ["Year", "Month"],
+    pov: { Scenario: "Plan", Version: "Current" },
+    kind,
+    resultKey: kind === "raw" ? null : "forecast.result",
+  });
+  const definition = {
+    ...base,
+    selection: {
+      ...base.selection,
+      dimensions: base.selection.dimensions.map((axis, index) => ({
+        ...axis,
+        exclude:
+          index === 1
+            ? { kind: "member" as const, memberId: "Region-excluded" }
+            : null,
+        ...(withPovSets && ["Scenario", "Version"].includes(axis.dimensionId)
+          ? {
+              include: {
+                kind: "members" as const,
+                memberIds:
+                  axis.dimensionId === "Scenario"
+                    ? ["Plan", "Actual"]
+                    : ["Current", "Prior"],
+              },
+              exclude: {
+                kind: "member" as const,
+                memberId: axis.dimensionId === "Scenario" ? "Actual" : "Prior",
+              },
+            }
+          : {}),
+      })),
+    },
+    layout: { ...base.layout, pages: ["Scenario"], filters: ["Version"] },
+    suppression: { missing: true, zero: true },
+    pageSize: 37,
+  };
+  const calls: Array<{ function: string; arguments: any }> = [];
+  const response = (result: unknown) =>
+    new Response(JSON.stringify({ result }));
+  const grid = {
+    ...savedView(definition.viewId),
+    name: definition.name,
+    definition,
+  };
+  const control: {
+    save?: (body: any) => Promise<Response>;
+    remove?: (body: any) => Promise<Response>;
+    list?: () => Response;
+    rows?: any[];
+  } = {};
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (path, init) => {
+      if (String(path) === "/api/operation-admission")
+        return operationAdmissionResponse();
+      const body = JSON.parse(String(init?.body));
+      const program = body.program;
+      calls.push(program);
+      if (program.function === "metadata.dimension.list")
+        return response({
+          rows: definition.selection.dimensions.map(({ dimensionId }) => ({
+            dimension_id: dimensionId,
+            name: dimensionId,
+            model_role: "Custom",
+            status: "Active",
+          })),
+          metadataRevision: 11,
+          nextAfterDimensionId: null,
+        });
+      if (program.function === "metadata.member.list")
+        return response({
+          rows: [
+            {
+              member_id: `${program.arguments.dimension}-member`,
+              name: "Member",
+              status: "Active",
+            },
+          ],
+          metadataRevision: 11,
+          nextAfterMemberId: null,
+        });
+      if (program.function === "grid.definition.list")
+        return control.list
+          ? control.list()
+          : response({
+              grids: [grid],
+              nextAfterGridId: null,
+              collectionToken: "b".repeat(64),
+            });
+      if (program.function === "grid.definition.save")
+        return control.save ? control.save(body) : response(grid);
+      if (program.function === "grid.definition.delete")
+        return control.remove
+          ? control.remove(body)
+          : response({ gridId: grid.gridId, status: "Deleted" });
+      if (program.function === "facts.cube.resolved.read")
+        return response({
+          format: "openepm-cube-view-read-v1",
+          dataSource:
+            program.arguments.view?.dataSource || definition.dataSource,
+          readPolicy: program.arguments.readPolicy,
+          complete: true,
+          rows: control.rows || [],
+          snapshot: { commitRevision: 9 },
+          presentation: { pageSize: 37, rowCount: control.rows?.length || 0 },
+        });
+      if (program.function === "facts.cell.editability.read")
+        return response({
+          editable: false,
+          reasonCode: "CALCULATED_RESULT_READ_ONLY",
+          message: "Calculated values are read only.",
+        });
+      throw new Error(`Unexpected ${program.function}`);
+    }),
+  );
+  const catalog = {
+    ...savedViewCatalog(),
+    functions: {
+      ...savedViewCatalog().functions,
+      "facts.cube.resolved.read": {
+        canonicalViewRead: "openepm-cube-view-read-v1",
+      },
+      "grid.definition.delete": {},
+      "facts.cell.editability.read": {},
+    },
+  };
+  const view = render(
+    <Analyze app={savedViewApp} catalog={catalog} index={0} subject="owner" />,
+  );
+  return { definition, grid, calls, control, response, view, catalog };
+}
+
+it.each(["raw", "calculated", "combined"] as const)(
+  "reshapes an opened %s canonical view without resetting its other meaning",
+  async (kind) => {
+    const fixture = canonicalReshapeFixture(kind);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+    fireEvent.change(screen.getByLabelText("Rows"), {
+      target: { value: "Region" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+    await waitFor(() =>
+      expect(
+        fixture.calls.some(
+          ({ function: fn }) => fn === "facts.cube.resolved.read",
+        ),
+      ).toBe(true),
+    );
+    const actual = fixture.calls.find(
+      ({ function: fn }) => fn === "facts.cube.resolved.read",
+    )!;
+    expect(actual.arguments.view).toEqual({
+      ...fixture.definition,
+      layout: {
+        ...fixture.definition.layout,
+        rows: [
+          "Region",
+          "Company",
+          "Product",
+          "Channel",
+          "Measure",
+          "Currency",
+        ],
+      },
+    });
+    expect(actual.arguments.readPolicy).toEqual({
+      semantics: kind === "raw" ? "own" : "stored",
+    });
+    expect(unsavedWorkSnapshot()).toHaveLength(1);
+  },
+);
+
+it("describes canonical layout and explicit read links without a conflicting scalar summary", async () => {
+  const fixture = canonicalReshapeFixture("combined", true);
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+  fireEvent.click(screen.getByRole("button", { name: "Configure layout" }));
+  const layout = screen.getByLabelText("Current grid layout");
+  expect(layout).toHaveTextContent("PAGES1 axis · Scenario");
+  expect(layout).toHaveTextContent("FILTERS1 axis · Version");
+  const drawer = screen.getByRole("complementary", {
+    name: "Pages, rows, columns and filters",
+  });
+  expect(
+    within(drawer).getByRole("group", { name: "Pages" }),
+  ).toHaveTextContent("Scenario");
+  expect(
+    within(drawer).getByRole("group", { name: "Filters" }),
+  ).toHaveTextContent("Version");
+  expect(drawer.querySelector(".layout-drawer-summary")).toBeNull();
+  expect(drawer).not.toHaveTextContent("No fixed members");
+  const semantics = screen.getByLabelText("Grid value semantics");
+  expect(semantics).toHaveTextContent(
+    "an explicit view link restores its stated supported read policy or refuses the read",
+  );
+  expect(semantics).toHaveTextContent(
+    "Effective bindings are session-only and are not restored by saved views or view links",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  await waitFor(() =>
+    expect(
+      fixture.calls.find(
+        ({ function: fn }) => fn === "facts.cube.resolved.read",
+      )?.arguments.view,
+    ).toEqual(fixture.definition),
+  );
+});
+
+it("does not clear a newer view draft when an earlier save acknowledgement arrives", async () => {
+  const fixture = canonicalReshapeFixture();
+  let finish!: (response: Response) => void;
+  fixture.control.save = () =>
+    new Promise<Response>((resolve) => {
+      finish = resolve;
+    });
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+  fireEvent.click(screen.getByText("Save current view"));
+  fireEvent.change(screen.getByLabelText("Display name"), {
+    target: { value: "Original reviewed view" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+  await waitFor(() => expect(finish).toBeDefined());
+  fireEvent.change(screen.getByLabelText("Display name"), {
+    target: { value: "Newer unsaved view" },
+  });
+  await act(async () =>
+    finish(
+      fixture.response({ ...fixture.grid, name: "Original reviewed view" }),
+    ),
+  );
+  expect(screen.getByLabelText("Display name")).toHaveValue(
+    "Newer unsaved view",
+  );
+  expect(unsavedWorkSnapshot()).toHaveLength(1);
+});
+
+it("keeps canonical selection and source when swapping first axes across layout roles", async () => {
+  const fixture = canonicalReshapeFixture();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+  fireEvent.change(screen.getByLabelText("Rows"), {
+    target: { value: "Month" },
+  });
+  fireEvent.change(screen.getByLabelText("Columns"), {
+    target: { value: "Scenario" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  await waitFor(() =>
+    expect(
+      fixture.calls.some(
+        ({ function: fn }) => fn === "facts.cube.resolved.read",
+      ),
+    ).toBe(true),
+  );
+  expect(
+    fixture.calls.find(({ function: fn }) => fn === "facts.cube.resolved.read")!
+      .arguments.view,
+  ).toEqual({
+    ...fixture.definition,
+    layout: {
+      rows: ["Month", "Region", "Product", "Channel", "Measure", "Currency"],
+      columns: ["Scenario", "Company"],
+      pages: ["Year"],
+      filters: ["Version"],
+    },
+  });
+});
+
+it("moves and reorders every canonical layout role without changing selection or emptying a required axis", async () => {
+  const fixture = canonicalReshapeFixture();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+  fireEvent.click(screen.getByRole("button", { name: "Configure layout" }));
+  fireEvent.change(screen.getByLabelText("Company axis location"), {
+    target: { value: "filters" },
+  });
+  fireEvent.change(screen.getByLabelText("Version axis location"), {
+    target: { value: "columns" },
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Move Month earlier in Columns" }),
+  );
+  fireEvent.change(screen.getByLabelText("Scenario axis location"), {
+    target: { value: "rows" },
+  });
+  fireEvent.change(screen.getByLabelText("Company axis location"), {
+    target: { value: "pages" },
+  });
+  fireEvent.change(screen.getByLabelText("Year axis location"), {
+    target: { value: "rows" },
+  });
+  fireEvent.change(screen.getByLabelText("Version axis location"), {
+    target: { value: "rows" },
+  });
+  expect(
+    within(screen.getByLabelText("Month axis location")).getByRole("option", {
+      name: "Rows",
+    }),
+  ).toBeDisabled();
+  // The transition itself also refuses an invalid event; the UI is not the only guard.
+  fireEvent.change(screen.getByLabelText("Month axis location"), {
+    target: { value: "rows" },
+  });
+  expect(screen.getByLabelText("Month axis location")).toHaveValue("columns");
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  await waitFor(() =>
+    expect(
+      fixture.calls.some(
+        ({ function: fn }) => fn === "facts.cube.resolved.read",
+      ),
+    ).toBe(true),
+  );
+  expect(
+    fixture.calls.find(({ function: fn }) => fn === "facts.cube.resolved.read")!
+      .arguments.view,
+  ).toEqual({
+    ...fixture.definition,
+    layout: {
+      rows: [
+        "Region",
+        "Product",
+        "Channel",
+        "Measure",
+        "Currency",
+        "Scenario",
+        "Year",
+        "Version",
+      ],
+      columns: ["Month"],
+      pages: ["Company"],
+      filters: [],
+    },
+  });
+  expect(unsavedWorkSnapshot()).toHaveLength(1);
+});
+
+it("suggests primary axes for an opened canonical view without regenerating its selection or layer", async () => {
+  const fixture = canonicalReshapeFixture("calculated");
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+  fireEvent.click(screen.getByRole("button", { name: "Configure layout" }));
+  fireEvent.click(screen.getByRole("button", { name: "Suggest layout" }));
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  await waitFor(() =>
+    expect(
+      fixture.calls.some(
+        ({ function: fn }) => fn === "facts.cube.resolved.read",
+      ),
+    ).toBe(true),
+  );
+  expect(
+    fixture.calls.find(({ function: fn }) => fn === "facts.cube.resolved.read")!
+      .arguments.view,
+  ).toEqual({
+    ...fixture.definition,
+    layout: {
+      ...fixture.definition.layout,
+      rows: ["Company", "Year", "Product", "Channel", "Measure", "Currency"],
+      columns: ["Region", "Month"],
+    },
+  });
+});
+
+it.each(["same-values-again", "changed-authority", "newer-layout"] as const)(
+  "fences an earlier save acknowledgement after %s",
+  async (change) => {
+    const fixture = canonicalReshapeFixture();
+    let finish!: (response: Response) => void;
+    fixture.control.save = () =>
+      new Promise<Response>((resolve) => {
+        finish = resolve;
+      });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+    fireEvent.click(screen.getByText("Save current view"));
+    fireEvent.change(screen.getByLabelText("Display name"), {
+      target: { value: "Reviewed view" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+    await waitFor(() => expect(finish).toBeDefined());
+    if (change === "changed-authority")
+      fixture.view.rerender(
+        <Analyze
+          app={savedViewApp}
+          catalog={{
+            ...fixture.catalog,
+            revisions: { ...fixture.catalog.revisions, security: 2 },
+          }}
+          index={0}
+          subject="owner"
+        />,
+      );
+    else if (change === "newer-layout")
+      fireEvent.change(screen.getByLabelText("Rows"), {
+        target: { value: "Region" },
+      });
+    else {
+      fireEvent.change(screen.getByLabelText("Display name"), {
+        target: { value: "Intervening edit" },
+      });
+      fireEvent.change(screen.getByLabelText("Display name"), {
+        target: { value: "Reviewed view" },
+      });
+    }
+    await act(async () =>
+      finish(fixture.response({ ...fixture.grid, name: "Reviewed view" })),
+    );
+    expect(unsavedWorkSnapshot()).toHaveLength(1);
+    if (change === "changed-authority")
+      expect(
+        screen.queryByText(/^Saved Reviewed view/),
+      ).not.toBeInTheDocument();
+    else
+      expect(
+        screen.getByText(/Your newer view edits are still unsaved/),
+      ).toBeVisible();
+  },
+);
+
+it.each(["save", "delete"] as const)(
+  "releases obsolete %s presentation on authority refresh without clearing a newer operation's busy state",
+  async (operation) => {
+    const fixture = canonicalReshapeFixture();
+    const pending: Array<(response: Response) => void> = [];
+    fixture.control.save = () =>
+      new Promise<Response>((resolve) => {
+        pending.push(resolve);
+      });
+    fixture.control.remove = fixture.control.save;
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+    fireEvent.click(screen.getByText("Save current view"));
+    fireEvent.change(screen.getByLabelText("Display name"), {
+      target: { value: "Earlier authority" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: operation === "save" ? "Save view" : "Delete view",
+      }),
+    );
+    await waitFor(() => expect(pending).toHaveLength(1));
+    fixture.view.rerender(
+      <Analyze
+        app={savedViewApp}
+        catalog={{
+          ...fixture.catalog,
+          revisions: { ...fixture.catalog.revisions, security: 2 },
+        }}
+        index={0}
+        subject="owner"
+      />,
+    );
+    const save = screen.getByRole("button", { name: "Save view" });
+    await waitFor(() => expect(save).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("Display name"), {
+      target: { value: "Current authority" },
+    });
+    fireEvent.click(save);
+    await waitFor(() => expect(pending).toHaveLength(2));
+    await act(async () =>
+      pending[0](
+        fixture.response(
+          operation === "save"
+            ? { ...fixture.grid, name: "Earlier authority" }
+            : { gridId: fixture.grid.gridId, status: "Deleted" },
+        ),
+      ),
+    );
+    expect(save).toBeDisabled();
+    expect(
+      screen.queryByText(/^Saved Earlier authority/),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Deleted /)).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Stable grid ID")).toHaveValue(
+      fixture.definition.viewId,
+    );
+    expect(screen.getByLabelText("Display name")).toHaveValue(
+      "Current authority",
+    );
+    expect(unsavedWorkSnapshot()).toHaveLength(1);
+    await act(async () =>
+      pending[1](
+        fixture.response({ ...fixture.grid, name: "Current authority" }),
+      ),
+    );
+    await waitFor(() => expect(save).toBeEnabled());
+    expect(screen.getByText("Saved Current authority.")).toBeVisible();
+    expect(unsavedWorkSnapshot()).toHaveLength(0);
+  },
+);
+
+it.each(["filtered", "refused"] as const)(
+  "clears an opened saved view and its catalogue entry when the current list is %s",
+  async (outcome) => {
+    const fixture = canonicalReshapeFixture();
+    const open = screen.getByRole("button", { name: "Open view" });
+    await waitFor(() => expect(open).toBeEnabled());
+    fireEvent.click(open);
+    expect(screen.getByLabelText("Configured grid source")).toHaveTextContent(
+      "combined",
+    );
+    fixture.control.list = () =>
+      outcome === "filtered"
+        ? fixture.response({
+            grids: [],
+            nextAfterGridId: null,
+            collectionToken: "c".repeat(64),
+          })
+        : new Response(
+            JSON.stringify({
+              code: "SAVED_GRID_SCOPE_UNAVAILABLE",
+              message:
+                "The complete saved-view selection is unavailable under your current dimensional access.",
+            }),
+            { status: 403 },
+          );
+    fireEvent.click(screen.getByRole("button", { name: "Refresh views" }));
+    await waitFor(() => expect(open).toBeDisabled());
+    await waitFor(() =>
+      expect(screen.getByLabelText("Configured grid source")).toHaveTextContent(
+        "raw",
+      ),
+    );
+    expect(
+      screen.queryByRole("option", { name: fixture.grid.name }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Opened /)).not.toBeInTheDocument();
+  },
+);
+
+it("keeps a newer local view draft after deletion of its original saved definition completes", async () => {
+  const fixture = canonicalReshapeFixture();
+  let finish!: (response: Response) => void;
+  fixture.control.remove = () =>
+    new Promise<Response>((resolve) => {
+      finish = resolve;
+    });
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+  fireEvent.click(screen.getByText("Save current view"));
+  fireEvent.click(screen.getByRole("button", { name: "Delete view" }));
+  await waitFor(() => expect(finish).toBeDefined());
+  fireEvent.change(screen.getByLabelText("Display name"), {
+    target: { value: "Newer local definition" },
+  });
+  await act(async () =>
+    finish(
+      fixture.response({ gridId: fixture.grid.gridId, status: "Deleted" }),
+    ),
+  );
+  expect(screen.getByLabelText("Display name")).toHaveValue(
+    "Newer local definition",
+  );
+  expect(screen.getByLabelText("Configured grid source")).toHaveTextContent(
+    "combined",
+  );
+  expect(unsavedWorkSnapshot()).toHaveLength(1);
+});
+
+it("retains the reshaped canonical draft when inspecting a cell and returning to it", async () => {
+  const fixture = canonicalReshapeFixture("calculated");
+  fixture.control.rows = [
+    {
+      members: Object.fromEntries(
+        fixture.definition.selection.dimensions.map((axis) => [
+          axis.dimensionId,
+          axis.include.kind === "member"
+            ? axis.include.memberId
+            : axis.include.memberIds[0],
+        ]),
+      ),
+      values: {
+        calculated: [
+          {
+            present: true,
+            value: "125.00000000",
+            unit: "amount",
+            origin: "materialized",
+            currentness: "current",
+            resultStateToken: "a".repeat(64),
+          },
+        ],
+      },
+    },
+  ];
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+  fireEvent.click(screen.getByText("Save current view"));
+  fireEvent.change(screen.getByLabelText("Rows"), {
+    target: { value: "Region" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  const cell = await screen.findByRole("button", { name: /125\.00000000/ });
+  fireEvent.click(cell);
+  const close = await screen.findByRole("button", { name: "Close writeback" });
+  await waitFor(() => expect(close).toBeEnabled());
+  fireEvent.click(close);
+  expect(cell).toHaveFocus();
+  expect(screen.getByLabelText("Stable grid ID")).toHaveValue(
+    fixture.definition.viewId,
+  );
+  expect(screen.getByLabelText("Display name")).toHaveValue(
+    fixture.definition.name,
+  );
+  expect(unsavedWorkSnapshot()).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+  await waitFor(() =>
+    expect(
+      fixture.calls.some(({ function: fn }) => fn === "grid.definition.save"),
+    ).toBe(true),
+  );
+  expect(
+    fixture.calls.find(({ function: fn }) => fn === "grid.definition.save")!
+      .arguments.definition,
+  ).toEqual({
+    ...fixture.definition,
+    layout: {
+      ...fixture.definition.layout,
+      rows: ["Region", "Company", "Product", "Channel", "Measure", "Currency"],
+    },
+  });
+});
 
 it("automatically discovers all shared saved views in a visible region without a refresh ritual", async () => {
   const requests: Record<string, unknown>[] = [];
@@ -2296,3 +3959,1125 @@ it("refreshes view discovery without losing a draft and guards opening another v
   expect(screen.getByLabelText("Rows")).toHaveValue("Account");
   expect(screen.getByLabelText("Stable grid ID")).toHaveValue("shared");
 });
+
+it("shows every configured saved axis and labels the own read actually executed", async () => {
+  const rowIds = [
+    "Company",
+    "Region",
+    "Product",
+    "Channel",
+    "Measure",
+    "Currency",
+  ];
+  const columnIds = ["Year", "Month"];
+  const fixedIds = [
+    "Scenario",
+    "View",
+    "Value",
+    "DataType",
+    "Team",
+    "Site",
+    "Skill",
+  ];
+  const definition = viewDefinition({
+    id: "many-axes",
+    rows: rowIds,
+    columns: columnIds,
+    pov: Object.fromEntries(fixedIds.map((id) => [id, `${id}-member`])),
+  });
+  definition.layout.pages = [fixedIds[0]];
+  definition.layout.filters = fixedIds.slice(1);
+  const calls: Array<{ function: string; arguments: Record<string, unknown> }> =
+    [];
+  const response = (result: unknown) =>
+    new Response(JSON.stringify({ result }));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_input, init) => {
+      const body = JSON.parse(String(init?.body));
+      const program = body.program;
+      calls.push(program);
+      if (program.function === "metadata.dimension.list")
+        return response({
+          rows: [...rowIds, ...columnIds, ...fixedIds].map((id) => ({
+            dimension_id: id,
+            name: id,
+            model_role: "Custom",
+            status: "Active",
+          })),
+          metadataRevision: 11,
+          nextAfterDimensionId: null,
+        });
+      if (program.function === "grid.definition.list")
+        return response({
+          grids: [
+            { ...savedView("many-axes"), name: definition.name, definition },
+          ],
+          nextAfterGridId: null,
+          collectionToken: "b".repeat(64),
+        });
+      if (program.function === "metadata.member.list")
+        return response({
+          rows: [
+            {
+              member_id: `${program.arguments.dimension}-member`,
+              name: `${program.arguments.dimension}-member`,
+              status: "Active",
+            },
+          ],
+          metadataRevision: 11,
+          nextAfterMemberId: null,
+        });
+      if (program.function === "facts.cube.resolved.binding.list")
+        return response({ bindings: [] });
+      if (program.function === "facts.cube.resolved.read")
+        return response({
+          rows: [
+            {
+              members: Object.fromEntries(
+                [...rowIds, ...columnIds, ...fixedIds].map((id) => [
+                  id,
+                  `${id}-member`,
+                ]),
+              ),
+              present: true,
+              value: "25.00",
+              resultUnit: "amount",
+              origin: "input",
+              currentness: "current",
+              resultStateToken: null,
+              lineage: [],
+            },
+          ],
+          snapshot: { commitRevision: 20 },
+          stages: [
+            { stage: "input", sourceDigest: "source", currentness: "current" },
+          ],
+          presentation: {
+            pageSize: 100,
+            suppression: { missing: false, zero: false },
+            rowCount: 1,
+          },
+        });
+      throw new Error(`Unexpected ${program.function}`);
+    }),
+  );
+  render(
+    <Analyze
+      app={savedViewApp}
+      catalog={{
+        ...savedViewCatalog(),
+        functions: {
+          ...savedViewCatalog().functions,
+          "facts.cube.resolved.read": {},
+          "facts.cube.resolved.binding.list": {},
+        },
+      }}
+      index={0}
+      subject="owner"
+    />,
+  );
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+  const summary = screen.getByLabelText("Current grid layout");
+  expect(summary).toHaveTextContent(`6 axes · ${rowIds.join(" / ")}`);
+  expect(summary).toHaveTextContent(`2 axes · ${columnIds.join(" / ")}`);
+  expect(summary).toHaveTextContent("1 axis · Scenario");
+  expect(summary).toHaveTextContent(
+    `6 axes · ${fixedIds.slice(1).join(" / ")}`,
+  );
+  const secondary = screen.getByLabelText("Opened grid layout");
+  for (const id of [...rowIds, ...columnIds, ...fixedIds])
+    expect(secondary).toHaveTextContent(id);
+  expect(screen.getByText("No snapshot read")).toBeInTheDocument();
+  expect(screen.getByLabelText("Value semantics")).toHaveValue("own");
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  await waitFor(() => expect(screen.getByText("25.00")).toBeInTheDocument());
+  expect(screen.getByLabelText("Loaded grid read")).toHaveTextContent(
+    "Own input at each member · input · current",
+  );
+  expect(screen.getByLabelText("Loaded grid read")).not.toHaveTextContent(
+    "effective",
+  );
+  const read = calls.find(
+    (call) => call.function === "facts.cube.resolved.read",
+  );
+  expect(read?.arguments).toMatchObject({
+    source: { semantics: "own" },
+    selection: definition.selection,
+    dynamicFallback: false,
+  });
+  fireEvent.change(screen.getByLabelText("Value semantics"), {
+    target: { value: "effective" },
+  });
+  expect(screen.getByRole("button", { name: "Read grid" })).toBeDisabled();
+  expect(screen.getByLabelText("Grid read unavailable")).toHaveTextContent(
+    "cannot replace that source layer",
+  );
+  expect(screen.queryByText("25.00")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Loaded grid read")).not.toBeInTheDocument();
+  expect(
+    calls.filter((call) => call.function === "facts.cube.resolved.read"),
+  ).toHaveLength(1);
+});
+
+it("ignores a delayed grid result after its read policy changes", async () => {
+  let resolveRead!: (response: Response) => void;
+  let readSignal: AbortSignal | undefined;
+  const response = (result: unknown) =>
+    new Response(JSON.stringify({ result }));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_input, init) => {
+      const { program } = JSON.parse(String(init?.body));
+      if (program.function === "metadata.dimension.list")
+        return savedViewDimensions();
+      if (program.function === "metadata.member.list")
+        return response({
+          rows: [{ member_id: "member", name: "Member", status: "Active" }],
+          metadataRevision: 11,
+          nextAfterMemberId: null,
+        });
+      if (program.function === "facts.cube.resolved.read") {
+        readSignal = init?.signal as AbortSignal;
+        return new Promise<Response>((resolve) => {
+          resolveRead = resolve;
+        });
+      }
+      throw new Error(`Unexpected ${program.function}`);
+    }),
+  );
+  render(
+    <Analyze
+      app={savedViewApp}
+      catalog={{
+        ...savedViewCatalog(),
+        functions: {
+          "metadata.dimension.list": {},
+          "metadata.member.list": {},
+          "facts.cube.resolved.read": {},
+        },
+      }}
+      index={0}
+      subject="owner"
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Configure layout" }));
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Suggest layout" }),
+    ).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Suggest layout" }));
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  await waitFor(() => expect(resolveRead).toBeTypeOf("function"));
+  fireEvent.change(screen.getByLabelText("Value semantics"), {
+    target: { value: "stored" },
+  });
+  expect(readSignal?.aborted).toBe(true);
+  await act(async () =>
+    resolveRead(
+      response({
+        rows: [
+          {
+            members: { Account: "member", Period: "member" },
+            present: true,
+            value: "stale-private-value",
+            resultUnit: "text",
+            origin: "input",
+            currentness: "current",
+            resultStateToken: null,
+            lineage: [],
+          },
+        ],
+        snapshot: { commitRevision: 20 },
+        stages: [],
+        presentation: {
+          pageSize: 100,
+          suppression: { missing: false, zero: false },
+          rowCount: 1,
+        },
+      }),
+    ),
+  );
+  expect(screen.queryByText("stale-private-value")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Loaded grid read")).not.toBeInTheDocument();
+  expect(screen.getByText("No snapshot read")).toBeInTheDocument();
+  expect(screen.getByLabelText("Configured read policy")).toHaveTextContent(
+    "Stored raw values",
+  );
+});
+
+it("reports a failed effective read without substituting own or raw values", async () => {
+  const reads: Array<Record<string, unknown>> = [];
+  const response = (result: unknown) =>
+    new Response(JSON.stringify({ result }));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_input, init) => {
+      const { program } = JSON.parse(String(init?.body));
+      if (program.function === "metadata.dimension.list")
+        return savedViewDimensions();
+      if (program.function === "metadata.member.list")
+        return response({
+          rows: [{ member_id: "member", name: "Member", status: "Active" }],
+          metadataRevision: 11,
+          nextAfterMemberId: null,
+        });
+      if (program.function === "facts.cube.resolved.binding.list")
+        return response({
+          bindings: [
+            {
+              bindingId: "governed-result",
+              stateToken: "b".repeat(64),
+              stages: [],
+            },
+          ],
+        });
+      reads.push(program);
+      return new Response(JSON.stringify({ code: "CALCULATION_REQUIRED" }), {
+        status: 409,
+      });
+    }),
+  );
+  render(
+    <Analyze
+      app={savedViewApp}
+      catalog={{
+        ...savedViewCatalog(),
+        functions: {
+          "metadata.dimension.list": {},
+          "metadata.member.list": {},
+          "facts.cube.resolved.read": {},
+          "facts.cube.resolved.binding.list": {},
+        },
+      }}
+      index={0}
+      subject="owner"
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Configure layout" }));
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Suggest layout" }),
+    ).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Suggest layout" }));
+  fireEvent.change(screen.getByLabelText("Value semantics"), {
+    target: { value: "effective" },
+  });
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Read grid" })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  await waitFor(() =>
+    expect(screen.getByRole("alert")).toHaveTextContent("CALCULATION_REQUIRED"),
+  );
+  expect(reads).toHaveLength(1);
+  expect(reads[0]).toMatchObject({
+    function: "facts.cube.resolved.read",
+    arguments: {
+      source: {
+        semantics: "effective",
+        bindingId: "governed-result",
+        bindingStateToken: "b".repeat(64),
+      },
+      dynamicFallback: false,
+    },
+  });
+  expect(screen.getByText("No snapshot read")).toBeInTheDocument();
+  expect(screen.queryByLabelText("Loaded grid read")).not.toBeInTheDocument();
+});
+
+it("reads the complete canonical combined selection and keeps its two values separate", async () => {
+  const definition = viewDefinition({
+    id: "combined-view",
+    kind: "combined",
+    resultKey: "forecast.result",
+  });
+  definition.selection.dimensions[0].include = {
+    kind: "members",
+    memberIds: ["Revenue", "Cost"],
+  };
+  const calls: Array<{ function: string; arguments: Record<string, unknown> }> =
+    [];
+  const response = (result: unknown) =>
+    new Response(JSON.stringify({ result }));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_input, init) => {
+      const { program } = JSON.parse(String(init?.body));
+      calls.push(program);
+      if (program.function === "metadata.dimension.list")
+        return savedViewDimensions();
+      if (program.function === "grid.definition.list")
+        return response({
+          grids: [
+            {
+              ...savedView("combined-view"),
+              name: definition.name,
+              definition,
+            },
+          ],
+          nextAfterGridId: null,
+          collectionToken: "b".repeat(64),
+        });
+      if (program.function === "metadata.member.list")
+        return response({
+          rows: [],
+          nextAfterMemberId: null,
+          metadataRevision: 11,
+        });
+      if (program.function === "facts.cell.editability.read")
+        return response({
+          editable: false,
+          reasonCode: "CALCULATED_RESULT_READ_ONLY",
+          message: "Separate result layers are read-only.",
+        });
+      if (program.function !== "facts.cube.resolved.read")
+        throw new Error(`Unexpected ${program.function}`);
+      return response({
+        format: "openepm-cube-view-read-v1",
+        dataSource: definition.dataSource,
+        readPolicy: { semantics: "stored" },
+        complete: true,
+        snapshot: { commitRevision: 23 },
+        presentation: { pageSize: 100, rowCount: 1 },
+        rows: [
+          {
+            members: { Account: "Revenue", Period: "Period-member" },
+            values: {
+              raw: [
+                {
+                  present: true,
+                  value: "100.00000000",
+                  unit: "amount",
+                  origin: "input",
+                  currentness: "current",
+                  resultStateToken: null,
+                },
+              ],
+              calculated: [
+                {
+                  present: true,
+                  value: "105.00000000",
+                  unit: "amount",
+                  origin: "materialized",
+                  currentness: "current",
+                  resultStateToken: "a".repeat(64),
+                },
+              ],
+            },
+          },
+        ],
+        calculation: {
+          resultKey: "forecast.result",
+          resultStateToken: "a".repeat(64),
+          inputRevisionStatus: { matchesAtRead: true },
+        },
+      });
+    }),
+  );
+  render(
+    <Analyze
+      app={savedViewApp}
+      catalog={{
+        ...savedViewCatalog(),
+        functions: {
+          ...savedViewCatalog().functions,
+          "facts.cube.resolved.read": {
+            canonicalViewRead: "openepm-cube-view-read-v1",
+          },
+          "facts.cell.editability.read": {},
+        },
+      }}
+      index={0}
+      subject="owner"
+    />,
+  );
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  await waitFor(() =>
+    expect(
+      screen.getByText("Raw: 100.00000000 · Calculated: 105.00000000"),
+    ).toBeInTheDocument(),
+  );
+  expect(screen.getByLabelText("Loaded grid read")).toHaveTextContent(
+    "Separate raw and calculated values",
+  );
+  expect(screen.getByRole("button", { name: "KPI" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Chart" })).toBeDisabled();
+  expect(
+    screen.getByText(
+      /KPI and chart presentations require a single source layer/,
+    ),
+  ).toBeInTheDocument();
+  const actual = calls.find(
+    (call) => call.function === "facts.cube.resolved.read",
+  );
+  expect(actual?.arguments).toEqual({
+    format: "openepm-cube-view-read-v1",
+    view: definition,
+    readPolicy: { semantics: "stored" },
+    limits: { maxRows: 500, maxSourceRows: 100_000, timeoutMs: 30_000 },
+  });
+  expect(
+    calls.some(
+      (call) =>
+        call.function === "facts.calculation.scan" ||
+        call.function === "facts.cube.scan",
+    ),
+  ).toBe(false);
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: /Account Revenue, Period Period-member\. Raw:/,
+    }),
+  );
+  expect(screen.getByLabelText("Separate source values")).toHaveTextContent(
+    "Raw100.00000000Calculated105.00000000",
+  );
+  expect(
+    screen.queryByRole("button", { name: "Submit durable writeback" }),
+  ).not.toBeInTheDocument();
+});
+
+const presentationValue = (
+  value: string | null,
+  unit: string | Record<string, unknown> = "amount",
+) => ({
+  value,
+  unit,
+  present: value !== null,
+  origin: "input",
+  currentness: "current",
+  resultStateToken: null,
+});
+
+it.each([
+  { name: "empty results", values: [], reason: /loaded page has none/ },
+  {
+    name: "missing values",
+    values: [[presentationValue(null)]],
+    reason: /missing values are not treated as zero/,
+  },
+  {
+    name: "present empty text",
+    values: [[presentationValue("", "text")]],
+    reason: /loaded page contains text/,
+  },
+  {
+    name: "mixed text and numbers",
+    values: [
+      [presentationValue("0.00000000")],
+      [presentationValue("note", "text")],
+    ],
+    reason: /loaded page contains text/,
+  },
+  {
+    name: "different currencies",
+    values: [
+      [presentationValue("1.20000000", { type: "currency", memberId: "CHF" })],
+      [presentationValue("1.30000000", { type: "currency", memberId: "USD" })],
+    ],
+    reason: /loaded page contains different units/,
+  },
+  {
+    name: "multiple values at one coordinate",
+    values: [
+      [presentationValue("1.00000000"), presentationValue("2.00000000")],
+    ],
+    reason: /require one value per coordinate/,
+  },
+  {
+    name: "zero alongside a missing value in another unit",
+    values: [
+      [presentationValue("0.00000000")],
+      [presentationValue(null, "ratio")],
+    ],
+    reason: null,
+    label: "0.00000000",
+    scope: /Showing 1 of 1 present numeric values.*Missing values are omitted/,
+  },
+  {
+    name: "matching currencies with differently ordered unit fields",
+    values: [
+      [presentationValue("1.20000000", { type: "currency", memberId: "CHF" })],
+      [presentationValue("1.30000000", { memberId: "CHF", type: "currency" })],
+    ],
+    reason: null,
+    label: "1.20000000 CHF",
+    scope: /Showing 2 of 2 present numeric values/,
+  },
+  {
+    name: "bounded cards within a larger page",
+    values: Array.from({ length: 25 }, () => [presentationValue("0.00000000")]),
+    reason: null,
+    label: "0.00000000",
+    scope: /Showing 24 of 25 present numeric values/,
+  },
+  {
+    name: "an intermediate presentation page",
+    values: [
+      [presentationValue("1.00000000")],
+      [presentationValue("2.00000000")],
+    ],
+    pageSize: 1,
+    reason: null,
+    label: "1.00000000",
+    scope: /More grid pages are available; this is not the complete selection/,
+  },
+])(
+  "explains KPI/chart availability for $name without changing the read",
+  async (scenario) => {
+    const definition = viewDefinition();
+    const rows = scenario.values.map((values, index) => ({
+      members: { Account: `Account-${index}`, Period: "Period-member" },
+      values: { raw: values },
+    }));
+    definition.selection.dimensions[0].include = {
+      kind: "members",
+      memberIds: rows.length
+        ? rows.map((row) => row.members.Account)
+        : ["Account-empty"],
+    };
+    const calls: string[] = [];
+    let finishRead: ((response: Response) => void) | undefined;
+    const response = (result: unknown) =>
+      new Response(JSON.stringify({ result }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input, init) => {
+        const { program } = JSON.parse(String(init?.body));
+        calls.push(program.function);
+        if (program.function === "metadata.dimension.list")
+          return savedViewDimensions();
+        if (program.function === "grid.definition.list")
+          return response({
+            grids: [
+              { ...savedView("grid-a"), name: definition.name, definition },
+            ],
+            nextAfterGridId: null,
+            collectionToken: "b".repeat(64),
+          });
+        if (program.function === "metadata.member.list")
+          return response({
+            rows: [],
+            nextAfterMemberId: null,
+            metadataRevision: 11,
+          });
+        if (program.function !== "facts.cube.resolved.read")
+          throw new Error(`Unexpected ${program.function}`);
+        return new Promise<Response>((resolve) => {
+          finishRead = resolve;
+        });
+      }),
+    );
+    render(
+      <Analyze
+        app={savedViewApp}
+        catalog={{
+          ...savedViewCatalog(),
+          functions: {
+            ...savedViewCatalog().functions,
+            "facts.cube.resolved.read": {
+              canonicalViewRead: "openepm-cube-view-read-v1",
+            },
+          },
+        }}
+        index={0}
+        subject="owner"
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+    expect(screen.getByRole("button", { name: "KPI" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "KPI" }),
+    ).toHaveAccessibleDescription(/Read the grid/);
+    expect(screen.getByText("No snapshot read")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+    await waitFor(() => expect(finishRead).toBeDefined());
+    expect(
+      screen.getByRole("button", { name: "Chart" }),
+    ).toHaveAccessibleDescription(/Reading the grid/);
+    expect(screen.queryByLabelText("Loaded grid read")).not.toBeInTheDocument();
+    const result = {
+      format: "openepm-cube-view-read-v1",
+      dataSource: definition.dataSource,
+      readPolicy: { semantics: "own" },
+      complete: true,
+      snapshot: { commitRevision: 23 },
+      presentation: {
+        pageSize: scenario.pageSize || 100,
+        rowCount: rows.length,
+      },
+      rows,
+    };
+    await act(async () => finishRead!(response(result)));
+    expect(screen.getByLabelText("Loaded grid read")).toBeInTheDocument();
+    if (scenario.reason) {
+      for (const name of ["KPI", "Chart"]) {
+        expect(screen.getByRole("button", { name })).toBeDisabled();
+        expect(
+          screen.getByRole("button", { name }),
+        ).toHaveAccessibleDescription(scenario.reason);
+      }
+      expect(screen.getByRole("button", { name: "Grid" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+      expect(
+        screen.queryByLabelText("Snapshot KPI cards"),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByLabelText("Snapshot value chart"),
+      ).not.toBeInTheDocument();
+    } else {
+      fireEvent.click(screen.getByRole("button", { name: "KPI" }));
+      const cards = screen.getByLabelText("Snapshot KPI cards");
+      expect(
+        within(cards).getAllByText(scenario.label!)[0],
+      ).toBeInTheDocument();
+      expect(cards.querySelectorAll("article")).toHaveLength(
+        Math.min(
+          24,
+          scenario.pageSize ||
+            scenario.values.filter((values) => values[0].present).length,
+        ),
+      );
+      expect(
+        screen.getByRole("button", { name: "KPI" }),
+      ).toHaveAccessibleDescription(scenario.scope!);
+      fireEvent.click(screen.getByRole("button", { name: "Chart" }));
+      expect(
+        within(screen.getByLabelText("Snapshot value chart")).getAllByText(
+          scenario.label!,
+        )[0],
+      ).toBeInTheDocument();
+      // A later valid read of text invalidates the selected numeric presentation.
+      finishRead = undefined;
+      fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+      await waitFor(() => expect(finishRead).toBeDefined());
+      await act(async () =>
+        finishRead!(
+          response({
+            ...result,
+            presentation: { pageSize: 100, rowCount: 1 },
+            rows: [
+              {
+                members: rows[0].members,
+                values: { raw: [presentationValue("", "text")] },
+              },
+            ],
+          }),
+        ),
+      );
+      expect(screen.getByRole("button", { name: "Grid" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+      expect(screen.getByRole("button", { name: "Chart" })).toBeDisabled();
+      expect(
+        screen.queryByLabelText("Snapshot value chart"),
+      ).not.toBeInTheDocument();
+    }
+    expect(
+      calls.every((name) =>
+        [
+          "metadata.dimension.list",
+          "metadata.member.list",
+          "grid.definition.list",
+          "facts.cube.resolved.read",
+        ].includes(name),
+      ),
+    ).toBe(true);
+  },
+);
+
+it("preserves empty text, missing values and multiple calculation units in canonical results", () => {
+  const value = {
+    present: true,
+    origin: "materialized",
+    currentness: "current",
+    resultStateToken: "a".repeat(64),
+  };
+  const cells = cubeViewRowsToCells({
+    format: "openepm-cube-view-read-v1",
+    dataSource: { kind: "calculated", resultKey: "forecast.result" },
+    readPolicy: { semantics: "stored" },
+    complete: true,
+    snapshot: { commitRevision: 4 },
+    presentation: { pageSize: 100, rowCount: 3 },
+    rows: [
+      {
+        members: { Account: "text" },
+        values: { calculated: [{ ...value, value: "", unit: "text" }] },
+      },
+      {
+        members: { Account: "missing" },
+        values: {
+          calculated: [{ ...value, present: false, value: null, unit: null }],
+        },
+      },
+      {
+        members: { Account: "currency" },
+        values: {
+          calculated: [
+            {
+              ...value,
+              value: "1.20",
+              unit: { type: "Currency", memberId: "CHF" },
+            },
+            {
+              ...value,
+              value: "1.30",
+              unit: { type: "Currency", memberId: "USD" },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  expect(cellPresence(cells[0])).toBe("Present empty text");
+  expect(cellPresence(cells[1])).toBe("Missing");
+  expect(cellValue(cells[2])).toBe("Calculated: 1.20 CHF / 1.30 USD");
+  expect(cellPresence(cells[2])).toBe("Separate source values");
+});
+
+it.each(["own", "effective"] as const)(
+  "restores or refuses an explicit %s saved-view handoff without fallback",
+  async (semantics) => {
+    const digest = "d".repeat(64);
+    const context = vi.fn();
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input, init) => {
+        const { program } = JSON.parse(String(init?.body));
+        calls.push(program.function);
+        if (program.function === "metadata.dimension.list")
+          return savedViewDimensions();
+        if (program.function === "grid.definition.read")
+          return new Response(
+            JSON.stringify({
+              result: { ...savedView("linked-view"), canonicalDigest: digest },
+            }),
+          );
+        throw new Error(`Unexpected ${program.function}`);
+      }),
+    );
+    render(
+      <Analyze
+        app={savedViewApp}
+        catalog={{
+          ...savedViewCatalog(),
+          functions: {
+            "metadata.dimension.list": {},
+            "metadata.member.list": {},
+            "grid.definition.read": {},
+            "facts.cube.resolved.read": {
+              canonicalViewRead: "openepm-cube-view-read-v1",
+            },
+          },
+        }}
+        index={0}
+        subject="owner"
+        targetViewId="linked-view"
+        targetViewDigest={digest}
+        targetAnalyticalRead={
+          semantics === "own"
+            ? { semantics }
+            : {
+                semantics,
+                bindingId: "bound",
+                bindingStateToken: "b".repeat(64),
+              }
+        }
+        onViewContextChange={context}
+      />,
+    );
+    if (semantics === "own") {
+      await waitFor(() =>
+        expect(context).toHaveBeenLastCalledWith({
+          viewId: "linked-view",
+          viewDigest: digest,
+          analyticalRead: { semantics: "own" },
+        }),
+      );
+      expect(screen.getByLabelText("Value semantics")).toHaveValue("own");
+      expect(screen.getByText("No snapshot read")).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText("Rows"), {
+        target: { value: "Period" },
+      });
+      await waitFor(() => expect(context).toHaveBeenLastCalledWith(null));
+    } else {
+      await waitFor(() =>
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "cannot restore an effective binding",
+        ),
+      );
+      expect(context).toHaveBeenLastCalledWith(null);
+      expect(screen.getByRole("button", { name: "Read grid" })).toBeDisabled();
+    }
+    expect(
+      calls.every(
+        (call) =>
+          call === "metadata.dimension.list" || call === "grid.definition.read",
+      ),
+    ).toBe(true);
+  },
+);
+
+it("never reports the prior view through a new same-application target callback", async () => {
+  let finishSecond!: (response: Response) => void;
+  const second = new Promise<Response>((resolve) => {
+    finishSecond = resolve;
+  });
+  const firstContext = vi.fn();
+  const secondContext = vi.fn();
+  const digest = "d".repeat(64);
+  const catalog = {
+    ...savedViewCatalog(),
+    functions: {
+      "metadata.dimension.list": {},
+      "metadata.member.list": {},
+      "grid.definition.read": {},
+      "facts.cube.resolved.read": {
+        canonicalViewRead: "openepm-cube-view-read-v1",
+      },
+    },
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_input, init) => {
+      const { program } = JSON.parse(String(init?.body));
+      if (program.function === "metadata.dimension.list")
+        return savedViewDimensions();
+      if (program.function === "grid.definition.read") {
+        if (program.arguments.gridId === "second-view") return second;
+        return new Response(
+          JSON.stringify({
+            result: { ...savedView("first-view"), canonicalDigest: digest },
+          }),
+        );
+      }
+      throw new Error(`Unexpected ${program.function}`);
+    }),
+  );
+  const { rerender } = render(
+    <Analyze
+      app={savedViewApp}
+      catalog={catalog}
+      index={0}
+      subject="owner"
+      targetViewId="first-view"
+      targetViewDigest={digest}
+      targetAnalyticalRead={{ semantics: "own" }}
+      onViewContextChange={firstContext}
+    />,
+  );
+  await waitFor(() =>
+    expect(firstContext).toHaveBeenLastCalledWith({
+      viewId: "first-view",
+      viewDigest: digest,
+      analyticalRead: { semantics: "own" },
+    }),
+  );
+  rerender(
+    <Analyze
+      app={savedViewApp}
+      catalog={catalog}
+      index={0}
+      subject="owner"
+      targetViewId="second-view"
+      targetViewDigest={digest}
+      targetAnalyticalRead={{ semantics: "stored" }}
+      onViewContextChange={secondContext}
+    />,
+  );
+  expect(secondContext).toHaveBeenCalled();
+  expect(secondContext.mock.calls.every(([context]) => context === null)).toBe(
+    true,
+  );
+  finishSecond(
+    new Response(
+      JSON.stringify({
+        result: { ...savedView("second-view"), canonicalDigest: digest },
+      }),
+    ),
+  );
+  await waitFor(() =>
+    expect(secondContext).toHaveBeenLastCalledWith({
+      viewId: "second-view",
+      viewDigest: digest,
+      analyticalRead: { semantics: "stored" },
+    }),
+  );
+  expect(
+    secondContext.mock.calls.every(
+      ([context]) => context === null || context.viewId === "second-view",
+    ),
+  ).toBe(true);
+});
+
+it("preserves a reopened saved-view exclusion when editing only its includes", async () => {
+  const original = viewDefinition({ id: "excluded", name: "View excluded" });
+  const definition = {
+    ...original,
+    selection: {
+      ...original.selection,
+      dimensions: original.selection.dimensions.map((dimension) =>
+        dimension.dimensionId === "Account"
+          ? {
+              ...dimension,
+              include: {
+                kind: "members" as const,
+                memberIds: ["Revenue", "Cost"],
+              },
+              exclude: { kind: "member" as const, memberId: "Cost" },
+            }
+          : dimension,
+      ),
+    },
+  };
+  const reads: any[] = [];
+  const response = (result: unknown) =>
+    new Response(JSON.stringify({ result }));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_path, init) => {
+      const { program } = JSON.parse(String(init?.body));
+      if (program.function === "metadata.dimension.list")
+        return savedViewDimensions();
+      if (program.function === "grid.definition.list")
+        return response({
+          grids: [{ ...savedView("excluded"), definition }],
+          nextAfterGridId: null,
+          collectionToken: "b".repeat(64),
+        });
+      if (program.function === "metadata.member.list")
+        return response({
+          rows: (program.arguments.dimension === "Account"
+            ? ["Revenue", "Cost"]
+            : ["Period-member"]
+          ).map((member_id) => ({
+            member_id,
+            name: member_id,
+            status: "Active",
+          })),
+          metadataRevision: 11,
+          nextAfterMemberId: null,
+        });
+      if (program.function === "facts.cube.resolved.read") {
+        reads.push(program.arguments);
+        return response({
+          format: "openepm-cube-view-read-v1",
+          dataSource: definition.dataSource,
+          readPolicy: { semantics: "stored" },
+          complete: true,
+          snapshot: { commitRevision: 9 },
+          presentation: { pageSize: 100, rowCount: 0 },
+          rows: [],
+        });
+      }
+      throw new Error(`Unexpected ${program.function}`);
+    }),
+  );
+  render(
+    <Analyze
+      app={savedViewApp}
+      catalog={{
+        ...savedViewCatalog(),
+        functions: {
+          ...savedViewCatalog().functions,
+          "facts.cube.resolved.read": {
+            canonicalViewRead: "openepm-cube-view-read-v1",
+          },
+        },
+      }}
+      index={0}
+      subject="owner"
+    />,
+  );
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+  fireEvent.click(screen.getByRole("button", { name: "Configure layout" }));
+  fireEvent.click(screen.getByRole("button", { name: "Choose row members" }));
+  const picker = await screen.findByRole("dialog", {
+    name: "Choose row members",
+  });
+  expect(picker).toHaveTextContent(/Existing exclusion is kept/);
+  fireEvent.click(within(picker).getByRole("button", { name: "Remove Cost" }));
+  fireEvent.click(
+    within(picker).getByRole("button", { name: "Apply selection" }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Read grid" }));
+  await waitFor(() => expect(reads).toHaveLength(1));
+  expect(
+    reads[0].view.selection.dimensions.find(
+      (dimension: any) => dimension.dimensionId === "Account",
+    ),
+  ).toMatchObject({
+    include: { kind: "members", memberIds: ["Revenue"] },
+    exclude: { kind: "member", memberId: "Cost" },
+  });
+});
+
+it.each(["raw", "calculated", "combined"] as const)(
+  "does not discover effective bindings for an opened %s canonical view",
+  async (kind) => {
+    const fixture = canonicalReshapeFixture(kind);
+    fixture.view.rerender(
+      <Analyze
+        app={savedViewApp}
+        catalog={{
+          ...fixture.catalog,
+          functions: {
+            ...fixture.catalog.functions,
+            "facts.cube.resolved.binding.list": {},
+          },
+        }}
+        index={0}
+        subject="owner"
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Open view" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Open view" }));
+    expect(screen.getByLabelText("Value semantics")).toHaveValue(
+      kind === "raw" ? "own" : "stored",
+    );
+    fireEvent.change(screen.getByLabelText("Value semantics"), {
+      target: { value: "effective" },
+    });
+    await act(async () => {});
+    expect(screen.getByLabelText("Value semantics")).toHaveValue("effective");
+    expect(screen.getByRole("button", { name: "Read grid" })).toBeDisabled();
+    expect(screen.getByLabelText("Grid read unavailable")).toHaveTextContent(
+      "This saved source layer cannot be replaced by an effective binding.",
+    );
+    expect(
+      fixture.calls.filter(
+        (call) => call.function === "facts.cube.resolved.binding.list",
+      ),
+    ).toHaveLength(0);
+    expect(
+      fixture.calls.filter(
+        (call) => call.function === "facts.cube.resolved.read",
+      ),
+    ).toHaveLength(0);
+    expect(screen.getByLabelText("Current grid layout")).toHaveTextContent(
+      "Company",
+    );
+  },
+);

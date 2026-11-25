@@ -136,6 +136,22 @@ afterEach(() => {
 });
 
 describe("PythonRuleEditor", () => {
+  it("shows read-only source immediately without waiting for the enhanced editor", () => {
+    vi.mocked(loadPythonEditor).mockReturnValue(new Promise(() => undefined));
+    render(
+      <PythonRuleEditor
+        value={"def build():\n    return 1"}
+        onChange={vi.fn()}
+        readOnly
+        ariaLabel="Authorized Python source"
+      />,
+    );
+    expect(
+      screen.getByRole("region", { name: "Authorized Python source" }),
+    ).toHaveTextContent("def build(): return 1");
+    expect(screen.queryByText("Loading Python editor…")).toBeNull();
+  });
+
   it("binds UTF-16 markers to the exact source and immediately clears stale diagnostics on editing", async () => {
     const fake = runtime();
     vi.mocked(loadPythonEditor).mockResolvedValue(fake.loaded);
@@ -248,10 +264,12 @@ describe("PythonRuleEditor", () => {
     expect(await screen.findByText("arguments.fieldId")).toBeInTheDocument();
     expect(screen.getByText(details.diagnostics[0].hint!)).toBeInTheDocument();
     expect(container.querySelector("img")).toBeNull();
-    expect(fake.monaco.editor.setModelMarkers).toHaveBeenLastCalledWith(
-      fake.models[0],
-      "openepm-python-validation",
-      [],
+    await waitFor(() =>
+      expect(fake.monaco.editor.setModelMarkers).toHaveBeenLastCalledWith(
+        fake.models[0],
+        "openepm-python-validation",
+        [],
+      ),
     );
   });
 

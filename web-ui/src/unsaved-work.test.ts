@@ -9,6 +9,7 @@ import {
   act,
   fireEvent,
   render,
+  renderHook,
   screen,
   waitFor,
 } from "@testing-library/react";
@@ -23,6 +24,7 @@ import {
   unsavedWorkSnapshot,
   usePreservedDraft,
   type UnsavedWorkItem,
+  type DraftRecoveryLease,
 } from "./unsaved-work";
 
 afterEach(resetUnsavedWorkForTests);
@@ -107,7 +109,7 @@ it("hydrates an exact in-memory draft and isolates identity and application", as
   discarded.unmount();
 });
 
-it("evicts the oldest scoped draft deterministically at the entry bound", async () => {
+it("retains the warning when an ordinary oldest draft exceeds the entry bound", async () => {
   setDraftIdentity("bounded-owner");
   for (let index = 0; index < 25; index += 1) {
     const rendered = render(
@@ -125,9 +127,10 @@ it("evicts the oldest scoped draft deterministically at the entry bound", async 
     );
     rendered.unmount();
   }
-  expect(unsavedWorkSnapshot()).toHaveLength(24);
+  expect(unsavedWorkSnapshot()).toHaveLength(25);
+  expect(canPreserveUnsavedWork()).toBe(false);
   expect(unsavedWorkSnapshot().some((item) => item.id.includes("app-0"))).toBe(
-    false,
+    true,
   );
   expect(unsavedWorkSnapshot().some((item) => item.id.includes("app-24"))).toBe(
     true,
@@ -425,4 +428,311 @@ it("allows safe same-tab navigation only when every dirty editor is retained", a
   view.unmount();
   expect(canPreserveUnsavedWork()).toBe(true);
   expect(unsavedWorkSnapshot()).toHaveLength(1);
+});
+
+function recoveryHook(editor = "operation", restore = vi.fn()) {
+  return renderHook(() =>
+    usePreservedDraft(
+      "ws",
+      "app",
+      editor,
+      "Unconfirmed operation",
+      false,
+      { value: "" },
+      restore,
+    ),
+  );
+}
+
+it("reserves an exact cloned packet synchronously and preserves it through clean renders, discard and remount", async () => {
+  const first = recoveryHook();
+  const input = { value: "original signed packet" };
+  let lease!: DraftRecoveryLease;
+  act(() => {
+    lease = first.result.current.retain(input);
+  });
+  input.value = "mutated caller value";
+  expect(canPreserveUnsavedWork()).toBe(true);
+  expect(unsavedWorkSnapshot()).toHaveLength(1);
+  first.rerender();
+  act(discardUnsavedWork);
+  expect(unsavedWorkSnapshot()).toHaveLength(1);
+  first.unmount();
+  const restore = vi.fn();
+  const second = recoveryHook("operation", restore);
+  await waitFor(() =>
+    expect(restore).toHaveBeenCalledWith({ value: "original signed packet" }),
+  );
+  expect(second.result.current.lease).toEqual(lease);
+  act(() => second.result.current.release(lease, { value: "" }));
+  expect(unsavedWorkSnapshot()).toEqual([]);
+});
+
+it("protects all existing pins at the count limit and rejects before a caller can dispatch", async () => {
+  for (let index = 0; index < 24; index += 1) {
+    const hook = recoveryHook(`pending-${index}`);
+    act(() => {
+      hook.result.current.retain({ value: `packet-${index}` });
+    });
+    hook.unmount();
+  }
+  const next = recoveryHook("pending-new");
+  const dispatch = vi.fn();
+  expect(() => {
+    next.result.current.retain({ value: "new packet" });
+    dispatch();
+  }).toThrow("cannot retain another recovery record");
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(unsavedWorkSnapshot()).toHaveLength(24);
+  expect(canPreserveUnsavedWork()).toBe(true);
+  next.unmount();
+  const restore = vi.fn();
+  recoveryHook("pending-0", restore);
+  await waitFor(() =>
+    expect(restore).toHaveBeenCalledWith({ value: "packet-0" }),
+  );
+});
+
+it("evicts ordinary drafts before pins and keeps their loss visible", async () => {
+  const pin = recoveryHook();
+  act(() => {
+    pin.result.current.retain({ value: "oldest unresolved packet" });
+  });
+  pin.unmount();
+  for (let index = 0; index < 24; index += 1) {
+    const ordinary = render(
+      createElement(DraftHarness, { editor: `ordinary-${index}` }),
+    );
+    fireEvent.change(screen.getByLabelText("Draft value"), {
+      target: { value: `draft-${index}` },
+    });
+    ordinary.unmount();
+  }
+  expect(unsavedWorkSnapshot()).toHaveLength(25);
+  expect(canPreserveUnsavedWork()).toBe(false);
+  const restore = vi.fn();
+  recoveryHook("operation", restore);
+  await waitFor(() =>
+    expect(restore).toHaveBeenCalledWith({ value: "oldest unresolved packet" }),
+  );
+});
+
+it("rotates the expected lease on every replacement and rejects stale updates and settlement", async () => {
+  const hook = recoveryHook();
+  let lease!: DraftRecoveryLease;
+  act(() => {
+    lease = hook.result.current.retain({ value: "packet one" });
+  });
+  expect(() => hook.result.current.retain({ value: "double click" })).toThrow(
+    "existing recovery record",
+  );
+  expect(() =>
+    hook.result.current.retain(
+      { value: "forged" },
+      { ...lease, token: lease.token + 1 },
+    ),
+  ).toThrow("existing recovery record");
+  const previous = lease;
+  act(() => {
+    lease = hook.result.current.retain({ value: "known accepted task" }, lease);
+  });
+  expect(lease).not.toEqual(previous);
+  expect(() =>
+    hook.result.current.retain({ value: "late packet" }, previous),
+  ).toThrow("existing recovery record");
+  expect(() => hook.result.current.release(previous, { value: "" })).toThrow(
+    "already changed or settled",
+  );
+  act(() => hook.result.current.release(lease, { value: "" }));
+  expect(() =>
+    hook.result.current.retain({ value: "late packet" }, lease),
+  ).toThrow("existing recovery record");
+  expect(() => hook.result.current.release(lease, { value: "" })).toThrow(
+    "already changed or settled",
+  );
+  expect(unsavedWorkSnapshot()).toEqual([]);
+});
+
+it("invalidates captured handles on explicit abandonment and identity changes", () => {
+  setDraftIdentity("owner-a");
+  const hook = recoveryHook();
+  const captured = hook.result.current;
+  let lease!: DraftRecoveryLease;
+  act(() => {
+    lease = captured.retain({ value: "private packet" });
+  });
+  act(() => discardUnsavedWork({ abandonRecovery: true }));
+  expect(() => captured.retain({ value: "late response" }, lease)).toThrow(
+    "no longer current",
+  );
+  expect(() => captured.release(lease, { value: "" })).toThrow(
+    "no longer current",
+  );
+  expect(unsavedWorkSnapshot()).toEqual([]);
+  hook.rerender();
+  const newHandle = hook.result.current;
+  act(() => {
+    lease = newHandle.retain({ value: "second private packet" });
+  });
+  setDraftIdentity("owner-b");
+  expect(() =>
+    newHandle.retain({ value: "late identity response" }, lease),
+  ).toThrow("no longer current");
+  act(() => discardUnsavedWork({ abandonRecovery: true }));
+  hook.unmount();
+  const restore = vi.fn();
+  recoveryHook("operation", restore);
+  expect(restore).not.toHaveBeenCalled();
+  expect(unsavedWorkSnapshot()).toEqual([]);
+});
+
+it("atomically refuses oversized replacement and aggregate byte admission without losing prior recovery", async () => {
+  // Exercise exact production byte thresholds without allocating hundreds of MiB.
+  const original = TextEncoder.prototype.encode;
+  vi.spyOn(TextEncoder.prototype, "encode").mockImplementation(function (
+    this: TextEncoder,
+    value,
+  ) {
+    const sizes: Record<string, number> = {
+      large: 100 * 1024 * 1024,
+      oversized: 141 * 1024 * 1024,
+    };
+    const size = sizes[JSON.parse(String(value)).value];
+    return size
+      ? ({ length: size } as Uint8Array<ArrayBuffer>)
+      : original.call(this, value);
+  });
+  try {
+    const first = recoveryHook("first");
+    let lease!: DraftRecoveryLease;
+    act(() => {
+      lease = first.result.current.retain({ value: "large" });
+    });
+    expect(() =>
+      first.result.current.retain({ value: "oversized" }, lease),
+    ).toThrow("too large");
+    // Failed replacement must not invalidate the previous compare-and-swap token.
+    const retainedLease = lease;
+    act(() => {
+      lease = first.result.current.retain({ value: "large" }, retainedLease);
+    });
+    expect(lease.token).not.toBe(retainedLease.token);
+    first.unmount();
+    const second = recoveryHook("second");
+    act(() => {
+      second.result.current.retain({ value: "large" });
+    });
+    second.unmount();
+    const third = recoveryHook("third");
+    expect(() => third.result.current.retain({ value: "large" })).toThrow(
+      "cannot retain another",
+    );
+    third.unmount();
+    const restore = vi.fn();
+    recoveryHook("first", restore);
+    await waitFor(() =>
+      expect(restore).toHaveBeenCalledWith({ value: "large" }),
+    );
+    expect(unsavedWorkSnapshot()).toHaveLength(2);
+  } finally {
+    vi.restoreAllMocks();
+  }
+});
+
+it("does not replace a new local edit with a queued ordinary restored value", async () => {
+  const first = render(createElement(DraftHarness));
+  fireEvent.change(screen.getByLabelText("Draft value"), {
+    target: { value: "older saved draft" },
+  });
+  first.unmount();
+  const second = render(createElement(DraftHarness));
+  fireEvent.change(screen.getByLabelText("Draft value"), {
+    target: { value: "newer local edit" },
+  });
+  await act(async () => undefined);
+  expect(screen.getByLabelText("Draft value")).toHaveValue("newer local edit");
+  second.unmount();
+  render(createElement(DraftHarness));
+  await waitFor(() =>
+    expect(screen.getByLabelText("Draft value")).toHaveValue(
+      "newer local edit",
+    ),
+  );
+});
+
+it("restores a queued pinned record through ordinary discard but refuses restoration after identity change", async () => {
+  const original = recoveryHook();
+  act(() => {
+    original.result.current.retain({ value: "original packet" });
+  });
+  original.unmount();
+  const restore = vi.fn();
+  const next = recoveryHook("operation", restore);
+  act(discardUnsavedWork);
+  await waitFor(() =>
+    expect(restore).toHaveBeenCalledWith({ value: "original packet" }),
+  );
+  next.unmount();
+  const privateRestore = vi.fn();
+  recoveryHook("operation", privateRestore);
+  setDraftIdentity("another-person");
+  await act(async () => undefined);
+  expect(privateRestore).not.toHaveBeenCalled();
+});
+
+it("keeps an ordinary oversized edit visible as unpreserved without throwing from its effect", async () => {
+  const original = TextEncoder.prototype.encode;
+  const encoded = vi
+    .spyOn(TextEncoder.prototype, "encode")
+    .mockImplementation(function (this: TextEncoder, value) {
+      return String(value).includes("oversized edit")
+        ? ({ length: 141 * 1024 * 1024 } as Uint8Array<ArrayBuffer>)
+        : original.call(this, value);
+    });
+  try {
+    render(createElement(DraftHarness));
+    fireEvent.change(screen.getByLabelText("Draft value"), {
+      target: { value: "oversized edit" },
+    });
+    await act(async () => undefined);
+    expect(screen.getByLabelText("Draft value")).toHaveValue("oversized edit");
+    expect(unsavedWorkSnapshot()).toHaveLength(1);
+    expect(canPreserveUnsavedWork()).toBe(false);
+  } finally {
+    encoded.mockRestore();
+  }
+});
+
+it("keeps a remounted owner's newer recovery when the old owner later updates or releases", async () => {
+  const first = recoveryHook();
+  const oldHandle = first.result.current;
+  let original!: DraftRecoveryLease;
+  act(() => {
+    original = oldHandle.retain({ value: "original request" });
+  });
+  first.unmount();
+  const second = recoveryHook();
+  await waitFor(() => expect(second.result.current.lease).toEqual(original));
+  let next!: DraftRecoveryLease;
+  act(() => {
+    next = second.result.current.retain(
+      { value: "newer phase packet" },
+      original,
+    );
+  });
+  expect(() =>
+    oldHandle.retain({ value: "late original response" }, original),
+  ).toThrow("existing recovery record");
+  expect(() => oldHandle.release(original, { value: "" })).toThrow(
+    "already changed or settled",
+  );
+  second.unmount();
+  const restore = vi.fn();
+  const third = recoveryHook("operation", restore);
+  await waitFor(() =>
+    expect(restore).toHaveBeenCalledWith({ value: "newer phase packet" }),
+  );
+  expect(third.result.current.lease).toEqual(next);
+  act(() => third.result.current.release(next, { value: "" }));
+  expect(unsavedWorkSnapshot()).toEqual([]);
 });

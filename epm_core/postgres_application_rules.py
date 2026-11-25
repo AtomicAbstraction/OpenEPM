@@ -7,6 +7,7 @@ fixed-core plan admission path before admitting work.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import re
 from datetime import date
@@ -19,7 +20,7 @@ from psycopg.rows import dict_row
 from .persistence_contract import ApplicationScope
 from .postgres_access import PostgresAccessChecker
 from .postgres_connection import connect_postgres
-from .postgres_expression_rules import PostgresExpressionRules
+from .postgres_expression_rules import PostgresExpressionRules, READ_AUTHORIZATION_STALE
 from .postgres_jobs import _canonical_digest
 from .postgres_member_lists import EVALUATE as MEMBER_LIST_EVALUATE
 from .postgres_member_lists import PostgresMemberLists
@@ -40,7 +41,11 @@ RUN_RECONCILE = "application.rule.run.reconcile"
 STORED_FUNCTION = "application.rule.plan"
 FORMAT = "openepm-application-rule-v1"
 MAX_OPERATIONS = 500
-_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
+_ID_BODY = r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}"
+_ID = re.compile(_ID_BODY + r"\Z")
+_LIST_LIMIT = 100
+_LIST_REVISIONS = ("expectedMetadataRevision", "expectedPolicyRevision")
+_LIST_TOKEN = re.compile(r"[0-9a-f]{64}\Z")
 _PARAMETER_TYPES = frozenset(("Amount", "Ratio", "Member", "MemberList",
                               "String", "Boolean", "Date"))
 
@@ -283,17 +288,22 @@ def parse(raw: object, function: str) -> dict:
         raise ValueError("APPLICATION_RULE_PROGRAM_INVALID")
     args = raw["arguments"]
     if function == LIST:
-        if (set(args) - {"limit", "afterRuleId", "expectedMetadataRevision",
-                         "expectedPolicyRevision"}
-                or type(args.get("limit", 100)) is not int
-                or not 1 <= args.get("limit", 100) <= 100
+        if (set(args) - {"limit", "afterRuleId", "containsOperation", "collectionToken", *_LIST_REVISIONS}
+                or type(args.get("limit", _LIST_LIMIT)) is not int
+                or not 1 <= args.get("limit", _LIST_LIMIT) <= _LIST_LIMIT
                 or ("afterRuleId" in args and (
                     type(args["afterRuleId"]) is not str
                     or _ID.fullmatch(args["afterRuleId"]) is None
-                    or not {"expectedMetadataRevision",
-                            "expectedPolicyRevision"} <= set(args)))):
+                    or not set(_LIST_REVISIONS) <= set(args)))
+                or ("containsOperation" in args and (
+                    type(args["containsOperation"]) is not str
+                    or _ID.fullmatch(args["containsOperation"]) is None
+                    or ("afterRuleId" in args and "collectionToken" not in args)))
+                or ("collectionToken" in args and (
+                    "afterRuleId" not in args or type(args["collectionToken"]) is not str
+                    or _LIST_TOKEN.fullmatch(args["collectionToken"]) is None))):
             raise ValueError("APPLICATION_RULE_ARGUMENTS_INVALID")
-        for key in ("expectedMetadataRevision", "expectedPolicyRevision"):
+        for key in _LIST_REVISIONS:
             if key in args and (type(args[key]) is not int or args[key] < 0):
                 raise ValueError("APPLICATION_RULE_ARGUMENTS_INVALID")
         return args
@@ -350,6 +360,7 @@ def parse(raw: object, function: str) -> dict:
 class PostgresApplicationRules(PostgresExpressionRules):
     SAVE, PUBLISH, RETIRE, READ, LIST = SAVE, PUBLISH, RETIRE, READ, LIST
     STORED_FUNCTION = STORED_FUNCTION
+    LIST_COLLECTION_FORMAT = "openepm-current-rule-list-v1"
     _parse = staticmethod(parse)
 
     @staticmethod
@@ -376,6 +387,7 @@ class PostgresApplicationRules(PostgresExpressionRules):
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
                 PostgresNumericFactStore._set_scope(db, scope)
+                PostgresAccessChecker.lock_directory_membership_for_assignment(db)
                 PostgresAccessChecker.lock_workspace(db, scope.workspace_id)
                 state = db.execute('''SELECT metadata_revision,policy_revision,
                     schema_epoch FROM epm.application_state
@@ -384,14 +396,17 @@ class PostgresApplicationRules(PostgresExpressionRules):
                 if state is None:
                     raise ValueError("APPLICATION_UNAVAILABLE")
                 PostgresAccessChecker.check_in_transaction(
-                    db,self.identity,scope,"write")
-                PostgresAccessChecker.check_in_transaction(
-                    db,self.identity,scope,"rule_run")
+                    db,self.identity,scope,"write",action="facts.write")
+                run_access = PostgresAccessChecker.check_in_transaction(
+                    db,self.identity,scope,"rule_run",function=RUN)
                 row=db.execute('''SELECT *
                     FROM epm.expression_rule_definition
                     WHERE workspace_id=%s AND application_id=%s
                       AND rule_id=%s''',
                     (scope.workspace_id,scope.application_id,rule_id)).fetchone()
+                if run_access.authorization_model=='group_assignments':
+                    from .postgres_group_rule_source import require_runnable_rule
+                    require_runnable_rule(db, self.identity, scope, row)
                 if row is None or row['definition_kind']!='ApplicationRule':
                     raise ValueError("APPLICATION_RULE_NOT_ACTIVE")
                 from .postgres_python_definitions import assert_source_active
@@ -490,7 +505,109 @@ class PostgresApplicationRules(PostgresExpressionRules):
             **({"memberListPins":list(pins)} if pins else {})})
 
 
+def read_program_contract(function: str) -> dict:
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    identifier = {"type": "string", "pattern": "^" + _ID_BODY + r"(?![\s\S])"}
+    revision = {"type": "integer", "minimum": 0}
+    text = {"type": ["string", "null"]}
+    boolean = {"type": "boolean"}
+    status = {"enum": ["Active", "Inactive", "Unavailable"]}
+    state = {**dict.fromkeys(
+        ("defined", "valid", "active", "sourceCurrent", "executable"), boolean),
+        "resultCurrent": {"type": "null"}, "reason": text, "status": status}
+    pins = {"ruleId": identifier, "stateToken": text, "programDigest": text}
+    if function == LIST:
+        token = {"type": "string", "pattern": r"^[0-9a-f]{64}(?![\s\S])"}
+        arguments = obj({
+            "limit": {**revision, "minimum": 1, "maximum": _LIST_LIMIT,
+                      "default": _LIST_LIMIT},
+            "afterRuleId": identifier,
+            "containsOperation": identifier,
+            "collectionToken": token,
+            **dict.fromkeys(_LIST_REVISIONS, revision)}, [])
+        arguments["allOf"] = [{"if": {"required": ["afterRuleId"]},
+                                "then": {"required": list(_LIST_REVISIONS)}},
+            {"if": {"required": ["afterRuleId", "containsOperation"]},
+             "then": {"required": ["collectionToken"]}},
+            {"if": {"required": ["collectionToken"]},
+             "then": {"required": ["afterRuleId"]}}]
+        required = {**pins, **state, "definitionMetadataRevision": revision,
+                    "metadataCurrent": boolean, "sourceBuildId": text}
+        row = obj({**required, "name": {"type": "string"}, "checkpointCount": revision,
+                   "statementCount": revision, "parameterCount": revision}, list(required))
+        result_fields = {"rows": {"type": "array", "maxItems": _LIST_LIMIT, "items": row},
+                      "metadataRevision": revision, "policyRevision": revision,
+                      "hasMore": boolean, "nextAfterRuleId": {"anyOf": [identifier, {"type": "null"}]},
+                      "collectionToken": token}
+        result = obj(result_fields)
+        result["allOf"] = [{
+            "if": {"properties": {"hasMore": {"const": True}}},
+            "then": {"properties": {"rows": {"minItems": 1},
+                                    "nextAfterRuleId": identifier}},
+            "else": {"properties": {"nextAfterRuleId": {"type": "null"}}},
+        }]
+        continuation = {"limit": 1, "afterRuleId": "example-rule",
+                        "expectedMetadataRevision": 1, "expectedPolicyRevision": 1,
+                        "collectionToken": "a" * 64}
+        continuation_binding = (
+            "Continue only when hasMore is true in the same application. Copy nextAfterRuleId to "
+            "afterRuleId, metadataRevision to expectedMetadataRevision, policyRevision to "
+            "expectedPolicyRevision, and collectionToken unchanged from the preceding page.")
+        examples = [
+            read_example(LIST, {"limit": 1}, name="Read the first current rule page",
+                         binding="Select an authorized application before using this example."),
+            read_example(LIST, continuation,
+                         name="Continue a current rule page at the same revision",
+                         binding=continuation_binding),
+            read_example(LIST, {"limit": 1, "containsOperation": "facts.numeric.sequence"},
+                         name="Find current rules with ordered numeric operations",
+                         binding="Select an authorized application and use the filtered continuation example if hasMore is true."),
+            read_example(LIST, {**continuation, "containsOperation": "facts.numeric.sequence"},
+                         name="Continue the ordered numeric rule list",
+                         binding=continuation_binding + " Keep containsOperation unchanged."),
+        ]
+        rules = [
+            "Legacy access can inspect inactive and unavailable definitions. A group runner sees current, active source-owned numeric rules whose coordinates their fact assignment can read and write. An empty page is a successful result.",
+            "Group-assigned planners page through currently runnable rules. A rule is visible when its accepted source is current and each target has both read and write access through the same assignment.",
+            "containsOperation matches the exact typed function name in the rule's stored current plan. Definitions without a current matching plan are excluded. The filter does not imply the matching rule is executable.",
+            "Every page includes collectionToken, including empty and terminal pages. It binds the application cut and exact filter. Supply it for filtered continuations and retain it for unfiltered continuations.",
+            "When hasMore is true, nextAfterRuleId is the last returned ruleId. Otherwise nextAfterRuleId is null.",
+            "Restart from the first page after STALE_EXPRESSION_RULE_LIST_REVISION. Every page rechecks the current READ grant.",
+            f"After {READ_AUTHORIZATION_STALE}, refresh current access and start from the first page.",
+        ]
+    else:
+        arguments = obj({"ruleId": identifier})
+        source = obj({"programId": identifier, "programSourceToken": text,
+                      "sourceDigest": text, "buildId": text, "active": boolean})
+        stored = obj({"languageVersion": {"const": 2}, "function": {"const": STORED_FUNCTION},
+                      "arguments": {"type": "object"}})
+        fields = {**pins, **state, "source": {"anyOf": [source, {"type": "null"}]},
+                  "program": {"anyOf": [stored, {"type": "null"}]},
+                  "definitionMetadataRevision": {"type": ["integer", "null"], "minimum": 0},
+                  "currentMetadataRevision": revision, "policyRevision": revision,
+                  "updatedOperationId": text, "updatedAt": text}
+        result = obj(fields, [key for key in fields if key != "status"])
+        examples = [read_example(READ, {"ruleId": "example-rule"},
+            name="Inspect one current rule at its returned stable ID",
+            binding="Replace example-rule with the ruleId returned by the authorized current rule list.")]
+        rules = [
+            "Read uses only a current ApplicationRule ID. An unknown ID returns defined=false.",
+            "The stored program uses the rule compiler's definition shape. The outer read result exposes the current state, source and immutable pins for this definition.",
+            "Check defined, executable and the returned state and program pins before considering a separate authorized run.",
+            f"After {READ_AUTHORIZATION_STALE}, refresh current access and read the exact rule again.",
+        ]
+    rules.append('For group assignments, the rules.run duty can inspect the published numeric definition after every source and target coordinate is authorized. Raw SDK source requires its own inspection duty.')
+    return read_contract(function, arguments, result, owner="PostgresApplicationRules",
+                         examples=examples, semantic_rules=rules)
+
+
 def catalog() -> dict:
+    from .postgres_application_rule_workflow import (
+        lineage_program_contract, workflow_effect_program_contract)
+    from .postgres_numeric_catalog import SOURCE_OWNED_REPLACEMENT
+    from .python_execution_contract import WORKFLOW_COUNT_GUIDANCE
     common = {"workClass": "short", "previewRequired": False}
     return {
         SAVE: {**common, "mode": "atomic_rule_definition",
@@ -523,13 +640,16 @@ def catalog() -> dict:
         READ: {**common, "mode": "read", "permission": "read",
                "idempotencyRequired": False,
                "arguments": {"ruleId": "stable ID"},
-               "result": "current definition and activation state"},
+               "result": "current definition and activation state",
+               **read_program_contract(READ)},
         LIST: {**common, "mode": "read", "permission": "read",
                "idempotencyRequired": False, "arguments": {},
                "optionalArguments": {"limit": "1-100", "afterRuleId": "stable keyset cursor",
                    "expectedMetadataRevision": "required with afterRuleId",
                    "expectedPolicyRevision": "required with afterRuleId"},
-               "result": "bounded current application-rule summaries"},
+               "result": "bounded current application-rule summaries",
+               "orderedNumericGuide": deepcopy(SOURCE_OWNED_REPLACEMENT),
+               **read_program_contract(LIST)},
         RUN: {**common, "mode": "durable_workflow",
               "permission": "rule_run", "idempotencyRequired": True,
               "workClass": "long",
@@ -538,20 +658,28 @@ def catalog() -> dict:
                   "exact values for every declared typed runtime parameter",
                   "expectedStateToken": "exact inspected Active rule state",
                   "expectedProgramDigest": "exact inspected compiled digest"},
-              "result": "durable rule workflow with binding digest and checkpoint receipts"},
+              "result": "durable rule workflow with binding digest and checkpoint receipts. " + WORKFLOW_COUNT_GUIDANCE,
+              **workflow_effect_program_contract(RUN)},
         RUN_READ: {**common, "mode": "read", "permission": "read",
                    "idempotencyRequired": False,
-                   "arguments": {"workflowId": "caller-owned workflow ID"},
-                   "result": "durable workflow, sealed child/receipt lineage and dependency freshness"},
+                   "arguments": {},
+                   "optionalArguments": {
+                       "workflowId": "One selector: the caller's existing workflow ID",
+                       "originalRequest": "Alternative selector: the exact original application.rule.run program and signed idempotencyKey, including after admission expiry",
+                   },
+                   "result": "durable workflow, sealed child/receipt lineage and dependency freshness. " + WORKFLOW_COUNT_GUIDANCE,
+                   **lineage_program_contract()},
         RUN_CANCEL: {**common, "mode": "technical_control",
                      "permission": "rule_run",
                      "idempotencyRequired": True,
                      "arguments": {"workflowId": "caller-owned workflow ID"},
-                     "result": "cancellation state; committed effects remain"},
+                     "result": "cancellation state; committed effects remain. " + WORKFLOW_COUNT_GUIDANCE,
+                     **workflow_effect_program_contract(RUN_CANCEL)},
         RUN_RECONCILE: {**common, "mode": "technical_control",
                         "permission": "rule_run",
                         "idempotencyRequired": True,
                         "arguments": {
                             "workflowId": "needs-inspection workflow ID"},
-                        "result": "durable child inspection and safe resume state"},
+                        "result": "durable child inspection and safe resume state.",
+                        **workflow_effect_program_contract(RUN_RECONCILE)},
     }

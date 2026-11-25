@@ -99,13 +99,24 @@ def _valid_result(operation,result):
 
 def _execute(operation,arguments):
     if operation=='migrate' and set(arguments) in (
-            {'dsn','directory'},{'dsn','directory','freshBaselineManifest'}):
+            {'dsn','directory'},{'dsn','directory','freshBaselineManifest'},
+            {'dsn','directory','expectedFinalMigration'},
+            {'dsn','directory','expectedFinalMigration','expectedSourceLedger'},
+            {'dsn','directory','expectedFinalMigration','expectedSourceLedger','expectedSourceDatabase'}):
         from scripts.apply_postgres_migrations import apply_migrations
         baseline=arguments.get('freshBaselineManifest')
-        if baseline is not None and type(baseline) is not str:
+        expected = arguments.get('expectedFinalMigration')
+        source_ledger = arguments.get('expectedSourceLedger')
+        source_database = arguments.get('expectedSourceDatabase')
+        if ((baseline is not None and type(baseline) is not str) or
+                ('expectedFinalMigration' in arguments and (type(expected) is not str or not expected)) or
+                ('expectedSourceLedger' in arguments and type(source_ledger) is not str) or
+                ('expectedSourceDatabase' in arguments and type(source_database) is not str)):
             raise ValueError('ADMIN_COMMAND_ARGUMENTS_INVALID')
         return apply_migrations(arguments['dsn'],Path(arguments['directory']),
-            fresh_baseline_manifest=None if baseline is None else Path(baseline))
+            fresh_baseline_manifest=None if baseline is None else Path(baseline),
+            expected_final_migration=expected, expected_source_ledger=source_ledger,
+            expected_source_database=source_database)
     if operation=='service-roles' and set(arguments)=={'dsn','passwords'}:
         from scripts.bootstrap_postgres_service_roles import bootstrap_service_roles
         return bootstrap_service_roles(arguments['dsn'],arguments['passwords'])

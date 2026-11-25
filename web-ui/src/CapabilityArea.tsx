@@ -7,12 +7,23 @@ import {
   requestAdmittedEffect,
 } from "./api";
 import { BuildRules } from "./BuildRules";
+import {
+  DEFINITION_OWNER_REASONS,
+  DEFINITION_VALIDATION_EXPLANATION,
+  definitionAvailabilityLabel,
+  isDefinitionLifecycle,
+} from "./definition-lifecycle";
 import { PythonRuleEditor } from "./PythonRuleEditor";
 import {
+  pythonEnvironmentSelection,
   pythonProgramActionBody,
   pythonProgramSaveBody,
+  newAssignedRuleOutput,
+  pythonSaveEnvironment,
+  pythonSourceSaveError,
 } from "./python-source-contract";
 import { PythonProgramTest } from "./PythonProgramTest";
+import { PythonSourceValidation } from "./PythonSourceValidation";
 import { PythonProgramRun } from "./PythonProgramRun";
 import {
   ParameterFields,
@@ -32,24 +43,33 @@ import {
 import type { PythonBuildStatus } from "./python-authoring";
 import { usePythonBuildObserver } from "./usePythonBuildObserver";
 import type { PythonBuildObservation } from "./usePythonBuildObserver";
-import { BuildSequences } from "./BuildSequences";
 import { BuildSchedules } from "./BuildSchedules";
 import { CalculatedMembers } from "./CalculatedMembers";
+import { PlanningPolicies } from "./PlanningPolicies";
 import { AdministrationSecurity } from "./AdministrationSecurity";
+import { EffectiveApplicationAccess } from "./EffectiveApplicationAccess";
+import { AuthorizationAssignments } from "./AuthorizationAssignments";
 import {
   collectSecuritySubjectOptions,
   type SecuritySubject,
 } from "./security-directory";
 import { DataLoad } from "./DataLoad";
 import { DataExport } from "./DataExport";
+import { FunctionReference } from "./FunctionReference";
 import { MemberLists } from "./MemberLists";
 import { SupportingDetail } from "./SupportingDetail";
-import type { ApplicationCatalog, ApplicationSummary } from "./types";
+import type { ApplicationCatalog, ApplicationSummary, Scope } from "./types";
+import { applicationRoleLabel } from "./types";
 import { usePreservedDraft, useUnsavedWork } from "./unsaved-work";
 import { useStableMutationIntentKey } from "./mutation-intent";
 import { collectAllContinuations } from "./continuation";
+import { useExecutionDelegationChange } from "./execution-delegation-change";
+import { usePythonScheduleRecovery } from "./python-schedule-recovery";
 import {
   resolveWorkspaceSection,
+  firstSecuritySection,
+  ruleSectionsFor,
+  securitySectionReads,
   workspaceSections,
 } from "./workspace-navigation";
 import type { WorkspaceArea } from "./workspace-navigation";
@@ -79,7 +99,7 @@ export type PythonProgramSummary = {
   programId: string;
   stateToken: string;
   sourceToken: string;
-  status: "Inactive" | "Active";
+  status: "Inactive" | "Active" | "Unavailable";
   entryPoint: string;
   environmentId: string;
   environmentStateToken: string;
@@ -90,7 +110,7 @@ export type PythonProgramSummary = {
   active?: boolean;
   sourceCurrent?: boolean;
   executable?: boolean;
-  reason?: "ownership_unresolved" | "validation_required" | null;
+  reason?: keyof typeof DEFINITION_OWNER_REASONS | null;
   validation?: PythonBuildStatus | null;
   latestImpactTest?: PythonBuildStatus | null;
 };
@@ -100,6 +120,14 @@ type PythonProgramDetail = PythonProgramSummary & {
   parameterSchema: unknown;
   sourceText: string;
 };
+type PythonDraftOrigin = Pick<
+  PythonProgramSummary,
+  | "programId"
+  | "stateToken"
+  | "environmentId"
+  | "environmentStateToken"
+  | "declaredOutput"
+>;
 
 type PythonProgramListResponse = {
   result: {
@@ -154,9 +182,17 @@ type PythonOccurrence = {
   schedule_id: string;
   schedule_state_token: string;
   status: string;
-  due_at?: string;
+  due_at: string;
   build_id?: string | null;
   workflow_id?: string | null;
+};
+
+type PythonOccurrenceSelection = { id: string };
+type PythonOccurrenceRead = {
+  selection: PythonOccurrenceSelection;
+  contextKey: string;
+  occurrence: PythonOccurrence | null;
+  error?: string;
 };
 
 export {
@@ -181,11 +217,9 @@ export { pythonProgramActionBody } from "./python-source-contract";
 
 export function pythonProgramAvailabilityLabel(program: PythonProgramSummary) {
   if (program.declaredOutput === null) return "Source only · no typed output";
-  if (program.reason === "ownership_unresolved")
-    return "Output ownership unresolved";
-  if (program.reason === "validation_required") return "Validation required";
-  if (program.active && program.executable) return "Executable";
-  return "Inactive by design";
+  return isDefinitionLifecycle(program)
+    ? definitionAvailabilityLabel(program)
+    : "Current definition unavailable";
 }
 
 const PROGRAM_ACRONYMS = new Set([
@@ -201,7 +235,9 @@ const PROGRAM_ACRONYMS = new Set([
   "yoy",
 ]);
 
-export function pythonProgramDisplayName(program: PythonProgramSummary) {
+export function pythonProgramDisplayName(
+  program: Pick<PythonProgramSummary, "programId" | "declaredOutput">,
+) {
   const definitionId = program.declaredOutput?.definitionId;
   const source =
     typeof definitionId === "string" && definitionId.trim()
@@ -209,7 +245,7 @@ export function pythonProgramDisplayName(program: PythonProgramSummary) {
       : program.programId.replace(/^source-rule-/, "");
   return source
     .split(/[._-]+/)
-    .filter((part) => part && part !== "rule")
+    .filter(Boolean)
     .map((part) =>
       PROGRAM_ACRONYMS.has(part.toLowerCase())
         ? part.toUpperCase()
@@ -238,7 +274,7 @@ export function pythonProgramHasParameters(schema: unknown) {
   );
 }
 
-function validatedPythonProgram(program: PythonProgramSummary) {
+function validatedPythonProgram(program: PythonProgramSummary, detail = false) {
   const output = program?.declaredOutput;
   if (
     !program ||
@@ -248,7 +284,7 @@ function validatedPythonProgram(program: PythonProgramSummary) {
     !/^[0-9a-f]{64}$/.test(program.stateToken) ||
     typeof program.sourceToken !== "string" ||
     !/^[0-9a-f]{64}$/.test(program.sourceToken) ||
-    !["Inactive", "Active"].includes(program.status) ||
+    !["Inactive", "Active", "Unavailable"].includes(program.status) ||
     typeof program.sourceDigest !== "string" ||
     !/^[0-9a-f]{64}$/.test(program.sourceDigest) ||
     !(output === null || (typeof output === "object" && !Array.isArray(output)))
@@ -256,7 +292,8 @@ function validatedPythonProgram(program: PythonProgramSummary) {
     throw new Error("Python program summary is invalid.");
   if (output === null) {
     if (
-      program.defined !== undefined ||
+      program.status === "Unavailable" ||
+      (detail ? program.defined !== true : program.defined !== undefined) ||
       program.valid !== undefined ||
       program.active !== undefined ||
       program.sourceCurrent !== undefined ||
@@ -267,22 +304,14 @@ function validatedPythonProgram(program: PythonProgramSummary) {
     return program;
   }
   if (
-    typeof program.defined !== "boolean" ||
-    typeof program.valid !== "boolean" ||
-    typeof program.active !== "boolean" ||
-    typeof program.sourceCurrent !== "boolean" ||
-    typeof program.executable !== "boolean" ||
-    program.reason === undefined ||
-    ![null, "ownership_unresolved", "validation_required"].includes(
-      program.reason,
+    !["ApplicationRule", "CalculatedMember", "MemberList"].includes(
+      String(output.kind),
     ) ||
-    (program.reason === "ownership_unresolved" &&
-      (program.sourceCurrent || program.executable)) ||
-    (program.reason === "validation_required" &&
-      (!program.sourceCurrent || program.valid || program.executable)) ||
-    (program.executable && (!program.valid || !program.active)) ||
-    (program.status === "Active") !== program.active
+    typeof output.definitionId !== "string" ||
+    !output.definitionId
   )
+    throw new Error("Python declared output is invalid.");
+  if (!isDefinitionLifecycle(program))
     throw new Error("Python program lifecycle is invalid.");
   return program;
 }
@@ -304,7 +333,8 @@ export function collectPythonPrograms(
   >({
     label: "Python programs",
     readPage: (cursor) => readPage(pythonProgramListArguments(cursor)),
-    rows: (page) => page.result.programs.map(validatedPythonProgram),
+    rows: (page) =>
+      page.result.programs.map((program) => validatedPythonProgram(program)),
     nextCursor: (page) => page.result.nextAfterProgramId,
     rowIdentity: (row) => row.programId,
   });
@@ -325,10 +355,6 @@ export function collectPythonEnvironments(
     nextCursor: (page) => page.result.nextAfterEnvironmentId,
     rowIdentity: (row) => `${row.environment_id}\u0000${row.state_token}`,
   });
-}
-
-function pythonEnvironmentSelection(environment: PythonEnvironment) {
-  return JSON.stringify([environment.environment_id, environment.state_token]);
 }
 
 export { pythonProgramSaveBody } from "./python-source-contract";
@@ -483,7 +509,10 @@ export function pythonScheduleMutationBody(
           expectedSchemaEpoch: catalog.revisions.schemaEpoch,
         }
       : action === "run"
-        ? { scheduleId: draft.scheduleId }
+        ? {
+            scheduleId: draft.scheduleId,
+            expectedStateToken: draft.expectedStateToken,
+          }
         : {
             scheduleId: draft.scheduleId,
             expectedStateToken: draft.expectedStateToken,
@@ -505,7 +534,7 @@ export function pythonScheduleMutationBody(
 }
 
 export function pythonOccurrenceBody(
-  app: ApplicationSummary,
+  app: Scope,
   action: "read" | "cancel",
   occurrenceId: string,
   idempotencyKey?: string,
@@ -592,8 +621,7 @@ const definitions: Record<
   },
   rules: {
     title: "Rules",
-    description:
-      "Manage reusable calculations, published sequences and scheduled work.",
+    description: "Manage calculation rules and scheduled work.",
     journeys: [
       {
         title: "Rules and calculations",
@@ -753,7 +781,9 @@ export function ApplicationLifecycleSummary({
           </article>
           <article>
             <span>Current authority</span>
-            <strong>{catalog?.applicationAccess.role || "Checking…"}</strong>
+            <strong>
+              {catalog ? applicationRoleLabel(catalog) : "Checking…"}
+            </strong>
             <small>
               {catalog?.applicationAccess.workspaceAdministrator
                 ? "Workspace Administrator"
@@ -783,6 +813,7 @@ type CapabilityAreaProps = {
   app?: ApplicationSummary;
   catalog: ApplicationCatalog | null;
   index: number;
+  canReadDirectoryGroups?: boolean;
   targetApplicationRule?: {
     ruleId: string;
     stateToken: string;
@@ -805,7 +836,7 @@ type CapabilityAreaProps = {
   };
   section?: string;
   onNavigateSection?: (section: string) => void;
-  onRequestTransition?: (action: () => void) => void;
+  onRequestTransition?: (action: () => void, preserveDrafts?: boolean) => void;
   onRefreshCatalog?: () => Promise<ApplicationCatalog>;
 };
 
@@ -822,16 +853,27 @@ export function CapabilityArea(props: CapabilityAreaProps) {
           : undefined;
   const section = resolveWorkspaceSection(
     props.area,
-    props.section ?? localSection,
+    props.section ??
+      localSection ??
+      (props.area === "security" && props.catalog
+        ? firstSecuritySection(props.catalog.functions)
+        : props.area === "rules" &&
+            !artifactKind &&
+            props.catalog?.applicationAccess.authorizationModel ===
+              "group_assignments"
+          ? ruleSectionsFor(props.catalog.functions)[0]?.id
+          : undefined),
     artifactKind,
   );
   const changeSection = (next: string) => {
-    if (next === section) return;
+    if (next === section && !props.targetApplicationSequence) return;
     const change = () =>
       props.onNavigateSection
         ? props.onNavigateSection(next)
         : setLocalSection(next);
-    if (props.onRequestTransition) props.onRequestTransition(change);
+    // Section navigation remounts each editor under its existing draft owner.
+    // The shell still refuses preservation if any dirty work cannot be retained.
+    if (props.onRequestTransition) props.onRequestTransition(change, true);
     else change();
   };
   return (
@@ -849,6 +891,7 @@ function CapabilityWorkspace({
   app,
   catalog,
   index,
+  canReadDirectoryGroups,
   targetApplicationRule,
   targetCalculatedMember,
   targetApplicationSequence,
@@ -863,6 +906,34 @@ function CapabilityWorkspace({
 }) {
   const mutationKey = useStableMutationIntentKey("capability-ui");
   const definition = definitions[area];
+  const workspace = workspaceSections[area].find(
+    (item) => item.id === section,
+  )!;
+  const canReadGroupAccess = Boolean(
+    catalog?.functions["security.application.group-access.list"],
+  );
+  const canReviewAccess = Boolean(
+    catalog?.functions[securitySectionReads["effective-access"]],
+  );
+  const unavailableSecuritySection = (id: string) =>
+    area === "security" &&
+    Object.entries(securitySectionReads).some(
+      ([sectionId, name]) => sectionId === id && !catalog?.functions[name],
+    );
+  const canReadExecutionAuthorities = Boolean(
+    catalog?.functions["execution.delegation.list"] &&
+      catalog?.functions["execution.delegation.read"],
+  );
+  const canReadPythonSchedules = Boolean(
+    catalog?.functions["python.schedule.list"] &&
+      catalog?.functions["python.schedule.read"],
+  );
+  const managementUnavailable =
+    (section === "authorities" && !canReadExecutionAuthorities) ||
+    (section === "python-schedules" && !canReadPythonSchedules);
+  const showProgramInventory =
+    section === "python" ||
+    (section === "python-schedules" && canReadPythonSchedules);
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [taskError, setTaskError] = useState("");
   const [pythonPrograms, setPythonPrograms] = useState<PythonProgramSummary[]>(
@@ -886,11 +957,12 @@ function CapabilityWorkspace({
     '{\n  "type": "object"\n}',
   );
   const [pythonDraftSource, setPythonDraftSource] = useState("");
-  const [pythonDraftDeclaredOutput, setPythonDraftDeclaredOutput] =
-    useState<Record<string, unknown> | null>(null);
+  const [pythonDraftOrigin, setPythonDraftOrigin] =
+    useState<PythonDraftOrigin | null>(null);
   const [pythonDraftEdited, setPythonDraftEdited] = useState(false);
   const [pythonAuthoringOpen, setPythonAuthoringOpen] = useState(false);
   const pythonAuthoringRef = useRef<HTMLElement | null>(null);
+  const pythonDetailRef = useRef<HTMLElement | null>(null);
   const pythonListGeneration = useRef(0);
   const [pythonValidation, setPythonValidation] = useState<{
     build: PythonBuildStatus;
@@ -920,12 +992,21 @@ function CapabilityWorkspace({
     app && catalog ? authoringContextKey(app, catalog) : "";
   const pythonContextKeyRef = useRef(pythonContextKey);
   pythonContextKeyRef.current = pythonContextKey;
+  const groupDesign =
+    catalog?.applicationAccess.authorizationModel === "group_assignments";
+  const observedRule = (programId?: string) =>
+    groupDesign
+      ? catalog?.functions["python.program.read"] && programId
+        ? programId
+        : null
+      : undefined;
   const selectedValidationObserver = usePythonBuildObserver(
     app,
     pythonContextKey,
     pythonSelectedValidation,
     "Validation",
     setPythonSelectedValidation,
+    observedRule(selectedPythonProgram?.programId),
   );
   const selectedValidation =
     pythonSelectedValidation?.build.buildId ===
@@ -943,9 +1024,13 @@ function CapabilityWorkspace({
       : null;
   const activationArtifact =
     currentSealedTest ??
-    (pythonSelectedContextKey === pythonContextKey &&
+    (!groupDesign &&
+    pythonSelectedContextKey === pythonContextKey &&
     selectedValidationObserver.current &&
-    selectedValidation?.status === "sealed"
+    selectedValidation?.status === "sealed" &&
+    selectedPythonProgram?.validation?.status === "sealed" &&
+    selectedPythonProgram.validation.current === true &&
+    selectedPythonProgram.validation.ownedByCaller !== false
       ? selectedValidation
       : null);
   const pythonActivationReady = Boolean(
@@ -956,7 +1041,8 @@ function CapabilityWorkspace({
       !app ||
       !selectedPythonProgram ||
       selectedValidation?.status !== "sealed" ||
-      selectedPythonProgram.validation?.status === "sealed" ||
+      (selectedPythonProgram.validation?.status === "sealed" &&
+        selectedPythonProgram.validation.current === true) ||
       !selectedValidationObserver.current
     )
       return;
@@ -977,6 +1063,7 @@ function CapabilityWorkspace({
     )
       .then((response) => {
         if (controller.signal.aborted) return;
+        validatedPythonProgram(response.result, true);
         if (
           !response.result.defined ||
           response.result.programId !== selected.programId ||
@@ -984,6 +1071,7 @@ function CapabilityWorkspace({
           response.result.sourceDigest !== selected.sourceDigest ||
           response.result.validation?.buildId !== selectedValidation.buildId ||
           response.result.validation.purpose !== "Validation" ||
+          response.result.validation.ownedByCaller === false ||
           response.result.validation.status !== "sealed" ||
           response.result.validation.current !== true
         )
@@ -1021,6 +1109,7 @@ function CapabilityWorkspace({
     pythonValidation,
     "Validation",
     setPythonValidation,
+    observedRule(pythonDraftOrigin?.programId),
   );
   const pythonEditorDiagnostics =
     pythonSourceDiagnostics?.contextKey === pythonContextKey
@@ -1038,15 +1127,45 @@ function CapabilityWorkspace({
   const [executionDelegations, setExecutionDelegations] = useState<
     ExecutionDelegation[]
   >([]);
-  const [executionSubjects, setExecutionSubjects] = useState<SecuritySubject[]>(
-    [],
+  const [executionDirectory, setExecutionDirectory] = useState<
+    | {
+        key: string;
+        status: "ready";
+        subjects: SecuritySubject[];
+        issuer: string;
+      }
+    | { key: string; status: "failed" }
+    | null
+  >(null);
+  const executionDirectoryKey =
+    app &&
+    area === "rules" &&
+    !managementUnavailable &&
+    ["authorities", "python-schedules"].includes(section) &&
+    catalog?.functions["security.application.subject.list"] &&
+    catalog.functions["security.identity.current.read"]
+      ? JSON.stringify([pythonContextKey, section])
+      : "";
+  const currentExecutionDirectory =
+    executionDirectory?.key === executionDirectoryKey
+      ? executionDirectory
+      : null;
+  const executionDirectoryPending = Boolean(
+    executionDirectoryKey && !currentExecutionDirectory,
   );
+  const executionSubjects =
+    currentExecutionDirectory?.status === "ready"
+      ? currentExecutionDirectory.subjects
+      : [];
+  const executionDirectoryIssuer =
+    currentExecutionDirectory?.status === "ready"
+      ? currentExecutionDirectory.issuer
+      : "";
   const [executionDelegationAfter, setExecutionDelegationAfter] = useState<
     string | null
   >(null);
   const executionDelegationListGeneration = useRef(0);
   const executionDelegationReadGeneration = useRef(0);
-  const [executionDirectoryIssuer, setExecutionDirectoryIssuer] = useState("");
   const [pythonDelegationSubject, setPythonDelegationSubject] = useState("");
   const [pythonDelegationValidFrom, setPythonDelegationValidFrom] =
     useState("");
@@ -1059,6 +1178,49 @@ function CapabilityWorkspace({
   const [pythonDelegationRevokeReviewed, setPythonDelegationRevokeReviewed] =
     useState(false);
   const [pythonDelegationResult, setPythonDelegationResult] = useState("");
+  const [delegationInventoryRefresh, setDelegationInventoryRefresh] =
+    useState(0);
+  const authorityHeading = useRef<HTMLHeadingElement | null>(null);
+  const retryAuthorityButton = useRef<HTMLButtonElement | null>(null);
+  const authorityChange = useExecutionDelegationChange(
+    app,
+    catalog,
+    pythonContextKey,
+    ({ action }) => {
+      if (document.activeElement === retryAuthorityButton.current)
+        authorityHeading.current?.focus();
+      setPythonDelegationResult(
+        action === "create"
+          ? "Authority creation was recorded."
+          : "Authority revocation was recorded.",
+      );
+      setPythonDelegationId("");
+      setPythonDelegationStateToken("");
+      setPythonDelegationSubject("");
+      setPythonDelegationValidFrom("");
+      setPythonDelegationValidUntil("");
+      setPythonDelegationBuild(true);
+      setPythonDelegationRun(true);
+      setPythonDelegation(null);
+      setPythonDelegationReadVerified(false);
+      setPythonDelegationCreateReviewed(false);
+      setPythonDelegationRevokeReviewed(false);
+      executionDelegationListGeneration.current += 1;
+      setExecutionDelegations([]);
+      setExecutionDelegationAfter(null);
+      if (app && onRefreshCatalog) {
+        void onRefreshCatalog()
+          .then((value) => {
+            if (authoringContextKey(app, value) === pythonContextKey)
+              setDelegationInventoryRefresh((value) => value + 1);
+          })
+          .catch(() =>
+            setPythonProgramError("Refresh to read the current authorities."),
+          );
+      } else setDelegationInventoryRefresh((value) => value + 1);
+    },
+  );
+  const authorityEditorLocked = authorityChange.pending || authorityChange.busy;
   const [pythonBuildParameters, setPythonBuildParameters] = useState("{}");
   const [pythonSchedules, setPythonSchedules] = useState<PythonSchedule[]>([]);
   const [pythonSchedulesRead, setPythonSchedulesRead] = useState(false);
@@ -1082,7 +1244,11 @@ function CapabilityWorkspace({
   const [pythonScheduleReviewedAction, setPythonScheduleReviewedAction] =
     useState<"save" | "activate" | "deactivate" | "run" | null>(null);
   const [pythonScheduleResult, setPythonScheduleResult] = useState("");
-  const [pythonOccurrence, setPythonOccurrence] =
+  const [pythonOccurrenceSelection, setPythonOccurrenceSelection] =
+    useState<PythonOccurrenceSelection | null>(null);
+  const [pythonOccurrenceRead, setPythonOccurrenceRead] =
+    useState<PythonOccurrenceRead | null>(null);
+  const [reviewedPythonOccurrence, setReviewedPythonOccurrence] =
     useState<PythonOccurrence | null>(null);
   const [pythonOccurrences, setPythonOccurrences] = useState<
     PythonOccurrence[]
@@ -1091,12 +1257,76 @@ function CapabilityWorkspace({
     string | null
   >(null);
   const [pythonOccurrenceBusy, setPythonOccurrenceBusy] = useState(false);
-  const pythonOccurrenceListGeneration = useRef(0);
-  const [pythonOccurrenceId, setPythonOccurrenceId] = useState("");
-  const [pythonOccurrenceReadVerified, setPythonOccurrenceReadVerified] =
-    useState(false);
-  const [pythonOccurrenceCancelReviewed, setPythonOccurrenceCancelReviewed] =
-    useState(false);
+  const pythonOccurrenceListRequest = useRef<AbortController | null>(null);
+  const canListPythonOccurrences = Boolean(
+    catalog?.functions["python.schedule.occurrence.list"],
+  );
+  const canReadPythonOccurrence = Boolean(
+    catalog?.functions["python.schedule.occurrence.read"],
+  );
+  const currentPythonOccurrenceRead =
+    canReadPythonOccurrence &&
+    pythonOccurrenceRead?.selection === pythonOccurrenceSelection &&
+    pythonOccurrenceRead.contextKey === pythonContextKey
+      ? pythonOccurrenceRead
+      : null;
+  const pythonOccurrence = currentPythonOccurrenceRead?.occurrence ?? null;
+  const pythonOccurrenceId = pythonOccurrenceSelection?.id ?? "";
+  const pythonOccurrenceCancelReviewed =
+    pythonOccurrence !== null && reviewedPythonOccurrence === pythonOccurrence;
+  const cancellablePythonOccurrence =
+    pythonOccurrence &&
+    [
+      "ready",
+      "running",
+      "building",
+      "running_program",
+      "cancel_requested",
+    ].includes(pythonOccurrence.status)
+      ? pythonOccurrence
+      : null;
+  const scheduleHeading = useRef<HTMLHeadingElement>(null);
+  const scheduleRecoveryControls = useRef<HTMLDivElement>(null);
+  const scheduleChange = usePythonScheduleRecovery(
+    app,
+    catalog,
+    pythonContextKey,
+    (details, result) => {
+      if (scheduleRecoveryControls.current?.contains(document.activeElement))
+        scheduleHeading.current?.focus();
+      setPythonScheduleResult(
+        result.status === "NotDue"
+          ? "No occurrence was due for the original request."
+          : details.action === "cancel"
+            ? `Original cancellation returned ${pythonOccurrenceStatusLabel(result.status)}.`
+            : `Schedule ${result.status} was recorded.`,
+      );
+      setPythonScheduleReviewedAction(null);
+      setPythonScheduleReadVerified(false);
+      setReviewedPythonOccurrence(null);
+      if (result.occurrenceId) choosePythonOccurrence(result.occurrenceId);
+      void readPythonSchedules(false);
+      if (catalog?.functions["python.schedule.occurrence.list"])
+        void readPythonOccurrences(false);
+      if (details.action !== "run" && details.action !== "cancel")
+        void onRefreshCatalog?.().catch(() =>
+          setPythonProgramError(
+            "Refresh the application context before reviewing another schedule change.",
+          ),
+        );
+    },
+  );
+  const scheduleChangeLocked = scheduleChange.pending || scheduleChange.busy;
+  const visiblePythonOccurrences = canListPythonOccurrences
+    ? pythonOccurrences
+    : [];
+  const occurrenceChoices =
+    pythonOccurrence &&
+    !visiblePythonOccurrences.some(
+      (item) => item.occurrence_id === pythonOccurrenceId,
+    )
+      ? [pythonOccurrence, ...visiblePythonOccurrences]
+      : visiblePythonOccurrences;
 
   const pythonProgramDirty = pythonDraftEdited;
   const pythonDelegationDirty = Boolean(
@@ -1108,7 +1338,6 @@ function CapabilityWorkspace({
             (pythonDelegationReadVerified
               ? pythonDelegation.state_token
               : "") ||
-          executionDirectoryIssuer !== pythonDelegation.issuer ||
           pythonDelegationSubject !== pythonDelegation.subject_id ||
           pythonDelegationValidFrom !==
             new Date(pythonDelegation.valid_from).toISOString().slice(0, 16) ||
@@ -1156,6 +1385,7 @@ function CapabilityWorkspace({
       environment: pythonDraftEnvironment,
       parameters: pythonDraftParameters,
       source: pythonDraftSource,
+      origin: pythonDraftOrigin,
     },
     (draft) => {
       setPythonDraftId(draft.programId);
@@ -1163,6 +1393,7 @@ function CapabilityWorkspace({
       setPythonDraftEnvironment(draft.environment);
       setPythonDraftParameters(draft.parameters);
       setPythonDraftSource(draft.source);
+      setPythonDraftOrigin(draft.origin ?? null);
       setPythonDraftEdited(true);
       setPythonAuthoringOpen(true);
       setPythonValidation(null);
@@ -1172,7 +1403,7 @@ function CapabilityWorkspace({
   useUnsavedWork(
     "capability-python-delegation",
     "Unsubmitted Python execution delegation",
-    pythonDelegationDirty,
+    pythonDelegationDirty && !authorityChange.pending,
   );
   useUnsavedWork(
     "capability-python-schedule",
@@ -1209,17 +1440,19 @@ function CapabilityWorkspace({
     catalog?.functions["python.program.list"] &&
       catalog?.functions["python.program.read"],
   );
-  const canAuthorPythonPrograms = Boolean(
-    catalog?.functions["python.environment.list"] &&
-      catalog?.functions["python.program.save"] &&
+  const canSavePythonProgram = Boolean(
+    catalog?.functions["python.program.save"] &&
       catalog.revisions.schemaEpoch !== undefined,
   );
+  const canCreatePythonProgram =
+    canSavePythonProgram &&
+    Boolean(catalog?.functions["python.environment.list"]);
   useEffect(() => {
     if (
       !app ||
       !canReadPythonPrograms ||
       area !== "rules" ||
-      !["python", "python-schedules"].includes(section)
+      !showProgramInventory
     )
       return;
     void readPythonPrograms();
@@ -1227,16 +1460,16 @@ function CapabilityWorkspace({
     app?.workspaceId,
     app?.applicationId,
     area,
-    section,
+    showProgramInventory,
     canReadPythonPrograms,
   ]);
   useEffect(() => {
     if (
       !app ||
       area !== "rules" ||
+      managementUnavailable ||
       !["python", "python-schedules", "authorities"].includes(section) ||
-      !catalog?.functions["execution.delegation.list"] ||
-      !catalog.functions["execution.delegation.read"]
+      !canReadExecutionAuthorities
     )
       return;
     void readExecutionDelegations(false);
@@ -1245,8 +1478,10 @@ function CapabilityWorkspace({
     app?.applicationId,
     area,
     section,
-    Boolean(catalog?.functions["execution.delegation.list"]),
-    Boolean(catalog?.functions["execution.delegation.read"]),
+    pythonContextKey,
+    delegationInventoryRefresh,
+    canReadExecutionAuthorities,
+    managementUnavailable,
   ]);
   useEffect(() => {
     if (
@@ -1303,6 +1538,7 @@ function CapabilityWorkspace({
     setPythonDraftEntry("build");
     setPythonDraftParameters('{"type":"object"}');
     setPythonDraftSource("");
+    setPythonDraftOrigin(null);
     setPythonAuthoringOpen(false);
     setPythonDraftEdited(false);
     setPythonValidation(null);
@@ -1312,14 +1548,12 @@ function CapabilityWorkspace({
     setPythonDelegationReadVerified(false);
     setPythonDelegationId("");
     setPythonDelegationStateToken("");
-    setExecutionDirectoryIssuer("");
     setPythonDelegationSubject("");
     setPythonDelegationValidFrom("");
     setPythonDelegationValidUntil("");
     setPythonDelegationBuild(true);
     setPythonDelegationRun(true);
     setExecutionDelegations([]);
-    setExecutionSubjects([]);
     setExecutionDelegationAfter(null);
     setPythonDelegationCreateReviewed(false);
     setPythonDelegationRevokeReviewed(false);
@@ -1331,23 +1565,16 @@ function CapabilityWorkspace({
     setPythonScheduleReadVerified(false);
     setPythonScheduleReviewedAction(null);
     setPythonScheduleResult("");
-    setPythonOccurrence(null);
+    setPythonOccurrenceRead(null);
     setPythonOccurrences([]);
     setPythonOccurrenceAfter(null);
-    setPythonOccurrenceId("");
-    setPythonOccurrenceReadVerified(false);
-    setPythonOccurrenceCancelReviewed(false);
+    setPythonOccurrenceSelection(null);
+    setReviewedPythonOccurrence(null);
   }, [app?.workspaceId, app?.applicationId]);
 
   useEffect(() => {
-    if (
-      !app ||
-      !["authorities", "python-schedules"].includes(section) ||
-      !catalog?.functions["security.application.subject.list"] ||
-      !catalog?.functions["security.identity.current.read"]
-    ) {
-      setExecutionSubjects([]);
-      setExecutionDirectoryIssuer("");
+    if (!app || !executionDirectoryKey) {
+      setExecutionDirectory(null);
       return;
     }
     const controller = new AbortController();
@@ -1373,8 +1600,11 @@ function CapabilityWorkspace({
     ])
       .then(([directory, identity]) => {
         if (controller.signal.aborted) return;
-        setExecutionSubjects(
-          [...directory.rows].sort(
+        setExecutionDirectory({
+          key: executionDirectoryKey,
+          status: "ready",
+          issuer: identity.issuer,
+          subjects: [...directory.rows].sort(
             (left, right) =>
               left.displayName.localeCompare(right.displayName, undefined, {
                 sensitivity: "base",
@@ -1383,41 +1613,91 @@ function CapabilityWorkspace({
                 sensitivity: "base",
               }),
           ),
-        );
-        setExecutionDirectoryIssuer(identity.issuer);
+        });
       })
       .catch((reason: Error) => {
         if (controller.signal.aborted) return;
-        setExecutionSubjects([]);
-        setExecutionDirectoryIssuer("");
+        setExecutionDirectory({ key: executionDirectoryKey, status: "failed" });
         setPythonProgramError(
           reason.message || "Unable to read authorized execution users.",
         );
       });
     return () => controller.abort();
-  }, [
-    app?.workspaceId,
-    app?.applicationId,
-    section,
-    Boolean(catalog?.functions["security.application.subject.list"]),
-    Boolean(catalog?.functions["security.identity.current.read"]),
-  ]);
+  }, [executionDirectoryKey]);
 
   useEffect(() => {
+    setPythonOccurrenceBusy(false);
     if (
       !app ||
       area !== "rules" ||
       section !== "python-schedules" ||
-      !catalog?.functions["python.schedule.occurrence.list"]
+      !canListPythonOccurrences
+    ) {
+      setPythonOccurrences([]);
+      setPythonOccurrenceAfter(null);
+      return;
+    }
+    void readPythonOccurrences(false);
+    return () => pythonOccurrenceListRequest.current?.abort();
+  }, [area, section, pythonContextKey, canListPythonOccurrences]);
+
+  useEffect(() => {
+    setPythonOccurrenceRead(null);
+    setReviewedPythonOccurrence(null);
+    if (
+      !app ||
+      area !== "rules" ||
+      section !== "python-schedules" ||
+      !canReadPythonOccurrence ||
+      !pythonOccurrenceSelection
     )
       return;
-    void readPythonOccurrences(false);
+    const controller = new AbortController();
+    const selection = pythonOccurrenceSelection;
+    const readIdentity = { selection, contextKey: pythonContextKey };
+    void request<{
+      result: { defined: boolean; occurrence: PythonOccurrence | null };
+    }>(
+      "/api/python-schedule",
+      pythonOccurrenceBody(app, "read", selection.id),
+      controller.signal,
+    )
+      .then(({ result }) => {
+        if (controller.signal.aborted) return;
+        const occurrence = result.occurrence;
+        if (!result.defined || !occurrence)
+          throw new Error("That schedule occurrence is unavailable.");
+        if (
+          occurrence.occurrence_id !== selection.id ||
+          !occurrence.schedule_id ||
+          typeof occurrence.schedule_id !== "string" ||
+          typeof occurrence.status !== "string" ||
+          typeof occurrence.due_at !== "string" ||
+          !Number.isFinite(Date.parse(occurrence.due_at))
+        )
+          throw new Error(
+            "The schedule run could not be verified. Open it again to review the current run.",
+          );
+        setPythonOccurrenceRead({ ...readIdentity, occurrence });
+      })
+      .catch((reason: unknown) => {
+        if (controller.signal.aborted) return;
+        setPythonOccurrenceRead({
+          ...readIdentity,
+          occurrence: null,
+          error:
+            reason instanceof Error
+              ? reason.message
+              : "Unable to read occurrence",
+        });
+      });
+    return () => controller.abort();
   }, [
-    app?.workspaceId,
-    app?.applicationId,
     area,
     section,
-    Boolean(catalog?.functions["python.schedule.occurrence.list"]),
+    pythonContextKey,
+    canReadPythonOccurrence,
+    pythonOccurrenceSelection,
   ]);
 
   async function readPythonPrograms() {
@@ -1456,7 +1736,7 @@ function CapabilityWorkspace({
   }
 
   async function readPythonEnvironments() {
-    if (!app || !canAuthorPythonPrograms) return;
+    if (!app || !canCreatePythonProgram) return;
     setPythonProgramBusy(true);
     setPythonProgramError("");
     try {
@@ -1506,32 +1786,21 @@ function CapabilityWorkspace({
   function exactPythonDraft() {
     const programId = pythonDraftId.trim();
     const entryPoint = pythonDraftEntry.trim();
-    let environmentSelection: unknown;
-    try {
-      environmentSelection = JSON.parse(pythonDraftEnvironment);
-    } catch {
-      environmentSelection = null;
-    }
-    const environmentId = Array.isArray(environmentSelection)
-      ? environmentSelection[0]
-      : null;
-    const environmentStateToken = Array.isArray(environmentSelection)
-      ? environmentSelection[1]
-      : null;
+    const origin = pythonDraftOrigin;
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(programId))
       throw new Error(
         "Program ID must be a stable 1-200 character identifier.",
       );
     if (!/^[A-Za-z_][A-Za-z0-9_]{0,99}$/.test(entryPoint))
       throw new Error("Entry point must be a Python identifier.");
-    if (
-      !pythonEnvironments.some(
-        (environment) =>
-          environment.environment_id === environmentId &&
-          environment.state_token === environmentStateToken &&
-          environment.status === "Active",
-      )
-    )
+    if (origin && origin.programId !== programId)
+      throw new Error("Reopen the saved source before editing it.");
+    const environment = pythonSaveEnvironment(
+      pythonDraftEnvironment,
+      origin ? null : pythonEnvironments,
+      origin,
+    );
+    if (!environment)
       throw new Error("Select an active approved Python environment.");
     const bytes = new TextEncoder().encode(pythonDraftSource).length;
     if (!bytes || bytes > 1048576 || pythonDraftSource.includes("\0"))
@@ -1548,20 +1817,17 @@ function CapabilityWorkspace({
       typeof parameterSchema !== "object"
     )
       throw new Error("Parameter schema must be a JSON object.");
+    const declaredOutput =
+      origin?.declaredOutput ??
+      (groupDesign ? newAssignedRuleOutput(programId) : undefined);
     return {
       programId,
       entryPoint,
-      environmentId,
-      environmentStateToken,
+      ...environment,
       parameterSchema: parameterSchema as Record<string, unknown>,
       sourceText: pythonDraftSource,
-      ...(selectedPythonProgram?.programId === programId &&
-      pythonDraftDeclaredOutput
-        ? { declaredOutput: pythonDraftDeclaredOutput }
-        : {}),
-      ...(selectedPythonProgram?.programId === programId
-        ? { expectedStateToken: selectedPythonProgram.stateToken }
-        : {}),
+      ...(declaredOutput ? { declaredOutput } : {}),
+      ...(origin ? { expectedStateToken: origin.stateToken } : {}),
     };
   }
 
@@ -1575,7 +1841,13 @@ function CapabilityWorkspace({
   }
 
   async function savePythonProgram() {
-    if (!app || !catalog || !canAuthorPythonPrograms || pythonProgramBusy)
+    if (
+      !app ||
+      !catalog ||
+      !canSavePythonProgram ||
+      (!pythonDraftOrigin && !canCreatePythonProgram) ||
+      pythonProgramBusy
+    )
       return;
     let draft;
     try {
@@ -1597,6 +1869,7 @@ function CapabilityWorkspace({
         result: {
           status?: string;
           operationId?: string;
+          stateToken?: string;
           validation?: PythonBuildStatus;
         };
       }>(
@@ -1614,10 +1887,18 @@ function CapabilityWorkspace({
       );
       if (generation !== authoringGeneration.current) return;
       setPythonProgramResult(
-        selectedPythonProgram?.programId === draft.programId
-          ? `Saved ${pythonProgramDisplayName(selectedPythonProgram)}.`
+        pythonDraftOrigin
+          ? `Saved ${pythonProgramDisplayName(pythonDraftOrigin)}.`
           : "Saved the new Python program.",
       );
+      if (response.result.stateToken)
+        setPythonDraftOrigin({
+          programId: draft.programId,
+          stateToken: response.result.stateToken,
+          environmentId: draft.environmentId,
+          environmentStateToken: draft.environmentStateToken,
+          declaredOutput: draft.declaredOutput ?? null,
+        });
       setPythonDraftEdited(false);
       if (response.result.validation?.purpose === "Validation")
         setPythonValidation({
@@ -1641,11 +1922,7 @@ function CapabilityWorkspace({
           diagnostics,
           contextKey: pythonContextKey,
         });
-      setPythonProgramError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to save Python program",
-      );
+      setPythonProgramError(pythonSourceSaveError(reason));
     } finally {
       if (generation === authoringGeneration.current)
         setPythonProgramBusy(false);
@@ -1663,15 +1940,20 @@ function CapabilityWorkspace({
         JSON.stringify(program.parameterSchema, null, 2),
       );
       setPythonDraftSource(program.sourceText);
-      setPythonDraftDeclaredOutput(program.declaredOutput);
+      setPythonDraftOrigin({
+        programId: program.programId,
+        stateToken: program.stateToken,
+        environmentId: program.environmentId,
+        environmentStateToken: program.environmentStateToken,
+        declaredOutput: program.declaredOutput,
+      });
       setPythonDraftEdited(false);
       setPythonValidation(null);
       setPythonSourceDiagnostics(null);
       setPythonAuthoringOpen(true);
       setPythonProgramResult("");
-      void readPythonEnvironments();
       window.requestAnimationFrame(() => {
-        pythonAuthoringRef.current?.scrollIntoView({ block: "start" });
+        pythonAuthoringRef.current?.scrollIntoView?.({ block: "start" });
         pythonAuthoringRef.current?.focus();
       });
     };
@@ -1679,11 +1961,36 @@ function CapabilityWorkspace({
     else edit();
   }
 
+  function startNewPythonProgram() {
+    const start = () => {
+      setPythonDraftOrigin(null);
+      setPythonDraftId("");
+      setPythonDraftEntry("build");
+      setPythonDraftEnvironment("");
+      setPythonDraftParameters('{"type":"object"}');
+      setPythonDraftSource("");
+      setPythonDraftEdited(false);
+      setPythonValidation(null);
+      setPythonSourceDiagnostics(null);
+      setPythonProgramResult("");
+    };
+    if (pythonDraftEdited && onRequestTransition) onRequestTransition(start);
+    else start();
+  }
+
   async function readPythonProgram(
     program: PythonProgramSummary,
-    currentCatalog?: ApplicationCatalog,
+    {
+      currentCatalog,
+      focusOrigin,
+    }: {
+      currentCatalog?: ApplicationCatalog;
+      focusOrigin?: HTMLButtonElement;
+    } = {},
   ) {
     if (!app || !canReadPythonPrograms) return;
+    const originDocument = focusOrigin?.ownerDocument;
+    const initialFocus = originDocument?.activeElement;
     setPythonProgramBusy(true);
     setPythonProgramError("");
     try {
@@ -1699,6 +2006,7 @@ function CapabilityWorkspace({
           },
         },
       );
+      validatedPythonProgram(detail.result, true);
       if (
         !detail.result.defined ||
         detail.result.programId !== program.programId ||
@@ -1717,12 +2025,20 @@ function CapabilityWorkspace({
         : pythonContextKey;
       setPythonSelectedContextKey(contextKey);
       setPythonSelectedValidation(
-        detail.result.validation?.purpose === "Validation"
+        detail.result.validation?.purpose === "Validation" &&
+          detail.result.validation.ownedByCaller !== false
           ? { build: detail.result.validation, contextKey }
           : null,
       );
 
       setPythonProgramResult("");
+      if (section === "python")
+        window.requestAnimationFrame(() => {
+          if (originDocument && originDocument.activeElement !== initialFocus)
+            return;
+          pythonDetailRef.current?.scrollIntoView?.({ block: "start" });
+          pythonDetailRef.current?.focus();
+        });
     } catch (reason) {
       setPythonProgramError(
         reason instanceof Error ? reason.message : "Unable to read program",
@@ -1776,7 +2092,9 @@ function CapabilityWorkspace({
       );
       const refreshed = await onRefreshCatalog?.();
       await readPythonPrograms();
-      await readPythonProgram(selectedPythonProgram, refreshed);
+      await readPythonProgram(selectedPythonProgram, {
+        currentCatalog: refreshed,
+      });
       setPythonProgramResult(
         `Program is ${response.result?.status || action}.`,
       );
@@ -1911,8 +2229,9 @@ function CapabilityWorkspace({
 
   function executionSubjectLabel(subjectId: string) {
     const subject = executionSubject(subjectId);
-    return subject
-      ? `${subject.displayName} (${subject.username})`
+    if (subject) return `${subject.displayName} (${subject.username})`;
+    return executionDirectoryPending
+      ? "Loading directory identity…"
       : "Directory identity unavailable";
   }
 
@@ -2048,23 +2367,33 @@ function CapabilityWorkspace({
   }
 
   async function mutateExecutionDelegation(action: "create" | "revoke") {
-    if (!app || !catalog || catalog.revisions.schemaEpoch === undefined) return;
+    if (
+      !app ||
+      !catalog ||
+      catalog.revisions.schemaEpoch === undefined ||
+      authorityEditorLocked
+    )
+      return;
     let draft;
     try {
-      draft = exactExecutionDelegationDraft();
-      if (
-        action === "create" &&
-        (pythonDelegationReadVerified || !pythonDelegationCreateReviewed)
-      )
-        return;
-      if (
-        action === "revoke" &&
-        (!pythonDelegationReadVerified ||
+      if (action === "create") {
+        if (pythonDelegationReadVerified || !pythonDelegationCreateReviewed)
+          return;
+        draft = exactExecutionDelegationDraft();
+      } else {
+        if (
+          !pythonDelegationReadVerified ||
           !pythonDelegationRevokeReviewed ||
           pythonDelegation?.status !== "Active" ||
-          pythonDelegation?.state_token !== draft.expectedStateToken)
-      )
-        return;
+          pythonDelegation.delegation_id !== pythonDelegationId.trim() ||
+          pythonDelegation.state_token !== pythonDelegationStateToken
+        )
+          return;
+        draft = {
+          delegationId: pythonDelegation.delegation_id,
+          expectedStateToken: pythonDelegation.state_token,
+        };
+      }
     } catch (reason) {
       setPythonProgramError(
         reason instanceof Error
@@ -2075,45 +2404,26 @@ function CapabilityWorkspace({
     }
     const verb = action === "create" ? "Create" : "Revoke";
     if (!window.confirm(`${verb} this current execution authority?`)) return;
-    setPythonProgramBusy(true);
     setPythonProgramError("");
     setPythonDelegationResult("");
-    try {
-      const response = await requestAdmittedEffect<{
-        result?: { status?: string; operationId?: string };
-      }>(
-        "/api/execution-delegation",
-        executionDelegationMutationBody(
-          app,
-          catalog,
+    setPythonDelegationCreateReviewed(false);
+    setPythonDelegationRevokeReviewed(false);
+    await authorityChange.submit(
+      executionDelegationMutationBody(
+        app,
+        catalog,
+        action,
+        draft,
+        mutationKey({
+          operation: "execution-delegation",
           action,
           draft,
-          mutationKey({
-            operation: "execution-delegation",
-            action,
-            draft,
-            revisions: catalog.revisions,
-          }),
-        ),
-      );
-      setPythonDelegationResult(
-        `Authority ${response.result?.status || action} was recorded.`,
-      );
-      setPythonDelegation(null);
-      setPythonDelegationReadVerified(false);
-      setPythonDelegationCreateReviewed(false);
-      setPythonDelegationRevokeReviewed(false);
-      await onRefreshCatalog?.();
-      await readExecutionDelegations(false);
-    } catch (reason) {
-      setPythonProgramError(
-        reason instanceof Error
-          ? reason.message
-          : `Unable to ${action} authority`,
-      );
-    } finally {
-      setPythonProgramBusy(false);
-    }
+          revisions: catalog.revisions,
+        }),
+      ),
+      draft.delegationId,
+      action,
+    );
   }
 
   function invalidatePythonScheduleDraft(
@@ -2261,6 +2571,7 @@ function CapabilityWorkspace({
   function pythonScheduleActionAllowed(
     action: "save" | "activate" | "deactivate" | "run",
   ) {
+    if (scheduleChangeLocked) return false;
     if (action === "save") {
       try {
         exactPythonScheduleDraft();
@@ -2324,55 +2635,27 @@ function CapabilityWorkspace({
       );
       return;
     }
-    setPythonProgramBusy(true);
     setPythonProgramError("");
-    try {
-      const response = await requestAdmittedEffect<{
-        result: {
-          status?: string;
-          operationId?: string;
-          occurrenceId?: string;
-        };
-      }>(
-        "/api/python-schedule",
-        pythonScheduleMutationBody(
-          app,
-          catalog,
-          action,
-          draft,
-          mutationKey({
-            operation: "python-schedule",
-            action,
-            draft,
-            revisions: catalog.revisions,
-          }),
-        ),
-      );
-      setPythonScheduleResult(
-        `Schedule ${response.result.status || action} was recorded.`,
-      );
-      if (response.result.occurrenceId)
-        setPythonOccurrenceId(response.result.occurrenceId);
-      setPythonScheduleReviewedAction(null);
-      setPythonScheduleReadVerified(false);
-      await readPythonSchedules(false);
-      if (catalog.functions["python.schedule.occurrence.list"])
-        await readPythonOccurrences(false);
-    } catch (reason) {
-      setPythonProgramError(
-        reason instanceof Error
-          ? reason.message
-          : `Unable to ${action} schedule`,
-      );
-    } finally {
-      setPythonProgramBusy(false);
-    }
+    setPythonScheduleResult("");
+    setPythonScheduleReviewedAction(null);
+    await scheduleChange.submit(
+      pythonScheduleMutationBody(
+        app,
+        catalog,
+        action,
+        draft,
+        `python-schedule-${crypto.randomUUID()}`,
+      ),
+      { action, scheduleId: draft.scheduleId },
+    );
   }
 
   async function readPythonOccurrences(next: boolean) {
-    if (!app || (next && !pythonOccurrenceAfter)) return;
-    const generation = ++pythonOccurrenceListGeneration.current;
-    const contextKey = pythonContextKey;
+    if (!app || !canListPythonOccurrences || (next && !pythonOccurrenceAfter))
+      return;
+    pythonOccurrenceListRequest.current?.abort();
+    const controller = new AbortController();
+    pythonOccurrenceListRequest.current = controller;
     setPythonOccurrenceBusy(true);
     setPythonProgramError("");
     try {
@@ -2384,12 +2667,9 @@ function CapabilityWorkspace({
       }>(
         "/api/python-schedule",
         pythonOccurrenceListBody(app, next ? pythonOccurrenceAfter : null),
+        controller.signal,
       );
-      if (
-        generation !== pythonOccurrenceListGeneration.current ||
-        contextKey !== pythonContextKeyRef.current
-      )
-        return;
+      if (controller.signal.aborted) return;
       setPythonOccurrences((current) =>
         next
           ? [...current, ...response.result.occurrences]
@@ -2397,30 +2677,22 @@ function CapabilityWorkspace({
       );
       setPythonOccurrenceAfter(response.result.nextAfterOccurrenceId);
     } catch (reason) {
-      if (
-        generation === pythonOccurrenceListGeneration.current &&
-        contextKey === pythonContextKeyRef.current
-      )
+      if (!controller.signal.aborted)
         setPythonProgramError(
           reason instanceof Error
             ? reason.message
             : "Unable to read schedule runs",
         );
     } finally {
-      if (
-        generation === pythonOccurrenceListGeneration.current &&
-        contextKey === pythonContextKeyRef.current
-      )
-        setPythonOccurrenceBusy(false);
+      if (pythonOccurrenceListRequest.current === controller) {
+        pythonOccurrenceListRequest.current = null;
+        if (!controller.signal.aborted) setPythonOccurrenceBusy(false);
+      }
     }
   }
 
   function choosePythonOccurrence(occurrenceId: string) {
-    setPythonOccurrenceId(occurrenceId);
-    setPythonOccurrence(null);
-    setPythonOccurrenceReadVerified(false);
-    setPythonOccurrenceCancelReviewed(false);
-    if (occurrenceId) void readPythonOccurrence(occurrenceId);
+    setPythonOccurrenceSelection(occurrenceId ? { id: occurrenceId } : null);
   }
 
   function pythonOccurrenceStatusLabel(status: string) {
@@ -2430,85 +2702,33 @@ function CapabilityWorkspace({
       .join(" ");
   }
 
-  async function readPythonOccurrence(
-    occurrenceId = pythonOccurrenceId.trim(),
-  ) {
-    if (!app || !occurrenceId) return;
-    setPythonProgramBusy(true);
-    setPythonProgramError("");
-    setPythonOccurrenceReadVerified(false);
-    try {
-      const response = await request<{
-        result: { defined: boolean; occurrence: PythonOccurrence };
-      }>(
-        "/api/python-schedule",
-        pythonOccurrenceBody(app, "read", occurrenceId),
-      );
-      if (!response.result.defined)
-        throw new Error("That schedule occurrence is unavailable.");
-      setPythonOccurrence(response.result.occurrence);
-      setPythonOccurrenceReadVerified(true);
-      setPythonOccurrenceCancelReviewed(false);
-    } catch (reason) {
-      setPythonProgramError(
-        reason instanceof Error ? reason.message : "Unable to read occurrence",
-      );
-    } finally {
-      setPythonProgramBusy(false);
-    }
-  }
-
   async function cancelPythonOccurrence() {
     if (
       !app ||
-      !pythonOccurrenceReadVerified ||
+      scheduleChangeLocked ||
       !pythonOccurrenceCancelReviewed ||
-      !pythonOccurrence ||
-      ![
-        "ready",
-        "running",
-        "building",
-        "running_program",
-        "cancel_requested",
-      ].includes(pythonOccurrence.status) ||
+      !cancellablePythonOccurrence ||
       !catalog?.functions["python.schedule.occurrence.cancel"]
     )
       return;
     if (!window.confirm("Request cancellation of this schedule run?")) return;
-    setPythonProgramBusy(true);
     setPythonProgramError("");
-    try {
-      const body = pythonOccurrenceBody(
-        app,
-        "cancel",
-        pythonOccurrence.occurrence_id,
-        mutationKey({
-          operation: "python-occurrence-cancel",
-          occurrenceId: pythonOccurrence.occurrence_id,
-        }),
-      );
-      if (!body.idempotencyKey)
-        throw new Error("Python occurrence cancellation identity is missing.");
-      const response = await requestAdmittedEffect<{
-        result: PythonOccurrence;
-      }>("/api/python-schedule", {
-        ...body,
-        idempotencyKey: body.idempotencyKey,
-      });
-      setPythonOccurrence(response.result);
-      setPythonOccurrenceCancelReviewed(false);
-      setPythonScheduleResult(
-        `Schedule run ${pythonOccurrenceStatusLabel(response.result.status)}.`,
-      );
-    } catch (reason) {
-      setPythonProgramError(
-        reason instanceof Error
-          ? reason.message
-          : "Unable to cancel occurrence",
-      );
-    } finally {
-      setPythonProgramBusy(false);
-    }
+    setPythonScheduleResult("");
+    setReviewedPythonOccurrence(null);
+    const occurrenceId = cancellablePythonOccurrence.occurrence_id;
+    await scheduleChange.submit(
+      {
+        ...pythonOccurrenceBody(app, "cancel", occurrenceId),
+        confirmed: true,
+        idempotencyKey: `python-occurrence-cancel-${crypto.randomUUID()}`,
+      },
+      {
+        action: "cancel",
+        occurrenceId,
+        scheduleId: cancellablePythonOccurrence.schedule_id,
+        dueAt: cancellablePythonOccurrence.due_at,
+      },
+    );
   }
 
   const dataActivity = useMemo(
@@ -2530,26 +2750,29 @@ function CapabilityWorkspace({
         <div>
           <small>{app?.name || "Application"}</small>
           <h1>{definition.title}</h1>
-          <p>
-            {workspaceSections[area].find((item) => item.id === section)
-              ?.description || definition.description}
-          </p>
+          <p>{workspace.description || definition.description}</p>
         </div>
       </div>
       <nav
         className="workspace-section-nav"
         aria-label={`${definition.title} workspaces`}
       >
-        {workspaceSections[area].map((item) => (
-          <button
-            key={item.id}
-            type="button"
-            aria-current={section === item.id ? "page" : undefined}
-            onClick={() => onNavigateSection(item.id)}
-          >
-            {item.label}
-          </button>
-        ))}
+        {(area === "rules" &&
+        catalog?.applicationAccess.authorizationModel === "group_assignments"
+          ? ruleSectionsFor(catalog.functions)
+          : workspaceSections[area]
+        )
+          .filter((item) => !unavailableSecuritySection(item.id))
+          .map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              aria-current={section === item.id ? "page" : undefined}
+              onClick={() => onNavigateSection(item.id)}
+            >
+              {item.label}
+            </button>
+          ))}
       </nav>
       {!catalog ? (
         <p className="workspace-pending" role="status">
@@ -2557,16 +2780,33 @@ function CapabilityWorkspace({
         </p>
       ) : (
         <>
-          {section !== "reference" &&
-            !["activity", "lifecycle"].includes(section) &&
-            !matchingFunctions(
-              catalog.functions,
-              workspaceSections[area].find((item) => item.id === section)!
-                .prefixes,
-            ).length && (
+          {section === "groups" && !canReadGroupAccess && (
+            <p className="workspace-unavailable" role="status">
+              Group access is unavailable in the current application catalogue.
+              Choose another workspace or inspect Function reference.
+            </p>
+          )}
+          {section !== "groups" && unavailableSecuritySection(section) && (
+            <p className="workspace-unavailable" role="status">
+              This security view is unavailable in the current application
+              catalogue. Choose an available view above.
+            </p>
+          )}
+          {section !== "groups" &&
+            !unavailableSecuritySection(section) &&
+            section !== "reference" &&
+            ![
+              "activity",
+              "lifecycle",
+              "authorities",
+              "python-schedules",
+            ].includes(section) &&
+            !matchingFunctions(catalog.functions, workspace.prefixes)
+              .length && (
               <p className="workspace-unavailable" role="status">
-                This workspace is not available to your current application
-                role. Choose another workspace or inspect Function reference.
+                This workspace has no matching functions in the current
+                application catalogue. Choose another workspace or inspect
+                Function reference.
               </p>
             )}
           {section === "reference" && (
@@ -2579,37 +2819,21 @@ function CapabilityWorkspace({
                   <small>CURRENT ROLE</small>
                   <h2 id="workspace-reference-heading">Function reference</h2>
                   <p>
-                    Available functions for {definition.title.toLowerCase()}.
-                    Opening this reference does not perform an operation.
+                    Published function contracts for{" "}
+                    {definition.title.toLowerCase()}. Opening this reference
+                    does not perform an operation.
                   </p>
                 </div>
               </div>
-              {!catalog ? (
-                <p role="status">Checking current access…</p>
-              ) : (
-                (() => {
-                  const names = matchingFunctions(
-                    catalog.functions,
-                    workspaceSections[area].find(
-                      (item) => item.id === "reference",
-                    )!.prefixes,
-                  );
-                  return names.length ? (
-                    <ul>
-                      {names.map((name) => (
-                        <li key={name}>
-                          <code>{name}</code>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="muted-copy">
-                      No functions in this workspace are available to your
-                      current role.
-                    </p>
-                  );
-                })()
-              )}
+              <FunctionReference
+                catalog={catalog}
+                names={matchingFunctions(
+                  catalog.functions,
+                  workspaceSections[area].find(
+                    (item) => item.id === "reference",
+                  )!.prefixes,
+                )}
+              />
             </section>
           )}
           {area === "rules" &&
@@ -2635,7 +2859,7 @@ function CapabilityWorkspace({
                           : "Program schedules"}
                     </h2>
                   </div>
-                  {["python", "python-schedules"].includes(section) && (
+                  {showProgramInventory && (
                     <button
                       disabled={pythonProgramBusy || !canReadPythonPrograms}
                       onClick={() => void readPythonPrograms()}
@@ -2644,502 +2868,610 @@ function CapabilityWorkspace({
                     </button>
                   )}
                 </div>
-                {pythonProgramError && (
+                {managementUnavailable && (
+                  <p className="workspace-unavailable" role="status">
+                    {workspace.label} are unavailable in the current application
+                    catalogue. Choose another workspace or inspect Function
+                    reference.
+                  </p>
+                )}
+                {!managementUnavailable && pythonProgramError && (
                   <div className="inline-error" role="alert">
                     {pythonProgramError}
                   </div>
                 )}
-                {pythonProgramResult && (
+                {!managementUnavailable && pythonProgramResult && (
                   <p role="status">{pythonProgramResult}</p>
                 )}
-                {section === "python" && canAuthorPythonPrograms && (
-                  <details
-                    className="workspace-create-disclosure"
-                    open={pythonAuthoringOpen}
-                    onToggle={(event) =>
-                      setPythonAuthoringOpen(event.currentTarget.open)
-                    }
-                  >
-                    <summary>
-                      {selectedPythonProgram &&
-                      pythonDraftId === selectedPythonProgram.programId
-                        ? `Edit ${pythonProgramDisplayName(selectedPythonProgram)}`
-                        : "Create a program"}
-                    </summary>
-                    <article
-                      ref={pythonAuthoringRef}
-                      className="program-inspector python-authoring"
-                      aria-label="New Python program"
-                      tabIndex={-1}
+                {section === "python" &&
+                  canSavePythonProgram &&
+                  (canCreatePythonProgram || pythonDraftOrigin) && (
+                    <details
+                      className="workspace-create-disclosure"
+                      open={pythonAuthoringOpen}
+                      onToggle={(event) =>
+                        setPythonAuthoringOpen(event.currentTarget.open)
+                      }
                     >
-                      <div className="section-heading-row">
-                        <div>
-                          <small>PYTHON SOURCE</small>
-                          <h3>
-                            {selectedPythonProgram &&
-                            pythonDraftId === selectedPythonProgram.programId
-                              ? `Edit ${pythonProgramDisplayName(selectedPythonProgram)}`
-                              : "Save a Python program"}
-                          </h3>
-                          <p>
-                            Save the current source and validate it in the
-                            isolated builder. Test the saved source before
-                            activating it.
-                          </p>
-                        </div>
-                        {(!selectedPythonProgram ||
-                          pythonDraftId !==
-                            selectedPythonProgram.programId) && (
-                          <button
-                            disabled={pythonProgramBusy}
-                            onClick={() => void readPythonEnvironments()}
-                          >
-                            {pythonEnvironments.length
-                              ? "Refresh environments"
-                              : "Read environments"}
-                          </button>
-                        )}
-                      </div>
-                      <fieldset
-                        disabled={pythonProgramBusy}
-                        className="python-authoring-form"
+                      <summary>
+                        {pythonDraftOrigin
+                          ? `Edit ${pythonProgramDisplayName(pythonDraftOrigin)}`
+                          : "Create a program"}
+                      </summary>
+                      <article
+                        ref={pythonAuthoringRef}
+                        className="program-inspector python-authoring"
+                        aria-label={
+                          pythonDraftOrigin
+                            ? "Edit saved Python source"
+                            : "New Python program"
+                        }
+                        tabIndex={-1}
                       >
-                        {(!selectedPythonProgram ||
-                          pythonDraftId !==
-                            selectedPythonProgram.programId) && (
-                          <>
-                            <div className="python-authoring-fields">
+                        <div className="section-heading-row">
+                          <div>
+                            <small>PYTHON SOURCE</small>
+                            <h3>
+                              {pythonDraftOrigin
+                                ? `Edit ${pythonProgramDisplayName(pythonDraftOrigin)}`
+                                : "Save a Python program"}
+                            </h3>
+                            <p>
+                              Save the current source and validate it in the
+                              isolated builder. Activation requires an
+                              appropriate current Validation or supported
+                              private Test.
+                            </p>
+                            {groupDesign && !pythonDraftOrigin && (
+                              <p>
+                                Return an ApplicationRule with the rule key
+                                entered below.
+                              </p>
+                            )}
+                            {pythonDraftOrigin && (
+                              <p>
+                                Editing this local draft does not change the
+                                saved definition. Saving changed source makes
+                                its owner Inactive and retires its previous
+                                compiled payload and acceptance certificate.
+                                Validate the saved source before activating its
+                                new definition.
+                              </p>
+                            )}
+                          </div>
+                          {pythonDraftOrigin && canCreatePythonProgram && (
+                            <button
+                              disabled={pythonProgramBusy}
+                              onClick={startNewPythonProgram}
+                            >
+                              Create a program
+                            </button>
+                          )}
+                          {!pythonDraftOrigin && (
+                            <button
+                              disabled={pythonProgramBusy}
+                              onClick={() => void readPythonEnvironments()}
+                            >
+                              {pythonEnvironments.length
+                                ? "Refresh environments"
+                                : "Read environments"}
+                            </button>
+                          )}
+                        </div>
+                        <fieldset
+                          disabled={pythonProgramBusy}
+                          className="python-authoring-form"
+                        >
+                          {pythonDraftOrigin && (
+                            <p>
+                              Approved environment:{" "}
+                              {pythonDraftOrigin.environmentId}
+                            </p>
+                          )}
+                          {!pythonDraftOrigin && (
+                            <>
+                              <div className="python-authoring-fields">
+                                <label>
+                                  Rule key
+                                  <input
+                                    aria-label="Python rule key"
+                                    value={pythonDraftId}
+                                    onChange={(event) =>
+                                      changePythonDraft(
+                                        () =>
+                                          setPythonDraftId(event.target.value),
+                                        true,
+                                      )
+                                    }
+                                    placeholder="cube-calculation"
+                                  />
+                                </label>
+                                <label>
+                                  Entry point
+                                  <input
+                                    aria-label="Python program entry point"
+                                    value={pythonDraftEntry}
+                                    onChange={(event) =>
+                                      changePythonDraft(() =>
+                                        setPythonDraftEntry(event.target.value),
+                                      )
+                                    }
+                                  />
+                                </label>
+                                <label>
+                                  Approved environment
+                                  <select
+                                    aria-label="Python program environment"
+                                    value={pythonDraftEnvironment}
+                                    onChange={(event) =>
+                                      changePythonDraft(() =>
+                                        setPythonDraftEnvironment(
+                                          event.target.value,
+                                        ),
+                                      )
+                                    }
+                                    disabled={!pythonEnvironments.length}
+                                  >
+                                    {!pythonEnvironments.length && (
+                                      <option value="">
+                                        Read environments first
+                                      </option>
+                                    )}
+                                    {pythonEnvironments.map((environment) => (
+                                      <option
+                                        key={`${environment.environment_id}:${environment.state_token}`}
+                                        value={pythonEnvironmentSelection(
+                                          environment,
+                                        )}
+                                      >
+                                        {environment.environment_id}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </label>
+                              </div>
                               <label>
-                                Rule key
-                                <input
-                                  aria-label="Python rule key"
-                                  value={pythonDraftId}
-                                  onChange={(event) =>
-                                    changePythonDraft(
-                                      () =>
-                                        setPythonDraftId(event.target.value),
-                                      true,
-                                    )
-                                  }
-                                  placeholder="cube-calculation"
-                                />
-                              </label>
-                              <label>
-                                Entry point
-                                <input
-                                  aria-label="Python program entry point"
-                                  value={pythonDraftEntry}
+                                Input definition
+                                <textarea
+                                  aria-label="Python input definition"
+                                  rows={5}
+                                  value={pythonDraftParameters}
                                   onChange={(event) =>
                                     changePythonDraft(() =>
-                                      setPythonDraftEntry(event.target.value),
-                                    )
-                                  }
-                                />
-                              </label>
-                              <label>
-                                Approved environment
-                                <select
-                                  aria-label="Python program environment"
-                                  value={pythonDraftEnvironment}
-                                  onChange={(event) =>
-                                    changePythonDraft(() =>
-                                      setPythonDraftEnvironment(
+                                      setPythonDraftParameters(
                                         event.target.value,
                                       ),
                                     )
                                   }
-                                  disabled={!pythonEnvironments.length}
-                                >
-                                  {!pythonEnvironments.length && (
-                                    <option value="">
-                                      Read environments first
-                                    </option>
-                                  )}
-                                  {pythonEnvironments.map((environment) => (
-                                    <option
-                                      key={`${environment.environment_id}:${environment.state_token}`}
-                                      value={pythonEnvironmentSelection(
-                                        environment,
-                                      )}
-                                    >
-                                      {environment.environment_id}
-                                    </option>
-                                  ))}
-                                </select>
+                                />
                               </label>
-                            </div>
-                            <label>
-                              Input definition
-                              <textarea
-                                aria-label="Python input definition"
-                                rows={5}
-                                value={pythonDraftParameters}
-                                onChange={(event) =>
-                                  changePythonDraft(() =>
-                                    setPythonDraftParameters(
-                                      event.target.value,
-                                    ),
-                                  )
-                                }
-                              />
-                            </label>
-                          </>
-                        )}
-                        <label>
-                          Python source
-                          <PythonRuleEditor
-                            ariaLabel="Python program source"
-                            value={pythonDraftSource}
-                            readOnly={pythonProgramBusy}
-                            diagnostics={pythonEditorDiagnostics}
-                            completions={
-                              pythonMetadata?.contextKey === pythonContextKey
-                                ? pythonMetadata.completions
-                                : []
-                            }
-                            onChange={(value) =>
-                              changePythonDraft(() =>
-                                setPythonDraftSource(value),
-                              )
-                            }
-                          />
-                        </label>
-                        <div className="reviewed-inline-actions">
-                          <button
-                            disabled={
-                              pythonProgramBusy ||
-                              !pythonDraftEdited ||
-                              !pythonDraftIsValid()
-                            }
-                            onClick={() => void savePythonProgram()}
-                          >
-                            Save and validate
-                          </button>
-                        </div>
-                      </fieldset>
-                      {pythonMetadataError && (
-                        <p role="status">
-                          {pythonMetadataError}{" "}
-                          <button
-                            onClick={() =>
-                              setPythonMetadataRefresh((value) => value + 1)
-                            }
-                          >
-                            Refresh metadata suggestions
-                          </button>
-                        </p>
-                      )}
-                      {pythonValidation && (
-                        <p role="status">
-                          Validation: {pythonValidation.build.status}
-                          {!pythonValidationCurrent
-                            ? " · application context changed; save the program again to validate the current application"
-                            : ""}
-                          {pythonValidation.build.errorCode
-                            ? ` · ${pythonValidation.build.errorCode}`
-                            : ""}
-                        </p>
-                      )}
-                      {pythonValidationError && (
-                        <p role="alert">
-                          {pythonValidationError}{" "}
-                          <button
-                            disabled={!pythonValidationCurrent}
-                            onClick={refreshPythonValidation}
-                          >
-                            Refresh validation status
-                          </button>
-                        </p>
-                      )}
-                    </article>
-                  </details>
-                )}
-                {section === "authorities" &&
-                  Boolean(catalog?.functions["execution.delegation.list"]) &&
-                  Boolean(catalog?.functions["execution.delegation.read"]) && (
-                    <article
-                      className="program-inspector execution-authorities"
-                      aria-label="Execution authority management"
-                    >
-                      <div className="section-heading-row">
-                        <div>
-                          <small>REVIEWED EXECUTION AUTHORITY</small>
-                          <h3>Execution authorities</h3>
-                          <p>
-                            Choose who may build or run an approved program,
-                            which operations they may use and when their
-                            authority expires.
+                            </>
+                          )}
+                          <label>
+                            Python source
+                            <PythonRuleEditor
+                              ariaLabel="Python program source"
+                              value={pythonDraftSource}
+                              readOnly={pythonProgramBusy}
+                              diagnostics={pythonEditorDiagnostics}
+                              completions={
+                                pythonMetadata?.contextKey === pythonContextKey
+                                  ? pythonMetadata.completions
+                                  : []
+                              }
+                              onChange={(value) =>
+                                changePythonDraft(() =>
+                                  setPythonDraftSource(value),
+                                )
+                              }
+                            />
+                          </label>
+                          <div className="reviewed-inline-actions">
+                            <button
+                              disabled={
+                                pythonProgramBusy ||
+                                !pythonDraftEdited ||
+                                !pythonDraftIsValid()
+                              }
+                              onClick={() => void savePythonProgram()}
+                            >
+                              Save and validate
+                            </button>
+                          </div>
+                        </fieldset>
+                        {pythonMetadataError && (
+                          <p role="status">
+                            {pythonMetadataError}{" "}
+                            <button
+                              onClick={() =>
+                                setPythonMetadataRefresh((value) => value + 1)
+                              }
+                            >
+                              Refresh metadata suggestions
+                            </button>
                           </p>
-                        </div>
-                        <div className="reviewed-inline-actions">
-                          <button
-                            disabled={pythonProgramBusy}
-                            onClick={() => void readExecutionDelegations(false)}
-                          >
-                            {executionDelegations.length
-                              ? "Refresh authorities"
-                              : "Read authorities"}
-                          </button>
-                          <button
-                            disabled={
-                              pythonProgramBusy || !executionDelegationAfter
-                            }
-                            onClick={() => void readExecutionDelegations(true)}
-                          >
-                            Next page
-                          </button>
-                        </div>
-                      </div>
-                      {executionDelegations.length ? (
-                        <div className="react-grid-scroll">
-                          <table className="react-cube-grid python-program-grid">
-                            <thead>
-                              <tr>
-                                <th>Authority</th>
-                                <th>State</th>
-                                <th>User</th>
-                                <th>Scope</th>
-                                <th>Valid until</th>
-                                <th>Use</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {executionDelegations.map((delegation) => (
-                                <tr key={delegation.delegation_id}>
-                                  <th>{delegation.delegation_id}</th>
-                                  <td>{delegation.status}</td>
-                                  <td>
-                                    {executionSubjectLabel(
-                                      delegation.subject_id,
-                                    )}
-                                  </td>
-                                  <td>
-                                    {executionScopeLabel(
-                                      delegation.operation_scope,
-                                    )}
-                                  </td>
-                                  <td>
-                                    {new Date(
-                                      delegation.valid_until,
-                                    ).toLocaleString()}
-                                  </td>
-                                  <td>
-                                    <button
-                                      disabled={pythonProgramBusy}
-                                      onClick={() =>
-                                        openExecutionDelegation(
-                                          delegation,
-                                          false,
-                                        )
-                                      }
-                                    >
-                                      Use authority details
-                                    </button>
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      ) : (
-                        <p className="muted-copy">
-                          No authority catalogue read yet.
+                        )}
+                        {pythonValidation && (
+                          <p role="status">
+                            Validation: {pythonValidation.build.status}
+                            {!pythonValidationCurrent
+                              ? " · application context changed; save the program again to validate the current application"
+                              : ""}
+                            {pythonValidation.build.errorCode
+                              ? ` · ${pythonValidation.build.errorCode}`
+                              : ""}
+                          </p>
+                        )}
+                        {pythonValidationError && (
+                          <p role="alert">
+                            {pythonValidationError}{" "}
+                            <button
+                              disabled={!pythonValidationCurrent}
+                              onClick={refreshPythonValidation}
+                            >
+                              Refresh validation status
+                            </button>
+                          </p>
+                        )}
+                      </article>
+                    </details>
+                  )}
+                {section === "authorities" && canReadExecutionAuthorities && (
+                  <article
+                    className="program-inspector execution-authorities"
+                    aria-label="Execution authority management"
+                  >
+                    <div className="section-heading-row">
+                      <div>
+                        <small>REVIEWED EXECUTION AUTHORITY</small>
+                        <h3 ref={authorityHeading} tabIndex={-1}>
+                          Execution authorities
+                        </h3>
+                        <p>
+                          Choose who may build or run an approved program, which
+                          operations they may use and when their authority
+                          expires.
                         </p>
-                      )}
-                      <div className="python-authoring-fields">
-                        <label>
-                          Authority code
-                          <input
-                            aria-label="Execution authority code"
-                            value={pythonDelegationId}
-                            onChange={(event) =>
-                              changeExecutionDelegationDraft(() =>
-                                setPythonDelegationId(event.target.value),
-                              )
-                            }
-                            placeholder="budget-planning-operator"
-                          />
-                        </label>
-                        <label>
-                          Authorized user
-                          <select
-                            aria-label="Execution authority user"
-                            value={pythonDelegationSubject}
-                            onChange={(event) =>
-                              changeExecutionDelegationDraft(() =>
-                                setPythonDelegationSubject(event.target.value),
-                              )
-                            }
-                          >
-                            <option value="">Choose a current user</option>
-                            {pythonDelegationSubject &&
-                              !executionSubject(pythonDelegationSubject) && (
-                                <option
-                                  value={pythonDelegationSubject}
-                                  disabled
-                                >
-                                  Directory identity unavailable
-                                </option>
-                              )}
-                            {executionSubjects.map((subject) => (
-                              <option
-                                key={subject.selectionKey}
-                                value={subject.selectionKey}
-                              >
-                                {subject.displayName} ({subject.username})
-                              </option>
+                      </div>
+                      <div className="reviewed-inline-actions">
+                        <button
+                          disabled={pythonProgramBusy}
+                          onClick={() => void readExecutionDelegations(false)}
+                        >
+                          {executionDelegations.length
+                            ? "Refresh authorities"
+                            : "Read authorities"}
+                        </button>
+                        <button
+                          disabled={
+                            pythonProgramBusy || !executionDelegationAfter
+                          }
+                          onClick={() => void readExecutionDelegations(true)}
+                        >
+                          Next page
+                        </button>
+                      </div>
+                    </div>
+                    {executionDelegations.length ? (
+                      <div className="react-grid-scroll">
+                        <table className="react-cube-grid python-program-grid">
+                          <thead>
+                            <tr>
+                              <th>Authority</th>
+                              <th>State</th>
+                              <th>User</th>
+                              <th>Scope</th>
+                              <th>Valid until</th>
+                              <th>Use</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {executionDelegations.map((delegation) => (
+                              <tr key={delegation.delegation_id}>
+                                <th>{delegation.delegation_id}</th>
+                                <td>{delegation.status}</td>
+                                <td>
+                                  {executionSubjectLabel(delegation.subject_id)}
+                                </td>
+                                <td>
+                                  {executionScopeLabel(
+                                    delegation.operation_scope,
+                                  )}
+                                </td>
+                                <td>
+                                  {new Date(
+                                    delegation.valid_until,
+                                  ).toLocaleString()}
+                                </td>
+                                <td>
+                                  <button
+                                    disabled={
+                                      pythonProgramBusy || authorityEditorLocked
+                                    }
+                                    onClick={() =>
+                                      openExecutionDelegation(delegation, false)
+                                    }
+                                  >
+                                    Use authority details
+                                  </button>
+                                </td>
+                              </tr>
                             ))}
-                          </select>
-                        </label>
-                        <label>
-                          Valid from
-                          <input
-                            aria-label="Execution authority valid from"
-                            type="datetime-local"
-                            value={pythonDelegationValidFrom}
-                            onChange={(event) =>
-                              changeExecutionDelegationDraft(() =>
-                                setPythonDelegationValidFrom(
-                                  event.target.value,
-                                ),
-                              )
-                            }
-                          />
-                        </label>
-                        <label>
-                          Valid until
-                          <input
-                            aria-label="Execution authority valid until"
-                            type="datetime-local"
-                            value={pythonDelegationValidUntil}
-                            onChange={(event) =>
-                              changeExecutionDelegationDraft(() =>
-                                setPythonDelegationValidUntil(
-                                  event.target.value,
-                                ),
-                              )
-                            }
-                          />
-                        </label>
+                          </tbody>
+                        </table>
                       </div>
-                      <fieldset className="authority-scope">
-                        <legend>Permitted functions</legend>
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={pythonDelegationBuild}
-                            onChange={(event) =>
-                              changeExecutionDelegationDraft(() =>
-                                setPythonDelegationBuild(event.target.checked),
-                              )
-                            }
-                          />
-                          Build sealed plans
-                        </label>
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={pythonDelegationRun}
-                            onChange={(event) =>
-                              changeExecutionDelegationDraft(() =>
-                                setPythonDelegationRun(event.target.checked),
-                              )
-                            }
-                          />
-                          Run sealed plans
-                        </label>
-                      </fieldset>
-                      <div className="reviewed-inline-actions">
-                        <button
-                          disabled={
-                            pythonProgramBusy || !pythonDelegationId.trim()
+                    ) : (
+                      <p className="muted-copy">
+                        No authority catalogue read yet.
+                      </p>
+                    )}
+                    <div className="python-authoring-fields">
+                      <label>
+                        Authority code
+                        <input
+                          aria-label="Execution authority code"
+                          disabled={authorityEditorLocked}
+                          value={pythonDelegationId}
+                          onChange={(event) =>
+                            changeExecutionDelegationDraft(() =>
+                              setPythonDelegationId(event.target.value),
+                            )
                           }
-                          onClick={() => void readPythonDelegation()}
-                        >
-                          Open authority
-                        </button>
-                        <label className="review-check">
-                          <input
-                            type="checkbox"
-                            checked={pythonDelegationCreateReviewed}
-                            disabled={!executionDelegationDraftValid()}
-                            onChange={(event) =>
-                              setPythonDelegationCreateReviewed(
-                                event.target.checked,
-                              )
-                            }
-                          />
-                          I reviewed this authority, authorized user, permitted
-                          functions, validity period and current application.
-                        </label>
-                        <button
+                          placeholder="budget-planning-operator"
+                        />
+                      </label>
+                      <label>
+                        Authorized user
+                        <select
+                          aria-label="Execution authority user"
                           disabled={
-                            pythonProgramBusy ||
-                            !pythonDelegationCreateReviewed ||
-                            !executionDelegationDraftValid() ||
-                            !catalog?.functions["execution.delegation.create"]
+                            authorityEditorLocked ||
+                            currentExecutionDirectory?.status !== "ready"
                           }
-                          onClick={() =>
-                            void mutateExecutionDelegation("create")
+                          value={pythonDelegationSubject}
+                          onChange={(event) =>
+                            changeExecutionDelegationDraft(() =>
+                              setPythonDelegationSubject(event.target.value),
+                            )
                           }
                         >
-                          Create authority
-                        </button>
-                      </div>
-                      <div className="reviewed-inline-actions">
-                        <label className="review-check">
-                          <input
-                            type="checkbox"
-                            checked={pythonDelegationRevokeReviewed}
-                            disabled={
-                              !pythonDelegationReadVerified ||
-                              pythonDelegation?.status !== "Active" ||
-                              pythonDelegation?.state_token !==
-                                pythonDelegationStateToken
-                            }
-                            onChange={(event) =>
-                              setPythonDelegationRevokeReviewed(
-                                event.target.checked,
-                              )
-                            }
-                          />
-                          I freshly read and reviewed this current active
-                          authority for revocation.
-                        </label>
-                        <button
+                          <option value="">Choose a current user</option>
+                          {pythonDelegationSubject &&
+                            !executionSubject(pythonDelegationSubject) && (
+                              <option value={pythonDelegationSubject} disabled>
+                                {executionSubjectLabel(pythonDelegationSubject)}
+                              </option>
+                            )}
+                          {executionSubjects.map((subject) => (
+                            <option
+                              key={subject.selectionKey}
+                              value={subject.selectionKey}
+                            >
+                              {subject.displayName} ({subject.username})
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        Valid from
+                        <input
+                          aria-label="Execution authority valid from"
+                          disabled={authorityEditorLocked}
+                          type="datetime-local"
+                          value={pythonDelegationValidFrom}
+                          onChange={(event) =>
+                            changeExecutionDelegationDraft(() =>
+                              setPythonDelegationValidFrom(event.target.value),
+                            )
+                          }
+                        />
+                      </label>
+                      <label>
+                        Valid until
+                        <input
+                          aria-label="Execution authority valid until"
+                          disabled={authorityEditorLocked}
+                          type="datetime-local"
+                          value={pythonDelegationValidUntil}
+                          onChange={(event) =>
+                            changeExecutionDelegationDraft(() =>
+                              setPythonDelegationValidUntil(event.target.value),
+                            )
+                          }
+                        />
+                      </label>
+                    </div>
+                    <fieldset
+                      className="authority-scope"
+                      disabled={authorityEditorLocked}
+                    >
+                      <legend>Permitted functions</legend>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={pythonDelegationBuild}
+                          onChange={(event) =>
+                            changeExecutionDelegationDraft(() =>
+                              setPythonDelegationBuild(event.target.checked),
+                            )
+                          }
+                        />
+                        Build sealed plans
+                      </label>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={pythonDelegationRun}
+                          onChange={(event) =>
+                            changeExecutionDelegationDraft(() =>
+                              setPythonDelegationRun(event.target.checked),
+                            )
+                          }
+                        />
+                        Run sealed plans
+                      </label>
+                    </fieldset>
+                    <div className="reviewed-inline-actions">
+                      <button
+                        disabled={
+                          pythonProgramBusy ||
+                          authorityChange.busy ||
+                          !pythonDelegationId.trim()
+                        }
+                        onClick={() => void readPythonDelegation()}
+                      >
+                        Open authority
+                      </button>
+                      <label className="review-check">
+                        <input
+                          type="checkbox"
+                          checked={pythonDelegationCreateReviewed}
                           disabled={
-                            pythonProgramBusy ||
-                            !pythonDelegationRevokeReviewed ||
+                            authorityEditorLocked ||
+                            !executionDelegationDraftValid()
+                          }
+                          onChange={(event) =>
+                            setPythonDelegationCreateReviewed(
+                              event.target.checked,
+                            )
+                          }
+                        />
+                        I reviewed this authority, authorized user, permitted
+                        functions, validity period and current application.
+                      </label>
+                      <button
+                        disabled={
+                          pythonProgramBusy ||
+                          authorityEditorLocked ||
+                          !pythonDelegationCreateReviewed ||
+                          !executionDelegationDraftValid() ||
+                          !catalog?.functions["execution.delegation.create"]
+                        }
+                        onClick={() => void mutateExecutionDelegation("create")}
+                      >
+                        Create authority
+                      </button>
+                    </div>
+                    <div className="reviewed-inline-actions">
+                      <label className="review-check">
+                        <input
+                          type="checkbox"
+                          checked={pythonDelegationRevokeReviewed}
+                          disabled={
+                            authorityEditorLocked ||
                             !pythonDelegationReadVerified ||
                             pythonDelegation?.status !== "Active" ||
                             pythonDelegation?.state_token !==
-                              pythonDelegationStateToken ||
-                            !catalog?.functions["execution.delegation.revoke"]
+                              pythonDelegationStateToken
                           }
-                          onClick={() =>
-                            void mutateExecutionDelegation("revoke")
+                          onChange={(event) =>
+                            setPythonDelegationRevokeReviewed(
+                              event.target.checked,
+                            )
                           }
-                        >
-                          Revoke authority
-                        </button>
-                      </div>
-                      {pythonDelegationReadVerified && pythonDelegation && (
-                        <p className="authority-summary" role="status">
-                          Current {pythonDelegation.status.toLowerCase()}{" "}
-                          authority for{" "}
-                          {executionSubjectLabel(pythonDelegation.subject_id)}
-                          {" · "}
-                          {executionScopeLabel(
-                            pythonDelegation.operation_scope,
-                          )}
+                        />
+                        I freshly read and reviewed this current active
+                        authority for revocation.
+                      </label>
+                      <button
+                        disabled={
+                          pythonProgramBusy ||
+                          authorityEditorLocked ||
+                          !pythonDelegationRevokeReviewed ||
+                          !pythonDelegationReadVerified ||
+                          pythonDelegation?.status !== "Active" ||
+                          pythonDelegation?.state_token !==
+                            pythonDelegationStateToken ||
+                          !catalog?.functions["execution.delegation.revoke"]
+                        }
+                        onClick={() => void mutateExecutionDelegation("revoke")}
+                      >
+                        Revoke authority
+                      </button>
+                    </div>
+                    {pythonDelegationReadVerified && pythonDelegation && (
+                      <p className="authority-summary" role="status">
+                        Current {pythonDelegation.status.toLowerCase()}{" "}
+                        authority for{" "}
+                        {executionSubjectLabel(pythonDelegation.subject_id)}
+                        {" · "}
+                        {executionScopeLabel(pythonDelegation.operation_scope)}
+                      </p>
+                    )}
+                    {pythonDelegationResult && (
+                      <p role="status">{pythonDelegationResult}</p>
+                    )}
+                    {authorityChange.pending && (
+                      <div
+                        className="authority-summary"
+                        role="region"
+                        aria-label="Original authority change"
+                      >
+                        <p role="status">
+                          {authorityChange.message ||
+                            (authorityChange.busy
+                              ? "Checking the original authority change…"
+                              : "The original authority change is unconfirmed.")}
                         </p>
-                      )}
-                      {pythonDelegationResult && (
-                        <p role="status">{pythonDelegationResult}</p>
-                      )}
-                    </article>
-                  )}
-                {["python", "python-schedules"].includes(section) &&
+                        {authorityChange.review && (
+                          <p>
+                            {authorityChange.review.action === "create"
+                              ? "Create authority "
+                              : "Revoke authority "}
+                            <strong>
+                              {authorityChange.review.delegationId}
+                            </strong>
+                          </p>
+                        )}
+                        <p>
+                          Retry uses the same request. After it expires, the
+                          server can only return an existing receipt.
+                        </p>
+                        <div className="reviewed-inline-actions">
+                          <button
+                            ref={retryAuthorityButton}
+                            disabled={!authorityChange.retryReady}
+                            aria-disabled={
+                              authorityChange.busy ||
+                              !authorityChange.retryReady
+                            }
+                            onClick={() => void authorityChange.retry()}
+                          >
+                            Retry original change
+                          </button>
+                          {authorityChange.review && (
+                            <button
+                              disabled={authorityChange.busy}
+                              onClick={() =>
+                                void authorityChange.copyOriginal()
+                              }
+                            >
+                              Copy original change for MCP
+                            </button>
+                          )}
+                          {authorityChange.canCloseRecovery && (
+                            <button
+                              onClick={() => {
+                                const delegationId =
+                                  authorityChange.closeRecovery();
+                                if (!delegationId) return;
+                                authorityHeading.current?.focus();
+                                setPythonDelegationId(delegationId);
+                                void readPythonDelegation(delegationId);
+                              }}
+                            >
+                              Close recovery and read current authority
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    {!authorityChange.pending && authorityChange.message && (
+                      <p role="status">{authorityChange.message}</p>
+                    )}
+                  </article>
+                )}
+                {showProgramInventory &&
                   (pythonPrograms.length ? (
                     <div className="react-grid-scroll">
                       <table className="react-cube-grid python-program-grid">
@@ -3149,27 +3481,30 @@ function CapabilityWorkspace({
                             <th>Status</th>
                             <th>Availability</th>
                             <th>Type</th>
-                            <th>Inspect</th>
                           </tr>
                         </thead>
                         <tbody>
                           {pythonPrograms.map((program) => (
                             <tr key={program.programId}>
-                              <th>{pythonProgramDisplayName(program)}</th>
+                              <th>
+                                <button
+                                  className="table-link"
+                                  aria-disabled={pythonProgramBusy || undefined}
+                                  aria-label={`${section === "python" ? "View code for" : "Use"} ${pythonProgramDisplayName(program)}`}
+                                  onClick={(event) => {
+                                    if (pythonProgramBusy) return;
+                                    setPythonScheduleReviewedAction(null);
+                                    void readPythonProgram(program, {
+                                      focusOrigin: event.currentTarget,
+                                    });
+                                  }}
+                                >
+                                  {pythonProgramDisplayName(program)}
+                                </button>
+                              </th>
                               <td>{program.status}</td>
                               <td>{pythonProgramAvailabilityLabel(program)}</td>
                               <td>{pythonProgramTypeLabel(program)}</td>
-                              <td>
-                                <button
-                                  disabled={pythonProgramBusy}
-                                  onClick={() => {
-                                    setPythonScheduleReviewedAction(null);
-                                    void readPythonProgram(program);
-                                  }}
-                                >
-                                  Open
-                                </button>
-                              </td>
                             </tr>
                           ))}
                         </tbody>
@@ -3181,18 +3516,23 @@ function CapabilityWorkspace({
                         ? pythonProgramBusy
                           ? "Loading permitted programs…"
                           : "No Python programs are available in this application."
-                        : "Your current role cannot read Python programs."}
+                        : "Python programs are unavailable in the current application context."}
                     </p>
                   ))}
                 {section === "python" && selectedPythonProgram && (
                   <article
+                    ref={pythonDetailRef}
                     className="program-inspector python-program-detail"
                     aria-label="Python program detail"
+                    tabIndex={-1}
                   >
                     <h3>{pythonProgramDisplayName(selectedPythonProgram)}</h3>
                     <p>
                       {selectedPythonProgram.status} ·{" "}
                       {pythonProgramTypeLabel(selectedPythonProgram)}
+                    </p>
+                    <p>
+                      {pythonProgramAvailabilityLabel(selectedPythonProgram)}
                     </p>
                     <h4>Current source</h4>
                     <PythonRuleEditor
@@ -3230,77 +3570,124 @@ function CapabilityWorkspace({
                         This program does not require parameters.
                       </p>
                     )}
-                    {canAuthorPythonPrograms && (
-                      <button
-                        disabled={pythonProgramBusy}
-                        onClick={() =>
-                          editCurrentPythonProgram(selectedPythonProgram)
+                    {canSavePythonProgram &&
+                      (!groupDesign ||
+                        selectedPythonProgram.status === "Inactive") && (
+                        <button
+                          disabled={pythonProgramBusy}
+                          onClick={() =>
+                            editCurrentPythonProgram(selectedPythonProgram)
+                          }
+                        >
+                          Edit current source
+                        </button>
+                      )}
+                    {app && catalog && canReadPythonPrograms && (
+                      <PythonSourceValidation
+                        key={selectedPythonProgram.sourceToken}
+                        app={app}
+                        catalog={catalog}
+                        source={selectedPythonProgram}
+                        contextKey={pythonContextKey}
+                        suspended={
+                          pythonProgramBusy ||
+                          pythonSelectedContextKey !== pythonContextKey
                         }
-                      >
-                        Edit current source
-                      </button>
+                        onAccepted={(build) => {
+                          setSelectedPythonProgram((current) =>
+                            current?.sourceToken ===
+                            selectedPythonProgram.sourceToken
+                              ? { ...current, validation: build }
+                              : current,
+                          );
+                          setPythonSelectedValidation({
+                            build,
+                            contextKey: pythonContextKey,
+                          });
+                        }}
+                      />
                     )}
-                    {app &&
-                      catalog &&
-                      Boolean(catalog.functions["python.program.test"]) && (
-                        <PythonProgramTest
-                          key={`${selectedPythonProgram.programId}:${selectedPythonProgram.sourceToken}:${selectedPythonProgram.latestImpactTest?.buildId}:${selectedPythonProgram.latestImpactTest?.status}:${selectedPythonProgram.latestImpactTest?.current}`}
-                          app={app}
-                          catalog={catalog}
-                          program={{
-                            ...selectedPythonProgram,
-                            validation:
-                              pythonSelectedContextKey === pythonContextKey &&
-                              selectedValidationObserver.current &&
-                              selectedValidation?.buildId ===
-                                selectedPythonProgram.validation?.buildId
-                                ? selectedValidation
-                                : null,
-                          }}
-                          parameters={pythonBuildParameters}
-                          onParametersChange={setPythonBuildParameters}
-                          definitionContextKey={
-                            pythonSelectedContextKey === pythonContextKey
-                              ? pythonSelectedContextKey
-                              : undefined
-                          }
-                          onSealedTest={setPythonSealedTest}
-                        />
-                      )}
-                    {app &&
-                      catalog &&
-                      Boolean(catalog.functions["python.program.build"]) &&
-                      Boolean(catalog.functions["python.program.run"]) &&
-                      !selectedPythonProgram.validation?.definition &&
-                      !selectedPythonProgram.latestImpactTest?.definition && (
-                        <PythonProgramRun
-                          app={app}
-                          catalog={catalog}
-                          program={selectedPythonProgram}
-                          parameters={pythonBuildParameters}
-                          suspended={pythonProgramBusy}
-                          authority={
-                            pythonDelegationReadVerified &&
-                            pythonDelegation?.delegation_id ===
-                              pythonDelegationId.trim() &&
-                            pythonDelegation.status === "Active" &&
-                            pythonDelegation.state_token ===
-                              pythonDelegationStateToken
-                              ? pythonDelegation
-                              : null
-                          }
-                          onSetupAuthority={() =>
-                            onNavigateSection("authorities")
-                          }
-                        />
-                      )}
-                    {selectedValidation && (
-                      <p>
-                        Validation: {selectedValidation.status}
-                        {!selectedValidationObserver.current
-                          ? " · stale application context"
-                          : ""}
+                    {app && catalog && canReadPythonPrograms && (
+                      <PythonProgramTest
+                        key={`${selectedPythonProgram.programId}:${selectedPythonProgram.sourceToken}:${selectedPythonProgram.latestImpactTest?.buildId}:${selectedPythonProgram.latestImpactTest?.status}:${selectedPythonProgram.latestImpactTest?.current}`}
+                        app={app}
+                        catalog={catalog}
+                        program={{
+                          ...selectedPythonProgram,
+                          validation:
+                            pythonSelectedContextKey === pythonContextKey &&
+                            selectedValidationObserver.current &&
+                            selectedValidation?.buildId ===
+                              selectedPythonProgram.validation?.buildId
+                              ? selectedValidation
+                              : null,
+                        }}
+                        parameters={pythonBuildParameters}
+                        onParametersChange={setPythonBuildParameters}
+                        definitionContextKey={
+                          pythonSelectedContextKey === pythonContextKey
+                            ? pythonSelectedContextKey
+                            : undefined
+                        }
+                        onSealedTest={setPythonSealedTest}
+                      />
+                    )}
+                    {app && catalog && (
+                      <PythonProgramRun
+                        app={app}
+                        catalog={catalog}
+                        program={selectedPythonProgram}
+                        parameters={pythonBuildParameters}
+                        suspended={pythonProgramBusy}
+                        authority={
+                          pythonDelegationReadVerified &&
+                          pythonDelegation?.delegation_id ===
+                            pythonDelegationId.trim() &&
+                          pythonDelegation.status === "Active" &&
+                          pythonDelegation.state_token ===
+                            pythonDelegationStateToken
+                            ? pythonDelegation
+                            : null
+                        }
+                        onSetupAuthority={
+                          canReadExecutionAuthorities
+                            ? () => onNavigateSection("authorities")
+                            : undefined
+                        }
+                      />
+                    )}
+                    {selectedPythonProgram.declaredOutput !== null && (
+                      <p className="muted-copy">
+                        This source defines a{" "}
+                        {pythonProgramTypeLabel(
+                          selectedPythonProgram,
+                        ).toLowerCase()}
+                        . Use its current definition in{" "}
+                        {selectedPythonProgram.declaredOutput.kind ===
+                        "ApplicationRule"
+                          ? "Rules"
+                          : selectedPythonProgram.declaredOutput.kind ===
+                              "CalculatedMember"
+                            ? "Calculated members"
+                            : "Member lists"}
+                        . A technical build's expiry does not turn a typed
+                        definition into a general execution Plan.
                       </p>
+                    )}
+                    {selectedValidation && (
+                      <>
+                        <p>
+                          Validation: {selectedValidation.status}
+                          {selectedValidation.ownedByCaller === false
+                            ? " · belongs to another user"
+                            : !selectedValidationObserver.current
+                              ? " · stale application context"
+                              : ""}
+                        </p>
+                        <p className="muted-copy">
+                          {DEFINITION_VALIDATION_EXPLANATION}
+                        </p>
+                      </>
                     )}
                     {selectedValidationObserver.error && (
                       <p role="alert">
@@ -3348,263 +3735,253 @@ function CapabilityWorkspace({
                     </div>
                   </article>
                 )}
-                {section === "python-schedules" &&
-                  Boolean(catalog?.functions["python.schedule.list"]) &&
-                  Boolean(catalog?.functions["python.schedule.read"]) && (
-                    <article
-                      className="program-inspector python-schedules"
-                      aria-label="Python schedule management"
-                    >
-                      <div className="section-heading-row">
-                        <div>
-                          <small>SERVER-OWNED RECURRENCE</small>
-                          <h3>Program schedules</h3>
-                          <p>
-                            Choose an active program and execution authority,
-                            then define its recurrence. Open an existing
-                            schedule to inspect or control it.
-                          </p>
-                        </div>
-                        <div className="reviewed-inline-actions">
-                          <button
-                            disabled={pythonProgramBusy}
-                            onClick={() => void readPythonSchedules(false)}
-                          >
-                            {pythonSchedules.length
-                              ? "Refresh schedules"
-                              : "Read schedules"}
-                          </button>
-                          <button
-                            disabled={pythonProgramBusy || !pythonScheduleAfter}
-                            onClick={() => void readPythonSchedules(true)}
-                          >
-                            Next page
-                          </button>
-                        </div>
-                      </div>
-                      {pythonSchedules.length ? (
-                        <div className="react-grid-scroll">
-                          <table className="react-cube-grid python-program-grid">
-                            <thead>
-                              <tr>
-                                <th>Schedule</th>
-                                <th>Status</th>
-                                <th>Program</th>
-                                <th>Interval</th>
-                                <th>Last due</th>
-                                <th>Use</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {pythonSchedules.map((schedule) => (
-                                <tr key={schedule.schedule_id}>
-                                  <th>{schedule.schedule_id}</th>
-                                  <td>{schedule.status}</td>
-                                  <td>{schedule.program_id}</td>
-                                  <td>{schedule.interval_seconds}s</td>
-                                  <td>
-                                    {schedule.last_due_at
-                                      ? new Date(
-                                          schedule.last_due_at,
-                                        ).toLocaleString()
-                                      : "Never"}
-                                  </td>
-                                  <td>
-                                    <button
-                                      disabled={pythonProgramBusy}
-                                      onClick={() =>
-                                        openPythonSchedule(schedule, false)
-                                      }
-                                    >
-                                      Use
-                                    </button>
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      ) : (
-                        <p className="muted-copy">
-                          {pythonSchedulesRead
-                            ? "No Python schedules are defined for this application."
-                            : "No schedule catalogue read yet."}
-                        </p>
-                      )}
-                      <div className="python-authoring-fields">
-                        <label>
-                          Schedule code
-                          <input
-                            aria-label="Python schedule code"
-                            value={pythonScheduleId}
-                            onChange={(event) =>
-                              invalidatePythonScheduleDraft(
-                                () => setPythonScheduleId(event.target.value),
-                                true,
-                              )
-                            }
-                          />
-                        </label>
-                        <button
-                          disabled={
-                            pythonProgramBusy || !pythonScheduleId.trim()
-                          }
-                          onClick={() => void readPythonSchedule()}
-                        >
-                          Open schedule
-                        </button>
-                        <label>
-                          Interval seconds
-                          <input
-                            aria-label="Python schedule interval seconds"
-                            inputMode="numeric"
-                            value={pythonScheduleInterval}
-                            onChange={(event) =>
-                              invalidatePythonScheduleDraft(() =>
-                                setPythonScheduleInterval(event.target.value),
-                              )
-                            }
-                          />
-                        </label>
-                        <label>
-                          First due
-                          <input
-                            aria-label="Python schedule first due"
-                            type="datetime-local"
-                            value={pythonScheduleFirstDue}
-                            onChange={(event) =>
-                              invalidatePythonScheduleDraft(() =>
-                                setPythonScheduleFirstDue(event.target.value),
-                              )
-                            }
-                          />
-                        </label>
-                        <label>
-                          Catch-up policy
-                          <select
-                            aria-label="Python schedule catch-up policy"
-                            value={pythonScheduleCatchUp}
-                            onChange={(event) =>
-                              invalidatePythonScheduleDraft(() =>
-                                setPythonScheduleCatchUp(
-                                  event.target.value as
-                                    | "skip"
-                                    | "latest"
-                                    | "all",
-                                ),
-                              )
-                            }
-                          >
-                            <option value="skip">
-                              Skip missed occurrences
-                            </option>
-                            <option value="latest">
-                              Run latest missed occurrence
-                            </option>
-                            <option value="all">
-                              Run bounded missed occurrences
-                            </option>
-                          </select>
-                        </label>
-                        <label>
-                          Maximum catch-up
-                          <input
-                            aria-label="Python schedule maximum catch-up"
-                            inputMode="numeric"
-                            value={pythonScheduleMaxCatchUp}
-                            onChange={(event) =>
-                              invalidatePythonScheduleDraft(() =>
-                                setPythonScheduleMaxCatchUp(event.target.value),
-                              )
-                            }
-                          />
-                        </label>
-                      </div>
-                      <ParameterFields
-                        label="Schedule parameters"
-                        advancedLabel="Python schedule parameters"
-                        value={pythonScheduleParameters}
-                        schema={pythonScheduleParameterSchema}
-                        disabled={pythonProgramBusy}
-                        onChange={(value) =>
-                          invalidatePythonScheduleDraft(() =>
-                            setPythonScheduleParameters(value),
-                          )
-                        }
-                      />
-                      {!pythonScheduleParameterSchema && (
+                {section === "python-schedules" && canReadPythonSchedules && (
+                  <article
+                    className="program-inspector python-schedules"
+                    aria-label="Python schedule management"
+                  >
+                    <div className="section-heading-row">
+                      <div>
+                        <small>SERVER-OWNED RECURRENCE</small>
+                        <h3 ref={scheduleHeading} tabIndex={-1}>
+                          Program schedules
+                        </h3>
                         <p>
-                          Open the schedule's current source in the current
-                          application context to use declared fields. The
-                          advanced object remains available.
+                          Choose an active program and execution authority, then
+                          define its recurrence. Open an existing schedule to
+                          inspect or control it.
                         </p>
-                      )}
-                      <p className="authority-summary">
-                        Program:{" "}
-                        {selectedPythonProgram?.programId ||
-                          "open an active current source"}
-                        {selectedPythonProgram
-                          ? ` (${selectedPythonProgram.status})`
-                          : ""}
-                        {" · "}Authority:{" "}
-                        {pythonDelegation
-                          ? `${executionSubjectLabel(pythonDelegation.subject_id)} (current)`
-                          : "choose an active authority"}
-                      </p>
-                      <div className="python-authoring-fields">
-                        <label>
-                          Execution authority
-                          <select
-                            aria-label="Schedule execution authority"
-                            value={pythonDelegationId}
-                            disabled={pythonProgramBusy}
-                            onChange={(event) => {
-                              invalidatePythonScheduleDraft(() =>
-                                chooseExecutionDelegation(event.target.value),
-                              );
-                            }}
-                          >
-                            <option value="">Choose an authority</option>
-                            {scheduleExecutionDelegations.map((delegation) => (
-                              <option
-                                key={delegation.delegation_id}
-                                value={delegation.delegation_id}
-                              >
-                                {executionSubjectLabel(delegation.subject_id)} ·{" "}
-                                {delegation.operation_scope
-                                  .map((scope) =>
-                                    scope === "python.program.build"
-                                      ? "Build"
-                                      : "Run",
-                                  )
-                                  .join(" and ")}{" "}
-                                · until{" "}
-                                {new Date(
-                                  delegation.valid_until,
-                                ).toLocaleString()}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
                       </div>
-                      {pythonDelegation && (
-                        <p className="authority-summary">
-                          Authorized user:{" "}
-                          {executionSubjectLabel(pythonDelegation.subject_id)}
-                          {" · "}
-                          {executionScopeLabel(
-                            pythonDelegation.operation_scope,
-                          )}
-                          {" · Expires "}
-                          {new Date(
-                            pythonDelegation.valid_until,
-                          ).toLocaleString()}
-                        </p>
-                      )}
                       <div className="reviewed-inline-actions">
-                        {(
-                          ["save", "activate", "deactivate", "run"] as const
-                        ).map((action) => (
+                        <button
+                          disabled={pythonProgramBusy}
+                          onClick={() => void readPythonSchedules(false)}
+                        >
+                          {pythonSchedules.length
+                            ? "Refresh schedules"
+                            : "Read schedules"}
+                        </button>
+                        <button
+                          disabled={pythonProgramBusy || !pythonScheduleAfter}
+                          onClick={() => void readPythonSchedules(true)}
+                        >
+                          Next page
+                        </button>
+                      </div>
+                    </div>
+                    {pythonSchedules.length ? (
+                      <div className="react-grid-scroll">
+                        <table className="react-cube-grid python-program-grid">
+                          <thead>
+                            <tr>
+                              <th>Schedule</th>
+                              <th>Status</th>
+                              <th>Program</th>
+                              <th>Interval</th>
+                              <th>Last due</th>
+                              <th>Use</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {pythonSchedules.map((schedule) => (
+                              <tr key={schedule.schedule_id}>
+                                <th>{schedule.schedule_id}</th>
+                                <td>{schedule.status}</td>
+                                <td>{schedule.program_id}</td>
+                                <td>{schedule.interval_seconds}s</td>
+                                <td>
+                                  {schedule.last_due_at
+                                    ? new Date(
+                                        schedule.last_due_at,
+                                      ).toLocaleString()
+                                    : "Never"}
+                                </td>
+                                <td>
+                                  <button
+                                    disabled={pythonProgramBusy}
+                                    onClick={() =>
+                                      openPythonSchedule(schedule, false)
+                                    }
+                                  >
+                                    Use
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <p className="muted-copy">
+                        {pythonSchedulesRead
+                          ? "No Python schedules are defined for this application."
+                          : "No schedule catalogue read yet."}
+                      </p>
+                    )}
+                    <div className="python-authoring-fields">
+                      <label>
+                        Schedule code
+                        <input
+                          aria-label="Python schedule code"
+                          value={pythonScheduleId}
+                          onChange={(event) =>
+                            invalidatePythonScheduleDraft(
+                              () => setPythonScheduleId(event.target.value),
+                              true,
+                            )
+                          }
+                        />
+                      </label>
+                      <button
+                        disabled={pythonProgramBusy || !pythonScheduleId.trim()}
+                        onClick={() => void readPythonSchedule()}
+                      >
+                        Open schedule
+                      </button>
+                      <label>
+                        Interval seconds
+                        <input
+                          aria-label="Python schedule interval seconds"
+                          inputMode="numeric"
+                          value={pythonScheduleInterval}
+                          onChange={(event) =>
+                            invalidatePythonScheduleDraft(() =>
+                              setPythonScheduleInterval(event.target.value),
+                            )
+                          }
+                        />
+                      </label>
+                      <label>
+                        First due
+                        <input
+                          aria-label="Python schedule first due"
+                          type="datetime-local"
+                          value={pythonScheduleFirstDue}
+                          onChange={(event) =>
+                            invalidatePythonScheduleDraft(() =>
+                              setPythonScheduleFirstDue(event.target.value),
+                            )
+                          }
+                        />
+                      </label>
+                      <label>
+                        Catch-up policy
+                        <select
+                          aria-label="Python schedule catch-up policy"
+                          value={pythonScheduleCatchUp}
+                          onChange={(event) =>
+                            invalidatePythonScheduleDraft(() =>
+                              setPythonScheduleCatchUp(
+                                event.target.value as "skip" | "latest" | "all",
+                              ),
+                            )
+                          }
+                        >
+                          <option value="skip">Skip missed occurrences</option>
+                          <option value="latest">
+                            Run latest missed occurrence
+                          </option>
+                          <option value="all">
+                            Run bounded missed occurrences
+                          </option>
+                        </select>
+                      </label>
+                      <label>
+                        Maximum catch-up
+                        <input
+                          aria-label="Python schedule maximum catch-up"
+                          inputMode="numeric"
+                          value={pythonScheduleMaxCatchUp}
+                          onChange={(event) =>
+                            invalidatePythonScheduleDraft(() =>
+                              setPythonScheduleMaxCatchUp(event.target.value),
+                            )
+                          }
+                        />
+                      </label>
+                    </div>
+                    <ParameterFields
+                      label="Schedule parameters"
+                      advancedLabel="Python schedule parameters"
+                      value={pythonScheduleParameters}
+                      schema={pythonScheduleParameterSchema}
+                      disabled={pythonProgramBusy}
+                      onChange={(value) =>
+                        invalidatePythonScheduleDraft(() =>
+                          setPythonScheduleParameters(value),
+                        )
+                      }
+                    />
+                    {!pythonScheduleParameterSchema && (
+                      <p>
+                        Open the schedule's current source in the current
+                        application context to use declared fields. The advanced
+                        object remains available.
+                      </p>
+                    )}
+                    <p className="authority-summary">
+                      Program:{" "}
+                      {selectedPythonProgram?.programId ||
+                        "open an active current source"}
+                      {selectedPythonProgram
+                        ? ` (${selectedPythonProgram.status})`
+                        : ""}
+                      {" · "}Authority:{" "}
+                      {pythonDelegation
+                        ? `${executionSubjectLabel(pythonDelegation.subject_id)} (current)`
+                        : "choose an active authority"}
+                    </p>
+                    <div className="python-authoring-fields">
+                      <label>
+                        Execution authority
+                        <select
+                          aria-label="Schedule execution authority"
+                          value={pythonDelegationId}
+                          disabled={pythonProgramBusy}
+                          onChange={(event) => {
+                            invalidatePythonScheduleDraft(() =>
+                              chooseExecutionDelegation(event.target.value),
+                            );
+                          }}
+                        >
+                          <option value="">Choose an authority</option>
+                          {scheduleExecutionDelegations.map((delegation) => (
+                            <option
+                              key={delegation.delegation_id}
+                              value={delegation.delegation_id}
+                            >
+                              {executionSubjectLabel(delegation.subject_id)} ·{" "}
+                              {delegation.operation_scope
+                                .map((scope) =>
+                                  scope === "python.program.build"
+                                    ? "Build"
+                                    : "Run",
+                                )
+                                .join(" and ")}{" "}
+                              · until{" "}
+                              {new Date(
+                                delegation.valid_until,
+                              ).toLocaleString()}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    {pythonDelegation && (
+                      <p className="authority-summary">
+                        Authorized user:{" "}
+                        {executionSubjectLabel(pythonDelegation.subject_id)}
+                        {" · "}
+                        {executionScopeLabel(pythonDelegation.operation_scope)}
+                        {" · Expires "}
+                        {new Date(
+                          pythonDelegation.valid_until,
+                        ).toLocaleString()}
+                      </p>
+                    )}
+                    <div className="reviewed-inline-actions">
+                      {(["save", "activate", "deactivate", "run"] as const).map(
+                        (action) => (
                           <label className="review-check" key={action}>
                             <input
                               type="radio"
@@ -3617,138 +3994,241 @@ function CapabilityWorkspace({
                             />
                             Review {action}
                           </label>
-                        ))}
-                        <button
+                        ),
+                      )}
+                      <button
+                        disabled={
+                          pythonProgramBusy ||
+                          !pythonScheduleReviewedAction ||
+                          !pythonScheduleActionAllowed(
+                            pythonScheduleReviewedAction || "save",
+                          )
+                        }
+                        onClick={() =>
+                          pythonScheduleReviewedAction &&
+                          void mutatePythonSchedule(
+                            pythonScheduleReviewedAction,
+                          )
+                        }
+                      >
+                        Apply reviewed schedule action
+                      </button>
+                    </div>
+                    {pythonScheduleReadVerified && pythonSchedule && (
+                      <p role="status">
+                        Current schedule · {pythonSchedule.status}
+                      </p>
+                    )}
+                    <div className="python-authoring-fields execution-status-fields">
+                      <label>
+                        Schedule run
+                        <select
+                          aria-label="Python schedule run"
+                          value={pythonOccurrenceId}
                           disabled={
                             pythonProgramBusy ||
-                            !pythonScheduleReviewedAction ||
-                            !pythonScheduleActionAllowed(
-                              pythonScheduleReviewedAction || "save",
-                            )
+                            pythonOccurrenceBusy ||
+                            !canReadPythonOccurrence
                           }
-                          onClick={() =>
-                            pythonScheduleReviewedAction &&
-                            void mutatePythonSchedule(
-                              pythonScheduleReviewedAction,
-                            )
+                          onChange={(event) =>
+                            choosePythonOccurrence(event.target.value)
                           }
                         >
-                          Apply reviewed schedule action
-                        </button>
-                      </div>
-                      {pythonScheduleReadVerified && pythonSchedule && (
-                        <p role="status">
-                          Current schedule · {pythonSchedule.status}
+                          <option value="">Choose a schedule run</option>
+                          {occurrenceChoices.map((occurrence) => (
+                            <option
+                              key={occurrence.occurrence_id}
+                              value={occurrence.occurrence_id}
+                            >
+                              {occurrence.schedule_id} ·{" "}
+                              {pythonOccurrenceStatusLabel(occurrence.status)}
+                              {occurrence.due_at
+                                ? ` · due ${new Date(
+                                    occurrence.due_at,
+                                  ).toLocaleString()}`
+                                : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        disabled={
+                          pythonProgramBusy ||
+                          pythonOccurrenceBusy ||
+                          !pythonOccurrenceAfter
+                        }
+                        onClick={() => void readPythonOccurrences(true)}
+                      >
+                        More schedule runs
+                      </button>
+                    </div>
+                    {!pythonProgramBusy &&
+                      !pythonOccurrenceBusy &&
+                      !occurrenceChoices.length && (
+                        <p className="muted-copy">
+                          No schedule runs are available.
                         </p>
                       )}
-                      <div className="python-authoring-fields execution-status-fields">
-                        <label>
-                          Schedule run
-                          <select
-                            aria-label="Python schedule run"
-                            value={pythonOccurrenceId}
-                            disabled={pythonProgramBusy || pythonOccurrenceBusy}
+                    {canReadPythonOccurrence &&
+                      pythonOccurrenceSelection &&
+                      !currentPythonOccurrenceRead && (
+                        <p role="status">Checking the current schedule run…</p>
+                      )}
+                    {currentPythonOccurrenceRead?.error && (
+                      <div className="reviewed-inline-actions">
+                        <p role="alert">{currentPythonOccurrenceRead.error}</p>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            choosePythonOccurrence(pythonOccurrenceId)
+                          }
+                        >
+                          Read schedule run again
+                        </button>
+                      </div>
+                    )}
+                    {pythonOccurrence && (
+                      <div className="execution-status-card">
+                        <strong>
+                          Run{" "}
+                          {pythonOccurrenceStatusLabel(pythonOccurrence.status)}
+                        </strong>
+                        <span>Schedule {pythonOccurrence.schedule_id}</span>
+                        {pythonOccurrence.due_at && (
+                          <span>
+                            Due{" "}
+                            {new Date(pythonOccurrence.due_at).toLocaleString()}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                    {cancellablePythonOccurrence && (
+                      <div className="reviewed-inline-actions">
+                        <label className="review-check">
+                          <input
+                            type="checkbox"
+                            checked={pythonOccurrenceCancelReviewed}
+                            disabled={scheduleChangeLocked}
                             onChange={(event) =>
-                              choosePythonOccurrence(event.target.value)
+                              setReviewedPythonOccurrence(
+                                event.target.checked
+                                  ? cancellablePythonOccurrence
+                                  : null,
+                              )
                             }
-                          >
-                            <option value="">Choose a schedule run</option>
-                            {pythonOccurrences.map((occurrence) => (
-                              <option
-                                key={occurrence.occurrence_id}
-                                value={occurrence.occurrence_id}
-                              >
-                                {occurrence.schedule_id} ·{" "}
-                                {pythonOccurrenceStatusLabel(occurrence.status)}
-                                {occurrence.due_at
-                                  ? ` · due ${new Date(
-                                      occurrence.due_at,
-                                    ).toLocaleString()}`
-                                  : ""}
-                              </option>
-                            ))}
-                          </select>
+                          />
+                          I reviewed this freshly read occurrence and request
+                          cancellation.
                         </label>
                         <button
                           disabled={
                             pythonProgramBusy ||
-                            pythonOccurrenceBusy ||
-                            !pythonOccurrenceAfter
+                            scheduleChangeLocked ||
+                            !pythonOccurrenceCancelReviewed ||
+                            !catalog?.functions[
+                              "python.schedule.occurrence.cancel"
+                            ]
                           }
-                          onClick={() => void readPythonOccurrences(true)}
+                          onClick={() => void cancelPythonOccurrence()}
                         >
-                          More schedule runs
+                          Cancel occurrence
                         </button>
                       </div>
-                      {!pythonProgramBusy &&
-                        !pythonOccurrenceBusy &&
-                        !pythonOccurrences.length && (
-                          <p className="muted-copy">
-                            No schedule runs are available.
-                          </p>
-                        )}
-                      {pythonOccurrence && (
-                        <div className="execution-status-card">
-                          <strong>
-                            Run{" "}
-                            {pythonOccurrenceStatusLabel(
-                              pythonOccurrence.status,
-                            )}
-                          </strong>
-                          <span>Schedule {pythonOccurrence.schedule_id}</span>
-                          {pythonOccurrence.due_at && (
-                            <span>
-                              Due{" "}
-                              {new Date(
-                                pythonOccurrence.due_at,
-                              ).toLocaleString()}
-                            </span>
+                    )}
+                    {scheduleChange.review && (
+                      <div
+                        ref={scheduleRecoveryControls}
+                        role="region"
+                        aria-label="Original Python schedule change"
+                      >
+                        <p role="status">
+                          {scheduleChange.message ||
+                            (scheduleChange.busy
+                              ? "Waiting for the server to confirm the original request…"
+                              : "The original schedule change is unconfirmed.")}
+                        </p>
+                        <p>
+                          {scheduleChange.review.action === "cancel"
+                            ? `Cancel the ${scheduleChange.review.scheduleId} run due ${new Date(scheduleChange.review.dueAt).toLocaleString()}`
+                            : `${scheduleChange.review.action} schedule ${scheduleChange.review.scheduleId}`}
+                        </p>
+                        <p>
+                          Retry uses the same request. After admission expires,
+                          the server can only return its recorded outcome.
+                        </p>
+                        <div className="reviewed-inline-actions">
+                          <button
+                            disabled={!scheduleChange.retryReady}
+                            aria-disabled={
+                              scheduleChange.busy || !scheduleChange.retryReady
+                            }
+                            onClick={() => void scheduleChange.retry()}
+                          >
+                            Retry original schedule change
+                          </button>
+                          <button
+                            disabled={scheduleChange.busy}
+                            onClick={() => void scheduleChange.copyOriginal()}
+                          >
+                            Copy original schedule change for MCP
+                          </button>
+                          {scheduleChange.canCloseRecovery && (
+                            <button
+                              onClick={() => {
+                                const original = scheduleChange.closeRecovery();
+                                if (!original) return;
+                                scheduleHeading.current?.focus();
+                                if (original.action === "cancel") {
+                                  choosePythonOccurrence(original.occurrenceId);
+                                } else {
+                                  setPythonScheduleId(original.scheduleId);
+                                  setPythonScheduleReadVerified(false);
+                                }
+                              }}
+                            >
+                              Close expired schedule request
+                            </button>
                           )}
                         </div>
-                      )}
-                      {pythonOccurrenceReadVerified &&
-                        pythonOccurrence &&
-                        [
-                          "ready",
-                          "running",
-                          "building",
-                          "running_program",
-                          "cancel_requested",
-                        ].includes(pythonOccurrence.status) && (
-                          <div className="reviewed-inline-actions">
-                            <label className="review-check">
-                              <input
-                                type="checkbox"
-                                checked={pythonOccurrenceCancelReviewed}
-                                onChange={(event) =>
-                                  setPythonOccurrenceCancelReviewed(
-                                    event.target.checked,
-                                  )
-                                }
-                              />
-                              I reviewed this freshly read occurrence and
-                              request cancellation.
-                            </label>
-                            <button
-                              disabled={
-                                pythonProgramBusy ||
-                                !pythonOccurrenceCancelReviewed ||
-                                !catalog?.functions[
-                                  "python.schedule.occurrence.cancel"
-                                ]
-                              }
-                              onClick={() => void cancelPythonOccurrence()}
-                            >
-                              Cancel occurrence
-                            </button>
-                          </div>
-                        )}
-                      {pythonScheduleResult && (
-                        <p role="status">{pythonScheduleResult}</p>
-                      )}
-                    </article>
-                  )}
+                      </div>
+                    )}
+                    {!scheduleChange.pending && scheduleChange.message && (
+                      <p role="status">{scheduleChange.message}</p>
+                    )}
+                    {pythonScheduleResult && (
+                      <p role="status">{pythonScheduleResult}</p>
+                    )}
+                  </article>
+                )}
               </section>
+            )}
+          {area === "rules" &&
+            section === "rules" &&
+            targetApplicationSequence && (
+              <div role="status">
+                <p>
+                  This saved sequence is a retired artifact. It is not opened as
+                  an ApplicationRule. Author new ordered work in Calculation
+                  rules; inspect a historical result through its original job or
+                  operation ID under current access.
+                </p>
+                {Boolean(catalog?.functions["application.rule.list"]) && (
+                  <button
+                    type="button"
+                    onClick={() => onNavigateSection("rules")}
+                  >
+                    Open Calculation rules
+                  </button>
+                )}
+                {canReadPythonPrograms && (
+                  <button
+                    type="button"
+                    onClick={() => onNavigateSection("python")}
+                  >
+                    Open Python programs
+                  </button>
+                )}
+              </div>
             )}
           {area === "rules" && section === "rules" && (
             <BuildRules
@@ -3766,14 +4246,6 @@ function CapabilityWorkspace({
               app={app}
               catalog={catalog}
               target={targetCalculatedMember}
-            />
-          )}
-          {area === "rules" && section === "sequences" && (
-            <BuildSequences
-              onRequestTransition={onRequestTransition}
-              app={app}
-              catalog={catalog}
-              target={targetApplicationSequence}
             />
           )}
           {area === "rules" && section === "schedules" && (
@@ -3800,18 +4272,35 @@ function CapabilityWorkspace({
             />
           )}
           {area === "security" &&
-            ["security", "policy", "audit"].includes(section) && (
+            section === "effective-access" &&
+            canReviewAccess &&
+            app && <EffectiveApplicationAccess app={app} catalog={catalog} />}
+          {area === "security" &&
+            (["security", "policy", "audit"].includes(section) ||
+              (section === "groups" && canReadGroupAccess)) && (
               <AdministrationSecurity
                 app={app}
                 catalog={catalog}
+                canReadDirectoryGroups={canReadDirectoryGroups}
                 view={
-                  section === "policy" || section === "audit"
+                  section === "groups" ||
+                  section === "policy" ||
+                  section === "audit"
                     ? section
                     : "access"
                 }
                 onRequestTransition={onRequestTransition}
               />
             )}
+          {area === "security" &&
+            section === "planning-policies" &&
+            app &&
+            catalog.functions[securitySectionReads["planning-policies"]] && (
+              <PlanningPolicies app={app} catalog={catalog} />
+            )}
+          {area === "security" && section === "assignments" && app && (
+            <AuthorizationAssignments app={app} catalog={catalog} />
+          )}
           {area === "data" && section === "import" && (
             <DataLoad app={app} catalog={catalog} />
           )}

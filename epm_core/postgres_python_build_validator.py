@@ -48,7 +48,7 @@ class PostgresPythonBuildOperationValidator:
     def __init__(self, dsn: str, *, identity: VerifiedIdentity,
                  preview_secret: bytes, metadata_revision: int,
                  policy_revision: int, schema_epoch: int,
-                 language=None, source_program=None):
+                 language=None, source_program=None, build_purpose=None, build_id=None, rule_run_pin=None):
         if (type(dsn) is not str or not dsn
                 or not isinstance(identity, VerifiedIdentity)
                 or type(preview_secret) is not bytes or len(preview_secret) < 32
@@ -59,6 +59,10 @@ class PostgresPythonBuildOperationValidator:
         self.preview_secret = preview_secret
         self.expected = (metadata_revision, policy_revision, schema_epoch)
         self.source_program = source_program
+        self.build_purpose = build_purpose
+        self.build_id = build_id
+        self._inside_rule = False
+        self.rule_run_pin = rule_run_pin
         self._ordered = None
         self.language = language or PostgresLanguageV2(
             dsn, identity=identity, preview_secret=preview_secret)
@@ -105,7 +109,9 @@ class PostgresPythonBuildOperationValidator:
         child = PostgresPythonBuildOperationValidator(self.dsn, identity=self.identity,
             preview_secret=self.preview_secret, metadata_revision=self.expected[0],
             policy_revision=self.expected[1], schema_epoch=self.expected[2],
-            language=self.language, source_program=self.source_program)
+            language=self.language, source_program=self.source_program, build_purpose=self.build_purpose,
+            build_id=self.build_id, rule_run_pin=self.rule_run_pin)
+        child._inside_rule = self._inside_rule
         child._ordered = {'scope': scope, 'declared': declared, 'needed': needed, 'outputs': {},
             'ordinal': 0, 'coordinates': 0, 'visits': 0}
         return child
@@ -300,7 +306,8 @@ class PostgresPythonBuildOperationValidator:
                 configure_statement_timeout(db, 15000)
                 PostgresNumericFactStore._set_scope(db, scope)
                 state = db.execute('''SELECT metadata_revision,policy_revision,
-                    schema_epoch,enabled_capabilities FROM epm.application_state
+                    schema_epoch,enabled_capabilities,authorization_model FROM epm.application_state
+                    JOIN epm.application USING(workspace_id,application_id)
                     WHERE workspace_id=%s AND application_id=%s''',
                     (scope.workspace_id, scope.application_id)).fetchone()
                 if state is None or tuple(state[key] for key in
@@ -339,9 +346,46 @@ class PostgresPythonBuildOperationValidator:
                 if permission not in ('write', 'admin', 'rule_design',
                                       'rule_publish', 'rule_run'):
                     raise ValueError('PYTHON_BUILD_FUNCTION_UNAVAILABLE')
-                PostgresAccessChecker.check_in_transaction(db, self.identity,
-                    scope, permission, function=function,
-                    arguments=dict(arguments))
+                if self.build_purpose == 'Validation' and function in KINDS:
+                    # Here SAVE is a typed artifact declaration. Only the
+                    # separate activation transaction can store its payload.
+                    permission = 'rule_validate'
+                if state.get('authorization_model')=='group_assignments' and self.rule_run_pin is not None:
+                    from .postgres_access import AccessDenied
+                    from .postgres_group_rule_source import NUMERIC_RULE_OPERATIONS
+                    if function not in NUMERIC_RULE_OPERATIONS:
+                        raise AccessDenied('RULE_RUN_TARGET_UNAVAILABLE')
+                    PostgresAccessChecker.check_in_transaction(db,self.identity,scope,'rule_run',
+                        function='application.rule.run')
+                    active = db.execute("""SELECT 1 FROM epm.expression_rule_definition
+                        WHERE workspace_id=%s AND application_id=%s AND rule_id=%s AND state_token=%s
+                          AND program_digest=%s AND definition_kind='ApplicationRule'
+                          AND ownership_state='Source' AND status='Active'""",
+                        (scope.workspace_id,scope.application_id,*self.rule_run_pin)).fetchone()
+                    if not active:
+                        raise AccessDenied('RULE_RUN_TARGET_UNAVAILABLE')
+                    PostgresAccessChecker.require_capability_in_transaction(db,scope,function,dict(arguments))
+                elif state.get('authorization_model')=='group_assignments':
+                    from .postgres_access import AccessDenied
+                    from .postgres_group_rule_source import (NUMERIC_RULE_OPERATIONS, require_build_source,
+                                                          require_numeric_rule_declaration)
+                    if self.build_purpose not in ('Validation','ImpactTest') or self.build_id is None:
+                        raise AccessDenied('RULE_SOURCE_VALIDATION_UNAVAILABLE')
+                    test = self.build_purpose=='ImpactTest'
+                    PostgresAccessChecker.check_in_transaction(db,self.identity,scope,'rule_validate',
+                        action='rules.test' if test else 'rules.design')
+                    rule_id = require_build_source(db,scope,self.identity,self.source_program,self.build_id,self.build_purpose)
+                    if self._inside_rule:
+                        if function not in NUMERIC_RULE_OPERATIONS:
+                            raise AccessDenied('RULE_SOURCE_VALIDATION_OPERATION_UNAVAILABLE')
+                        PostgresAccessChecker.check_in_transaction(db,self.identity,scope,'write',action='facts.write')
+                    else:
+                        require_numeric_rule_declaration(rule_id,function,arguments,impact=test)
+                    # A typed validation duty does not enable a disabled application capability.
+                    PostgresAccessChecker.require_capability_in_transaction(db,scope,function,dict(arguments))
+                else:
+                    PostgresAccessChecker.check_in_transaction(db, self.identity,
+                        scope, permission, function=function, arguments=dict(arguments))
                 from .postgres_authoring_references import bind_authoring_references
                 arguments = bind_authoring_references(db, scope, self.identity,
                     arguments, metadata_revision=self.expected[0], function=function)
@@ -375,7 +419,10 @@ class PostgresPythonBuildOperationValidator:
             if any(operation['function'] in KINDS for unit in bound['units']
                     for operation in unit['operations']):
                 raise ValueError('PYTHON_DEFINITION_NESTING_FORBIDDEN')
-            validate_proposed_plan(scope, definition_plan(bound), registry=self,
+            from copy import copy
+            body_registry = copy(self)
+            body_registry._inside_rule = True
+            validate_proposed_plan(scope, definition_plan(bound), registry=body_registry,
                 compiler_version='application-rule-v1')
         if definition_checked:
             self._read_state(scope)
@@ -441,6 +488,6 @@ class PostgresPythonBuildOperationValidator:
                 {'series_key': item.coordinate.series_key,
                  'members': dict(item.coordinate.members), 'ordinal': index}
                 for index, item in enumerate(mutations, 1)]}
-        validate_coordinates(db, scope, normalized)
         enforce_sequence_dimensional_security(db, self.identity, scope, normalized)
+        validate_coordinates(db, scope, normalized)
         return True

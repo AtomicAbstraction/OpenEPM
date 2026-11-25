@@ -2,8 +2,9 @@
 
 The opaque key contains only version, expiry, nonce and an HMAC.  Scope,
 verified actor, function and exact intent digest are authenticated inputs, not
-client claims.  Once the key expires, fixed core rejects it without retaining
-an unbounded tombstone or historical business payload.
+client claims. Expiry always prohibits new work. A separately authenticated
+lookup may reconcile an already retained exact request under current authority;
+it cannot extend expiry or create a missing record.
 """
 from __future__ import annotations
 
@@ -20,9 +21,16 @@ from .persistence_contract import ApplicationScope
 from .postgres_access import VerifiedIdentity
 
 
-_KEY = re.compile(r"oa1_([0-9a-z]{1,13})_([0-9a-f]{32})_([A-Za-z0-9_-]{43})\Z")
+_KEY_BODY = r"oa1_([0-9a-z]{1,13})_([0-9a-f]{32})_([A-Za-z0-9_-]{43})"
+_KEY = re.compile(_KEY_BODY + r"\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 MAX_TTL_SECONDS = 86_400
+_RECORDED_SCHEDULE_CONTROLS = frozenset((
+    'python.schedule.run', 'python.schedule.occurrence.cancel'))
+
+
+def signed_operation_id_schema() -> dict:
+    return {"type": "string", "pattern": "^" + _KEY_BODY + r"(?![\s\S])"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +53,11 @@ def _material(scope: ApplicationScope, identity: VerifiedIdentity, *,
         "issuer": identity.issuer,
         "nonce": nonce,
         "subjectId": identity.subject_id,
-        "version": "openepm-operation-admission-v1",
+        # Earlier controls did not retain an outcome. Their signed IDs must
+        # never authorize a fresh effect after installing receipt-backed control.
+        "version": ("openepm-operation-admission-v1-recorded-schedule-control"
+                    if function in _RECORDED_SCHEDULE_CONTROLS
+                    else "openepm-operation-admission-v1"),
         "workspaceId": scope.workspace_id,
     }, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
@@ -79,9 +91,10 @@ def issue_operation_admission(secret: bytes, scope: ApplicationScope,
         expires_at=expires_at, intent_digest=intent_digest)
 
 
-def validate_operation_admission(secret: bytes, scope: ApplicationScope,
+def authenticate_operation_admission(secret: bytes, scope: ApplicationScope,
         identity: VerifiedIdentity, *, operation_id: str, function: str,
-        intent_digest: str, now: int | None = None) -> OperationAdmission:
+        intent_digest: str) -> OperationAdmission:
+    """Authenticate original identity and intent; this grants no new admission."""
     if (not isinstance(secret, bytes) or len(secret) < 32
             or not isinstance(identity, VerifiedIdentity)
             or not isinstance(operation_id, str)
@@ -97,18 +110,26 @@ def validate_operation_admission(secret: bytes, scope: ApplicationScope,
         supplied = base64.urlsafe_b64decode(matched.group(3) + "=")
     except (ValueError, TypeError) as error:
         raise ValueError("OPERATION_ADMISSION_INVALID") from error
-    current = int(time.time()) if now is None else now
-    if type(current) is not int or current < 0:
-        raise ValueError("OPERATION_ADMISSION_INVALID")
     expected = hmac.new(secret, _material(scope, identity,
         function=function, intent_digest=intent_digest,
         expires_at=expires_at, nonce=matched.group(2)), sha256).digest()
     if not hmac.compare_digest(supplied, expected):
         raise ValueError("OPERATION_ADMISSION_MISMATCH")
-    if expires_at < current:
-        raise ValueError("OPERATION_ADMISSION_EXPIRED")
     return OperationAdmission(operation_id=operation_id,
         expires_at=expires_at, intent_digest=intent_digest)
+
+
+def validate_operation_admission(secret: bytes, scope: ApplicationScope,
+        identity: VerifiedIdentity, *, operation_id: str, function: str,
+        intent_digest: str, now: int | None = None) -> OperationAdmission:
+    admission = authenticate_operation_admission(secret, scope, identity,
+        operation_id=operation_id, function=function, intent_digest=intent_digest)
+    current = int(time.time()) if now is None else now
+    if type(current) is not int or current < 0:
+        raise ValueError("OPERATION_ADMISSION_INVALID")
+    if admission.expires_at < current:
+        raise ValueError("OPERATION_ADMISSION_EXPIRED")
+    return admission
 
 
 def is_signed_operation_id(value: object) -> bool:

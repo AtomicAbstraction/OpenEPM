@@ -298,18 +298,25 @@ class PostgresFactReconstructionPublisher:
 
 
 def catalog():
+    outputs = output_schemas()
     schema = {'$schema': 'https://json-schema.org/draft/2020-12/schema', 'type': 'object',
         'additionalProperties': False, 'required': ['languageVersion', 'function', 'arguments'],
-        'properties': {'languageVersion': {'const': 2}, 'function': {'const': FUNCTION},
+        'properties': {'languageVersion': {'type': 'integer', 'const': 2}, 'function': {'const': FUNCTION},
             'arguments': {'type': 'object', 'additionalProperties': False, 'required': ['reason'],
-                'properties': {'reason': {'type': 'string', 'minLength': 1, 'maxLength': 500}}}}}
+                'properties': {'reason': {'type': 'string', 'minLength': 1,
+                    'description': 'The fixed owner trims whitespace, then requires 1–500 characters; NUL is forbidden. Raw length is not the trimmed length.'}}}}}
     return {FUNCTION: {'mode': 'durable_write', 'permission': 'admin',
         'arguments': {'reason': '1–500 nonblank characters explaining derived-state recovery'},
         'result': 'jobId then durable checkpoints and atomic generation activation receipt; source history and original change IDs preserved',
         'previewRequired': True, 'idempotencyRequired': True, 'workClass': 'long',
         'programContract': {'programSchema': schema,
+            'resultSchema': outputs['submission']['schema'], 'resultSchemaScope': 'envelope',
+            'outputSchemas': outputs,
+            'historicalOutputSchemas': historical_output_schemas(),
             'examples': [{'program': {'languageVersion': 2, 'function': FUNCTION,
-                'arguments': {'reason': 'Recover current projections from sealed history'}}}],
+                'arguments': {'reason': 'Recover current projections from sealed history'}},
+                'prerequisites': 'Use an Active disposable application with current Administrator permission, a complete active coordinate layout and sealed valid source history. This reason-only request does not provision metadata, repair source events or accept replacement values. Preview resolves the current commit/schema/revision pins; a source change invalidates them.',
+                'workflow': 'Keep the exact program and preview, obtain operation admission, submit once, and inspect the original owned job through checkpoints until publication or failure. A checkpoint is not an activated generation.'}],
             'semanticRules': ['Administrator permission is required at preview, admission, replay and publication.',
                 'Reason is trimmed, nonblank and excludes NUL; arbitrary SQL or replacement values are forbidden.',
                 'Preview pins commit revision, schema epoch and metadata/data/policy revisions without scanning facts.',
@@ -317,6 +324,63 @@ def catalog():
                 'The fixed compiler builds hidden numeric, text, detail, opaque JSON and coordinate projections in bounded durable quanta.',
                 'Only native certified generation activation publishes the complete replacement; checkpoints remain invisible to current readers.',
                 'Source events, change IDs and data revision are retained; only commit revision advances.',
-                'Each V2 quantum has a 20-second budget and preserves shorter deployment limits; accepted V1 jobs keep their 20-second total budget.'],
+                'Each V2 quantum has a 20-second budget and preserves shorter deployment limits; accepted V1 jobs keep their 20-second total budget.',
+                'A checkpoint result is the last durable quantum, not a statement of the outer job current status; it can remain visible while that job is running, failed or cancelled.',
+                'Exact accepted-job replay still authenticates the original preview even after preview expiry, current authority and unchanged intent/dependencies. This function has no expired outer-operation-admission replay profile; inspect a known owned job instead of automatically obtaining a new operation identity.',
+                'Current outputSchemas describe the V2 compiler. historicalOutputSchemas separately describe retained V1 publication results without upgrading them or enabling new V1 authoring.'],
             'execution': {'scope': 'one authorized application; durable long worker queue',
                 'compiler': COMPILER, 'planDigest': PLAN_DIGEST}}}}
+
+
+def output_schemas():
+    """Current V2 responses owned by preview and native migration 0078."""
+    from .postgres_jobs import job_submission_schema
+    from .postgres_numeric_catalog import obj
+    dialect = 'https://json-schema.org/draft/2020-12/schema'
+    count = {'type': 'integer', 'minimum': 0}
+    positive = {'type': 'integer', 'minimum': 1}
+    digest = {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}
+    preview_schema = {'$schema': dialect, **obj({
+        'languageVersion': {'type': 'integer', 'const': 2}, 'function': {'const': FUNCTION},
+        'previewToken': {'type': 'string', 'minLength': 1}, 'programDigest': digest,
+        'revisionVector': obj({name: count for name in (
+            'metadata_revision', 'data_revision', 'policy_revision')}),
+        'workClass': {'const': 'long'}, 'sourceCommitRevision': count, 'schemaEpoch': count})}
+    checkpoint = {'$schema': dialect, **obj({
+        'status': {'const': 'ready'}, 'checkpoint': {'type': 'boolean', 'const': True},
+        'phase': {'enum': ['coordinates', 'numeric', 'text', 'detail', 'generic', 'activate']},
+        'processedEvents': {'type': 'integer', 'minimum': 0, 'maximum': 128},
+        'targetGeneration': positive, 'quantumCount': positive})}
+    required = ('coordinateRows', 'numericEvents', 'textEvents', 'detailEvents', 'genericEvents')
+    optional = ('numericRows', 'textRows', 'detailRows', 'genericRows')
+    published = {'$schema': dialect, **obj({
+        'committedRevision': positive, 'sourceCommitRevision': count, 'schemaEpoch': count,
+        'reason': {'type': 'string', 'minLength': 1, 'maxLength': 500},
+        'projections': obj({name: count for name in (*required, *optional)}, required=list(required)),
+        'targetGeneration': positive, 'historyPreserved': {'type': 'boolean', 'const': True}})}
+    return {
+        'preview': {'schema': preview_schema, 'scope': 'envelope',
+            'surface': 'preview_v2_program / POST /api/preview; complete read-only V2 source-pin response.'},
+        'submission': {'schema': job_submission_schema(), 'scope': 'envelope',
+            'surface': 'submit_v2_program / POST /api/submit; complete admission or exact accepted-job replay response, not publication.'},
+        'checkpointResult': {'schema': checkpoint, 'scope': 'result',
+            'surface': 'read_v2_job / POST /api/job result field when checkpoint is true. Last durable V2 checkpoint; inspect outer job status separately. Not the worker response wrapper or activated generation.'},
+        'publishedResult': {'schema': published, 'scope': 'result',
+            'surface': 'read_v2_job / POST /api/job result field for a published current V2 rebuild; also its operation receipt result. Not the whole job or worker wrapper.'}}
+
+
+def historical_output_schemas():
+    """Describe retained V1 results without admitting V1 authoring or coercion."""
+    from .postgres_numeric_catalog import obj
+    count = {'type': 'integer', 'minimum': 0}
+    counters = ('coordinateMemberRows', 'coordinateMemberRemoved',
+        'numericRows', 'numericRemoved', 'textRows', 'textRemoved',
+        'detailRows', 'detailRemoved', 'genericRows', 'genericRemoved')
+    schema = {'$schema': 'https://json-schema.org/draft/2020-12/schema', **obj({
+        'committedRevision': {'type': 'integer', 'minimum': 1},
+        'sourceCommitRevision': count, 'schemaEpoch': count,
+        'reason': {'type': 'string', 'minLength': 1, 'maxLength': 500},
+        'projections': obj({name: count for name in counters}),
+        'historyPreserved': {'type': 'boolean', 'const': True}})}
+    return {LEGACY_COMPILER: {'publishedResult': {'schema': schema, 'scope': 'result',
+        'surface': 'Retained accepted V1 job/operation receipt result produced by native migration 0077. No targetGeneration or checkpoint stage. This historical shape is not a valid current V2 publication result.'}}}

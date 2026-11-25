@@ -21,11 +21,16 @@ from epm_core.postgres_access import AccessDenied, VerifiedIdentity
 from epm_core.postgres_auth import AuthError, access_token
 from epm_core.postgres_execution_policy import HTTP_POST_SECONDS, TIMEOUT_RESPONSE_SECONDS
 from epm_core.postgres_http_budget import bounded_request
+from epm_core.postgres_identity_directory import DirectoryPasswordOutcomeUnknown
 from epm_core.postgres_mcp_execution import (
     PLATFORM_WEB_MODULE, execute_platform_web_request, verified_mcp_request,
 )
 from epm_core.postgres_platform_mcp_application import PostgresPlatformMCPApplication
-from epm_core.postgres_verified_principal import principal_claims
+from epm_core.public_program_diagnostics import ProgramValidationError
+from epm_core.postgres_verified_principal import (
+    BROWSER_IDENTITY_HEADER, BROWSER_IDENTITY_INVALID, principal_claims,
+    validate_browser_identity,
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -103,6 +108,9 @@ class PlatformBrowserApp:
         if scope["path"] == WRITE_PATH and headers.get("origin") != [self.public_origin]:
             await self._json(send, 403, {"error": "WEB_ORIGIN_REQUIRED"})
             return
+        if len(headers.get(BROWSER_IDENTITY_HEADER, [])) > 1:
+            await self._json(send, 400, {"error": BROWSER_IDENTITY_INVALID})
+            return
         try:
             body = await self._body(receive)
             configuration = {"provisionDsn": self.provision_dsn,
@@ -110,7 +118,7 @@ class PlatformBrowserApp:
             result = await execute_platform_web_request(
                 {"configuration": configuration, "path": scope["path"], "body": body},
                 {name: values[0] for name, values in headers.items()
-                 if name in ("authorization", "origin")
+                 if name in ("authorization", "origin", BROWSER_IDENTITY_HEADER)
                  and len(values) == 1})
             await self._json(send, result["status"], result["payload"])
         except ToolError:
@@ -146,6 +154,8 @@ def _web_request(arguments, headers):
             raise ValueError("PLATFORM_WEB_CONFIGURATION_INVALID")
         public_origin = _origin(config["publicOrigin"])
         principal = principal_claims(access_token(headers), "web")
+        validate_browser_identity(principal["issuer"], principal["subject"],
+                                  headers.get(BROWSER_IDENTITY_HEADER))
         identity = VerifiedIdentity(principal["issuer"], principal["subject"],
                                     principal.get("groups", ()),
                                     issued_at=principal["issuedAt"])
@@ -170,13 +180,20 @@ def _web_request(arguments, headers):
     except AuthError as error:
         return {"status": error.status, "payload": {"error": error.code}}
     except AccessDenied as error:
-        if arguments.get("path") == CATALOG_PATH:
+        code = str(error)
+        if error.invalid_session:
+            return {"status": 401, "payload": {"error": code}}
+        if arguments.get("path") == CATALOG_PATH and code == "PLATFORM_OPERATOR_REQUIRED":
             return {"status": 200, "payload": {
                 "languageVersion": 2,
                 "authorized": False,
                 "functions": {},
             }}
-        return {"status": 403, "payload": {"error": str(error)}}
+        return {"status": 403, "payload": {"error": code}}
+    except DirectoryPasswordOutcomeUnknown as error:
+        return {"status": 409, "payload": {"error": error.code}}
+    except ProgramValidationError as error:
+        return {"status": 400, "payload": {"error": error.code, "details": error.diagnostics}}
     except (KeycloakDirectoryError, ValueError) as error:
         return {"status": 400, "payload": {"error": str(error)}}
     except psycopg.Error:

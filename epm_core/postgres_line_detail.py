@@ -342,12 +342,14 @@ class PostgresLineDetailStore:
         rows=[{'series_key':coordinate.series_key,
                'members':dict(coordinate.members)}]
         validate_coordinates(db,scope,rows)
-        point=db.execute('''SELECT coordinate_id FROM epm.coordinate
+        point=db.execute('''SELECT coordinate_id,members FROM epm.coordinate
             WHERE workspace_id=%s AND application_id=%s
             AND series_key=%s''',(scope.workspace_id,
             scope.application_id,coordinate.series_key)).fetchone()
         if point is None:
             return None,False,None,None
+        if point['members'] != dict(coordinate.members):
+            raise ValueError('COORDINATE_HASH_COLLISION')
         coordinate_id=point['coordinate_id']
         text=db.execute('''SELECT present FROM epm.text_cell_current
             WHERE workspace_id=%s AND application_id=%s

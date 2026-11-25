@@ -2,20 +2,105 @@
 
 from __future__ import annotations
 
+from psycopg import sql
 from psycopg.rows import dict_row
 
+from .member_list_evaluator import MAX_EVALUATED_PLACEMENTS, MAX_PLACEMENT_DEPTH
 from .persistence_contract import ApplicationScope
-from .postgres_access import PostgresAccessChecker, VerifiedIdentity, assert_nonowner_role
+from .postgres_access import AccessDenied, PostgresAccessChecker, VerifiedIdentity, assert_nonowner_role
 from .postgres_connection import connect_postgres
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_member_selection import load_selection_context, SelectionReadBudget
 from .postgres_dimensional_scope import resolve_effective_dimensional_scope
 from .postgres_processing_limits import configure_lock_wait, configure_statement_timeout
-from .selection_contract import canonical_selection
-from .selection_resolver import resolve_selection, selector_definition, MAX_RESOLVED_MEMBERS
+from .selection_contract import (
+    FORMAT as SELECTION_FORMAT, INLINE_EXPRESSION_FORMAT, MAX_DIMENSIONS,
+    SELECTION_METADATA_STALE, canonical_selection,
+    selection_identifier_schema, selection_parameters_schema, structural_schema_definitions)
+from .selection_resolver import (
+    MAX_RESOLVED_MEMBERS, RESOLVED_FORMAT, resolve_selection, selector_definition)
 
 
 PREVIEW = "cube.selection.preview"
+
+
+def resolved_selection_schema(*, retained=False) -> dict:
+    from .metadata_read_contract import obj
+
+    revision = {"type": "integer", "minimum": 0}
+    dimension_id = selection_identifier_schema()
+    stable_id = {"type": "string", "minLength": 1}
+    token = {"type": "string", "pattern": r"^[0-9a-f]{64}(?![\s\S])"}
+    placement = obj({"memberId": stable_id, "pathRelationshipIds": {
+        "type": "array", "maxItems": MAX_PLACEMENT_DEPTH, "items": stable_id}})
+    pin = obj({"listId": dimension_id, "stateToken": token, "canonicalDigest": token,
+        "parameters": selection_parameters_schema()})
+
+    def dimension_arrays(item, limit, *, unique=False):
+        return {"type": "object", "minProperties": 1, "maxProperties": MAX_DIMENSIONS,
+            "propertyNames": dimension_id, "additionalProperties": {
+                "type": "array", "maxItems": limit, "items": item, "uniqueItems": unique}}
+
+    fields = {"format": {"const": RESOLVED_FORMAT},
+        "metadataRevision": {**revision, "minimum": 1}, "policyRevision": revision,
+        "schemaEpoch": revision, "securityRevision": revision, "commitRevision": revision,
+        "members": dimension_arrays(stable_id, MAX_RESOLVED_MEMBERS, unique=True),
+        "placements": dimension_arrays(placement, MAX_EVALUATED_PLACEMENTS),
+        "placementUnavailableDimensions": {"type": "array", "minItems": 1,
+            "maxItems": MAX_DIMENSIONS, "uniqueItems": True, "items": dimension_id},
+        "memberListPins": {"type": "array", "maxItems": 2 * MAX_DIMENSIONS, "items": pin},
+        "resolutionDigest": token}
+    optional = {"placementUnavailableDimensions"}
+    if retained:
+        # Earlier sealed results omit these observations. Replay returns the
+        # original bytes instead of assigning them modern revision values.
+        optional.update(("schemaEpoch", "securityRevision"))
+    return obj(fields, [name for name in fields if name not in optional])
+
+
+def read_program_contract() -> dict:
+    from .metadata_read_contract import obj, read_contract, read_example
+
+    arguments = obj({"selection": {"$ref": "#/$defs/cubeSelection"},
+                     "expectedPolicyRevision": {"type": "integer", "minimum": 0}})
+
+    def example(include, exclude, *, name, binding):
+        return read_example(PREVIEW, {"expectedPolicyRevision": 1, "selection": {
+            "format": SELECTION_FORMAT, "metadataRevision": 1, "dimensions": [{
+                "dimensionId": "custom-axis", "include": include, "exclude": exclude}]}},
+            name=name, binding="Use current metadata and policy revisions from application.state.read. "
+                "Use the full authorized grain described by metadata.authoring.context when available. " + binding)
+
+    examples = [
+        example({"kind": "member", "memberId": "member-a"}, None,
+            name="Preview a complete exact coordinate",
+            binding="Use member and axis IDs from authorized application metadata."),
+        example({"kind": "member_list", "listId": "current-business-list", "parameters": {}},
+            {"kind": "member", "memberId": "member-b"},
+            name="Preview a reusable business selection with an exclusion",
+            binding="Bind a current executable Member List on the chosen axis. Supply its declared parameters."),
+        example({"kind": "inline_expression", "expressionFormat": INLINE_EXPRESSION_FORMAT,
+            "expression": {"kind": "navigation", "operation": "leaf_descendants",
+                "scope": "hierarchy", "hierarchyId": "main", "anchor": {
+                    "memberId": "parent", "pathRelationshipIds": None}, "includeSelf": False,
+                "allParents": False}}, None,
+            name="Preview strict leaf descendants without a saved Member List",
+            binding="Bind the current hierarchy and anchor. Use an exact relationship path where needed."),
+    ]
+    result_contract = read_contract(PREVIEW, arguments, resolved_selection_schema(), owner="PostgresSelectionPreview.read",
+        examples=examples, definitions=structural_schema_definitions(), semantic_rules=[
+            "This read evaluates all active fact axes at the current authorized metadata, policy, security and schema revisions. It produces a complete result within the fixed bounds or refuses the request.",
+            "A dimension with an empty member array stays empty. An unavailable or denied scope returns an error.",
+            "Inline selectors compare and order current authorized attribute values. Unreadable MemberReference values are absent. A named selector also requires current READ on the typed references in its definition.",
+            "Placements preserve certified relationship paths. An empty path belongs to a direct member. Dimensions listed in placementUnavailableDimensions have member results without contribution paths.",
+            "Member List pins identify the inputs used in resolution. The resolution digest describes this result and conveys no authority to perform an effect.",
+        ])
+    result_contract["resultSchema"].pop("$defs")
+    result_contract["programContract"]["recovery"] = (
+        "For stale metadata or policy, or a changed preview state, refresh application.state.read and review the "
+        "complete selection under current authority before asking for another preview. On unavailable scope, "
+        "rediscover only currently authorized references.")
+    return result_contract
 
 
 def catalog() -> dict:
@@ -27,6 +112,7 @@ def catalog() -> dict:
             "expectedPolicyRevision": "current authorization policy revision",
         },
         "result": "resolved authorized member IDs, reusable-list pins and resolution digest; requested scopes bounded to 100000 members/edges",
+        **read_program_contract(),
     }}
 
 
@@ -43,21 +129,26 @@ def _program(raw: object) -> dict:
     return raw["arguments"]
 
 
-def load_current_member_lists(db, scope, selection):
-    """Load exactly the current reusable lists required by a canonical selection."""
+def load_current_member_lists(db, scope, selection, *, authority=None):
+    """Load current reusable definitions under the caller's selection authority."""
+    from .postgres_member_lists import member_list_definition_visible_sql
+    from .postgres_python_definitions import assert_source_active
+
     references = {selector["listId"]
         for dimension in selection["dimensions"]
         for selector in (dimension["include"], dimension["exclude"])
         if selector is not None and selector["kind"] == "member_list"}
     member_lists = {}
     for list_id in sorted(references):
-        row = db.execute("""SELECT * FROM
-            epm.member_list_definition WHERE workspace_id=%s AND application_id=%s
-            AND list_id=%s AND status='Published'""", (scope.workspace_id,
+        row = db.execute(sql.SQL("""SELECT d.* FROM
+            epm.member_list_definition d WHERE workspace_id=%s AND application_id=%s
+            AND list_id=%s AND status='Published' AND {}""").format(
+                member_list_definition_visible_sql(authority)), (scope.workspace_id,
             scope.application_id, list_id)).fetchone()
         if row is None:
+            if authority is not None and authority.policy is not None:
+                raise AccessDenied('METADATA_SELECTION_SCOPE_UNAVAILABLE')
             raise ValueError("CUBE_SELECTION_MEMBER_LIST_UNPUBLISHED")
-        from .postgres_python_definitions import assert_source_active
         assert_source_active(db, scope, row)
         member_lists[list_id] = {"definition":row["definition"],
                                  "stateToken":row["state_token"]}
@@ -115,23 +206,27 @@ def selection_semantic_references_in_transaction(db, scope, selection):
 
 def resolve_selection_in_transaction(db, scope: ApplicationScope,
                                      selection: object,
-                                     metadata_revision: int, *, authority=None) -> dict:
+                                     metadata_revision: int, *, authority=None,
+                                     require_current_layout: bool = False) -> dict:
     """Resolve one canonical selection inside the caller's pinned transaction.
 
     The caller owns authorization, scope setup and locking.  Keeping this
     storage adapter shared prevents workflow persistence from implementing a
     weaker member-list or metadata interpretation than the public preview.
     """
-    layout = db.execute("""SELECT l.dimensions
+    layout = db.execute("""SELECT l.dimensions,s.metadata_revision
         FROM epm.application_state s JOIN epm.coordinate_layout l
           USING(workspace_id,application_id,schema_epoch)
         WHERE s.workspace_id=%s AND s.application_id=%s""", (
         scope.workspace_id, scope.application_id)).fetchone()
     if layout is None:
         raise ValueError("COORDINATE_LAYOUT_UNAVAILABLE")
+    if require_current_layout and layout["metadata_revision"] != metadata_revision:
+        raise ValueError(SELECTION_METADATA_STALE)
     dimensions = list(layout["dimensions"])
-    canonical = canonical_selection(selection, active_dimensions=dimensions)
-    member_lists = load_current_member_lists(db, scope, canonical)
+    canonical = canonical_selection(selection, active_dimensions=dimensions,
+        expected_metadata_revision=metadata_revision)
+    member_lists = load_current_member_lists(db, scope, canonical, authority=authority)
     members = {dimension: {} for dimension in dimensions}
     attributes = {dimension: {} for dimension in dimensions}
     attribute_types = {dimension: {} for dimension in dimensions}
@@ -189,6 +284,11 @@ class PostgresSelectionPreview:
         PostgresNumericFactStore._set_scope(db, scope)
 
     def read(self, scope: ApplicationScope, raw: dict) -> dict:
+        result, _ = self.read_with_authority(scope, raw)
+        return result
+
+    def read_with_authority(self, scope: ApplicationScope, raw: dict) -> tuple[dict, str]:
+        """Return the preview and its internal authorization binding to the seal owner."""
         args = _program(raw)
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
@@ -220,5 +320,7 @@ class PostgresSelectionPreview:
                         or end["schema_epoch"] != state["schema_epoch"]
                         or final_authority.scope_digest != authority.scope_digest):
                     raise ValueError("CUBE_SELECTION_STATE_CHANGED_DURING_PREVIEW")
-                return {**resolved, "policyRevision": state["policy_revision"],
+                result = {**resolved, "policyRevision": state["policy_revision"],
+                        "schemaEpoch": state["schema_epoch"], "securityRevision": state["security_revision"],
                         "commitRevision": state["commit_revision"]}
+                return result, authority.scope_digest

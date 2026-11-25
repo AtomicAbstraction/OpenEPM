@@ -12,9 +12,11 @@ from .applicability_relation_contract import (
 from .applicability_domain_contract import canonical_applicability_domain
 from .apportionment_domain_contract import canonical_apportionment_domain
 from .current_object_contract import collection_token, new_state_token, require_state_token
+from .dimensional_security_policy import ResolvedMemberSecurity
 from .persistence_contract import ApplicationScope
-from .postgres_access import PostgresAccessChecker, VerifiedIdentity, assert_nonowner_role
+from .postgres_access import AccessDenied, PostgresAccessChecker, VerifiedIdentity, assert_nonowner_role
 from .postgres_connection import connect_postgres
+from .postgres_dimensional_scope import metadata_reference_read_allowed, resolve_effective_dimensional_scope
 from .postgres_jobs import _canonical_digest
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_processing_limits import configure_lock_wait, configure_statement_timeout
@@ -32,28 +34,32 @@ _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
 _KEY = re.compile(r"[A-Za-z0-9._-]{8,128}\Z")
 
 
-def resolve_apportionment_domain(db, scope, value, *, active_dimensions):
-    """Resolve and validate grouped allocation policy rows as one business domain."""
-    from decimal import Decimal
-    from .expression_apportionment import QUANTA
-    if not isinstance(scope, ApplicationScope):
-        raise ValueError("APPLICABILITY_RELATION_SCOPE_INVALID")
-    relation_id = value.get("relationId") if isinstance(value, dict) else None
-    _id(relation_id)
-    state = db.execute('''SELECT metadata_revision FROM epm.application_state
-        WHERE workspace_id=%s AND application_id=%s''',
-        (scope.workspace_id, scope.application_id)).fetchone()
-    definition = db.execute('''SELECT * FROM epm.applicability_relation_definition
-        WHERE workspace_id=%s AND application_id=%s AND relation_id=%s''',
+def _pinned_apportionment_definition(db, scope, relation_id, value):
+    definition = db.execute('''SELECT d.status,d.state_token,d.definition_digest,
+        d.metadata_revision,d.columns,s.metadata_revision AS current_metadata_revision
+        FROM epm.applicability_relation_definition d
+        JOIN epm.application_state s USING (workspace_id,application_id)
+        WHERE d.workspace_id=%s AND d.application_id=%s AND d.relation_id=%s''',
         (scope.workspace_id, scope.application_id, relation_id)).fetchone()
     if definition is None or definition["status"] != "Active":
         raise ValueError("APPLICABILITY_RELATION_NOT_ACTIVE")
     if (definition["state_token"] != value.get("relationStateToken")
             or definition["definition_digest"] != value.get("relationDigest")):
         raise ValueError("APPLICABILITY_RELATION_PIN_STALE")
-    if (state is None
-            or definition["metadata_revision"] != state["metadata_revision"]):
+    if definition["metadata_revision"] != definition["current_metadata_revision"]:
         raise ValueError("APPLICABILITY_RELATION_METADATA_STALE")
+    return definition
+
+
+def resolve_apportionment_domain(db, scope, value, *, active_dimensions):
+    """Return the exact bounded rows validated under the requested relation pins."""
+    from decimal import Decimal
+    from .expression_apportionment import QUANTA
+    if not isinstance(scope, ApplicationScope):
+        raise ValueError("APPLICABILITY_RELATION_SCOPE_INVALID")
+    relation_id = value.get("relationId") if isinstance(value, dict) else None
+    _id(relation_id)
+    definition = _pinned_apportionment_definition(db, scope, relation_id, value)
     domain = canonical_apportionment_domain(value,
         active_dimensions=tuple(active_dimensions),
         relation_columns=tuple(definition["columns"]))
@@ -63,6 +69,10 @@ def resolve_apportionment_domain(db, scope, value, *, active_dimensions):
         ORDER BY row_id LIMIT %s''',
         (scope.workspace_id, scope.application_id, relation_id,
          domain["maxRows"] + 1)).fetchall()
+    # A writer can commit between the header and row reads at READ COMMITTED.
+    # Each relation lifecycle effect replaces the token. Rechecking it binds
+    # the bounded row set to the header used to validate its interpretation.
+    _pinned_apportionment_definition(db, scope, relation_id, domain)
     if len(rows) > domain["maxRows"]:
         raise ValueError("APPORTIONMENT_DOMAIN_ROW_BUDGET_EXCEEDED")
     anchors = {item["dimensionId"]: item["columnId"]
@@ -112,7 +122,7 @@ def resolve_apportionment_domain(db, scope, value, *, active_dimensions):
         "groupCount": len(groups), "relationId": relation_id,
         "relationStateToken": definition["state_token"],
         "relationDigest": definition["definition_digest"],
-        "metadataRevision": definition["metadata_revision"]}
+        "metadataRevision": definition["metadata_revision"]}, rows
 
 
 def resolve_applicability_domain(db, scope, value, *, active_dimensions):
@@ -183,7 +193,7 @@ def catalog() -> dict:
             "expectedPolicyRevision": "current policy revision",
         },
     }
-    return {
+    functions = {
         SAVE: {**common, "mode": "current_definition_write",
             "permission": "rule_design", "idempotencyRequired": True,
             "arguments": {
@@ -211,6 +221,9 @@ def catalog() -> dict:
                 "expectedCollectionToken": "required with cursor"},
             "result": "bounded current relation summaries"},
     }
+    for function in WRITE_FUNCTIONS:
+        functions[function].update(write_program_contract(function))
+    return functions
 
 
 def _id(value: object) -> str:
@@ -252,10 +265,19 @@ class PostgresApplicabilityRelations:
         PostgresNumericFactStore._set_scope(db, scope)
 
     @staticmethod
-    def _validate_members(db, scope, definition):
-        member_columns = [item for item in definition["columns"]
-                          if item["type"] == "Member"]
-        dimensions = sorted({item["dimensionId"] for item in member_columns})
+    def _member_references(definition):
+        references = {}
+        for column in definition["columns"]:
+            if column["type"] == "Member":
+                column_id = column["columnId"]
+                references.setdefault(column["dimensionId"], set()).update(
+                    row["values"][column_id] for row in definition["rows"])
+        return references
+
+    @classmethod
+    def _validate_members(cls, db, scope, definition):
+        references = cls._member_references(definition)
+        dimensions = sorted(references)
         if dimensions:
             found = db.execute('''SELECT dimension_id FROM epm.dimension
                 WHERE workspace_id=%s AND application_id=%s
@@ -264,11 +286,7 @@ class PostgresApplicabilityRelations:
             if {row["dimension_id"] for row in found} != set(dimensions):
                 raise ValueError("APPLICABILITY_RELATION_DIMENSION_UNAVAILABLE")
         for dimension in dimensions:
-            column_ids = [item["columnId"] for item in member_columns
-                          if item["dimensionId"] == dimension]
-            requested = {row["values"][column_id]
-                         for row in definition["rows"]
-                         for column_id in column_ids}
+            requested = references[dimension]
             found = db.execute('''SELECT member_id FROM epm.member
                 WHERE workspace_id=%s AND application_id=%s
                   AND dimension_id=%s AND member_id=ANY(%s)
@@ -277,6 +295,45 @@ class PostgresApplicabilityRelations:
                  sorted(requested))).fetchall()
             if {row["member_id"] for row in found} != requested:
                 raise ValueError("APPLICABILITY_RELATION_MEMBER_UNAVAILABLE")
+
+    @staticmethod
+    def _authorize_member_references(db, scope, authority, references):
+        rows = db.execute('''WITH requested AS (
+            SELECT dimensions.key AS dimension_id, members.member_id
+            FROM jsonb_each(%s::jsonb) AS dimensions
+            CROSS JOIN LATERAL jsonb_array_elements_text(dimensions.value) AS members(member_id)
+        )
+        SELECT r.dimension_id,r.member_id,d.read_security_tags AS dimension_read,
+          d.write_security_tags AS dimension_write,
+          m.read_security_tags AS member_read,m.write_security_tags AS member_write
+        FROM requested r
+        LEFT JOIN epm.dimension d ON d.workspace_id=%s AND d.application_id=%s
+          AND d.dimension_id=r.dimension_id
+        LEFT JOIN epm.member m ON m.workspace_id=d.workspace_id AND m.application_id=d.application_id
+          AND m.dimension_id=r.dimension_id AND m.member_id=r.member_id''', (
+            Jsonb({axis: sorted(members) for axis, members in references.items()}),
+            scope.workspace_id, scope.application_id)).fetchall()
+        checked_dimensions = set()
+        for row in rows:
+            axis = row["dimension_id"]
+            if row["dimension_read"] is None or row["member_read"] is None:
+                raise AccessDenied("APPLICABILITY_RELATION_SCOPE_UNAVAILABLE")
+            if axis not in checked_dimensions:
+                reference = ResolvedMemberSecurity(axis, axis, tuple(row["dimension_read"]),
+                    tuple(row["dimension_write"]))
+                if not metadata_reference_read_allowed(authority, reference):
+                    raise AccessDenied("APPLICABILITY_RELATION_SCOPE_UNAVAILABLE")
+                checked_dimensions.add(axis)
+            reference = ResolvedMemberSecurity(axis, row["member_id"], tuple(row["member_read"]),
+                tuple(row["member_write"]))
+            if not metadata_reference_read_allowed(authority, reference):
+                raise AccessDenied("APPLICABILITY_RELATION_SCOPE_UNAVAILABLE")
+
+    def _recheck_read_access(self, db, scope, function, access):
+        # Directory membership changes independently of the workspace fence.
+        if PostgresAccessChecker.check_in_transaction(
+                db, self.identity, scope, "read", function=function) != access:
+            raise ValueError("APPLICABILITY_RELATION_AUTHORIZATION_STALE")
 
     @staticmethod
     def _summary(row: dict) -> dict:
@@ -483,14 +540,8 @@ class PostgresApplicabilityRelations:
             with db.transaction():
                 db.execute("SET TRANSACTION READ ONLY")
                 self._scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
+                access = PostgresAccessChecker.check_in_transaction(
                     db, self.identity, scope, "read", function=function)
-                state = db.execute('''SELECT metadata_revision,policy_revision,
-                    commit_revision FROM epm.application_state
-                    WHERE workspace_id=%s AND application_id=%s''',
-                    (scope.workspace_id, scope.application_id)).fetchone()
-                if state is None:
-                    raise ValueError("APPLICATION_UNAVAILABLE")
                 if function == LIST:
                     if set(args) - {"limit", "afterRelationId",
                                     "expectedCollectionToken"}:
@@ -506,53 +557,194 @@ class PostgresApplicabilityRelations:
                     if "expectedCollectionToken" in args:
                         require_state_token(args["expectedCollectionToken"],
                             error="APPLICABILITY_RELATION_COLLECTION_TOKEN_INVALID")
-                    token_rows = db.execute('''SELECT relation_id,state_token
+                    # The complete token set and page come from one snapshot.
+                    # Only the bounded page carries the column definitions.
+                    rows = db.execute('''WITH page AS (
+                        SELECT relation_id,name,columns,definition_digest,status,
+                            metadata_revision,updated_at
                         FROM epm.applicability_relation_definition
-                        WHERE workspace_id=%s AND application_id=%s
-                        ORDER BY relation_id''',
-                        (scope.workspace_id, scope.application_id)).fetchall()
+                        WHERE workspace_id=%(workspace)s AND application_id=%(application)s
+                          AND (%(after)s::text IS NULL OR relation_id>%(after)s)
+                        ORDER BY relation_id LIMIT %(limit)s
+                    )
+                    SELECT d.relation_id,d.state_token,page.relation_id IS NOT NULL AS on_page,
+                        page.name,page.columns,page.definition_digest,page.status,
+                        page.metadata_revision,page.updated_at
+                    FROM epm.application_state s
+                    LEFT JOIN epm.applicability_relation_definition d USING (workspace_id,application_id)
+                    LEFT JOIN page ON page.relation_id=d.relation_id
+                    WHERE s.workspace_id=%(workspace)s AND s.application_id=%(application)s
+                    ORDER BY d.relation_id''', {'workspace': scope.workspace_id,
+                        'application': scope.application_id, 'after': after, 'limit': limit + 1}).fetchall()
+                    if not rows:
+                        raise ValueError("APPLICATION_UNAVAILABLE")
                     token = collection_token((row["relation_id"], row["state_token"])
-                                             for row in token_rows)
+                                             for row in rows if row["relation_id"] is not None)
                     if args.get("expectedCollectionToken", token) != token:
                         raise ValueError("APPLICABILITY_RELATION_LIST_STALE")
-                    rows = db.execute('''SELECT *
-                        FROM epm.applicability_relation_definition
-                        WHERE workspace_id=%s AND application_id=%s
-                          AND (%s::text IS NULL OR relation_id>%s)
-                        ORDER BY relation_id LIMIT %s''',
-                        (scope.workspace_id, scope.application_id, after, after,
-                         limit + 1)).fetchall()
-                    values = [self._summary(row) for row in rows[:limit]]
+                    page = [row for row in rows if row["on_page"]]
+                    values = [self._summary(row) for row in page[:limit]]
+                    self._recheck_read_access(db, scope, function, access)
                     return {"applicabilityRelations": values,
                         "nextAfterRelationId": (values[-1]["relationId"]
-                            if len(rows) > limit else None),
+                            if len(page) > limit else None),
                         "collectionToken": token}
                 if set(args) != {"relationId"}:
                     raise ValueError("APPLICABILITY_RELATION_ARGUMENTS_INVALID")
                 relation_id = _id(args["relationId"])
-                row = db.execute('''SELECT *
-                    FROM epm.applicability_relation_definition
-                    WHERE workspace_id=%s AND application_id=%s
-                      AND relation_id=%s''',
-                    (scope.workspace_id, scope.application_id,
-                     relation_id)).fetchone()
+                # Aggregate once to avoid repeating the header for each row.
+                row = db.execute('''SELECT d.relation_id,d.name,d.columns,d.state_token,
+                    d.definition_digest,d.status,d.metadata_revision,d.updated_at,
+                    s.metadata_revision AS current_metadata_revision,s.policy_revision,s.commit_revision,s.security_revision,
+                    COALESCE((SELECT jsonb_agg(jsonb_build_object('rowId',r.row_id,'values',r.values)
+                        ORDER BY r.row_id) FROM epm.applicability_relation_row r
+                        WHERE r.workspace_id=d.workspace_id AND r.application_id=d.application_id
+                          AND r.relation_id=d.relation_id), '[]'::jsonb) AS relation_rows
+                    FROM epm.application_state s
+                    LEFT JOIN epm.applicability_relation_definition d
+                      ON d.workspace_id=s.workspace_id AND d.application_id=s.application_id
+                      AND d.relation_id=%s
+                    WHERE s.workspace_id=%s AND s.application_id=%s''',
+                    (relation_id, scope.workspace_id, scope.application_id)).fetchone()
                 if row is None:
+                    raise ValueError("APPLICATION_UNAVAILABLE")
+                if row["relation_id"] is None:
                     raise ValueError("APPLICABILITY_RELATION_NOT_FOUND")
-                relation_rows = db.execute('''SELECT row_id,values
-                    FROM epm.applicability_relation_row
-                    WHERE workspace_id=%s AND application_id=%s
-                      AND relation_id=%s ORDER BY row_id''',
-                    (scope.workspace_id, scope.application_id,
-                     relation_id)).fetchall()
                 definition = {"format": "openepm-applicability-relation-v1",
                     "relationId": relation_id, "name": row["name"],
-                    "columns": row["columns"],
-                    "rows": [{"rowId": item["row_id"],
-                              "values": item["values"]}
-                             for item in relation_rows]}
+                    "columns": row["columns"], "rows": row["relation_rows"]}
                 if applicability_relation_digest(definition) != row["definition_digest"]:
                     raise ValueError("APPLICABILITY_RELATION_STORAGE_CORRUPT")
+                references = self._member_references(definition)
+                if references:
+                    authority = resolve_effective_dimensional_scope(db, self.identity, scope, access=access)
+                    if authority.policy is not None:
+                        self._authorize_member_references(db, scope, authority, references)
+                        revisions = db.execute('''SELECT metadata_revision,security_revision
+                            FROM epm.application_state WHERE workspace_id=%s AND application_id=%s''',
+                            (scope.workspace_id, scope.application_id)).fetchone()
+                        if revisions != {"metadata_revision": row["current_metadata_revision"],
+                                         "security_revision": row["security_revision"]}:
+                            raise ValueError("APPLICABILITY_RELATION_READ_STALE")
+                self._recheck_read_access(db, scope, function, access)
                 return {**self._summary(row), "definition": definition,
-                    "currentMetadataRevision": state["metadata_revision"],
-                    "policyRevision": state["policy_revision"],
-                    "commitRevision": state["commit_revision"]}
+                    "currentMetadataRevision": row["current_metadata_revision"],
+                    "policyRevision": row["policy_revision"],
+                    "commitRevision": row["commit_revision"]}
+
+
+def write_program_contract(function):
+    """Project the existing relation lifecycle contract for both clients."""
+    from .metadata_read_contract import obj, read_contract, read_example
+    from .applicability_relation_contract import FORMAT, structural_schema_definitions
+
+    identifier = {'type': 'string', 'pattern': '^' + _ID.pattern.removesuffix(r'\Z') + r'(?![\s\S])'}
+    token = {'type': 'string', 'minLength': 64, 'maxLength': 64, 'pattern': '^[0-9a-f]{64}$'}
+    revision = {'type': 'integer', 'minimum': 0}
+    pins = {'expectedMetadataRevision': revision, 'expectedPolicyRevision': revision}
+    example_pins = dict.fromkeys(pins, 1)
+    relation = 'business-mapping'
+    state = 'a' * 64
+    lifecycle = {ACTIVATE: ('Active', 'Activate the exact saved or inactive relation'),
+        DEACTIVATE: ('Inactive', 'Deactivate the exact active relation'),
+        DELETE: ('Deleted', 'Delete the exact current relation')}
+    if function == SAVE:
+        status = 'Saved'
+        arguments = obj({'definition': {'$ref': '#/$defs/applicabilityDefinition'}, **pins,
+            'expectedStateToken': {'anyOf': [token, {'type': 'null'}]}}, ['definition', *pins])
+        example = {'definition': {'format': FORMAT, 'relationId': relation,
+            'name': 'Resource eligibility', 'columns': [
+                {'columnId': 'Resource', 'type': 'Member', 'dimensionId': 'Resource'},
+                {'columnId': 'Weight', 'type': 'Ratio', 'dimensionId': None}],
+            'rows': [{'rowId': 'eligibility-a', 'values': {'Resource': 'ResourceA', 'Weight': '1.000000000000'}}]},
+            **example_pins}
+        binding = ('Use active dimension and member IDs from the selected application. '
+            'Read metadataRevision and policyRevision from application.state.read.')
+        examples = [read_example(function, example, name='Save a new business relation', binding=binding),
+            read_example(function, {**example, 'expectedStateToken': state},
+                name='Replace a current business relation', binding=binding +
+                ' Read the current definition and copy its stateToken from metadata.applicability_relation.read.')]
+    else:
+        status, name = lifecycle[function]
+        arguments = obj({'relationId': identifier, 'expectedStateToken': token, **pins})
+        examples = [read_example(function, {'relationId': relation, 'expectedStateToken': state, **example_pins},
+            name=name, binding='Read the current relation and copy relationId, stateToken, currentMetadataRevision '
+                'and policyRevision into their corresponding request fields. Confirm the intended lifecycle effect.')]
+    result = {'operationId': {'type': 'string', 'pattern': '^' + _KEY.pattern.removesuffix(r'\Z') + r'(?![\s\S])'},
+        'relationId': identifier, 'status': {'const': status}, 'definitionDigest': token,
+        'stateToken': {'type': 'null'} if function == DELETE else token,
+        'metadataRevision': revision, 'policyRevision': revision, 'impactDigest': token}
+    required = [field for field in result if function != SAVE or field != 'impactDigest']
+    contract = read_contract(function, arguments, obj(result, required),
+        owner='PostgresApplicabilityRelations.execute', examples=examples,
+        definitions=structural_schema_definitions() if function == SAVE else None,
+        semantic_rules=[
+            'Every row has exactly the declared column IDs and values of the corresponding native types. '
+            'Use strings for exact Amount and Ratio values. Row identity, tuple uniqueness and active '
+            'dimension/member resolution are checked by the fixed core.',
+            'A new relation has no prior state token. Replacement requires its exact current token. '
+            'Save returns Saved. Replacing an Active relation removes its active pin and advances policy.',
+            'Activate and Deactivate rotate the state token. Delete returns a null token. An operation '
+            'that advances policy returns an impactDigest. These are receipts for the accepted effect.',
+            'The authenticated scope, current rule authority and an operation ID bound to this exact '
+            'intent are checked separately from the application program shape.',
+        ])
+    contract['programContract']['recovery'] = (
+        'If the reply is lost, reconcile the original operation by its operationId or replay the exact '
+        'accepted program with the same valid operation ID. For a definite stale refusal, re-read the '
+        'application and relation, review the changed intent, then obtain a new operation ID.')
+    return contract
+
+
+def read_program_contract(function):
+    if function not in READ_FUNCTIONS:
+        return None
+    from .metadata_read_contract import read_contract, read_example, obj
+    from .applicability_relation_contract import structural_schema_definitions
+    identifier = {'type': 'string', 'pattern': '^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$'}
+    token = {'type': 'string', 'pattern': '^[0-9a-f]{64}$'}
+    revision = {'type': 'integer', 'minimum': 0}
+    definitions = structural_schema_definitions()
+    summary = {'relationId': identifier, 'stateToken': token,
+        'name': {'type': 'string', 'minLength': 1, 'maxLength': 200},
+        'columns': {'$ref': '#/$defs/applicabilityColumns'},
+        'definitionDigest': token, 'status': {'enum': ['Saved', 'Active', 'Inactive']},
+        'definitionMetadataRevision': revision, 'updatedAt': {'type': 'string'}}
+    if function == LIST:
+        arguments = obj({'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100},
+            'afterRelationId': {'anyOf': [identifier, {'type': 'null'}]},
+            'expectedCollectionToken': token}, [])
+        arguments['allOf'] = [{'if': {'required': ['afterRelationId'],
+            'properties': {'afterRelationId': {'type': 'string'}}},
+            'then': {'required': ['expectedCollectionToken']}}]
+        result = obj({'applicabilityRelations': {'type': 'array', 'maxItems': 100,
+            'items': obj(summary)}, 'nextAfterRelationId': {'anyOf': [identifier, {'type': 'null'}]},
+            'collectionToken': token})
+        example = {'limit': 100}
+        boundary = ('List returns relation summaries without row values. A listed summary does not grant '
+                    'access to its complete definition.',)
+    else:
+        arguments = obj({'relationId': identifier})
+        result = obj({**summary, 'definition': {'$ref': '#/$defs/applicabilityDefinition'},
+            'currentMetadataRevision': revision, 'policyRevision': revision, 'commitRevision': revision})
+        example = {'relationId': 'business-mapping'}
+        boundary = ('Read returns the definition and application revisions from the same snapshot and '
+                    'verifies the persisted canonical content before returning it.',
+                    'The active dimensional read policy must permit every Member reference and its dimension. '
+                    'An unavailable scope returns APPLICABILITY_RELATION_SCOPE_UNAVAILABLE instead of a partial definition.')
+    contract = read_contract(function, arguments, result, owner='PostgresApplicabilityRelations.read',
+        definitions=definitions,
+        examples=[read_example(function, example, name='Inspect a current business applicability relation',
+            binding='List needs no relation. Read uses an exact relationId from the authorized list.')],
+        semantic_rules=['Relation row values have the exact declared column set and native column types; dynamic column/value correspondence, canonical digest and duplicate tuple checks remain native.',
+            'Amounts and ratios are strings with native exact numeric limits, not binary floats. A relation is business mapping data, not worker partition state.',
+            'A list page and its collectionToken describe the same snapshot. Continue with the returned '
+            'nextAfterRelationId and collectionToken. A null nextAfterRelationId ends the list.',
+            *boundary])
+    contract['programContract']['recovery'] = (
+        'On APPLICABILITY_RELATION_LIST_STALE, restart from the first page without the old '
+        'cursor or collection token. On APPLICABILITY_RELATION_NOT_FOUND, list current '
+        'relations and select an authorized relation ID. On APPLICABILITY_RELATION_AUTHORIZATION_STALE, '
+        'check current application access and repeat the read. On APPLICABILITY_RELATION_READ_STALE, '
+        'repeat the exact definition read with current dimensional metadata.')
+    return contract

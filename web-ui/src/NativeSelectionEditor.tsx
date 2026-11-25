@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { readProgram } from "./api";
 import type { ApplicationCatalog, ApplicationSummary } from "./types";
 import {
+  collectCapabilityAttributeDefinitions,
   collectCapabilityDimensions,
   type MetadataDimension,
 } from "./metadata-data";
@@ -9,9 +10,11 @@ import {
   collectMetadataHierarchies,
   type MetadataHierarchy,
 } from "./metadata-hierarchies";
-import { collectAllContinuations } from "./continuation";
 import { useUnsavedWork } from "./unsaved-work";
 import { parseParameterJson } from "./exact-parameters";
+import { NativeNavigationControls } from "./member-selection/NativeNavigationControls";
+import { navigation } from "./member-selection/native-selection";
+import type { NavigationExpression } from "./member-selection/selection-types";
 
 const hierarchyKinds = [
   "parents",
@@ -29,12 +32,6 @@ type Attribute = {
   value_type: string;
   status: string;
 };
-type AttributePage = {
-  rows: Attribute[];
-  nextAfterAttributeId: string | null;
-  metadataRevision: number;
-  hasMore: boolean;
-};
 export type SelectionDefinition = {
   format: "openepm-member-list-v1";
   listId: string;
@@ -49,7 +46,9 @@ function object(value: unknown): value is Expression {
 function simple(expression: unknown): expression is Expression {
   return (
     object(expression) &&
-    (["explicit", ...hierarchyKinds].includes(String(expression.kind)) ||
+    (["explicit", "navigation", ...hierarchyKinds].includes(
+      String(expression.kind),
+    ) ||
       (expression.kind === "attribute" &&
         expression.operator !== "in" &&
         ["string", "boolean"].includes(typeof expression.value)))
@@ -57,6 +56,7 @@ function simple(expression: unknown): expression is Expression {
 }
 function newExpression(kind: string): Expression {
   if (kind === "explicit") return { kind, memberIds: [] };
+  if (kind === "navigation") return navigation("all", null);
   if (kind === "attribute")
     return { kind, attributeId: "", operator: "eq", value: "" };
   return { kind, hierarchyId: "", memberId: "", includeSelf: false };
@@ -75,7 +75,7 @@ export function NativeSelectionEditor({
   initial?: Record<string, unknown> | null;
   current: boolean;
   busy: boolean;
-  onSave: (definition: SelectionDefinition) => Promise<void>;
+  onSave: (definition: SelectionDefinition) => Promise<void | false>;
   onDirtyChange: (dirty: boolean) => void;
 }) {
   const [listId, setListId] = useState(String(initial?.listId ?? ""));
@@ -144,6 +144,7 @@ export function NativeSelectionEditor({
     app.workspaceId,
     app.applicationId,
     current,
+    catalog.accessContext,
     catalog.revisions.metadata,
     catalog.revisions.policy,
     catalog.revisions.security,
@@ -157,7 +158,8 @@ export function NativeSelectionEditor({
     if (!dimensionId || !current) return () => abort.abort();
     const load = async () => {
       if (
-        hierarchyKinds.includes(String(expression.kind)) &&
+        (hierarchyKinds.includes(String(expression.kind)) ||
+          expression.kind === "navigation") &&
         catalog.functions["metadata.hierarchy.list"]
       ) {
         const result = await collectMetadataHierarchies(
@@ -173,9 +175,8 @@ export function NativeSelectionEditor({
         expression.kind === "attribute" &&
         catalog.functions["metadata.attribute-definition.list"]
       ) {
-        const result = await collectAllContinuations<AttributePage, Attribute>({
-          label: "Member attributes",
-          readPage: (cursor) =>
+        const result = await collectCapabilityAttributeDefinitions<Attribute>(
+          (continuation) =>
             readProgram(
               app,
               "metadata.attribute-definition.list",
@@ -184,23 +185,12 @@ export function NativeSelectionEditor({
                 dimensionId,
                 status: "Active",
                 limit: 200,
-                ...(cursor ? { afterAttributeId: cursor } : {}),
+                ...continuation,
               },
               abort.signal,
             ),
-          rows: (page) => {
-            if (page.hasMore !== (page.nextAfterAttributeId !== null))
-              throw new Error("Invalid attribute continuation.");
-            return page.rows;
-          },
-          nextCursor: (page) => page.nextAfterAttributeId,
-          rowIdentity: (row) => row.attribute_id,
-          consistencyIdentity: (page) => {
-            if (page.metadataRevision !== catalog.revisions.metadata)
-              throw new Error("Metadata changed while reading attributes.");
-            return page.metadataRevision;
-          },
-        });
+          { expectedMetadataRevision: catalog.revisions.metadata },
+        );
         if (!abort.signal.aborted && reading === generation.current)
           setAttributes(result.rows);
       }
@@ -214,6 +204,7 @@ export function NativeSelectionEditor({
     dimensionId,
     expression.kind,
     current,
+    catalog.accessContext,
     catalog.revisions.metadata,
     catalog.revisions.policy,
     catalog.revisions.security,
@@ -257,7 +248,7 @@ export function NativeSelectionEditor({
           !selectedExpression.memberIds.length)
       )
         throw new Error("Choose at least one member ID.");
-      await onSave({
+      const acknowledged = await onSave({
         format: "openepm-member-list-v1",
         listId: listId.trim(),
         name: name.trim(),
@@ -265,7 +256,7 @@ export function NativeSelectionEditor({
         parameters,
         expression: selectedExpression,
       });
-      setDirty(false);
+      if (acknowledged !== false) setDirty(false);
     } catch (reason) {
       setError(
         reason instanceof Error ? reason.message : "Unable to save selection.",
@@ -341,16 +332,24 @@ export function NativeSelectionEditor({
                 onChange={(event) => change(newExpression(event.target.value))}
               >
                 <option value="explicit">Selected members</option>
+                <option value="navigation">Native navigation</option>
                 <option value="parents">Parents</option>
-                <option value="base">Base members</option>
+                <option value="base">This member if base</option>
                 <option value="children">Children</option>
                 <option value="descendants">Descendants</option>
                 <option value="ancestors">Ancestors</option>
                 <option value="siblings">Siblings</option>
-                <option value="leaves">Leaves</option>
+                <option value="leaves">Strict leaf descendants (legacy)</option>
                 <option value="attribute">Member attribute</option>
               </select>
             </label>
+            {expression.kind === "navigation" && (
+              <NativeNavigationControls
+                value={expression as NavigationExpression}
+                hierarchies={hierarchies}
+                onChange={(value) => change(value)}
+              />
+            )}
             {expression.kind === "explicit" && (
               <label>
                 Member IDs, one per line

@@ -24,6 +24,14 @@ MAX_PAGE_SIZE = 500
 RESULT_TTL_SECONDS = 15 * 60
 POSTGRES_EXACT_DIMENSIONAL_BACKEND = (
     'postgres_exact_sql')
+AMOUNT_MEASURE_REQUIRED = 'CUBE_AGGREGATE_AMOUNT_MEASURE_REQUIRED'
+AUTHORIZATION_REVOKED = 'CUBE_AGGREGATE_AUTHORIZATION_REVOKED'
+STALE_CONTEXT = 'CUBE_AGGREGATE_STALE_CONTEXT'
+
+
+class AggregateAmountMeasureRequired(ValueError):
+    def __init__(self):
+        super().__init__(AMOUNT_MEASURE_REQUIRED)
 
 
 def _identifier(value: object, code: str) -> str:
@@ -78,7 +86,8 @@ _TRANSITIONS = {
                                              AggregateQueryStatus.FAILED)),
     AggregateQueryStatus.COMPUTED: frozenset((AggregateQueryStatus.SEALED,
                                               AggregateQueryStatus.CANCELLED,
-                                              AggregateQueryStatus.FAILED)),
+                                              AggregateQueryStatus.FAILED,
+                                              AggregateQueryStatus.EXPIRED)),
     AggregateQueryStatus.CANCEL_REQUESTED: frozenset((AggregateQueryStatus.CANCELLED,
                                                        AggregateQueryStatus.COMPUTED,
                                                        AggregateQueryStatus.FAILED)),
@@ -323,6 +332,15 @@ class AggregateAuthorization(Protocol):
                        subject: str, pins: AggregateSourcePins | None = None) -> None: ...
 
 
+def technical_worker_outcome(record: AggregateQueryRecord, certificate_wire) -> dict:
+    result = {'queryId': record.query_id, 'status': record.status.value}
+    if record.status is AggregateQueryStatus.SEALED:
+        result['technicalCertificate'] = certificate_wire(record.certificate)
+    elif record.error_code is not None:
+        result['errorCode'] = record.error_code
+    return result
+
+
 class AggregateQueryRepository(Protocol):
     """Required durable PostgreSQL boundary; no fallback store is provided."""
 
@@ -336,6 +354,7 @@ class AggregateQueryRepository(Protocol):
                        certificate: AggregateTechnicalCertificate,
                        rows: Sequence[dict], *, claim: dict
                        ) -> AggregateQueryRecord: ...
+    def seal(self, current: AggregateQueryRecord) -> AggregateQueryRecord: ...
     def page(self, record: AggregateQueryRecord, *, after_ordinal: int,
              limit: int) -> tuple[Sequence[dict], bool]: ...
     def delete_expired_result(self, record: AggregateQueryRecord) -> None: ...

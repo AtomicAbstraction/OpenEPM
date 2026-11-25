@@ -31,7 +31,9 @@ if __package__ in (None, ""):
 from scripts.capture_macos_pilot_running_state import compose_frontend
 from scripts import macos_pilot_ui_review as review
 from scripts.macos_pilot_active_work import (
-    ActiveWorkError, ActiveWorkObserver, FAMILIES, SOURCES,
+    ActiveWorkError, ActiveWorkObserver, FAMILIES,
+    SOURCE_INTRODUCED_SCHEMA, SOURCE_RETIRED_SCHEMA,
+    sources_for_schema as active_work_sources_for_schema,
 )
 from scripts.qualify_macos_pilot_backup_restore import create_group_roles
 from scripts.qualify_macos_pilot_service_switch import (
@@ -57,43 +59,6 @@ PRIVATE_PORTS = {"workspace": 5292, "platform": 5293,
 MIN_SUSPEND_FREE_KIB = 1024 * 1024
 DATABASE_STORAGE_PATH = "/var/lib/postgresql"
 MAX_RETAINED_OWNER_UAT_BACKUPS = 5
-
-# The active-work inventory spans lifecycle tables introduced over many
-# schema generations.  A retained pre-upgrade generation must not be queried
-# for a table that did not exist yet, while a table missing at or after its
-# introducing migration must still fail closed.  Keep this fixed allow-list in
-# lockstep with ``macos_pilot_active_work.SOURCES``.
-SOURCE_INTRODUCED_SCHEMA = {
-    "epm.workspace": 1,
-    "epm.application": 1,
-    "epm.job": 12,
-    "epm.source_batch": 15,
-    "epm.expression_rule_sequence": 44,
-    "epm.full_aggregate_sequence": 54,
-    "epm.cube_aggregate_query": 88,
-    "epm.python_program_build": 89,
-    "epm.python_program_workflow": 89,
-    "epm.layout_replacement_request": 107,
-    "epm.layout_replacement_activation": 110,
-    "epm.fact_export_producer_request": 113,
-    "epm.transfer_cleanup_request": 115,
-    "epm.python_program_occurrence": 132,
-    "epm.python_program_schedule_state": 132,
-    "epm.source_import_execution": 151,
-    "epm.application_rule_workflow": 217,
-    "epm.application_schedule_occurrence": 220,
-    "epm.application_schedule_state": 220,
-}
-
-# Current-only schedule migrations physically remove the former dispatch-state
-# relations after proving admitted work settled. A source is applicable only
-# from its introduction through the schema immediately before its retirement.
-# Missing any other canonical source continues to fail closed.
-SOURCE_RETIRED_SCHEMA = {
-    "epm.application_schedule_state": 312,
-    "epm.python_program_schedule_state": 315,
-}
-
 
 class OwnerUatError(RuntimeError):
     pass
@@ -234,33 +199,6 @@ def all_up(base: list[str], environment: dict, no_deps: bool = False) -> None:
 
 def all_stop(base: list[str], environment: dict) -> None:
     compose(base, "stop", *APP_SERVICES, environment=environment)
-
-
-def active_work_sources_for_schema(schema: int) -> dict[str, tuple]:
-    """Return the canonical work sources that exist in ``schema``.
-
-    This is deliberately schema-history-aware rather than an exception-based
-    fallback.  An unexpected missing relation at or after its introducing
-    migration therefore remains a hard SQL failure.
-    """
-    canonical = {
-        table for family in FAMILIES
-        for table, _status, _active, _terminal in SOURCES[family]
-    }
-    if (not isinstance(schema, int) or isinstance(schema, bool) or schema < 1
-            or set(SOURCE_INTRODUCED_SCHEMA) != canonical
-            or not set(SOURCE_RETIRED_SCHEMA).issubset(canonical)
-            or any(SOURCE_RETIRED_SCHEMA[table]
-                   <= SOURCE_INTRODUCED_SCHEMA[table]
-                   for table in SOURCE_RETIRED_SCHEMA)):
-        raise ActiveWorkError("active-work schema inventory differs")
-    return {
-        family: tuple(source for source in SOURCES[family]
-                      if SOURCE_INTRODUCED_SCHEMA[source[0]] <= schema
-                      and schema < SOURCE_RETIRED_SCHEMA.get(
-                          source[0], schema + 1))
-        for family in FAMILIES
-    }
 
 
 def verify_no_active_work(base: list[str], environment: dict) -> dict[str, int]:

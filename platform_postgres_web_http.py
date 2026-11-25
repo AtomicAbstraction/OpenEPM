@@ -21,40 +21,80 @@ from epm_core.postgres_auth import AuthError, access_token, mode
 from epm_core.deployment_secrets import configured_hex_bytes, configured_text
 from epm_core.postgres_mcp_execution import (authenticate_http, execute_web_request,
     check_startup, verified_mcp_request, WEB_MODULE)
-from epm_core.postgres_verified_principal import principal_claims
+from epm_core.postgres_verified_principal import (
+    BROWSER_IDENTITY_CHANGED, BROWSER_IDENTITY_HEADER, BROWSER_IDENTITY_INVALID,
+    browser_identity_binding, principal_claims, validate_browser_identity,
+)
 from epm_core.postgres_http_budget import bounded_request
 from epm_core.postgres_execution_policy import HTTP_POST_SECONDS, TIMEOUT_RESPONSE_SECONDS
 from mcp.server.mcpserver.exceptions import ToolError
-from openepm.diagnostics import SourceValidationError, validate_diagnostic_payload
+from openepm.diagnostics import SourceValidationError
+from epm_core.public_program_diagnostics import ProgramValidationError
+from epm_core.mcp_diagnostics import validate_public_diagnostic_payload
+from epm_core.multidimensional_roles import programmable_application_blueprint
 from epm_core.persistence_contract import ApplicationScope
 from epm_core.operation_admission_contract import (
     is_signed_operation_id, issue_operation_admission,
     validate_operation_admission)
-from epm_core.postgres_access import (AccessDenied, PostgresAccessChecker,
+from epm_core.postgres_access import (SECURITY_READ_AUTHORIZATION_STALE,
+                                      AccessDenied, PostgresAccessChecker,
                                       VerifiedIdentity, assert_lifecycle_role)
-from epm_core.postgres_application_capabilities import _state as capability_state
-from epm_core.postgres_capability_contract import (FUNCTION_REGISTRY_FORMAT,
-    assert_public_program_admitted, filter_catalog, function_registry_digest)
+from epm_core.postgres_application_capabilities import catalog_access_state
+from epm_core.postgres_attribute_catalog import WRITE_FUNCTIONS as ATTRIBUTE_WRITES
+from epm_core.postgres_capacity_metrics import CAPACITY_READ_AUTHORIZATION_STALE
+from epm_core.postgres_calculated_members import (EVALUATION_AUTHORIZATION_STALE,
+    EVALUATION_SNAPSHOT_STALE, PREVIEW_SNAPSHOT_STALE, REVIEW_AUTHORIZATION_STALE)
+from epm_core.postgres_capability_contract import assert_public_program_admitted
+from epm_core.application_catalog_projection import (
+    CATALOG_CONTINUATION_STALE, CATALOG_DISCOVERY_CODES, CatalogDiscoveryError,
+    application_catalog, discover_catalog)
 from epm_core.postgres_connection import connect_postgres
-from epm_core.postgres_jobs import PostgresJobQueue, _canonical_digest
-from epm_core.postgres_language_v2 import PostgresLanguageV2
+from epm_core.postgres_cube_query import FUNCTION as RAW_CUBE_SCAN
+from epm_core.postgres_calculation_scan import FUNCTION as CALCULATION_SCAN
+from epm_core.postgres_calendar import SET_FUNCTION as CALENDAR_SET
+from epm_core.postgres_adjusted_scan import FUNCTION as ADJUSTED_SCAN
+from epm_core.postgres_cube_layer_report import FUNCTION as LAYER_REPORT_SCAN
+from epm_core.postgres_fact_export import FUNCTION as FACT_EXPORT_PAGE
+from epm_core.postgres_generic_facts import READ_AUTHORIZATION_STALE as GENERIC_FACT_READ_AUTHORIZATION_STALE
+from epm_core.postgres_dimensional_security import CUBE_READ_AUTHORIZATION_STALE
+from epm_core.postgres_jobs import JOB_READ_AUTHORIZATION_STALE, PostgresJobQueue, _canonical_digest
+from epm_core.postgres_language_v2 import POPULATED_LAYOUT_REQUESTS, PostgresLanguageV2
+from epm_core.postgres_populated_layout_preview import (
+    FUNCTION as POPULATED_LAYOUT_PREVIEW, REVIEW as POPULATED_LAYOUT_REVIEW)
+from epm_core.postgres_metadata import VALUE_EDIT_FUNCTIONS as METADATA_VALUE_EFFECTS
+from epm_core.postgres_operation_receipts import RECEIPT_AUTHORIZATION_STALE
+from epm_core.public_program_contracts import HIERARCHY_EFFECTS, MEMBER_LIST_EFFECTS
 from epm_core.postgres_mcp_router import PostgresMCPRouter
 from epm_core.postgres_python_environments import ApprovedPythonEnvironment
 from epm_core.postgres_python_environment_startup import load_python_environment_profiles
+from epm_core.postgres_python_schedules import (
+    READS as _PYTHON_SCHEDULE_READS, READ_AUTHORIZATION_STALE as _PYTHON_SCHEDULE_READ_AUTHORIZATION_STALE)
+from epm_core.postgres_metadata import HIERARCHY_BUILD as _HIERARCHY_BUILD
+from epm_core.postgres_metadata import MODEL_STATE_EDIT_FUNCTIONS as _METADATA_MODEL_STATE_ACTIONS
+from epm_core.postgres_metadata import SECURITY_TAG_EDIT_FUNCTIONS as _METADATA_SECURITY_TAG_ACTIONS
+from epm_core.postgres_metadata import STRUCTURE_EDIT_FUNCTIONS as _METADATA_STRUCTURE_EDIT_FUNCTIONS
 from epm_core.postgres_numeric_store import PostgresNumericFactStore
-from epm_core.postgres_capacity_metrics import PostgresCapacityMetrics
+from epm_core.postgres_processing_limits import BUSY_CODE, ProcessingBusy
 from epm_core.personal_mcp_endpoint import personal_endpoint, endpoint_secret
-from epm_core.postgres_processing_limits import policy as processing_policy
-from epm_core.processing_operation_registry import (
-    PROCESSING_REGISTRY_FORMAT,admit_operation,operation_contracts)
+from epm_core.processing_operation_registry import admit_operation
 from epm_core.observability import observe_request
+from epm_core import postgres_resource_access
+from epm_core import application_authorization_config as authorization_config
+from epm_core import postgres_authorization_config, postgres_authorization_objects, postgres_access_explanation, postgres_authorization_tags, postgres_effective_access
+from epm_core import application_authorization_migration as auth_migration
+from epm_core import postgres_authorization_migration
+from epm_core import postgres_workspace_access_review as workspace_review
 from epm_core.postgres_security_language import (PostgresSecurityLanguage,
     FUNCTION as _SECURITY_ACCESS_SET, LIST_FUNCTION as _SECURITY_ACCESS_LIST,
+    GROUP_FUNCTION as _SECURITY_GROUP_ACCESS_SET,
+    GROUP_LIST_FUNCTION as _SECURITY_GROUP_ACCESS_LIST,
     SUBJECT_LIST_FUNCTION as _SECURITY_SUBJECT_LIST,
     AUDIT_LIST_FUNCTION as _SECURITY_AUDIT_LIST,
     RECEIPT_READ_FUNCTION as _SECURITY_RECEIPT_READ,
     DIMENSION_FUNCTION as _SECURITY_DIMENSION_SET,
+    GROUP_DIMENSION_FUNCTION as _SECURITY_GROUP_DIMENSION_SET,
     DIMENSION_READ_FUNCTION as _SECURITY_DIMENSION_READ,
+    GROUP_DIMENSION_READ_FUNCTION as _SECURITY_GROUP_DIMENSION_READ,
     DIMENSION_TAGS_FUNCTION as _SECURITY_DIMENSION_TAGS,
     MEMBER_TAGS_READ_FUNCTION as _SECURITY_MEMBER_TAGS,
     DIMENSION_METADATA_TAGS_READ_FUNCTION as _SECURITY_DIMENSION_METADATA_TAGS,
@@ -63,7 +103,8 @@ from epm_core.postgres_security_language import (PostgresSecurityLanguage,
     DIMENSION_POLICY_READ_FUNCTION as _SECURITY_POLICY_READ,
     DIMENSION_POLICY_ACTIVATE_FUNCTION as _SECURITY_POLICY_ACTIVATE,
     DIMENSION_POLICY_DEACTIVATE_FUNCTION as _SECURITY_POLICY_DEACTIVATE,
-    RULE_FUNCTION as _SECURITY_RULE_SET)
+    RULE_FUNCTION as _SECURITY_RULE_SET,
+    RULE_GROUP_FUNCTION as _SECURITY_RULE_GROUP_SET)
 from epm_core.postgres_tasks import PostgresTaskService
 from epm_core.postgres_workspace_lifecycle import (
     FUNCTION as _WORKSPACE_APPLICATION_CREATE,
@@ -83,9 +124,13 @@ def _ui_root() -> Path:
 
 MAX_BODY = 16_384
 MAX_SOURCE_LOAD_BODY = 10_000_000
+# A raw read may carry the core's full signed cursor or escaped Unicode filters.
+MAX_RAW_CUBE_BODY = 192 * 1024
 _HEX40 = re.compile(r'^[0-9a-f]{40}$')
 _IMAGE_DIGEST = re.compile(r'^sha256:[0-9a-f]{64}$')
 _ERROR_CODE = re.compile(r'^[A-Z][A-Z0-9_]{2,127}$')
+_DIAGNOSTIC_ERRORS = (SourceValidationError, ProgramValidationError, CatalogDiscoveryError)
+_DIAGNOSTIC_CODES = CATALOG_DISCOVERY_CODES | {SourceValidationError.code, ProgramValidationError.code}
 
 
 def _error_payload(scope: dict, status: int, code: object,
@@ -102,10 +147,147 @@ def _error_payload(scope: dict, status: int, code: object,
     if not isinstance(correlation, str) or not re.fullmatch(
             r'[0-9a-f]{32}', correlation):
         correlation = '0' * 32
+    message = stable.replace('_', ' ').capitalize()
+    if stable == 'APPLICATION_QUEUE_FULL' and status == 429:
+        message = ('This application’s queue is full. The server refused this submission. '
+                   'Check existing tasks in Monitor before retrying.')
+    if stable == BUSY_CODE and status == 429:
+        message = 'The application is busy. Retry the same request.'
+    if stable == 'STALE_EXPRESSION_RULE_LIST_REVISION' and status == 409:
+        message = 'The rules changed while loading. Start again from the first page.'
+    if stable == 'RULE_READ_AUTHORIZATION_STALE' and status == 409:
+        message = 'Rule access changed while loading. Choose Refresh rules to check current access.'
+    if stable == EVALUATION_AUTHORIZATION_STALE and status == 409:
+        message = 'Access changed during evaluation. Check current application access and inspect the definition again.'
+    if stable == EVALUATION_SNAPSHOT_STALE and status == 409:
+        message = 'The application changed during evaluation. Inspect the current calculated member and evaluate again.'
+    if stable == PREVIEW_SNAPSHOT_STALE and status == 409:
+        message = 'The application changed during materialization preview. Inspect the current result and preview again.'
+    if stable == REVIEW_AUTHORIZATION_STALE and status == 409:
+        message = 'Access changed during the materialization request. Check current access before reviewing or recovering the work.'
+    if stable == SECURITY_READ_AUTHORIZATION_STALE and status == 409:
+        message = ('Security access changed during the read. Check current access and start again '
+                   'from the first page, or repeat the exact inspection.')
+    if stable == CAPACITY_READ_AUTHORIZATION_STALE and status == 409:
+        message = 'Access changed while reading queue metrics. Check current application access and refresh the queue.'
+    if stable == 'METADATA_DIRECTORY_READ_AUTHORIZATION_STALE' and status == 409:
+        message = 'Application access changed during the metadata read. Refresh to start the read again.'
+    if stable in ('METADATA_DIRECTORY_CURSOR_REQUIRED', 'METADATA_DIRECTORY_CURSOR_STALE') and status == 409:
+        message = 'Restart the metadata list from the first page under current access.'
+    if stable == 'METADATA_DIRECTORY_SCOPE_UNAVAILABLE' and status == 403:
+        message = 'The full metadata selection is unavailable under your current dimensional access.'
+    if stable == 'ATTRIBUTE_USAGE_SCOPE_UNAVAILABLE' and status == 403:
+        message = 'The full attribute usage selection is unavailable under your current dimensional access.'
+    if stable == 'SAVED_GRID_LIST_STALE' and status == 409:
+        message = 'Saved views changed while loading. Choose Refresh views to start from the first page.'
+    if stable == 'SAVED_GRID_SCOPE_UNAVAILABLE' and status == 403:
+        message = 'The complete saved-view selection is unavailable under your current dimensional access.'
+    if stable == 'SAVED_GRID_AUTHORIZATION_STALE' and status == 409:
+        message = 'Saved-view access changed during the request. Refresh views under current access.'
+    if stable == 'SAVED_GRID_READ_STALE' and status == 409:
+        message = 'The application changed while opening the view. Refresh views and open it again.'
+    if stable == 'SAVED_GRID_NOT_FOUND' and status == 400:
+        message = 'This saved view is unavailable. Refresh views and choose a current view.'
+    if stable == 'APPLICABILITY_RELATION_LIST_STALE' and status == 409:
+        message = 'Relations changed. Start from the first page to get the current list.'
+    if stable == 'APPLICABILITY_RELATION_SCOPE_UNAVAILABLE' and status == 403:
+        message = 'The complete relation definition is unavailable under your current dimensional access.'
+    if stable == 'APPLICABILITY_RELATION_READ_STALE' and status == 409:
+        message = 'Dimensional metadata changed. Read the relation again.'
+    if stable == 'APPLICABILITY_RELATION_AUTHORIZATION_STALE' and status == 409:
+        message = 'Access changed while loading the relation. Check current access before retrying.'
+    if stable == 'MEMBER_LIST_LIST_STALE' and status == 409:
+        message = 'Member lists changed. Start from the first page to get the current list.'
+    if stable == 'MEMBER_LIST_READ_STALE' and status == 409:
+        message = 'This member list changed while loading. Read the current list again.'
+    if stable == 'MEMBER_LIST_AUTHORIZATION_STALE' and status == 409:
+        message = 'Member-list access changed during the request. Refresh the application and review the current list.'
+    if stable == 'MEMBER_LIST_SCOPE_UNAVAILABLE' and status == 403:
+        message = 'The saved selections catalogue is unavailable under your current dimensional access.'
+    if stable == 'MEMBER_LIST_NOT_FOUND' and status == 400:
+        message = 'This saved selection is unavailable. Refresh member lists and choose a current selection.'
+    if stable == 'MEMBER_LIST_RETIREMENT_CONSUMERS_STALE' and status == 409:
+        message = 'Dependencies may have changed. Start the deletion review again.'
+    if stable in ('SOURCE_EVIDENCE_CURSOR_STALE', 'SOURCE_EVIDENCE_CURSOR_INVALID'):
+        message = 'Start again from the first source evidence page under current access.'
+    if stable == 'SOURCE_EVIDENCE_READ_AUTHORIZATION_STALE' and status == 409:
+        message = 'Source evidence access changed. Refresh the application and repeat the inspection.'
+    if stable == 'SOURCE_PREVIEW_AUTHORIZATION_STALE' and status == 409:
+        message = 'Access changed while preparing the import preview. Refresh the application and preview again under current access.'
+    if stable == 'DEFINITION_REFERENCES_BLOCK_REMOVAL':
+        message = 'Current definitions still depend on this item. Update those definitions before removing it.'
+    if stable == 'APPLICATION_ASSIGNMENT_COLLECTION_CHANGED' and status == 409:
+        message = 'Assignments changed. Start from the first page to get the current list.'
+    if stable == 'APPLICATION_WORKFLOW_COLLECTION_CHANGED' and status == 409:
+        message = 'Workflows changed. Start from the first page to get the current list.'
+    if stable in ('APPLICATION_ASSIGNMENT_SCOPE_UNAVAILABLE', 'APPLICATION_WORKFLOW_SCOPE_UNAVAILABLE') and status == 403:
+        message = 'The complete definition catalogue is unavailable under your current dimensional access.'
+    if stable in ('APPLICATION_ASSIGNMENT_AUTHORIZATION_STALE', 'APPLICATION_WORKFLOW_AUTHORIZATION_STALE',
+                  'APPLICATION_ASSIGNMENT_READ_STALE', 'APPLICATION_WORKFLOW_READ_STALE') and status == 409:
+        message = 'The model or access changed. Refresh the definition list under current access.'
+    if stable == CUBE_READ_AUTHORIZATION_STALE and status == 409:
+        message = 'Read access changed while loading this cube page. Start again from the first page.'
+    if stable == GENERIC_FACT_READ_AUTHORIZATION_STALE and status == 409:
+        message = 'Access changed while reading generic facts. Refresh application access and start the read again.'
+    if stable == 'RESOLVED_READ_SNAPSHOT_CHANGED' and status == 409:
+        message = 'The cube changed while loading. Refresh the application and run the read again.'
+    if stable == 'SCENARIO_COMPARISON_SNAPSHOT_STALE' and status == 409:
+        message = 'The application changed during the comparison. Refresh the application context and compare again.'
+    if stable in (JOB_READ_AUTHORIZATION_STALE, RECEIPT_AUTHORIZATION_STALE) and status == 409:
+        message = 'Access changed while checking this outcome. Refresh the application and check the original request again.'
+    if stable in ('APPLICABILITY_RELATION_PIN_STALE', 'APPORTIONMENT_PREVIEW_INPUT_STALE') and status == 409:
+        message = 'Allocation inputs changed. Read the current relation and preview the allocation again.'
+    if stable == 'APPORTIONMENT_PREVIEW_AUTHORIZATION_STALE' and status == 409:
+        message = 'Access changed while preparing the allocation. Check current application access and preview the allocation again.'
+    if stable in ('CUBE_SELECTION_METADATA_STALE', 'CUBE_SELECTION_STATE_CHANGED_DURING_PREVIEW',
+                  'CUBE_SELECTION_STATE_CHANGED_BEFORE_SEAL', 'SEALED_SELECTION_METADATA_STALE',
+                  'SEALED_SELECTION_POLICY_STALE') and status == 409:
+        message = 'The selection context changed. Refresh the application and review the selection again.'
+    if stable == 'APPLICATION_WORKFLOW_EVIDENCE_LIST_STALE' and status == 409:
+        message = 'Evidence changed while loading. Refresh the workflow to check choices from the first page.'
+    if stable == 'APPLICATION_WORKFLOW_RECEIPT_CONTRACT_UNSUPPORTED':
+        message = 'Choose an operation receipt supported by the activity destination, then review the workflow again.'
+    if stable in ('APPLICATION_WORKFLOW_EVIDENCE_VIEW_SCOPE_MISMATCH', 'APPLICATION_WORKFLOW_EVIDENCE_VIEW_UNSUPPORTED'):
+        message = 'The saved view and receipt must cover the workflow selection. Review the effective members and exclusions.'
+    if stable == 'APPLICATION_WORKFLOW_STALE_CONTEXT':
+        message = 'The workflow context changed. Read the current workflow and review a new start.'
+    if stable in ('PYTHON_ENVIRONMENT_STALE_CONTEXT', 'PYTHON_ENVIRONMENT_STATE_CONFLICT'):
+        message = 'The environment or application changed. Read its current state and the application revisions before reviewing a new registration.'
+    if stable == 'PYTHON_PROGRAM_READ_AUTHORIZATION_STALE':
+        message = 'Source access changed while loading. Refresh the application and read the source again.'
+    if stable == _PYTHON_SCHEDULE_READ_AUTHORIZATION_STALE:
+        message = 'Schedule access changed while loading. Refresh the application before reading the schedule or run again.'
+    if stable in ('APPLICATION_WORKFLOW_ACTIVITY_STALE', 'APPLICATION_WORKFLOW_OCCURRENCE_STALE',
+                  'APPLICATION_WORKFLOW_RETURN_TARGET_STALE') and status == 409:
+        message = 'The workflow state changed. Read the same occurrence before reviewing another action.'
+    if stable == 'CALCULATION_CURRENTNESS_READ_CUT_CHANGED':
+        message = 'Calculation state changed while loading. Read the current definition and restart status from the first page.'
+    if stable in ('CALCULATION_BINDING_UNAVAILABLE', 'CALCULATION_TEMPLATE_UNAVAILABLE'):
+        message = 'This calculation binding could not be explained. Read current calculation status before choosing a binding again.'
+    if stable == 'APPLICATION_ASSIGNMENT_WORKFLOW_REFERENCE_CONFLICT' and status == 409:
+        message = 'A workflow still references this assignment. Review its workflow dependencies before changing it.'
+    if stable == BROWSER_IDENTITY_CHANGED and status == 409:
+        message = 'The signed-in account changed. Check the current account before continuing.'
+    if stable == 'APPLICATION_WORKFLOW_REVIEW_BASIS_STALE':
+        message = 'Required evidence has changed. Return the work to replace that evidence.'
+    if stable == 'APPLICATION_WORKFLOW_REVIEW_BASIS_UNAVAILABLE':
+        message = 'Required evidence could not be verified. Check the evidence and refresh the workflow.'
+    if stable == 'SECURITY_TAG_IN_USE':
+        message = ('This tag is still assigned to a dimension, member, relationship, or access grant. '
+                   'Review those assignments before inactivating it.')
+    if stable == 'SECURITY_TAG_NOT_CATALOGUED':
+        message = 'Every assigned tag must be active in this dimension. Refresh the tag catalogue and review the assignments.'
+    if stable in CATALOG_DISCOVERY_CODES | {ProgramValidationError.code} and details:
+        diagnostic_code, validated = validate_public_diagnostic_payload(details)
+        if diagnostic_code != stable:
+            raise ValueError('PUBLIC_DIAGNOSTIC_CODE_MISMATCH')
+        details = validated
+        message = (details['recovery'] if stable in CATALOG_DISCOVERY_CODES else
+                   f"{details['path']}: expected {details['expected']}. {details['recovery']}")
     return {
         'error': stable,
         'code': stable,
-        'message': stable.replace('_', ' ').capitalize(),
+        'message': message,
         'details': details or {},
         'correlationId': correlation,
         'retryable': status in (429, 502, 503, 504),
@@ -120,7 +302,15 @@ def _value_error_response(error: ValueError)->tuple[int,str]:
     if (code in ('REQUEST_TOO_LARGE','SOURCE_RECORD_TOO_LARGE')
             or code.endswith(('_PAYLOAD_TOO_LARGE','_BODY_TOO_LARGE'))):
         return 413,code
-    if (code=='IDEMPOTENCY_KEY_REUSED'
+    if (code in ('IDEMPOTENCY_KEY_REUSED','STALE_EXPRESSION_RULE_LIST_REVISION',
+                 CATALOG_CONTINUATION_STALE,
+                 'METADATA_DIRECTORY_CURSOR_REQUIRED',
+                 'RESOLVED_READ_SNAPSHOT_CHANGED',
+                 'CALCULATION_CURRENTNESS_READ_CUT_CHANGED',
+                 'PYTHON_ENVIRONMENT_STALE_CONTEXT',
+                 'APPLICATION_ASSIGNMENT_COLLECTION_CHANGED', 'APPLICATION_WORKFLOW_COLLECTION_CHANGED',
+                 'CUBE_SELECTION_STATE_CHANGED_DURING_PREVIEW', 'CUBE_SELECTION_STATE_CHANGED_BEFORE_SEAL',
+                 'SECURITY_TAG_IN_USE', 'LAYOUT_REPLACEMENT_WORK_IN_PROGRESS')
             or code.endswith(('_STALE','_CONFLICT','_REVISION_MISMATCH',
                               '_ALREADY_EXISTS'))):
         return 409,code
@@ -135,7 +325,8 @@ def _value_error_response(error: ValueError)->tuple[int,str]:
     # explicitly describe a well-formed request failing semantic validation
     # receive 422; a blanket ``*_INVALID`` mapping changes established request
     # syntax contracts and makes clients misclassify errors they must repair.
-    if (code in ('SEMANTIC_VALIDATION_FAILED','VALIDATION_FAILED')
+    if (code in ('SEMANTIC_VALIDATION_FAILED','VALIDATION_FAILED','SECURITY_TAG_NOT_CATALOGUED',
+                 'APPLICATION_WORKFLOW_RECEIPT_CONTRACT_UNSUPPORTED', 'APPLICATION_WORKFLOW_EVIDENCE_VIEW_SCOPE_MISMATCH')
             or code.endswith(('_SEMANTIC_INVALID','_SEMANTIC_UNSUPPORTED'))):
         return 422,code
     return 400,code
@@ -184,30 +375,19 @@ _APPLICATION_WORKFLOW_OCCURRENCE_ACTIONS=frozenset((
     'application.workflow.activity.complete',
     'application.workflow.activity.return',
     'application.workflow.occurrence.cancel'))
+_METADATA_PREFLIGHT_ACTIONS = (_METADATA_STRUCTURE_EDIT_FUNCTIONS | _METADATA_MODEL_STATE_ACTIONS
+                               | _METADATA_SECURITY_TAG_ACTIONS | MEMBER_LIST_EFFECTS
+                               | POPULATED_LAYOUT_REQUESTS | {_HIERARCHY_BUILD, CALENDAR_SET})
 _METADATA_ACTIONS=frozenset((
     'metadata.dimension.create','metadata.member.create',
-    'metadata.security-tag.create','metadata.security-tag.update',
-    'metadata.security-tag.status.set',
     'metadata.dimension.rename','metadata.member.rename',
     'metadata.relationship.rename','metadata.dimension.describe',
     'metadata.member.describe','metadata.relationship.describe',
-    'metadata.dimension.status.set','metadata.member.status.set',
-    'metadata.member.security-tags.set',
-    'metadata.member.security-string.set',
     'metadata.relationship.create',
-    'metadata.relationship.aggregation-operator.set',
-    'metadata.relationship.status.set','metadata.hierarchy.build',
-    'metadata.attribute-definition.create',
-    'metadata.attribute-value.set',
-    'metadata.semantic_column.create','metadata.semantic_column.update',
-    'metadata.member.attribute.set',
-    'metadata.relationship.semantic_column.create',
-    'metadata.relationship.semantic_column.update',
-    'metadata.relationship.attribute.set',
     'metadata.member_list.save','metadata.member_list.activate',
     'metadata.member_list.deactivate',
     'metadata.member_list.delete',
-    'grid.definition.save','grid.definition.delete'))
+    'grid.definition.save','grid.definition.delete',CALENDAR_SET)) | ATTRIBUTE_WRITES | METADATA_VALUE_EFFECTS | HIERARCHY_EFFECTS | _METADATA_MODEL_STATE_ACTIONS | _METADATA_SECURITY_TAG_ACTIONS | POPULATED_LAYOUT_REQUESTS
 _RULE_ACTIONS=frozenset((
     'rules.expression.save',
     'rules.expression.activate',
@@ -221,17 +401,33 @@ _RULE_ACTIONS=frozenset((
 _OWNERSHIP_ACTIONS=frozenset((
     'consolidation.ownership.value.set',))
 _SOURCE_ACTIONS=frozenset((
+    'facts.slice.copy.prepare',
     'facts.planning.scenario.copy.prepare',
     'facts.source.preview','facts.source.publish'))
 _SOURCE_LOAD_SOURCE_READS=frozenset((
-    'facts.source.preview','facts.transfer.import.read'))
+    'facts.source.preview','facts.source.staging.read','facts.transfer.import.read'))
 _SOURCE_LOAD_ARTIFACT_READS=frozenset((
     'facts.transfer.import.diagnostics.read',
     'facts.transfer.import.diagnostics.list'))
+_SOURCE_LOAD_IMPORT_WRITES=frozenset((
+    'facts.transfer.import.request','facts.transfer.import.cancel'))
 _SOURCE_LOAD_WRITES=frozenset((
     'facts.source.begin','facts.source.csv.append','facts.source.seal',
-    'facts.source.manifest.attach',
-    'facts.transfer.import.request','facts.transfer.import.cancel'))
+    'facts.source.manifest.attach')) | _SOURCE_LOAD_IMPORT_WRITES
+_LARGE_SOURCE_ADMISSIONS = _SOURCE_LOAD_WRITES - {'facts.transfer.import.cancel'}
+_REQUEST_BODY_LIMITS = {
+    '/api/operation-admission': (MAX_BODY, dict.fromkeys(
+        _LARGE_SOURCE_ADMISSIONS | POPULATED_LAYOUT_REQUESTS, MAX_SOURCE_LOAD_BODY)),
+    '/api/metadata-action': (MAX_BODY, dict.fromkeys(POPULATED_LAYOUT_REQUESTS, MAX_SOURCE_LOAD_BODY)),
+    '/api/source-load': (MAX_SOURCE_LOAD_BODY, None),
+    '/api/read': (MAX_BODY, {
+        **dict.fromkeys((RAW_CUBE_SCAN, CALCULATION_SCAN, ADJUSTED_SCAN,
+                         LAYER_REPORT_SCAN, FACT_EXPORT_PAGE), MAX_RAW_CUBE_BODY),
+        POPULATED_LAYOUT_PREVIEW: MAX_SOURCE_LOAD_BODY,
+        POPULATED_LAYOUT_REVIEW: MAX_SOURCE_LOAD_BODY,
+    }),
+    '/api/application-decision': (72 * 1024, None),
+}
 _EXPORT_ORCHESTRATION_READS=frozenset((
     'facts.transfer.export.read',))
 _EXPORT_ARTIFACT_READS=frozenset((
@@ -244,6 +440,7 @@ _AGGREGATE_READS=frozenset((
     'facts.cube.aggregate.read',))
 
 _PROGRAM_OPERATION_KEY_FIELDS={
+    'facts.slice.copy.prepare':'idempotencyKey',
     'facts.planning.scenario.copy.prepare':'idempotencyKey',
     'facts.source.begin':'idempotencyKey',
     'facts.source.manifest.attach':'requestKey',
@@ -286,7 +483,7 @@ _OBSERVABLE_ROUTES=frozenset(('/', '/ui/*', '/api/applications',
     '/api/application-workflow', '/api/application-decision',
     '/api/application-workflow-occurrence', '/api/tasks', '/api/task',
     '/api/task-logs',
-    '/api/workspace-application','/api/application-purge'))
+    '/api/workspace-application','/api/application-purge','/api/workspace-access','/api/workspace-catalog'))
 # Every browser POST requires same-origin protection.  Function descriptors,
 # not route names, classify reads, technical controls and business mutations;
 # for example /api/read can admit a Reader-authorized durable technical query.
@@ -304,7 +501,7 @@ _BROWSER_POST_ROUTES=frozenset((
     '/api/security','/api/application-schedule','/api/application-assignment',
     '/api/application-workflow','/api/application-decision',
     '/api/application-workflow-occurrence',
-    '/api/workspace-application','/api/application-purge'))
+    '/api/workspace-application','/api/application-purge','/api/workspace-access','/api/workspace-catalog'))
 _AGGREGATE_CONTROLS=frozenset((
     'facts.cube.aggregate.request','facts.cube.aggregate.cancel'))
 _PYTHON_PROGRAM_READS=frozenset((
@@ -316,22 +513,24 @@ _PYTHON_ENVIRONMENT_READS=frozenset((
     'python.environment.read','python.environment.list',
     'python.environment.profile.list'))
 _PYTHON_ENVIRONMENT_WRITES=frozenset(('python.environment.register',))
-_PYTHON_SCHEDULE_READS=frozenset((
-    'python.schedule.read','python.schedule.list',
-    'python.schedule.occurrence.read'))
 _PYTHON_SCHEDULE_WRITES=frozenset((
     'python.schedule.save','python.schedule.activate',
     'python.schedule.deactivate','python.schedule.run',
     'python.schedule.occurrence.cancel'))
 _SECURITY_READS=frozenset((
-    _SECURITY_ACCESS_LIST,_SECURITY_SUBJECT_LIST,
+    _SECURITY_ACCESS_LIST,_SECURITY_SUBJECT_LIST,postgres_effective_access.FUNCTION,
+    authorization_config.READ,authorization_config.PREVIEW,postgres_authorization_tags.FUNCTION,postgres_authorization_objects.FUNCTION,postgres_access_explanation.FUNCTION,postgres_resource_access.FUNCTION,
+    _SECURITY_GROUP_ACCESS_LIST,
     _SECURITY_AUDIT_LIST,_SECURITY_RECEIPT_READ,
-    _SECURITY_DIMENSION_READ,_SECURITY_DIMENSION_TAGS,
+    _SECURITY_DIMENSION_READ,_SECURITY_GROUP_DIMENSION_READ,_SECURITY_DIMENSION_TAGS,
     _SECURITY_MEMBER_TAGS,_SECURITY_POLICY_READ,
     _SECURITY_DIMENSION_METADATA_TAGS,_SECURITY_RELATIONSHIP_TAGS,
     ))
 _SECURITY_WRITES=frozenset((
-    _SECURITY_ACCESS_SET,_SECURITY_DIMENSION_SET,_SECURITY_RULE_SET,
+    authorization_config.APPLY,
+    _SECURITY_ACCESS_SET,_SECURITY_GROUP_ACCESS_SET,
+    _SECURITY_DIMENSION_SET,_SECURITY_GROUP_DIMENSION_SET,
+    _SECURITY_RULE_SET,_SECURITY_RULE_GROUP_SET,
     _SECURITY_POLICY_SAVE,_SECURITY_POLICY_ACTIVATE,
     _SECURITY_POLICY_DEACTIVATE))
 _EXECUTION_DELEGATION_READS=frozenset((
@@ -424,7 +623,9 @@ class PostgresWebApp:
             b'application/json; charset=utf-8')
 
     @staticmethod
-    async def _body(receive,max_bytes: int=MAX_BODY) -> dict:
+    async def _body(receive, default_limit: int = MAX_BODY, *,
+                    program_limits: dict[str, int] | None = None) -> dict:
+        max_bytes = max((default_limit, *(program_limits or {}).values()))
         data=bytearray()
         while True:
             message=await receive()
@@ -435,24 +636,41 @@ class PostgresWebApp:
                 raise ValueError('REQUEST_TOO_LARGE')
             if not message.get('more_body',False):
                 break
+        check_large_program = len(data) > default_limit
         try:
             result=json.loads(data)
-        except (UnicodeError,json.JSONDecodeError) as error:
-            raise ValueError('JSON_BODY_REQUIRED') from error
+        except (UnicodeError,json.JSONDecodeError,RecursionError) as error:
+            code = 'REQUEST_TOO_LARGE' if check_large_program else 'JSON_BODY_REQUIRED'
+            raise ValueError(code) from error
         if not isinstance(result,dict):
-            raise ValueError('JSON_OBJECT_REQUIRED')
+            raise ValueError('REQUEST_TOO_LARGE' if check_large_program else 'JSON_OBJECT_REQUIRED')
+        if check_large_program:
+            program = result.get('program')
+            function = program.get('function') if isinstance(program,dict) else None
+            if (not isinstance(function, str) or program_limits is None
+                    or len(data) > program_limits.get(function, default_limit)):
+                raise ValueError('REQUEST_TOO_LARGE')
         return result
 
     def _dispatch(self,path: str,query: bytes,body: dict | None,
                   identity: VerifiedIdentity) -> object:
         if path=='/api/applications':
             try:
-                params=parse_qs(query.decode('ascii'),strict_parsing=True)
+                params=parse_qs(query.decode('ascii'),strict_parsing=True,keep_blank_values=True)
             except (UnicodeDecodeError,ValueError) as error:
                 raise ValueError('APPLICATION_LIST_ARGUMENTS_INVALID') from error
-            if set(params)-{'afterWorkspaceId','afterApplicationId','limit'}:
-                raise ValueError('APPLICATION_LIST_ARGUMENTS_INVALID')
             if any(len(values)!=1 for values in params.values()):
+                raise ValueError('APPLICATION_LIST_ARGUMENTS_INVALID')
+            if params.get('view') == ['managedWorkspaces']:
+                if set(params)-{'view','after','limit'}:
+                    raise ValueError('WORKSPACE_DISCOVERY_ARGUMENTS_INVALID')
+                try:
+                    limit = int(params.get('limit',['100'])[0])
+                except ValueError:
+                    raise ValueError('WORKSPACE_DISCOVERY_LIMIT_INVALID') from None
+                return self.router.managed_workspaces_for_identity(
+                    identity,after=params.get('after',[None])[0],limit=limit)
+            if set(params)-{'afterWorkspaceId','afterApplicationId','limit'}:
                 raise ValueError('APPLICATION_LIST_ARGUMENTS_INVALID')
             after=None
             if 'afterWorkspaceId' in params or 'afterApplicationId' in params:
@@ -468,12 +686,27 @@ class PostgresWebApp:
                 identity,after=after,limit=limit)
         if body is None:
             raise ValueError('JSON_BODY_REQUIRED')
+        if path=='/api/workspace-catalog':
+            if set(body) != {'workspaceId'} or not isinstance(body['workspaceId'],str) or not 1 <= len(body['workspaceId']) <= 200:
+                raise ValueError('WORKSPACE_CATALOG_ARGUMENTS_INVALID')
+            workspace_id = body['workspaceId']
+            service_dsn = self.lifecycle_dsn or self.router.security_dsn
+            if not service_dsn:
+                raise ValueError('POSTGRES_WORKSPACE_SERVICE_NOT_CONFIGURED')
+            PostgresWorkspaceLifecycle(service_dsn,identity=identity).check(workspace_id)
+            functions = [*workspace_review.FUNCTIONS, *auth_migration.FUNCTIONS] if self.router.security_dsn else []
+            result = {'workspaceId':workspace_id,'functions':functions}
+            if self.lifecycle_dsn:
+                functions.append(_WORKSPACE_APPLICATION_CREATE)
+                result['applicationBlueprint'] = programmable_application_blueprint()
+            result['functions'] = sorted(functions)
+            return result
         program=body.get('program')
         if isinstance(program,dict) and isinstance(program.get('function'),str):
             function=program.get('function')
             try:
                 contract=admit_operation(program,
-                    scope=('workspace' if path in ('/api/workspace-application','/api/application-purge')
+                    scope=('workspace' if path in ('/api/workspace-application','/api/application-purge','/api/workspace-access')
                            else 'application'))
             except ValueError as error:
                 # Route-specific confirmation/allow-list errors remain the
@@ -485,6 +718,7 @@ class PostgresWebApp:
                     raise
             else:
                 expected_boundary=(
+                    'workspace_security_adapter' if path=='/api/workspace-access' else
                     'workspace_lifecycle_adapter'
                     if path in ('/api/workspace-application','/api/application-purge') else
                     'application_security_adapter'
@@ -494,6 +728,23 @@ class PostgresWebApp:
                 if contract['handlerBoundary']!=expected_boundary:
                     raise ValueError('PROCESSING_OPERATION_HANDLER_MISMATCH:'+
                                      function)
+        if path=='/api/workspace-access':
+            if isinstance(program,dict) and program.get('function') in auth_migration.FUNCTIONS:
+                write=program['function']==auth_migration.ACTIVATE
+                needed={'workspaceId','program'} | ({'idempotencyKey','confirmed'} if write else set())
+                if set(body)!=needed or (write and body.get('confirmed') is not True):
+                    raise ValueError('WORKSPACE_AUTHORIZATION_MIGRATION_CONFIRMATION_REQUIRED')
+                if not self.router.security_dsn:
+                    raise ValueError('POSTGRES_SECURITY_SERVICE_NOT_CONFIGURED')
+                return postgres_authorization_migration.execute(self.router.security_dsn,body['workspaceId'],identity,
+                    program,secret=self.router.preview_secret,operation_id=body.get('idempotencyKey'))
+            if (set(body)!={'workspaceId','program'} or not isinstance(body['workspaceId'],str)
+                    or not isinstance(program,dict) or program.get('function') not in workspace_review.FUNCTIONS):
+                raise ValueError('WORKSPACE_ACCESS_REVIEW_ARGUMENTS_INVALID')
+            if not self.router.security_dsn:
+                raise ValueError('POSTGRES_SECURITY_SERVICE_NOT_CONFIGURED')
+            return workspace_review.read(self.router.security_dsn,body['workspaceId'],identity,
+                                         program,secret=self.router.preview_secret)
         if path=='/api/application-purge':
             from epm_core.postgres_application_purge import PostgresApplicationPurge
             if set(body)!={'workspaceId','program','idempotencyKey'}:
@@ -544,49 +795,23 @@ class PostgresWebApp:
                     'expiresAt':admission.expires_at,
                     'intentDigest':admission.intent_digest}
         if path=='/api/catalog':
-            if set(body)!={'workspaceId','applicationId'}:
+            if (not {'workspaceId','applicationId'} <= set(body)
+                    or set(body) - {'workspaceId','applicationId','discovery'}):
                 raise ValueError('CATALOG_ARGUMENTS_INVALID')
-            with connect_postgres(self.router.runtime_dsn,row_factory=dict_row) as db:
-                with db.transaction():
-                    PostgresNumericFactStore._set_scope(db,scope)
-                    checker=PostgresAccessChecker.check_in_transaction
-                    checker(db,identity,scope,'read')
-                    allowed={'read'}
-                    for permission in ('write','admin','workspace_admin',
-                                       'rule_design','rule_publish','rule_run'):
-                        if permission.startswith('rule_') and 'write' not in allowed:
-                            continue
-                        try:
-                            checker(db,identity,scope,permission)
-                            allowed.add(permission)
-                        except AccessDenied:
-                            pass
-                    state=capability_state(db,scope)
-                    if state is None:
-                        raise AccessDenied('APPLICATION_UNAVAILABLE')
-                    enabled=state['enabled_capabilities']
-                    revision=state['capability_revision']
-            catalog=filter_catalog(PostgresLanguageV2.catalog(),enabled)
-            if self.router.security_dsn:
-                catalog['functions'].update(
-                    PostgresSecurityLanguage.catalog()['functions'])
-            functions={name:spec for name,spec in catalog['functions'].items()
-                       if spec['permission'] in allowed}
-            contracts=operation_contracts(functions,scope='application')
-            return {'languageVersion':2,
-                    'registryFormat':FUNCTION_REGISTRY_FORMAT,
-                    'registryDigest':function_registry_digest(functions),
-                    'processingRegistryFormat':PROCESSING_REGISTRY_FORMAT,
-                    'operationContracts':contracts,
-                    'processingPolicy':processing_policy(),
-                    'listener':{'scope':'application',
-                                'workspaceId':scope.workspace_id,
-                                'applicationId':scope.application_id},
-                    'enabledCapabilities':sorted(enabled),
-                    'capabilityRevision':revision,
+            allowed, state = catalog_access_state(self.router.runtime_dsn, identity, scope,
+                                                  secret=self.router.preview_secret)
+            result=application_catalog(PostgresLanguageV2.catalog(),
+                security_functions=(PostgresSecurityLanguage.catalog()['functions']
+                                    if self.router.security_dsn else {}),
+                enabled=state['enabled_capabilities'], allowed=allowed,
+                scope=scope, state=state, channel='browser')
+            result.update({
                     'applicationAccess':{
                         'role':('Administrator' if 'admin' in allowed else
                                 'Editor' if 'write' in allowed else 'Reader'),
+                        **({'role':'Assigned','authorizationModel':'group_assignments',
+                            'roles':list(state['authorization_roles'])}
+                           if 'authorization_actions' in state else {}),
                         'workspaceAdministrator':'workspace_admin' in allowed,
                         'issuer':identity.issuer,
                         'subjectId':identity.subject_id},
@@ -598,19 +823,27 @@ class PostgresWebApp:
                         'capability':state['capability_revision'],
                         'security':state['security_revision'],
                         'schemaEpoch':state['schema_epoch']},
-                    'functions':functions}
+                    })
+            if self.router.security_dsn and 'workspace_admin' in allowed:
+                result['workspaceFunctions']=sorted((*workspace_review.FUNCTIONS,*auth_migration.FUNCTIONS))
+            if self.lifecycle_dsn and 'workspace_admin' in allowed:
+                result['applicationBlueprint']=programmable_application_blueprint()
+            return discover_catalog(result,body.get('discovery'))
         if path=='/api/capacity-metrics':
-            if set(body)!={'workspaceId','applicationId'}:
+            if set(body) not in ({'workspaceId','applicationId'},
+                                 {'workspaceId','applicationId','view'}):
                 raise ValueError('CAPACITY_METRICS_ARGUMENTS_INVALID')
-            return PostgresCapacityMetrics(self.router.runtime_dsn).read(
-                identity,scope)
+            return self.router.capacity_metrics_for_identity(
+                identity,scope.workspace_id,scope.application_id,
+                view=body.get('view','full'))
         if path=='/api/read':
             if set(body)!={'workspaceId','applicationId','program'}:
                 raise ValueError('READ_ARGUMENTS_INVALID')
             assert_public_program_admitted(body['program'])
             return PostgresLanguageV2(self.router.runtime_dsn,
                 identity=identity,
-                preview_secret=self.router.preview_secret).execute_read(
+                preview_secret=self.router.preview_secret,
+                approved_python_profiles=self.router.approved_python_profiles).execute_read(
                     scope,body['program'])
         if path=='/api/preview':
             if set(body)!={'workspaceId','applicationId','program'}:
@@ -641,8 +874,16 @@ class PostgresWebApp:
                 raise ValueError('OPERATION_ADMISSION_REQUIRED')
             language=PostgresLanguageV2(self.router.runtime_dsn,
                 identity=identity,preview_secret=self.router.preview_secret)
-            language._validate_signed_operation_id(
-                scope,body['program'],body['idempotencyKey'])
+            try:
+                language._validate_signed_operation_id(
+                    scope,body['program'],body['idempotencyKey'])
+            except ValueError as error:
+                if str(error) != 'OPERATION_ADMISSION_EXPIRED':
+                    raise
+                return language.reconcile_expired_operation(scope, body['program'],
+                    idempotency_key=body['idempotencyKey'],
+                    depends_on_job_ids=tuple(body['dependsOnJobIds']),
+                    transport=('browserPath', '/api/submit'),preview_token=body['previewToken'])
             replay=language.replay_batch(scope,body['program'],
                 idempotency_key=body['idempotencyKey'],
                 depends_on_job_ids=tuple(body['dependsOnJobIds']))
@@ -668,27 +909,51 @@ class PostgresWebApp:
                 raise ValueError('METADATA_ACTION_CONFIRMATION_REQUIRED')
             if not is_signed_operation_id(body['idempotencyKey']):
                 raise ValueError('OPERATION_ADMISSION_REQUIRED')
+            if body['program']['function'] in _METADATA_PREFLIGHT_ACTIONS:
+                assert_public_program_admitted(body['program'])
             language=PostgresLanguageV2(self.router.runtime_dsn,
                 identity=identity,
                 preview_secret=self.router.preview_secret)
-            language._validate_signed_operation_id(
-                scope,body['program'],body['idempotencyKey'])
+            function=body['program']['function']
+            try:
+                if function in POPULATED_LAYOUT_REQUESTS:
+                    return language.execute_metadata(scope,body['program'],
+                        idempotency_key=body['idempotencyKey'])
+                language._validate_signed_operation_id(
+                    scope,body['program'],body['idempotencyKey'])
+            except ValueError as error:
+                if (function not in POPULATED_LAYOUT_REQUESTS | {CALENDAR_SET}
+                        or str(error)!='OPERATION_ADMISSION_EXPIRED'):
+                    raise
+                return language.reconcile_expired_operation(
+                    scope,body['program'],idempotency_key=body['idempotencyKey'],
+                    transport=('browserPath',path))
+            if function==CALENDAR_SET:
+                return language.execute_calendar(scope,body['program'],
+                    idempotency_key=body['idempotencyKey'])
             return language.execute_metadata(scope,body['program'],
                 idempotency_key=body['idempotencyKey'])
         if path=='/api/application-decision':
             from epm_core.postgres_application_decisions import WRITES
             if (set(body)!={'workspaceId','applicationId','program','idempotencyKey'}
                     or not isinstance(body['program'],dict)
-                    or body['program'].get('function') not in WRITES
                     or not isinstance(body['idempotencyKey'],str)):
+                raise ValueError('APPLICATION_DECISION_REQUEST_INVALID')
+            assert_public_program_admitted(body['program'])
+            if body['program']['function'] not in WRITES:
                 raise ValueError('APPLICATION_DECISION_REQUEST_INVALID')
             if not is_signed_operation_id(body['idempotencyKey']):
                 raise ValueError('OPERATION_ADMISSION_REQUIRED')
             language=PostgresLanguageV2(self.router.runtime_dsn,
                 identity=identity,
                 preview_secret=self.router.preview_secret)
-            language._validate_signed_operation_id(
-                scope,body['program'],body['idempotencyKey'])
+            try:
+                language._validate_signed_operation_id(scope,body['program'],body['idempotencyKey'])
+            except ValueError as error:
+                if str(error) != 'OPERATION_ADMISSION_EXPIRED':
+                    raise
+                return language.reconcile_expired_operation(scope,body['program'],
+                    idempotency_key=body['idempotencyKey'],transport=('browserPath','/api/application-decision'))
             return language.execute_application_decision(
                 scope,body['program'],idempotency_key=body['idempotencyKey'])
         if path=='/api/rule-action':
@@ -704,8 +969,14 @@ class PostgresWebApp:
             language=PostgresLanguageV2(self.router.runtime_dsn,
                 identity=identity,
                 preview_secret=self.router.preview_secret)
-            language._validate_signed_operation_id(
-                scope,body['program'],body['idempotencyKey'])
+            try:
+                language._validate_signed_operation_id(
+                    scope,body['program'],body['idempotencyKey'])
+            except ValueError as error:
+                if str(error) != 'OPERATION_ADMISSION_EXPIRED':
+                    raise
+                return language.reconcile_expired_operation(scope,body['program'],
+                    idempotency_key=body['idempotencyKey'],transport=('browserPath',path))
             return language.execute_expression_rule(scope,body['program'],
                 idempotency_key=body['idempotencyKey'])
         if path=='/api/ownership-action':
@@ -740,8 +1011,15 @@ class PostgresWebApp:
             assert_public_program_admitted(body['program'])
             if not is_signed_operation_id(body['idempotencyKey']):
                 raise ValueError('OPERATION_ADMISSION_REQUIRED')
-            language._validate_signed_operation_id(
-                scope,body['program'],body['idempotencyKey'])
+            try:
+                language._validate_signed_operation_id(
+                    scope,body['program'],body['idempotencyKey'])
+            except ValueError as error:
+                if str(error) != 'OPERATION_ADMISSION_EXPIRED':
+                    raise
+                return language.reconcile_expired_operation(scope,body['program'],
+                    idempotency_key=body['idempotencyKey'],preview_token=body['previewToken'],
+                    transport=('browserPath', '/api/planning-action'))
             replay=language.replay_planning_lock(
                 scope,body['program'],idempotency_key=body['idempotencyKey'])
             if replay is not None:
@@ -757,7 +1035,8 @@ class PostgresWebApp:
                     or body['program'].get('function') not in
                     _PLANNING_POLICY_ACTIONS):
                 raise ValueError('PLANNING_POLICY_CONFIRMATION_REQUIRED')
-            function=body['program']['function'];key=body['idempotencyKey']
+            assert_public_program_admitted(body['program'])
+            key=body['idempotencyKey']
             if not isinstance(key,str) or not key:
                 raise ValueError('PLANNING_POLICY_CONFIRMATION_REQUIRED')
             if not is_signed_operation_id(key):
@@ -784,9 +1063,18 @@ class PostgresWebApp:
                 identity=identity,
                 preview_secret=self.router.preview_secret)
             program=body['program']
+            if function in ('facts.source.preview','facts.source.publish'):
+                assert_public_program_admitted(program)
             if function!='facts.source.preview':
-                program=_admitted_browser_program(
-                    language,scope,program,body['idempotencyKey'])
+                try:
+                    program=_admitted_browser_program(
+                        language,scope,program,body['idempotencyKey'])
+                except ValueError as error:
+                    if str(error) != 'OPERATION_ADMISSION_EXPIRED':
+                        raise
+                    return language.reconcile_expired_operation(scope, program,
+                        idempotency_key=body['idempotencyKey'],
+                        transport=('browserPath', '/api/source-action'))
             return language.execute_source(scope,program)
         if path=='/api/source-load':
             if not isinstance(body.get('program'),dict):
@@ -806,9 +1094,17 @@ class PostgresWebApp:
             language=PostgresLanguageV2(self.router.runtime_dsn,
                 identity=identity,preview_secret=self.router.preview_secret)
             program=body['program']
+            assert_public_program_admitted(program)
             if function in _SOURCE_LOAD_WRITES:
-                program=_admitted_browser_program(
-                    language,scope,program,body['idempotencyKey'])
+                try:
+                    program=_admitted_browser_program(
+                        language,scope,program,body['idempotencyKey'])
+                except ValueError as error:
+                    if str(error) != 'OPERATION_ADMISSION_EXPIRED':
+                        raise
+                    return language.reconcile_expired_operation(scope, program,
+                        idempotency_key=body['idempotencyKey'],
+                        transport=('browserPath', '/api/source-load'))
             return (language.execute_read(scope,body['program'])
                     if function in _SOURCE_LOAD_ARTIFACT_READS else
                     language.execute_source(scope,program))
@@ -833,9 +1129,17 @@ class PostgresWebApp:
             language=PostgresLanguageV2(self.router.runtime_dsn,
                 identity=identity,preview_secret=self.router.preview_secret)
             program=body['program']
+            assert_public_program_admitted(program)
             if function in _EXPORT_WRITES:
-                program=_admitted_browser_program(
-                    language,scope,program,body['idempotencyKey'])
+                try:
+                    program=_admitted_browser_program(
+                        language,scope,program,body['idempotencyKey'])
+                except ValueError as error:
+                    if str(error) != 'OPERATION_ADMISSION_EXPIRED':
+                        raise
+                    return language.reconcile_expired_operation(scope, program,
+                        idempotency_key=body['idempotencyKey'],
+                        transport=('browserPath', '/api/export'))
             return (language.execute_read(scope,body['program'])
                     if execute=='read' else
                     language.execute_source(scope,program))
@@ -852,6 +1156,7 @@ class PostgresWebApp:
                     raise ValueError('AGGREGATE_CONFIRMATION_REQUIRED')
             else:
                 raise ValueError('AGGREGATE_ACTION_INVALID')
+            assert_public_program_admitted(body['program'])
             return PostgresLanguageV2(self.router.runtime_dsn,
                 identity=identity,
                 preview_secret=self.router.preview_secret).execute_read(
@@ -865,6 +1170,7 @@ class PostgresWebApp:
             if function in _PYTHON_PROGRAM_READS:
                 if set(body)!={'workspaceId','applicationId','program'}:
                     raise ValueError('PYTHON_PROGRAM_ACTION_INVALID')
+                assert_public_program_admitted(body['program'])
                 return language.execute_read(scope,body['program'])
             if function in _PYTHON_PROGRAM_WRITES:
                 if (set(body)!={'workspaceId','applicationId','program',
@@ -875,6 +1181,7 @@ class PostgresWebApp:
                     raise ValueError('PYTHON_PROGRAM_CONFIRMATION_REQUIRED')
                 if not is_signed_operation_id(body['idempotencyKey']):
                     raise ValueError('OPERATION_ADMISSION_REQUIRED')
+                assert_public_program_admitted(body['program'])
                 language._validate_signed_operation_id(
                     scope,body['program'],body['idempotencyKey'])
                 return language.execute_python_program(scope,body['program'],
@@ -891,8 +1198,25 @@ class PostgresWebApp:
             if function in _SECURITY_READS:
                 if set(body)!={'workspaceId','applicationId','program'}:
                     raise ValueError('SECURITY_ACTION_INVALID')
+                assert_public_program_admitted(body['program'])
+                if function in (authorization_config.READ,authorization_config.PREVIEW):
+                    return postgres_authorization_config.run_configuration(self.router.security_dsn,scope,
+                        identity,body['program'],secret=self.router.preview_secret)
+                if function==postgres_resource_access.FUNCTION:
+                    return postgres_resource_access.read(self.router.runtime_dsn,scope,identity,body['program'],secret=self.router.preview_secret)
+                if function == postgres_access_explanation.FUNCTION:
+                    return postgres_access_explanation.read_explanation(self.router.runtime_dsn,scope,identity,body['program'])
+                if function == postgres_authorization_objects.FUNCTION:
+                    return postgres_authorization_objects.read_objects(self.router.security_dsn,scope,identity,body['program'])
+                if function == postgres_authorization_tags.FUNCTION:
+                    return postgres_authorization_tags.read_tags(self.router.security_dsn,scope,identity,body['program'])
+                if function == postgres_effective_access.FUNCTION:
+                    return postgres_effective_access.read_report(self.router.security_dsn, scope,
+                        identity, body['program'], secret=self.router.preview_secret)
                 if function==_SECURITY_ACCESS_LIST:
                     return security.list_application_access(scope,body['program'])
+                if function==_SECURITY_GROUP_ACCESS_LIST:
+                    return security.list_application_group_access(scope,body['program'])
                 if function==_SECURITY_SUBJECT_LIST:
                     return security.list_application_subjects(
                         scope,body['program'])
@@ -914,6 +1238,8 @@ class PostgresWebApp:
                 if function == _SECURITY_POLICY_READ:
                     return security.read_dimension_policy(
                         scope,body['program'])
+                if function == _SECURITY_GROUP_DIMENSION_READ:
+                    return security.read_group_dimension_access(scope,body['program'])
                 return security.read_dimension_access(scope,body['program'])
             if function in _SECURITY_WRITES:
                 if (set(body)!={'workspaceId','applicationId','program',
@@ -922,10 +1248,14 @@ class PostgresWebApp:
                         or not isinstance(body['idempotencyKey'],str)
                         or not body['idempotencyKey']):
                     raise ValueError('SECURITY_CONFIRMATION_REQUIRED')
+                assert_public_program_admitted(body['program'])
                 _validate_browser_operation(
                     self.router.preview_secret,scope,identity,
                     body['program'],body['idempotencyKey'])
-                if function==_SECURITY_RULE_SET:
+                if function==authorization_config.APPLY:
+                    return postgres_authorization_config.run_configuration(self.router.security_dsn,scope,
+                        identity,body['program'],operation_id=body['idempotencyKey'],secret=self.router.preview_secret)
+                if function in (_SECURITY_RULE_SET,_SECURITY_RULE_GROUP_SET):
                     return security.execute_rule(scope,body['program'],
                         idempotency_key=body['idempotencyKey'])
                 return security.execute(scope,body['program'],
@@ -941,6 +1271,7 @@ class PostgresWebApp:
             if function in _PYTHON_ENVIRONMENT_READS:
                 if set(body)!={'workspaceId','applicationId','program'}:
                     raise ValueError('PYTHON_ENVIRONMENT_ACTION_INVALID')
+                assert_public_program_admitted(body['program'])
                 return language.execute_read(scope,body['program'])
             if function in _PYTHON_ENVIRONMENT_WRITES:
                 if (set(body)!={'workspaceId','applicationId','program',
@@ -951,6 +1282,7 @@ class PostgresWebApp:
                     raise ValueError('PYTHON_ENVIRONMENT_CONFIRMATION_REQUIRED')
                 if not is_signed_operation_id(body['idempotencyKey']):
                     raise ValueError('OPERATION_ADMISSION_REQUIRED')
+                assert_public_program_admitted(body['program'])
                 language._validate_signed_operation_id(
                     scope,body['program'],body['idempotencyKey'])
                 return language.execute_python_program(scope,body['program'],
@@ -965,6 +1297,7 @@ class PostgresWebApp:
             if function in _PYTHON_SCHEDULE_READS:
                 if set(body)!={'workspaceId','applicationId','program'}:
                     raise ValueError('PYTHON_SCHEDULE_ACTION_INVALID')
+                assert_public_program_admitted(body['program'])
                 return language.execute_read(scope,body['program'])
             if function in _PYTHON_SCHEDULE_WRITES:
                 if (set(body)!={'workspaceId','applicationId','program',
@@ -975,8 +1308,15 @@ class PostgresWebApp:
                     raise ValueError('PYTHON_SCHEDULE_CONFIRMATION_REQUIRED')
                 if not is_signed_operation_id(body['idempotencyKey']):
                     raise ValueError('OPERATION_ADMISSION_REQUIRED')
-                language._validate_signed_operation_id(
-                    scope,body['program'],body['idempotencyKey'])
+                try:
+                    language._validate_signed_operation_id(
+                        scope,body['program'],body['idempotencyKey'])
+                except ValueError as error:
+                    if str(error)!='OPERATION_ADMISSION_EXPIRED':
+                        raise
+                    return language.reconcile_expired_operation(
+                        scope,body['program'],idempotency_key=body['idempotencyKey'],
+                        transport=('browserPath',path))
                 return language.execute_python_program(scope,body['program'],
                     idempotency_key=body['idempotencyKey'])
             raise ValueError('PYTHON_SCHEDULE_ACTION_INVALID')
@@ -999,12 +1339,20 @@ class PostgresWebApp:
                     raise ValueError('EXECUTION_DELEGATION_CONFIRMATION_REQUIRED')
                 if not is_signed_operation_id(body['idempotencyKey']):
                     raise ValueError('OPERATION_ADMISSION_REQUIRED')
-                language._validate_signed_operation_id(
-                    scope,body['program'],body['idempotencyKey'])
+                try:
+                    language._validate_signed_operation_id(
+                        scope,body['program'],body['idempotencyKey'])
+                except ValueError as error:
+                    if str(error)!='OPERATION_ADMISSION_EXPIRED':
+                        raise
+                    return language.reconcile_expired_operation(
+                        scope,body['program'],idempotency_key=body['idempotencyKey'],
+                        transport=('browserPath','/api/execution-delegation'))
                 return language.execute_execution_delegation(
                     scope,body['program'],idempotency_key=body['idempotencyKey'])
             raise ValueError('EXECUTION_DELEGATION_ACTION_INVALID')
         if path=='/api/python-build':
+            from epm_core.python_execution_contract import BUILD_PURPOSES
             language=PostgresLanguageV2(self.router.runtime_dsn,
                 identity=identity,preview_secret=self.router.preview_secret)
             action=body.get('action')
@@ -1013,20 +1361,30 @@ class PostgresWebApp:
                                 'idempotencyKey','confirmed'}
                         or body['confirmed'] is not True
                         or not isinstance(body['program'],dict)
-                        or body['program'].get('function') not in ('python.program.build','python.program.test')
+                        or type(body['program'].get('function')) is not str
+                        or body['program']['function'] not in BUILD_PURPOSES
                         or not isinstance(body['idempotencyKey'],str)
                         or not body['idempotencyKey']):
                     raise ValueError('PYTHON_BUILD_CONFIRMATION_REQUIRED')
                 if not is_signed_operation_id(body['idempotencyKey']):
                     raise ValueError('OPERATION_ADMISSION_REQUIRED')
-                language._validate_signed_operation_id(
-                    scope,body['program'],body['idempotencyKey'])
+                try:
+                    language._validate_signed_operation_id(
+                        scope,body['program'],body['idempotencyKey'])
+                except ValueError as error:
+                    if str(error)!='OPERATION_ADMISSION_EXPIRED':
+                        raise
+                    return language.reconcile_expired_operation(
+                        scope,body['program'],idempotency_key=body['idempotencyKey'],
+                        transport=('browserPath',path))
                 return language.execute_python_build(scope,body['program'],
                     idempotency_key=body['idempotencyKey'])
             if action=='read':
-                if set(body)!={'workspaceId','applicationId','action','buildId'}:
+                if set(body) not in ({'workspaceId','applicationId','action','buildId'},
+                                    {'workspaceId','applicationId','action','originalRequest'}):
                     raise ValueError('PYTHON_BUILD_ACTION_INVALID')
-                return {'result':language.read_python_build(scope,body['buildId'])}
+                return {'result':language.read_python_build(scope,body.get('buildId'),
+                    original_request=body.get('originalRequest'))}
             if action=='artifact':
                 if set(body)!={'workspaceId','applicationId','action','buildId',
                                'section','cursor'}:
@@ -1056,15 +1414,23 @@ class PostgresWebApp:
                     raise ValueError('PYTHON_RUN_CONFIRMATION_REQUIRED')
                 if not is_signed_operation_id(body['idempotencyKey']):
                     raise ValueError('OPERATION_ADMISSION_REQUIRED')
-                language._validate_signed_operation_id(
-                    scope,body['program'],body['idempotencyKey'])
+                try:
+                    language._validate_signed_operation_id(
+                        scope,body['program'],body['idempotencyKey'])
+                except ValueError as error:
+                    if str(error)!='OPERATION_ADMISSION_EXPIRED':
+                        raise
+                    return language.reconcile_expired_operation(
+                        scope,body['program'],idempotency_key=body['idempotencyKey'],
+                        transport=('browserPath',path))
                 return language.execute_python_run(scope,body['program'],
                     idempotency_key=body['idempotencyKey'])
             if action=='read':
-                if set(body)!={'workspaceId','applicationId','action','workflowId'}:
+                if set(body) not in ({'workspaceId','applicationId','action','workflowId'},
+                                    {'workspaceId','applicationId','action','originalRequest'}):
                     raise ValueError('PYTHON_RUN_ACTION_INVALID')
                 return {'result':language.read_python_workflow(
-                    scope,body['workflowId'])}
+                    scope,body.get('workflowId'),original_request=body.get('originalRequest'))}
             if action=='cancel':
                 if (set(body)!={'workspaceId','applicationId','action','workflowId',
                                 'confirmed'} or body['confirmed'] is not True):
@@ -1091,14 +1457,21 @@ class PostgresWebApp:
                 key=body['idempotencyKey']
             else:
                 raise ValueError('APPLICATION_SCHEDULE_ACTION_INVALID')
+            assert_public_program_admitted(body['program'])
             if key is not None and not is_signed_operation_id(key):
                 raise ValueError('OPERATION_ADMISSION_REQUIRED')
             language=PostgresLanguageV2(self.router.runtime_dsn,
                 identity=identity,
                 preview_secret=self.router.preview_secret)
             if key is not None:
-                language._validate_signed_operation_id(
-                    scope,body['program'],key)
+                try:
+                    language._validate_signed_operation_id(scope,body['program'],key)
+                except ValueError as error:
+                    if str(error) != 'OPERATION_ADMISSION_EXPIRED':
+                        raise
+                    return language.reconcile_expired_operation(
+                        scope,body['program'],idempotency_key=key,
+                        transport=('browserPath', '/api/application-schedule'))
             return language.execute_application_schedule(
                 scope,body['program'],idempotency_key=key)
         if path in ('/api/application-assignment','/api/application-workflow'):
@@ -1126,13 +1499,20 @@ class PostgresWebApp:
                 key=body['idempotencyKey']
             else:
                 raise ValueError('APPLICATION_GOVERNANCE_ACTION_INVALID')
+            assert_public_program_admitted(body['program'])
             language=PostgresLanguageV2(self.router.runtime_dsn,
                 identity=identity,preview_secret=self.router.preview_secret)
             if key is not None:
                 if not is_signed_operation_id(key):
                     raise ValueError('OPERATION_ADMISSION_REQUIRED')
-                language._validate_signed_operation_id(
-                    scope,body['program'],key)
+                try:
+                    language._validate_signed_operation_id(scope,body['program'],key)
+                except ValueError as error:
+                    if str(error) != 'OPERATION_ADMISSION_EXPIRED':
+                        raise
+                    return language.reconcile_expired_operation(
+                        scope,body['program'],idempotency_key=key,
+                        transport=('browserPath',path))
             if path=='/api/application-assignment':
                 return language.execute_application_assignment(
                     scope,body['program'],idempotency_key=key)
@@ -1154,8 +1534,15 @@ class PostgresWebApp:
             language=PostgresLanguageV2(
                 self.router.runtime_dsn,identity=identity,
                 preview_secret=self.router.preview_secret)
-            language._validate_signed_operation_id(
-                scope,body['program'],body['idempotencyKey'])
+            try:
+                language._validate_signed_operation_id(
+                    scope,body['program'],body['idempotencyKey'])
+            except ValueError as error:
+                if str(error) != 'OPERATION_ADMISSION_EXPIRED':
+                    raise
+                return language.reconcile_expired_operation(
+                    scope,body['program'],idempotency_key=body['idempotencyKey'],
+                    transport=('browserPath', '/api/application-workflow-occurrence'))
             return language.execute_application_workflow_occurrence(
                 scope,body['program'],
                 idempotency_key=body['idempotencyKey'])
@@ -1191,15 +1578,16 @@ class PostgresWebApp:
                 raise ValueError('EVENT_ARGUMENTS_INVALID')
             return queue.events(scope,after_sequence=body.get('afterSequence',0),
                                 limit=body.get('limit',100))
-        if path in ('/api/job','/api/cancel'):
-            expected={'workspaceId','applicationId','jobId'}
-            if (set(body)!=(expected if path=='/api/job'
-                            else expected|{'confirmed'})
-                    or path=='/api/cancel'
-                    and body.get('confirmed') is not True):
+        if path=='/api/job':
+            reference=set(body)-{'workspaceId','applicationId'}
+            if reference not in ({'jobId'},{'operationId'}):
                 raise ValueError('JOB_ARGUMENTS_INVALID')
-            if path=='/api/job':
-                return queue.read(scope,body['jobId'])
+            return queue.read(scope,body.get('jobId'),
+                              operation_id=body.get('operationId'))
+        if path=='/api/cancel':
+            if (set(body)!={'workspaceId','applicationId','jobId','confirmed'}
+                    or body.get('confirmed') is not True):
+                raise ValueError('JOB_ARGUMENTS_INVALID')
             return queue.request_cancel(scope,body['jobId'])
         raise ValueError('UNKNOWN_ROUTE')
 
@@ -1270,6 +1658,12 @@ class PostgresWebApp:
             return
         try:
             principal=await authenticate_http(WEB_MODULE,{header_name:tokens[0]})
+            expected_identity=headers.get(BROWSER_IDENTITY_HEADER,[])
+            if len(expected_identity)>1:
+                raise AuthError('The browser identity binding is invalid', status=400,
+                                code=BROWSER_IDENTITY_INVALID)
+            validate_browser_identity(principal.issuer, principal.subject,
+                                      expected_identity[0] if expected_identity else None)
         except AuthError as error:
             LOG.warning('Browser authentication rejected: code=%s correlationId=%s',
                         error.code,scope.get('openepm.correlation_id','0'*32))
@@ -1295,6 +1689,7 @@ class PostgresWebApp:
             await self._json(send,200,{
                 'issuer':principal.issuer,
                 'subject':principal.subject,
+                'identityBinding':browser_identity_binding(principal.issuer,principal.subject),
                 'displayIdentity':principal.login_id,
                 'loginIdSha256':principal.login_id_sha256,
                 'audience':principal.audience,
@@ -1320,9 +1715,8 @@ class PostgresWebApp:
                     scope,403,'WEB_ORIGIN_REQUIRED'))
                 return
         try:
-            body=(await self._body(receive,
-                    MAX_SOURCE_LOAD_BODY if path=='/api/source-load' else
-                    72*1024 if path=='/api/application-decision' else MAX_BODY)
+            default_limit, program_limits = _REQUEST_BODY_LIMITS.get(path, (MAX_BODY, None))
+            body=(await self._body(receive, default_limit, program_limits=program_limits)
                   if method=='POST' else None)
             configuration={'accessDsn':self.router.access_dsn,'runtimeDsn':self.router.runtime_dsn,
                 'secretHex':self.router.preview_secret.hex(),'publicOrigin':self.public_origin,
@@ -1339,9 +1733,11 @@ class PostgresWebApp:
             payload=result['payload']
             if (result['status'] >= 400 and isinstance(payload,dict)
                     and 'error' in payload):
-                details = (validate_diagnostic_payload(payload['details'])
-                    if payload['error'] == SourceValidationError.code
-                    and 'details' in payload else None)
+                details = None
+                if payload['error'] in _DIAGNOSTIC_CODES and 'details' in payload:
+                    diagnostic_code, details = validate_public_diagnostic_payload(payload['details'])
+                    if diagnostic_code != payload['error']:
+                        raise ValueError('PUBLIC_DIAGNOSTIC_CODE_MISMATCH')
                 payload=_error_payload(scope,result['status'],payload['error'],
                                        details=details)
             await self._json(send,result['status'],payload)
@@ -1350,11 +1746,12 @@ class PostgresWebApp:
             await self._json(send,503,_error_payload(
                 scope,503,'WEB_OPERATION_OUTCOME_UNKNOWN'))
         except AccessDenied as error:
-            await self._json(send,403,_error_payload(scope,403,str(error)))
+            status = 401 if error.invalid_session else 403
+            await self._json(send,status,_error_payload(scope,status,str(error)))
         except ValueError as error:
             status,code=_value_error_response(error)
             await self._json(send,status,_error_payload(scope,status,code,
-                details=error.diagnostics if isinstance(error,SourceValidationError) else None))
+                details=error.diagnostics if isinstance(error,_DIAGNOSTIC_ERRORS) else None))
         except psycopg.Error:
             LOG.exception('PostgreSQL web operation failed')
             await self._json(send,503,_error_payload(
@@ -1461,13 +1858,16 @@ def _web_request(arguments,headers):
                     ApplicationScope(workspace,application),program,str(error))
             except Exception:
                 LOG.exception('Privileged browser denial audit failed')
-        return {'status':403,'payload':{'error':str(error)}}
+        return {'status':401 if error.invalid_session else 403,
+                'payload':{'error':str(error)}}
     except ValueError as error:
         status,code=_value_error_response(error)
         payload={'error':code}
-        if isinstance(error,SourceValidationError):
+        if isinstance(error,_DIAGNOSTIC_ERRORS):
             payload['details']=error.diagnostics
         return {'status':status,'payload':payload}
+    except ProcessingBusy:
+        return {'status':429,'payload':{'error':BUSY_CODE}}
     except psycopg.Error:
         LOG.exception('PostgreSQL web operation failed')
         return {'status':503,'payload':{'error':'POSTGRES_OPERATION_FAILED'}}

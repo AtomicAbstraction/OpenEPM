@@ -1,3 +1,5 @@
+export class ContinuationConsistencyError extends Error {}
+
 export type ContinuationOptions<Page, Row> = {
   label: string;
   readPage: (cursor: string | null) => Promise<Page>;
@@ -5,6 +7,7 @@ export type ContinuationOptions<Page, Row> = {
   nextCursor: (page: Page) => string | null;
   rowIdentity?: (row: Row) => string;
   consistencyIdentity?: (page: Page) => string | number;
+  onVerifiedPage?: (rows: Row[]) => void;
 };
 
 export async function collectAllContinuations<Page, Row>({
@@ -14,6 +17,7 @@ export async function collectAllContinuations<Page, Row>({
   nextCursor,
   rowIdentity,
   consistencyIdentity,
+  onVerifiedPage,
 }: ContinuationOptions<Page, Row>): Promise<{ rows: Row[]; finalPage: Page }> {
   const found: Row[] = [];
   const seenCursors = new Set<string>();
@@ -34,7 +38,9 @@ export async function collectAllContinuations<Page, Row>({
         expectedConsistency !== undefined &&
         consistency !== expectedConsistency
       )
-        throw new Error(`${label} changed while reading continuations.`);
+        throw new ContinuationConsistencyError(
+          `${label} changed while reading continuations.`,
+        );
       expectedConsistency = consistency;
     }
     for (const row of pageRows) {
@@ -55,6 +61,7 @@ export async function collectAllContinuations<Page, Row>({
         throw new Error(`${label} continuation cursor repeated.`);
       seenCursors.add(next);
     }
+    onVerifiedPage?.(pageRows);
     cursor = next;
     finalPage = page;
   } while (cursor !== null);

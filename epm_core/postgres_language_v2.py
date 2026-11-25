@@ -34,21 +34,25 @@ from .postgres_cell_editability import (
     FUNCTION as _CELL_EDITABILITY_READ, PostgresCellEditability,
     catalog as _cell_editability_catalog,
 )
-from .postgres_access import PostgresAccessChecker, VerifiedIdentity
+from .postgres_access import AccessGroupsChanged, PostgresAccessChecker, VerifiedIdentity
 from .operation_admission_contract import (
     OperationAdmission, is_signed_operation_id,
     issue_operation_admission as issue_signed_operation_admission,
-    validate_operation_admission)
-from .postgres_cube_query import PostgresCubeQuery
+    authenticate_operation_admission, validate_operation_admission)
+from .postgres_cube_query import FUNCTION as _RAW_CUBE_SCAN, PostgresCubeQuery, scan_program_contract
+from .postgres_scenario_comparison import (
+    FUNCTION as _SCENARIO_COMPARE, comparison_program_contract, read_comparison)
 from .postgres_cube_layer_report import (
     FUNCTION as _LAYER_REPORT_SCAN,
     PostgresCubeLayerReport)
 from .cube_aggregate_lifecycle import AggregateCursorCodec, AggregateQueryBudgets
+from .cube_aggregate_public_contract import aggregate_program_contract
 from .cube_aggregate_service import CubeAggregateService
 from .cube_aggregate_native import NativeCubeAggregateStage
 from .postgres_cube_aggregate_repository import PostgresCubeAggregateRepository
 from .postgres_populated_layout_preview import (
-    FUNCTION as _POPULATED_LAYOUT_PREVIEW,
+    FUNCTION as _POPULATED_LAYOUT_PREVIEW, SOURCE_READ as _POPULATED_LAYOUT_SOURCE_READ,
+    REVIEW as _POPULATED_LAYOUT_REVIEW,
     PostgresPopulatedLayoutPreview,
 )
 from .postgres_hierarchies import (catalog as named_hierarchy_catalog,
@@ -72,6 +76,7 @@ from .postgres_populated_layout_activation import (
     READ as _LAYOUT_ACTIVATE_READ,
     CANCEL as _LAYOUT_ACTIVATE_CANCEL,
     PUBLIC_FUNCTIONS as _LAYOUT_ACTIVATE_FUNCTIONS,
+    RECOVERY_GUIDANCE as _LAYOUT_ACTIVATE_RECOVERY_GUIDANCE,
 )
 from .postgres_python_program_repository import (
     PostgresPythonPrograms, SAVE as _PYTHON_PROGRAM_SAVE,
@@ -79,19 +84,19 @@ from .postgres_python_program_repository import (
     ACTIVATE as _PYTHON_PROGRAM_ACTIVATE,
     DEACTIVATE as _PYTHON_PROGRAM_DEACTIVATE,
     DELETE as _PYTHON_PROGRAM_DELETE)
+from .current_python_contract import mutation_program_contract, source_read_program_contract
 from .postgres_python_environments import (PostgresPythonEnvironments,
     ApprovedPythonEnvironment, REGISTER as _PYTHON_ENVIRONMENT_REGISTER,
     READ as _PYTHON_ENVIRONMENT_READ, LIST as _PYTHON_ENVIRONMENT_LIST,
     PROFILE_LIST as _PYTHON_ENVIRONMENT_PROFILE_LIST)
 from .postgres_python_build_public import (
     PostgresPythonBuildPublic, BUILD as _PYTHON_PROGRAM_BUILD,
-    TEST as _PYTHON_PROGRAM_TEST)
+    TEST as _PYTHON_PROGRAM_TEST, VALIDATE as _PYTHON_PROGRAM_VALIDATE)
 from .postgres_python_build_artifact import PostgresPythonBuildArtifact
 from .postgres_python_run import PostgresPythonRun, RUN as _PYTHON_PROGRAM_RUN
 from .postgres_python_schedules import (PostgresPythonSchedules,
     FUNCTIONS as _PYTHON_SCHEDULE_FUNCTIONS,catalog as python_schedule_catalog,
-    READ as _PYTHON_SCHEDULE_READ,LIST as _PYTHON_SCHEDULE_LIST,
-    OCCURRENCE_READ as _PYTHON_OCCURRENCE_READ)
+    READS as _PYTHON_SCHEDULE_READS)
 from .postgres_execution_delegations import (PostgresExecutionDelegations,
     catalog as execution_delegation_catalog, CREATE as _DELEGATION_CREATE,
     READ as _DELEGATION_READ, LIST as _DELEGATION_LIST,
@@ -415,12 +420,14 @@ from .postgres_expression_rules import (
     PostgresExpressionRules, SAVE as _RULE_SAVE,
     PUBLISH as _RULE_PUBLISH, READ as _RULE_READ,
     LIST as _RULE_LIST,
-    RUN as _RULE_RUN, verify_published_rule)
+    RUN as _RULE_RUN, read_program_contract as expression_rule_read_contract,
+    verify_published_rule)
 from .postgres_expression_sequence import (
     PostgresExpressionSequence,
     FUNCTION as _RULE_SEQUENCE_RUN,
     READ as _RULE_SEQUENCE_READ,
-    CANCEL as _RULE_SEQUENCE_CANCEL)
+    CANCEL as _RULE_SEQUENCE_CANCEL,
+    read_program_contract as _expression_sequence_read_contract)
 from .postgres_equity_rollforward_chain import (
     PostgresEquityRollforwardChain,
     INSPECT as _EQUITY_CHAIN_INSPECT,
@@ -470,7 +477,10 @@ from .postgres_consolidation_translated import (
     PLAN_DIGEST as _TRANSLATED_FULL_PLAN_DIGEST,
     compile_translated_full, validate_translated_full,
     enforce_translated_full_dimensional_security)
-from .postgres_metadata import PostgresMetadataStore
+from .postgres_metadata import (HIERARCHY_BUILD, HIERARCHY_BUILD_FIELDS,
+    HIERARCHY_BUILD_OPTIONAL_FIELDS, MODEL_STATE_EDIT_FIELDS, MODEL_STATE_EDIT_FUNCTIONS,
+    PostgresMetadataStore, SECURITY_TAG_EDIT_FIELDS, SECURITY_TAG_EDIT_FUNCTIONS, STRUCTURE_EDIT_FIELDS,
+    STRUCTURE_EDIT_FUNCTIONS, STRUCTURE_EDIT_OPTIONAL_FIELDS, VALUE_EDIT_FIELDS, VALUE_EDIT_FUNCTIONS)
 from .postgres_attribute_catalog import (
     PostgresAttributeCatalog,
     DEFINITION_CREATE as _ATTRIBUTE_DEFINITION_CREATE,
@@ -500,7 +510,15 @@ from .postgres_generic_facts import (
     LIST as _GENERIC_LIST, READ as _GENERIC_READ,
     SCAN as _GENERIC_SCAN,
     SNAPSHOT_SCAN as _GENERIC_SNAPSHOT_SCAN)
-from .postgres_source_batch import PostgresSourceBatch
+from .postgres_source_batch import (
+    PostgresSourceBatch, csv_input_rejections, preview_program_contract,
+    source_lifecycle_program_contract,
+)
+from .source_staging_status import (
+    READ as _SOURCE_STAGING_STATUS_READ, catalog as source_staging_status_catalog,
+    batch_staging_program_contract,
+    read_status as read_source_staging_status, replay_stage as replay_source_stage,
+)
 from .postgres_transfer_orchestration import (
     PostgresTransferOrchestration,
     PUBLIC_FUNCTIONS as _TRANSFER_ORCHESTRATION_FUNCTIONS,
@@ -527,6 +545,8 @@ from .postgres_export_payload import (
 from .postgres_scale import (compile_scale_program, _scale_candidate,
                              enforce_scale_dimensional_security,
                              PostgresScaleReader,
+                             PUBLICATION_LIST as _CALCULATION_PUBLICATION_LIST,
+                             publication_list_program_contract,
                              _COMPILER as _SCALE_COMPILER,
                              _PLAN_DIGEST as _SCALE_PLAN_DIGEST)
 from .postgres_planning_spread import (
@@ -541,9 +561,11 @@ from .postgres_planning_locks import (
     ALL_FUNCTIONS as _CUBE_WRITE_SCOPE_TRANSITIONS,
     PUBLIC_READ as _CUBE_WRITE_SCOPE_READ,
     PUBLIC_WORKLIST as _CUBE_WRITE_SCOPE_WORKLIST,
-    PostgresPlanningLocks)
+    PostgresPlanningLocks, scope_program_contract)
 from .postgres_planning_copy import (
     FUNCTION as _COPY_FUNCTION,PostgresScenarioCopy)
+from .slice_copy_contract import (FUNCTION as _SLICE_COPY_FUNCTION,
+    STATUS_READ as _SLICE_COPY_STATUS_READ, catalog as slice_copy_catalog)
 from .postgres_planning_allocation import (
     FUNCTION as _ALLOCATION_FUNCTION,COMPILER as _ALLOCATION_COMPILER,
     PLAN_DIGEST as _ALLOCATION_PLAN_DIGEST,
@@ -701,6 +723,112 @@ def compile_text_program(program: object) -> tuple[TextMutation, ...]:
     return result
 
 
+def batch_program_contract(function: str) -> dict:
+    """Describe the existing batch compilers and their public response stages.
+
+    This is discovery, not a replacement compiler. NumericCell, TextCell and
+    Coordinate retain their native semantics, and preview/publication retain
+    current metadata, CAS, planning-policy and authorization checks.
+    """
+    from .postgres_jobs import job_submission_schema
+    from .postgres_numeric_catalog import obj, program_schema
+
+    if function not in ('facts.numeric.batch', 'facts.text.batch'):
+        raise ValueError('BATCH_PROGRAM_CONTRACT_FUNCTION_INVALID')
+    numeric = function == 'facts.numeric.batch'
+    dialect = 'https://json-schema.org/draft/2020-12/schema'
+    identifier = {'type': 'string', 'minLength': 1}
+    coordinate = {'type': 'object', 'minProperties': 1,
+        'propertyNames': identifier, 'additionalProperties': identifier}
+    common = {'coordinate': coordinate,
+              'expectedChangeId': {'type': 'string', 'maxLength': 200}}
+    literal = (obj({'type': {'const': 'AmountLiteral'},
+        'decimal': {'type': 'string', 'description':
+            'Finite exact NUMERIC(28,8) input accepted by NumericCell; no JSON number. The native owner validates decimal syntax, exponent and precision.'}})
+        if numeric else obj({'type': {'const': 'TextLiteral'},
+            'text': {'type': 'string', 'maxLength': 32768,
+                'description': 'Unicode text; empty string is present. The native TextCell owner rejects NUL.'}}))
+    mutations = [obj({**common, 'op': {'const': 'clear'}})]
+    mutations += [obj({**common, 'op': {'const': operation}, 'value': literal})
+                  for operation in (('set', 'add') if numeric else ('set',))]
+    schema = program_schema(function, obj({'mutations': {
+        'type': 'array', 'minItems': 1, 'maxItems': 500,
+        'items': {'oneOf': mutations}}}))
+    revision = {'type': 'integer', 'minimum': 0}
+    preview = {'$schema': dialect, **obj({
+        'languageVersion': {'type': 'integer', 'const': 2},
+        'function': {'const': function},
+        'programDigest': {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'},
+        'revisionVector': obj({name: revision for name in (
+            'metadata_revision', 'data_revision', 'policy_revision')}),
+        'previewToken': {'type': 'string', 'minLength': 1},
+        'changedCount': {'type': 'integer', 'minimum': 1, 'maximum': 500}})}
+    submission = job_submission_schema()
+    published = {'$schema': dialect, **obj({
+        'changedCount': {'type': 'integer', 'minimum': 1, 'maximum': 500},
+        'committedRevision': {'type': 'integer', 'minimum': 1}})}
+
+    def example(name, operation, value=None, *, change_id='', prerequisite):
+        row = {'coordinate': {'Metric': 'Input'}, 'op': operation,
+               'expectedChangeId': change_id}
+        if operation != 'clear':
+            row['value'] = ({'type': 'AmountLiteral', 'decimal': value}
+                            if numeric else {'type': 'TextLiteral', 'text': value})
+        return {'name': name, 'program': {'languageVersion': 2,
+            'function': function, 'arguments': {'mutations': [row]}},
+            'binding': 'Synthetic stable IDs and change IDs. Replace the coordinate with all active fact axes in the selected application and bind expectedChangeId to its current ' +
+                ('numeric' if numeric else 'text') + ' change ID before preview.',
+            'prerequisites': prerequisite}
+
+    if numeric:
+        examples = [
+            example('Set a numeric value', 'set', '12.50000000',
+                prerequisite='Independent fresh numeric target with no previous numeric event, text value or supporting detail; empty expectedChangeId is valid only for no previous numeric event.'),
+            example('Add an exact numeric amount', 'add', '2.50000000',
+                change_id='17:1', prerequisite='Target currently contains numeric 10.00000000; replace 17:1 with its actual numeric change ID. The resulting amount is 12.50000000.'),
+            example('Clear a numeric value', 'clear', change_id='17:1',
+                prerequisite='Target has an existing numeric value; replace 17:1 with its actual numeric change ID. Clear makes the numeric value missing and retains a new change identity.')]
+    else:
+        examples = [
+            example('Set text', 'set', 'Reviewed forecast',
+                prerequisite='Independent fresh text target with no previous text event, numeric value or supporting detail.'),
+            example('Set present empty text', 'set', '',
+                prerequisite='Independent fresh text target with no previous text event, numeric value or supporting detail. Empty text remains present; it is not Clear.'),
+            example('Clear text', 'clear', change_id='17:1',
+                prerequisite='Target has existing text; replace 17:1 with its actual text change ID. Clear makes text missing and retains a new change identity.')]
+    return {'schemaCoverage': 'program-and-result', 'schemaDialect': dialect,
+        'programSchema': schema, 'resultSchema': submission, 'resultSchemaScope': 'envelope',
+        'programContract': {'owner': 'postgres_language_v2.' + (
+            'compile_numeric_program' if numeric else 'compile_text_program'),
+            'examples': examples,
+            'outputSchemas': {
+                'preview': {'schema': preview,
+                    'surface': 'preview_v2_program / POST /api/preview; read-only preview. changedCount is the declared target count, not proof of publication.',
+                    'scope': 'envelope'},
+                'submission': {'schema': submission,
+                    'surface': 'submit_v2_program / POST /api/submit; direct admission or exact-replay response. jobId identifies durable work; admission does not assert publication.',
+                    'scope': 'envelope'},
+                'publishedResult': {'schema': published,
+                    'surface': 'read_v2_job / POST /api/job; only the result field when job status is published, not the full job record, operation receipt or an in-progress result.',
+                    'scope': 'result'}},
+            'examplePrerequisites': {
+                'application': 'Use an authorized disposable application and bind each example independently. These examples do not provision metadata or grant access.',
+                'metadata': 'Metric/Input is illustrative. Discover actual stable IDs; the coordinate must cover every active fact axis except modelRole Currency.',
+                'currentInput': 'Read current typed presence and the numeric or text change ID. A cleared tombstone has a change ID; do not replace it with an empty string.',
+                'execution': 'Preview the exact bound program, then submit it with the returned preview token and an authorized operation identity. Inspect the original job; no client-authored SQL, private normalized program or per-row submission loop is required.'},
+            'semanticRules': [
+                'The fixed compiler rejects unknown fields and duplicate coordinates; a batch contains 1–500 distinct full coordinates. Use an ordered sequence explicitly when repeated writes to one coordinate are required.',
+                'Coordinates and change IDs are opaque strings; current metadata, exact fact grain, CAS, dimensional grants and planning locks remain native checks. No display-name resolution, invented axes or implicit metadata creation occurs.',
+                'Numeric values are strings accepted by NumericCell, finite within NUMERIC(28,8). Decimal syntax is not restricted to canonical plain notation; JSON numbers are rejected. Add on a missing numeric value starts from zero.',
+                'Text permits empty strings and at most 32768 Unicode characters; NUL is forbidden. Clear has no value and differs from numeric zero or present empty text.',
+                'A coordinate with supporting detail cannot be edited through these batch operations. Numeric/text type conflicts are checked at preview and publication; structural validity does not establish write permission.',
+                'Preview is read-only. One accepted batch publishes all fact events, current values, receipt and revision atomically or publishes none. Public responses do not expose the private normalized mutation program.',
+                'Retain the original program and operation identity. Exact replay returns the original owned job under current authority and never rebases targets. For unknown outcomes inspect the original job; expired-admission reconciliation is lookup-only and cannot create missing work.']}}
+
+
+POPULATED_LAYOUT_REQUESTS = frozenset((_LAYOUT_REPLACE_REQUEST, _LAYOUT_ACTIVATE_REQUEST))
+
+
 class PostgresLanguageV2:
     """Preview and admit V2 programs against a current scoped revision vector."""
 
@@ -767,6 +895,136 @@ class PostgresLanguageV2:
                 function=program.get("function") if isinstance(program, dict) else "",
                 intent_digest=_canonical_digest(program), now=now)
 
+    def reconcile_expired_operation(self, scope: ApplicationScope, program: dict, *,
+            idempotency_key: str, depends_on_job_ids: tuple[str, ...] = (),
+            transport: tuple[str, str] | None = None,
+            allowed_owners: tuple[str, ...] | None = None,
+            preview_token: str | None = None) -> dict:
+        """Authenticated lookup only; a missing original can never become work.
+
+        This closed list uses each owner's exact replay transaction and current
+        grant. Other expired families retain their rejection; neither source,
+        preview, admission nor execution is recreated here.
+        """
+        authenticate_operation_admission(self.preview_secret, scope, self.identity,
+            operation_id=idempotency_key,
+            function=program.get('function') if isinstance(program, dict) else '',
+            intent_digest=_canonical_digest(program))
+        function = program['function']
+        from .expired_operation_replay import replay_owner_profile
+        profile = replay_owner_profile(function)
+        if profile is None:
+            raise ValueError('OPERATION_ADMISSION_EXPIRED')
+        owner = profile['owner']
+        if (transport is not None and (
+                transport[0] not in ('browserPath', 'mcpTool')
+                or not transport[1] or profile[transport[0]] != transport[1])
+                or allowed_owners is not None and owner not in allowed_owners):
+            raise ValueError('OPERATION_ADMISSION_EXPIRED')
+        if owner == 'batch':
+            result = self.replay_batch(scope, program, idempotency_key=idempotency_key,
+                                       depends_on_job_ids=depends_on_job_ids)
+        elif owner == 'detail':
+            from .postgres_line_detail_job import compile_program
+            result = PostgresJobQueue(self.dsn, identity=self.identity).replay_batch(
+                scope, idempotency_key=idempotency_key, function_name=function,
+                mutations=compile_program(program), depends_on_job_ids=depends_on_job_ids)
+        elif owner == 'spread':
+            result = self.replay_spread(scope, program, idempotency_key=idempotency_key,
+                                        depends_on_job_ids=depends_on_job_ids)
+        elif owner == 'calculated-member':
+            result = self.replay_calculated_member(scope,program,
+                preview_token=preview_token,idempotency_key=idempotency_key,
+                depends_on_job_ids=depends_on_job_ids)
+        elif owner == 'cube-write-scope' and not depends_on_job_ids:
+            result = self.replay_planning_lock(scope, program, idempotency_key=idempotency_key)
+        elif owner == 'application-decision' and not depends_on_job_ids:
+            result = PostgresApplicationDecisions(self.dsn, identity=self.identity).replay(
+                scope, program, idempotency_key=idempotency_key)
+        else:
+            if depends_on_job_ids:
+                raise ValueError('OPERATION_ADMISSION_EXPIRED')
+            args = program.get('arguments')
+            if not isinstance(args, dict):
+                raise ValueError('OPERATION_ADMISSION_PROGRAM_INVALID')
+            if owner == 'import' and set(args) == {
+                    'idempotencyKey', 'batchId', 'previewToken'}:
+                from .postgres_import_execution import PostgresImportExecution
+                result = PostgresImportExecution(self.dsn, identity=self.identity).replay(
+                    scope, idempotency_key=idempotency_key,
+                    batch_id=args['batchId'], preview_token=args['previewToken'])
+            elif owner in ('source-begin', 'source-csv-append', 'source-seal', 'source-manifest'):
+                result = replay_source_stage(self.dsn, scope, self.identity,
+                    self.preview_secret, program, operation_id=idempotency_key)
+            elif owner == 'source-publish' and set(args) == {'batchId', 'previewToken'}:
+                result = PostgresSourceBatch(self.dsn, identity=self.identity,
+                    preview_secret=self.preview_secret).replay_publication(
+                        scope, args['batchId'], preview_token=args['previewToken'])
+            elif owner == 'scenario-copy':
+                # Browser admission replaces only the native operation identity;
+                # repeat the same mapping before the owner's exact digest check.
+                native_program = {**program, 'arguments': {**args, 'idempotencyKey': idempotency_key}}
+                result = PostgresScenarioCopy(self.dsn, identity=self.identity).prepare(
+                    scope, native_program, replay_only=True)
+            elif owner == 'export':
+                native_program = {**program, 'arguments': {**args, 'idempotencyKey': idempotency_key}}
+                result = PostgresTransferOrchestration(self.dsn, identity=self.identity,
+                    preview_secret=self.preview_secret).execute(scope, native_program, replay_only=True)
+            elif owner == 'schedule':
+                result = PostgresApplicationSchedules(self.dsn, identity=self.identity).execute(
+                    scope, program, idempotency_key=idempotency_key, replay_only=True)
+            elif owner == 'execution-delegation':
+                result = PostgresExecutionDelegations(self.dsn, identity=self.identity).execute(
+                    scope, program, idempotency_key=idempotency_key, replay_only=True)
+            elif owner == 'python-schedule':
+                result = PostgresPythonSchedules(self.dsn, identity=self.identity).execute(
+                    scope, program, idempotency_key=idempotency_key, replay_only=True)
+            elif owner == 'assignment-definition':
+                result = PostgresApplicationAssignments(self.dsn, identity=self.identity).execute(
+                    scope, program, idempotency_key=idempotency_key, replay_only=True)
+            elif owner == 'workflow-definition':
+                result = PostgresApplicationWorkflows(self.dsn, identity=self.identity).execute(
+                    scope, program, idempotency_key=idempotency_key, replay_only=True)
+            elif owner == 'python-build':
+                result = PostgresPythonBuildPublic(self.dsn,identity=self.identity).execute(
+                    scope,program,idempotency_key=idempotency_key,replay_only=True)
+            elif owner == 'python-run':
+                result = PostgresPythonRun(self.dsn,identity=self.identity,
+                    admission=self).replay(scope,program,idempotency_key=idempotency_key)
+            elif owner == 'application-rule-run':
+                from .postgres_application_rule_workflow import PostgresApplicationRuleRun, parse_program
+                request = parse_program(program, function)
+                result = PostgresApplicationRuleRun(self.dsn, identity=self.identity,
+                    language=self).replay(scope, request['ruleId'], bindings=request['bindings'],
+                        expected_state_token=request.get('expectedStateToken'),
+                        expected_program_digest=request.get('expectedProgramDigest'),
+                        idempotency_key=idempotency_key)
+            elif owner == 'calculation-recalculate':
+                result = PostgresCalculationInspection(self.dsn, identity=self.identity).recalculate(
+                    scope, program, idempotency_key=idempotency_key, admission_secret=self.preview_secret,
+                    replay_only=True)
+            elif owner == 'workflow-occurrence':
+                result = PostgresApplicationWorkflowOccurrences(
+                    self.dsn, identity=self.identity).execute_program(
+                    scope, program, idempotency_key=idempotency_key,
+                    available_functions=(), replay_only=True)
+            elif owner == 'calendar-period':
+                result = PostgresCalendarPeriods(self.dsn, identity=self.identity).replay(
+                    scope, program, idempotency_key=idempotency_key)
+            elif owner == 'layout-replacement-request':
+                result = PostgresPopulatedLayoutReplacements(self.dsn, identity=self.identity).execute(
+                    scope, program, replay_only=True)
+            elif owner == 'layout-activation-request':
+                result = PostgresPopulatedLayoutActivation(self.dsn, identity=self.identity).execute(
+                    scope, program, replay_only=True)
+            else:
+                raise ValueError('OPERATION_ADMISSION_EXPIRED')
+            if result is not None:
+                return {'languageVersion': 2, 'function': function, 'result': result}
+        if result is None:
+            raise ValueError('OPERATION_ADMISSION_EXPIRED')
+        return result
+
     def _aggregate_layout(self, scope: ApplicationScope) -> tuple[list, dict]:
         """Resolve trusted active axes after a fresh current read grant check."""
         with connect_postgres(self.dsn,row_factory=dict_row) as db:
@@ -789,6 +1047,8 @@ class PostgresLanguageV2:
             **transfer_artifact_catalog(),
             **export_payload_catalog(),
             **transfer_orchestration_catalog(),
+            **source_staging_status_catalog(),
+            **slice_copy_catalog(),
             **source_evidence_catalog(),
             **source_evidence_cutover_catalog(),
             **import_execution_catalog(),
@@ -822,6 +1082,19 @@ class PostgresLanguageV2:
             **statement_definition_catalog(),
             **PostgresConsolidationLayout.catalog(),
             **financial_close_catalog(),
+            _POPULATED_LAYOUT_SOURCE_READ: {
+                'mode': 'read_only', 'permission': 'admin', 'previewRequired': False,
+                'idempotencyRequired': False, 'workClass': 'medium', 'arguments': {},
+                'result': 'complete bounded current layout source inventory; current coordinate READ required, no fact values or partial success'},
+            _POPULATED_LAYOUT_REVIEW: {
+                'mode': 'read_only', 'permission': 'admin', 'previewRequired': False,
+                'idempotencyRequired': False, 'workClass': 'medium',
+                'arguments': {'expectedPins': 'current exact layout revision vector',
+                    'targetAxes': 'explicit target member axes',
+                    'axisMapping': 'complete source axis mapping',
+                    'coordinateMappings': 'complete old-to-new coordinate mapping',
+                    'targetMetadata': 'optional one proposed Custom axis and its exact mapped members'},
+                'result': 'original preview plus complete rule/publication inventory and exact dependency digest'},
             _POPULATED_LAYOUT_PREVIEW: {
                 'mode': 'read_only', 'permission': 'admin',
                 'previewRequired': False, 'idempotencyRequired': False,
@@ -832,7 +1105,7 @@ class PostgresLanguageV2:
                     'axisMapping': 'complete source-axis to target-axis or null mapping',
                     'coordinateMappings': 'complete bounded old-to-new coordinate mapping',
                     'targetMetadata': 'optional plan-v2 definition of exactly one new Custom leaf axis and explicitly mapped members'},
-                'result': 'read-only deterministic impact summary and sealed plan/preview digests',
+                'result': 'read-only deterministic impact summary and sealed plan/preview digests; current READ on every stored source coordinate required',
                 'workflowRoute':{
                     'stages':['metadata.layout.populated.replace.request',
                         'metadata.layout.populated.replace.read',
@@ -845,32 +1118,36 @@ class PostgresLanguageV2:
                 'workClass': 'medium',
                 'arguments': {'preview': 'exact current populated-layout preview certificate',
                     'plan': 'complete canonical explicit coordinate mapping plan, maximum 100,000 coordinates',
+                    'dependencyDecisions': 'required for fresh admission: complete current rule/publication kind/id/Compatible|Invalidate|Rebuild intents (maximum 10,000 and 1 MiB stored JSON), including explicit [] when none; original omitted-intent programs support exact prior retrieval only',
+                    'expectedDependencyDigest': 'optional exact dependencyDigest from metadata.layout.populated.review, enforced at admission and validation',
                     'idempotencyKey': '8-128 safe characters'},
-                'result': 'durable private replacement request and target generation identity; no activation'},
+                'result': 'durable private replacement request and target generation identity; maintained worker stages, materializes and certifies it under original current authority; separate activation remains deliberate'},
             _LAYOUT_REPLACE_READ: {
                 'mode': 'read_only', 'permission': 'admin',
                 'previewRequired': False, 'idempotencyRequired': False,
                 'workClass': 'short',
                 'arguments': {'requestId': 'exact 32-character hexadecimal request identity'},
-                'result': 'bounded technical state, pins, digests and staged-coordinate count'},
+                'result': 'bounded state, pins, digests, staged count, materialization progress and actual persisted certificate; unsealed legacy work is explicitly identified'},
             _LAYOUT_REPLACE_CANCEL: {
                 'mode': 'technical_control', 'permission': 'admin',
                 'previewRequired': False, 'idempotencyRequired': False,
                 'workClass': 'short',
                 'arguments': {'requestId': 'exact 32-character hexadecimal request identity',
-                    'expectedStatus': 'exact Accepted or Staging state pin'},
-                'result': 'Cancelled only before staged completion; no active layout effect'},
+                    'expectedStatus': 'exact current unpublished private request state',
+                    'expectedStateVersion': 'exact nonnegative stateVersion returned by replace.read'},
+                'result': 'Cancelled only for exact unclaimed unpublished private work; live phase leases and pending or sealed activation refuse; evidence remains'},
             _LAYOUT_ACTIVATE_REQUEST: {
                 'mode': 'durable_workflow', 'permission': 'admin',
+                'semanticRules': list(_LAYOUT_ACTIVATE_RECOVERY_GUIDANCE),
                 'previewRequired': False, 'idempotencyRequired': True,
                 'workClass': 'short',
                 'arguments': {'requestId': 'exact validated 32-character request identity',
                     'targetGenerationId': 'exact validated private generation identity',
                     'validationDigest': 'exact eligible validation certificate digest',
                     'expectedPins': 'exact metadata/data/policy/schema/commit source revision vector',
-                    'dependencyDecisions': '0-10,000 explicit compatible/invalidate/rebuild rule or publication decisions',
+                    'dependencyDecisions': 'complete kind/id/decision intents from all pages of application.rule.list, calculated.member.list, rules.expression.list (active rows) and facts.calculation.publication.list; the server binds current tokens in the certificate, not caller fields; Compatible requires unchanged grain and identity mapping; Invalidate/Rebuild retain evidence and execute no work',
                     'idempotencyKey': '8-128 safe characters'},
-                'result': 'durable Requested activation identity; a private worker owns publication'},
+                'result': 'durable Requested activation identity; a private worker rechecks the complete current inventory and dependency certificate before publication. Existing definition/result currentness fences apply after the schema change; no automatic rebuild or fresh acceptance is claimed'},
             _LAYOUT_ACTIVATE_READ: {
                 'mode': 'read_only', 'permission': 'admin',
                 'previewRequired': False, 'idempotencyRequired': False,
@@ -964,7 +1241,7 @@ class PostgresLanguageV2:
                     'memberId': 'active member ID',
                     'numericValueKind': 'amount, ratio, or null to clear',
                     'expectedMetadataRevision': 'nonnegative integer'},
-                'result': 'metadata revision and atomic receipt',
+                'result': 'atomic receipt with operationId, committedRevision and changedCount',
                 'previewRequired': False, 'idempotencyRequired': True,
                 'workClass': 'short',
             },
@@ -1057,6 +1334,7 @@ class PostgresLanguageV2:
                 'result': 'durable status or one bounded persisted result page with a technical query certificate; never a business receipt',
                 'previewRequired': False, 'idempotencyRequired': False,
                 'workClass': 'short',
+                **aggregate_program_contract('facts.cube.aggregate.read'),
             },
             'facts.cube.aggregate.request': {
                 'mode': 'durable_technical_query', 'permission': 'read',
@@ -1065,6 +1343,7 @@ class PostgresLanguageV2:
                 'result': 'durable ready query ID; a technical worker computes asynchronously without a business receipt or revision',
                 'previewRequired': False, 'idempotencyRequired': False,
                 'workClass': 'medium',
+                **aggregate_program_contract('facts.cube.aggregate.request'),
             },
             'facts.cube.aggregate.cancel': {
                 'mode': 'technical_control', 'permission': 'read',
@@ -1072,6 +1351,7 @@ class PostgresLanguageV2:
                 'result': 'durable cancellation state; no business revision or receipt',
                 'previewRequired': False, 'idempotencyRequired': False,
                 'workClass': 'short',
+                **aggregate_program_contract('facts.cube.aggregate.cancel'),
             },
             _PYTHON_PROGRAM_SAVE: {
                 'mode': 'atomic_rule_authoring', 'permission': 'rule_design',
@@ -1080,21 +1360,24 @@ class PostgresLanguageV2:
                     'expectedPolicyRevision': 'current revision',
                     'expectedSchemaEpoch': 'current schema epoch'},
                 'optionalArguments': {'expectedStateToken': 'required exact token when replacing the current source',
+                    'expectedOwnerStateToken': 'reviewed token when adopting an existing configuration-owned output',
                     'validationParameters': 'bounded sample parameter object; defaults to {}'},
                 'result': 'current inactive source, state/source tokens, receipt and atomically queued Validation build',
                 'previewRequired': False, 'idempotencyRequired': True,
-                'workClass': 'short'},
+                'workClass': 'short',
+                **mutation_program_contract(_PYTHON_PROGRAM_SAVE)},
             _PYTHON_PROGRAM_ACTIVATE: {
                 'mode': 'atomic_rule_publication', 'permission': 'rule_publish',
                 'arguments': {'programId': 'saved program ID',
                     'expectedStateToken': 'exact current program state token',
+                    'validationBuildId': 'exact reviewed caller-owned current Validation or complete ImpactTest build',
                     'expectedMetadataRevision': 'current revision',
                     'expectedPolicyRevision': 'current revision',
                     'expectedSchemaEpoch': 'current schema epoch'},
-                'optionalArguments': {'validationBuildId': 'exact reviewed caller-owned current Validation or ImpactTest build; required for typed definition activation'},
                 'result': 'active current source and receipt after sealed Validation or completed ImpactTest of this exact source',
                 'previewRequired': False, 'idempotencyRequired': True,
-                'workClass': 'short'},
+                'workClass': 'short',
+                **mutation_program_contract(_PYTHON_PROGRAM_ACTIVATE)},
             _PYTHON_PROGRAM_DEACTIVATE: {
                 'mode': 'atomic_rule_publication', 'permission': 'rule_publish',
                 'arguments': {'programId': 'currently published program ID',
@@ -1104,7 +1387,8 @@ class PostgresLanguageV2:
                     'expectedSchemaEpoch': 'current schema epoch'},
                 'result': 'inactive current source and operation receipt',
                 'previewRequired': False, 'idempotencyRequired': True,
-                'workClass': 'short'},
+                'workClass': 'short',
+                **mutation_program_contract(_PYTHON_PROGRAM_DEACTIVATE)},
             _PYTHON_PROGRAM_DELETE: {
                 'mode': 'atomic_rule_publication', 'permission': 'rule_publish',
                 'arguments': {'programId': 'inactive current program ID',
@@ -1114,20 +1398,21 @@ class PostgresLanguageV2:
                     'expectedSchemaEpoch': 'current schema epoch'},
                 'result': 'deleted current source and operation receipt',
                 'previewRequired': False, 'idempotencyRequired': True,
-                'workClass': 'short'},
+                'workClass': 'short',
+                **mutation_program_contract(_PYTHON_PROGRAM_DELETE)},
             _PYTHON_PROGRAM_READ: {
                 'mode': 'read_only', 'permission': 'read',
                 'arguments': {'programId': 'program ID'},
                 'result': 'authorized current source and lifecycle state',
                 'previewRequired': False, 'idempotencyRequired': False,
-                'workClass': 'short'},
+                'workClass': 'short', **source_read_program_contract(_PYTHON_PROGRAM_READ)},
             _PYTHON_PROGRAM_LIST: {
                 'mode': 'read_only', 'permission': 'read',
                 'arguments': {'limit': 'optional 1-100',
                     'afterProgramId': 'optional keyset cursor'},
                 'result': 'bounded current publication summaries',
                 'previewRequired': False, 'idempotencyRequired': False,
-                'workClass': 'short'},
+                'workClass': 'short', **source_read_program_contract(_PYTHON_PROGRAM_LIST)},
             _PYTHON_PROGRAM_BUILD: {
                 'mode': 'durable_technical_build', 'permission': 'rule_run',
                 'arguments': {'programId': 'published program ID',
@@ -1143,6 +1428,17 @@ class PostgresLanguageV2:
                 'result': 'durable build ID and technical status; no business effect or receipt',
                 'previewRequired': False, 'idempotencyRequired': True,
                 'workClass': 'medium'},
+            _PYTHON_PROGRAM_VALIDATE: {
+                'mode': 'durable_technical_build', 'permission': 'rule_validate',
+                'arguments': {'programId': 'saved program ID, active or inactive',
+                    'programSourceToken': 'exact current source token',
+                    'parameters': 'bounded typed validation sample values',
+                    'expectedMetadataRevision': 'current revision',
+                    'expectedPolicyRevision': 'current revision',
+                    'expectedSchemaEpoch': 'current schema epoch'},
+                'result': 'caller-owned durable static Validation build and task ID; no business effect or receipt',
+                'previewRequired': False, 'idempotencyRequired': True,
+                'workClass': 'medium'},
             _PYTHON_PROGRAM_TEST: {
                 'mode': 'durable_technical_build', 'permission': 'rule_design',
                 'arguments': {'programId': 'saved program ID, active or inactive',
@@ -1152,7 +1448,7 @@ class PostgresLanguageV2:
                     'expectedPolicyRevision': 'current revision',
                     'expectedSchemaEpoch': 'current schema epoch'},
                 'optionalArguments': {'definitionParameters': 'explicit returned-definition runtime bindings, distinct from builder parameters; default {}'},
-                'result': 'ImpactTest build/task ID; sealed status includes complete private Impact artifact, never live writes',
+                'result': 'ImpactTest build/task ID and technical status; when sealed, read the private Impact section using read_v2_python_program_build_artifact; never live writes',
                 'previewRequired': False, 'idempotencyRequired': True,
                 'workClass': 'medium',
                 'limits': python_impact_limits()},
@@ -1764,27 +2060,28 @@ class PostgresLanguageV2:
                 'mode': 'atomic_write', 'permission': 'admin',
                 'arguments': {'dimensionId': 'active stable ID',
                               'memberId': 'active stable ID',
-                              'securityString': 'canonical read=...;write=... using known dimension tags',
+                              'securityString': 'read=...;write=... using current dimension tags, or empty to clear',
                               'expectedMetadataRevision': 'nonnegative integer'},
-                'result': 'normalized member security arrays, metadata revision and atomic receipt',
+                'result': 'atomic receipt with operationId, committedRevision and changedCount',
                 'previewRequired': False, 'idempotencyRequired': True,
                 'workClass': 'short',
             },
             'metadata.dimension.security-string.set': {
                 'mode': 'atomic_write', 'permission': 'admin',
                 'arguments': {'dimensionId': 'active stable ID',
-                              'securityString': 'canonical read=...;write=... using known dimension tags',
+                              'securityString': 'read=...;write=... using current dimension tags, or empty to clear',
                               'expectedMetadataRevision': 'nonnegative integer'},
-                'result': 'normalized dimension security arrays, metadata and security revisions, and atomic receipt',
+                'result': 'atomic receipt with operationId, committedRevision and changedCount',
                 'previewRequired': False, 'idempotencyRequired': True,
                 'workClass': 'short',
             },
             'metadata.relationship.security-string.set': {
                 'mode': 'atomic_write', 'permission': 'admin',
                 'arguments': {'relationshipId': 'active stable ID',
-                              'securityString': 'canonical read=...;write=... using tags from the relationship dimension',
+                              'securityString': ('read=...;write=... using current tags from the '
+                                                 'relationship dimension, or empty to clear'),
                               'expectedMetadataRevision': 'nonnegative integer'},
-                'result': 'normalized relationship security arrays, metadata and security revisions, and atomic receipt',
+                'result': 'atomic receipt with operationId, committedRevision and changedCount',
                 'previewRequired': False, 'idempotencyRequired': True,
                 'workClass': 'short',
             },
@@ -1906,7 +2203,7 @@ class PostgresLanguageV2:
                 'workClass': 'short',
             },
             **named_hierarchy_catalog(),
-            'metadata.hierarchy.build': {
+            HIERARCHY_BUILD: {
                 'mode':'atomic_write','permission':'admin',
                 'arguments':{'dimensionId':'active dimension stable ID',
                              'expectedMetadataRevision':'nonnegative integer'},
@@ -2008,8 +2305,10 @@ class PostgresLanguageV2:
                     'status': 'Active or Inactive',
                     'query': 'bounded ID, display-name or semantic search',
                     'limit': '1–500',
-                    'afterAttributeId': 'exclusive stable-ID cursor'},
-                'result': 'revision-pinned definition page',
+                    'afterAttributeId': 'exact prior nextAfterAttributeId',
+                    'expectedMetadataRevision': 'metadata revision of the prior page',
+                    'expectedPageToken': 'exact prior nextPageToken when returned'},
+                'result': 'definition page with continuation bound to current dimensional authority when active',
                 'previewRequired': False, 'idempotencyRequired': False,
                 'workClass': 'short',
             },
@@ -2166,7 +2465,8 @@ class PostgresLanguageV2:
                 'optionalArguments': {
                     'limit': '1–500; defaults to 100',
                     'afterDimensionId': 'stable ID from prior page',
-                    'expectedMetadataRevision': 'revision from prior page'},
+                    'expectedMetadataRevision': 'revision from prior page',
+                    'expectedPageToken': 'opaque nextPageToken from a protected page'},
                 'result': 'bounded dimensions with descriptions, statuses and revision',
                 'previewRequired': False, 'idempotencyRequired': False,
                 'workClass': 'short',
@@ -2185,7 +2485,8 @@ class PostgresLanguageV2:
                 'optionalArguments': {
                     'limit': '1–500; defaults to 100',
                     'afterMemberId': 'stable ID from prior page',
-                    'expectedMetadataRevision': 'revision from prior page'},
+                    'expectedMetadataRevision': 'revision from prior page',
+                    'expectedPageToken': 'opaque nextPageToken from a protected page'},
                 'result': ('bounded members with descriptions, statuses, '
                            'numeric_value_kind, exact custom values and revision'),
                 'previewRequired': False, 'idempotencyRequired': False,
@@ -2255,9 +2556,10 @@ class PostgresLanguageV2:
                 'previewRequired': True, 'idempotencyRequired': True,
                 'workClass': 'short',
             },
-            'facts.cube.scan': {
+            _RAW_CUBE_SCAN: {
                 'mode': 'read', 'permission': 'read',
-                'arguments': {'members': 'stable-ID equality filters',
+                'arguments': {},
+                'optionalArguments': {'members': 'stable-ID equality filters',
                               'limit': '1–500',
                               'cursor': 'opaque signed continuation',
                               'snapshotRevision': 'optional committed revision on the first page',
@@ -2266,6 +2568,7 @@ class PostgresLanguageV2:
                 'result': 'authorization-complete snapshot-pinned raw numeric/text page with explicit missing/zero inclusion; fails closed if more than 10,000 raw candidates are required to prove one visible page',
                 'previewRequired': False, 'idempotencyRequired': False,
                 'workClass': 'bounded_read',
+                **scan_program_contract(),
             },
             _LAYER_REPORT_SCAN: {
                 'mode': 'read', 'permission': 'read',
@@ -2337,7 +2640,8 @@ class PostgresLanguageV2:
                 'previewRequired': False, 'idempotencyRequired': False,
                 'workClass': 'short',
             },
-            'facts.calculation.publication.list': {
+            _CALCULATION_PUBLICATION_LIST: {
+                **publication_list_program_contract(),
                 'mode': 'read', 'permission': 'read',
                 'arguments': {'limit': 'optional 1–100',
                               'afterResultKey': 'optional stable keyset cursor'},
@@ -2761,6 +3065,7 @@ class PostgresLanguageV2:
                 'result':'current definition, state token and activation status',
                 'previewRequired':False,'idempotencyRequired':False,
                 'workClass':'short',
+                **expression_rule_read_contract(_RULE_READ),
             },
             _RULE_LIST: {
                 'mode':'read','permission':'read',
@@ -2769,10 +3074,12 @@ class PostgresLanguageV2:
                     'limit':'1–100 current rules; default 100',
                     'afterRuleId':'last ruleId from previous page',
                     'expectedMetadataRevision':'required with afterRuleId',
-                    'expectedPolicyRevision':'required with afterRuleId'},
-                'result':'current active rule IDs, state tokens, result keys, typed parameter declarations and revision-pinned next page; saved inactive definitions omitted',
+                    'expectedPolicyRevision':'required with afterRuleId',
+                    'collectionToken':'reuse the previous page token with afterRuleId'},
+                'result':'current expression rule IDs, lifecycle states, result keys, parameter declarations and a bound next page',
                 'previewRequired':False,'idempotencyRequired':False,
                 'workClass':'short',
+                **expression_rule_read_contract(_RULE_LIST),
             },
             _RULE_RUN: {
                 'mode':'durable_calculation','permission':'rule_run',
@@ -2786,16 +3093,17 @@ class PostgresLanguageV2:
                 'mode':'durable_sequence','permission':'rule_run',
                 'arguments':{'ruleIds':'2–8 distinct published expression rules in execution order'},
                 'optionalArguments':{'bindings':'rule ID to exact decimal or active stable-member binding map for each parameterized step'},
-                'result':'durable sequence ID, per-step job IDs and terminal status',
+                'result':'durable sequence acknowledgement; use rules.expression.sequence.read with the sequence ID or original signed request for retained status and step receipts',
                 'previewRequired':True,'idempotencyRequired':True,
                 'workClass':'bounded_write',
             },
             _RULE_SEQUENCE_READ: {
                 'mode':'read','permission':'read',
-                'arguments':{'sequenceId':'caller-owned durable sequence ID'},
-                'result':'step progress, job IDs and terminal error',
+                'arguments':{'oneSelector':'caller-owned sequenceId or originalRequest (exact run program and signed admission)'},
+                'result':'retained parent status, ordered child commit receipts and separate commit state',
                 'previewRequired':False,'idempotencyRequired':False,
                 'workClass':'short',
+                **_expression_sequence_read_contract(),
             },
             _RULE_SEQUENCE_CANCEL: {
                 'mode':'atomic_sequence_control','permission':'write',
@@ -2895,6 +3203,7 @@ class PostgresLanguageV2:
                 'workClass':'short',
             },
             'cube.write.scope.lock': {
+                **scope_program_contract('cube.write.scope.lock'),
                 'mode':'reviewed_policy_write','permission':'admin',
                 'arguments':{'scopeMembers':'stable-ID equality filter',
                              'scopeAll':'explicit whole-application flag',
@@ -2904,6 +3213,7 @@ class PostgresLanguageV2:
                 'workClass':'short',
             },
             'cube.write.scope.submit': {
+                **scope_program_contract('cube.write.scope.submit'),
                 'mode':'reviewed_workflow_write','permission':'write',
                 'arguments':{'scopeMembers':'stable-ID equality filter',
                              'scopeAll':'explicit whole-application flag',
@@ -2915,6 +3225,7 @@ class PostgresLanguageV2:
                 'workClass':'short',
             },
             'cube.write.scope.approve': {
+                **scope_program_contract('cube.write.scope.approve'),
                 'mode':'reviewed_workflow_write','permission':'admin',
                 'arguments':{'lockId':'submission lock ID',
                              'expectedSubmissionStateToken':'exact current submission token',
@@ -2924,6 +3235,7 @@ class PostgresLanguageV2:
                 'workClass':'short',
             },
             'cube.write.scope.reopen': {
+                **scope_program_contract('cube.write.scope.reopen'),
                 'mode':'reviewed_policy_write','permission':'admin',
                 'arguments':{'lockId':'server-issued lock ID',
                              'expectedStateToken':'exact current lock token',
@@ -2933,6 +3245,7 @@ class PostgresLanguageV2:
                 'workClass':'short',
             },
             'cube.write.scope.read': {
+                **scope_program_contract('cube.write.scope.read'),
                 'mode':'read','permission':'read',
                 'arguments':{'lockId':'server-issued lock ID'},
                 'result':'exact lock scope and status',
@@ -2940,6 +3253,7 @@ class PostgresLanguageV2:
                 'workClass':'short',
             },
             'cube.write.scope.worklist': {
+                **scope_program_contract('cube.write.scope.worklist'),
                 'mode':'read','permission':'read',
                 'arguments':{
                     'limit':'optional 1–100, default 100',
@@ -2959,6 +3273,7 @@ class PostgresLanguageV2:
                               'expectedDataRevision': 'nonnegative integer'},
                 'result': 'durable batchId', 'previewRequired': False,
                 'idempotencyRequired': True, 'workClass': 'short',
+                **batch_staging_program_contract('facts.source.begin'),
             },
             'facts.source.append': {
                 'mode': 'durable_staging', 'permission': 'write',
@@ -2968,6 +3283,7 @@ class PostgresLanguageV2:
                 'result': 'cumulative row count and digest',
                 'previewRequired': False, 'idempotencyRequired': True,
                 'workClass': 'short',
+                **batch_staging_program_contract('facts.source.append'),
             },
             'facts.source.csv.append': {
                 'mode': 'durable_staging', 'permission': 'write',
@@ -2975,8 +3291,10 @@ class PostgresLanguageV2:
                               'chunkIndex': 'ordered 0–999',
                               'csvText': 'UTF-8 CSV with axis.<dimensionId>, literalType, value and sourceRef columns; at most 500 rows'},
                 'result': 'cumulative staged row count and digest',
+                'inputRejections': csv_input_rejections(),
                 'previewRequired': False, 'idempotencyRequired': True,
                 'workClass': 'short',
+                **batch_staging_program_contract('facts.source.csv.append'),
             },
             'facts.source.seal': {
                 'mode': 'durable_staging', 'permission': 'write',
@@ -2985,6 +3303,7 @@ class PostgresLanguageV2:
                               'expectedContentDigest': 'acknowledged digest'},
                 'result': 'ready batch', 'previewRequired': False,
                 'idempotencyRequired': True, 'workClass': 'short',
+                **batch_staging_program_contract('facts.source.seal'),
             },
             'facts.source.cancel': {
                 'mode': 'durable_write', 'permission': 'write',
@@ -2992,18 +3311,26 @@ class PostgresLanguageV2:
                 'result': 'idempotent terminal batch state and whether committed effects remain',
                 'previewRequired': False, 'idempotencyRequired': False,
                 'workClass': 'short',
+                **source_lifecycle_program_contract('facts.source.cancel'),
             },
             'facts.source.preview': {
                 'mode': 'preview', 'permission': 'write',
                 'arguments': {'batchId': 'ready batch'},
                 'optionalArguments': {
                     'allowWarnings': 'explicit boolean; default false'},
-                'result': 'set/clear counts and signed token',
+                'result': 'set/clear counts, signed token and bounded read-authorized before/after examples with exact coordinate IDs, typed presence and revision pins',
+                'changeReview': {
+                    'format': 'openepm-source-change-review-v1',
+                    'sampleLimitPerAction': 20,
+                    'completeness': 'setsComplete/clearsComplete distinguish complete examples from a bounded or read-restricted sample; counts cover the full authorized write intent',
+                    'authority': 'Examples require current coordinate READ permission in addition to full intent WRITE authorization; hidden coordinates are omitted',
+                    'publication': 'Examples explain the intent; only the signed preview and current publication fences can authorize its effects'},
                 'operationalPublication':{
                     'function':'facts.source.publish',
                     'boundary':'separate preview-token-bound durable publication of the same ready source batch under current authorization'},
                 'previewRequired': False, 'idempotencyRequired': False,
                 'workClass': 'short',
+                **preview_program_contract(),
             },
             'facts.source.publish': {
                 'mode': 'durable_write', 'permission': 'write',
@@ -3012,6 +3339,7 @@ class PostgresLanguageV2:
                 'result': 'atomic receipt and exact set/clear counts',
                 'previewRequired': True, 'idempotencyRequired': True,
                 'workClass': 'bounded_write',
+                **source_lifecycle_program_contract('facts.source.publish'),
             },
             _COPY_FUNCTION: {
                 'mode':'durable_staging','permission':'write',
@@ -3034,6 +3362,18 @@ class PostgresLanguageV2:
         catalog['functions'].update(saved_sequence_catalog())
         catalog['functions'].update(calculated_member_catalog())
         catalog['functions'].update(resolved_cube_read_catalog())
+        catalog['functions'][_SCENARIO_COMPARE] = {
+            'mode': 'read', 'permission': 'read', 'workClass': 'bounded_read',
+            'previewRequired': False, 'idempotencyRequired': False,
+            'calculatedScenarioComparison': True,
+            'arguments': {'baselineMemberId': 'current Scenario member ID',
+                'alternativeMemberId': 'different current Scenario member ID',
+                'expectedMetadataRevision': 'current authorized metadata revision',
+                'coordinates': 'bounded exact coordinates across all other active fact axes',
+                'calculation': 'optional current result key, state token and exact unit'},
+            'result': 'exact aligned stored or published observations and numeric differences at one current revision',
+            **comparison_program_contract(),
+        }
         catalog['functions'].update(calculation_inspection_catalog())
         catalog['functions'].update(application_rule_catalog())
         catalog['functions'].update(application_schedule_catalog())
@@ -3064,6 +3404,27 @@ class PostgresLanguageV2:
         from .postgres_projection_cleanup import catalog as cleanup_catalog
         catalog['functions'].update(cleanup_catalog())
         catalog['functions'].update(python_schedule_catalog())
+        from .metadata_read_contract import FUNCTIONS as metadata_read_functions, metadata_read_program_contract
+        for function in metadata_read_functions:
+            catalog['functions'][function].update(metadata_read_program_contract(function))
+        from .python_execution_contract import FUNCTIONS as execution_functions, execution_program_contract
+        for function in execution_functions:
+            catalog['functions'][function].update(execution_program_contract(function))
+        for function in ('facts.numeric.batch', 'facts.text.batch'):
+            catalog['functions'][function].update(batch_program_contract(function))
+        from .public_program_contracts import (
+            ADJUSTED_READS, ATTRIBUTE_EFFECTS, CALCULATION_READS, HIERARCHY_EFFECTS, MEMBER_LIST_EFFECTS, SCALE,
+            FACT_EXPORT_PAGE, LAYER_REPORT, LINE_DETAIL_REPLACE, METADATA_DISCOVERY_FUNCTIONS,
+            SOURCE_EVIDENCE_READS, SOURCE_EVIDENCE_WRITES,
+            public_program_contract)
+        for function in (METADATA_DISCOVERY_FUNCTIONS | ATTRIBUTE_EFFECTS | STRUCTURE_EDIT_FUNCTIONS
+                         | VALUE_EDIT_FUNCTIONS | HIERARCHY_EFFECTS | MEMBER_LIST_EFFECTS | MODEL_STATE_EDIT_FUNCTIONS
+                         | SECURITY_TAG_EDIT_FUNCTIONS | SOURCE_EVIDENCE_READS | SOURCE_EVIDENCE_WRITES
+                         | ADJUSTED_READS | CALCULATION_READS
+                         | {SCALE, LINE_DETAIL_REPLACE, LAYER_REPORT, FACT_EXPORT_PAGE, _CALENDAR_SET_FUNCTION,
+                            _LAYOUT_REPLACE_REQUEST, _LAYOUT_REPLACE_CANCEL,
+                            _LAYOUT_ACTIVATE_REQUEST, _LAYOUT_ACTIVATE_CANCEL}):
+            catalog['functions'][function].update(public_program_contract(function))
         catalog['processingPolicy'] = processing_policy()
         return describe_catalog(catalog)
 
@@ -3083,6 +3444,15 @@ class PostgresLanguageV2:
     def execute_metadata(self, scope: ApplicationScope, program: dict, *,
                          idempotency_key: str) -> dict:
         from .postgres_python_definitions import RETIRED_PUBLIC_AUTHORING
+        if isinstance(program, dict) and program.get('function') in POPULATED_LAYOUT_REQUESTS:
+            if not is_signed_operation_id(idempotency_key):
+                raise ValueError('OPERATION_ADMISSION_REQUIRED')
+            self._validate_signed_operation_id(scope, program, idempotency_key)
+            function = program['function']
+            store = (PostgresPopulatedLayoutReplacements if function == _LAYOUT_REPLACE_REQUEST
+                     else PostgresPopulatedLayoutActivation)
+            result = store(self.dsn, identity=self.identity).execute(scope, program)
+            return {'languageVersion': 2, 'function': function, 'result': result}
         if isinstance(program, dict) and program.get('function') in RETIRED_PUBLIC_AUTHORING:
             raise ValueError('PYTHON_SOURCE_AUTHORING_REQUIRED')
         if (isinstance(program, dict) and program.get('function') in
@@ -3171,75 +3541,18 @@ class PostgresLanguageV2:
             return {'languageVersion': 2, 'function': program['function'],
                     'result': result}
         fields = {
-            'metadata.dimension.create': {'dimensionId','name','modelRole',
-                                          'expectedMetadataRevision'},
-            'metadata.member.create': {'dimensionId','memberId','name',
-                                       'expectedMetadataRevision'},
-            'metadata.dimension.rename': {'dimensionId','name',
-                                          'expectedMetadataRevision'},
-            'metadata.member.rename': {'dimensionId','memberId','name',
-                                       'expectedMetadataRevision'},
-            'metadata.dimension.describe': {'dimensionId',
-                'shortDescription','detailedDescription',
-                'expectedMetadataRevision'},
-            'metadata.member.describe': {'dimensionId','memberId',
-                'shortDescription','detailedDescription',
-                'expectedMetadataRevision'},
-            'metadata.member.security-tags.set': {
-                'dimensionId','memberId','readTags','writeTags',
-                'expectedMetadataRevision'},
-            'metadata.member.security-string.set': {
-                'dimensionId','memberId','securityString',
-                'expectedMetadataRevision'},
-            'metadata.dimension.security-string.set': {
-                'dimensionId','securityString','expectedMetadataRevision'},
-            'metadata.relationship.security-string.set': {
-                'relationshipId','securityString','expectedMetadataRevision'},
-            'metadata.security-tag.create': {
-                'dimensionId','tagId','displayName','shortDescription',
-                'semanticDescription','expectedMetadataRevision'},
-            'metadata.security-tag.update': {
-                'dimensionId','tagId','displayName','shortDescription',
-                'semanticDescription','expectedMetadataRevision'},
-            'metadata.security-tag.status.set': {
-                'dimensionId','tagId','status','expectedMetadataRevision'},
-            'metadata.member.status.set': {'dimensionId','memberId','status',
-                                           'expectedMetadataRevision'},
-            'metadata.dimension.status.set': {'dimensionId','status',
-                                             'expectedMetadataRevision'},
+            **STRUCTURE_EDIT_FIELDS,
+            **SECURITY_TAG_EDIT_FIELDS,
+            **MODEL_STATE_EDIT_FIELDS,
             'metadata.dimension.delete': {'dimensionId',
                                           'expectedMetadataRevision'},
-            'metadata.member.numeric-kind.set': {
-                'dimensionId','memberId','numericValueKind',
-                'expectedMetadataRevision'},
-            'metadata.member.aggregation-operator.set': {
-                'dimensionId','memberId','aggregationOperator',
-                'expectedMetadataRevision'},
-            'metadata.relationship.create': {'dimensionId','relationshipId',
-                'parentMemberId','childMemberId','expectedMetadataRevision'},
-            'metadata.relationship.rename': {'relationshipId','name',
-                'expectedMetadataRevision'},
-            'metadata.relationship.describe': {'relationshipId',
-                'shortDescription','detailedDescription',
-                'expectedMetadataRevision'},
-            'metadata.relationship.status.set': {'relationshipId','status',
-                'expectedMetadataRevision'},
-            'metadata.relationship.aggregation-operator.set': {
-                'relationshipId','aggregationOperatorOverride',
-                'expectedMetadataRevision'},
-            'metadata.hierarchy.build': {'dimensionId',
-                                         'expectedMetadataRevision'},
+            HIERARCHY_BUILD: HIERARCHY_BUILD_FIELDS,
+            **VALUE_EDIT_FIELDS,
             **{name: required | {'expectedMetadataRevision'} for name, required in NAMED_HIERARCHY_MUTATIONS.items()},
         }
         optional = {
-            'metadata.dimension.create': {'shortDescription',
-                                          'detailedDescription'},
-            'metadata.member.create': {'shortDescription',
-                                       'detailedDescription'},
-            'metadata.relationship.create': {'name', 'shortDescription',
-                                             'detailedDescription', 'hierarchyId', 'status'},
-            'metadata.hierarchy.build': {'membershipSemantics', 'hierarchyId',
-                                         'expectedStateToken'},
+            **STRUCTURE_EDIT_OPTIONAL_FIELDS,
+            HIERARCHY_BUILD: HIERARCHY_BUILD_OPTIONAL_FIELDS,
         }
         if (not isinstance(program,dict)
                 or set(program) != {'languageVersion','function','arguments'}
@@ -3349,7 +3662,7 @@ class PostgresLanguageV2:
                 scope, dimension_id=args['dimensionId'],
                 member_id=args['memberId'],
                 aggregation_operator=args['aggregationOperator'], **common)
-        elif function == 'metadata.hierarchy.build':
+        elif function == HIERARCHY_BUILD:
             result = metadata.build_hierarchy(
                 scope, dimension_id=args['dimensionId'],
                 membership_semantics=args.get('membershipSemantics'),
@@ -3482,9 +3795,10 @@ class PostgresLanguageV2:
         from .postgres_saved_numeric_sequence import PostgresSavedNumericSequences, SAVE as saved_save, PUBLISH as saved_publish
         function=program.get('function')
         if function == _CALCULATION_RECALCULATE:
+            admission = {'admission_secret': self.preview_secret} if is_signed_operation_id(idempotency_key) else {}
             result = PostgresCalculationInspection(
                 self.dsn, identity=self.identity).recalculate(
-                    scope, program, idempotency_key=idempotency_key)
+                    scope, program, idempotency_key=idempotency_key, **admission)
             return {'languageVersion': 2, 'function': function,
                     'result': result}
         if function in (_APPLICATION_RULE_RUN,
@@ -3599,9 +3913,23 @@ class PostgresLanguageV2:
         return {'languageVersion': 2, 'function': program['function'],
                 'result': result}
 
-    def read_python_build(self, scope: ApplicationScope, build_id: str) -> dict:
-        return PostgresPythonBuildPublic(
-            self.dsn, identity=self.identity).read(scope, build_id)
+    def _python_historical_reference(self, scope, identifier, original_request, *, build):
+        from .python_execution_contract import parse_historical_read
+        original = parse_historical_read(identifier, original_request, build=build)
+        if original is not None:
+            program = original['program']
+            authenticate_operation_admission(self.preview_secret, scope, self.identity,
+                operation_id=original['idempotencyKey'], function=program['function'],
+                intent_digest=_canonical_digest(program))
+        return original
+
+    def read_python_build(self, scope: ApplicationScope, build_id: str | None = None, *,
+                          original_request: dict | None = None) -> dict:
+        original = self._python_historical_reference(scope, build_id, original_request, build=True)
+        owner = PostgresPythonBuildPublic(self.dsn, identity=self.identity)
+        if original is not None:
+            return owner.read_original(scope, original['program'], idempotency_key=original['idempotencyKey'])
+        return owner.read(scope, build_id)
 
     def read_python_build_artifact(self, scope: ApplicationScope, *,
                                    build_id: str, section: str,
@@ -3622,9 +3950,13 @@ class PostgresLanguageV2:
                 'result':result}
 
     def read_python_workflow(self, scope: ApplicationScope,
-                             workflow_id: str) -> dict:
-        return PostgresPythonRun(self.dsn,identity=self.identity,
-            admission=self).read(scope,workflow_id)
+                             workflow_id: str | None = None, *,
+                             original_request: dict | None = None) -> dict:
+        original = self._python_historical_reference(scope, workflow_id, original_request, build=False)
+        owner = PostgresPythonRun(self.dsn, identity=self.identity, admission=self)
+        if original is not None:
+            return owner.read_original(scope, original['program'], idempotency_key=original['idempotencyKey'])
+        return owner.read(scope, workflow_id)
 
     def cancel_python_workflow(self, scope: ApplicationScope,
                                workflow_id: str) -> dict:
@@ -3803,6 +4135,10 @@ class PostgresLanguageV2:
 
     def execute_source(self, scope: ApplicationScope, program: dict) -> dict:
         """Execute only catalogued staged-load programs through fixed core."""
+        if isinstance(program, dict) and program.get('function') == _SOURCE_STAGING_STATUS_READ:
+            result = read_source_staging_status(self.dsn, scope, self.identity,
+                                                self.preview_secret, program)
+            return {'languageVersion': 2, 'function': _SOURCE_STAGING_STATUS_READ, 'result': result}
         if (isinstance(program, dict)
                 and program.get('function') in _IMPORT_EXECUTION_FUNCTIONS):
             result = PostgresImportExecutionPublic(
@@ -3818,10 +4154,10 @@ class PostgresLanguageV2:
             return {'languageVersion': 2,
                     'function': program['function'], 'result': result}
         if (isinstance(program,dict)
-                and program.get('function')==_COPY_FUNCTION):
+                and program.get('function') in (_COPY_FUNCTION, _SLICE_COPY_FUNCTION)):
             result=PostgresScenarioCopy(
                 self.dsn,identity=self.identity).prepare(scope,program)
-            return {'languageVersion':2,'function':_COPY_FUNCTION,
+            return {'languageVersion':2,'function':program['function'],
                     'result':result}
         fields = {
             'facts.source.begin': {'idempotencyKey','mode','scopeMembers',
@@ -3864,48 +4200,8 @@ class PostgresLanguageV2:
                 scope, args['batchId'], chunk_index=args['chunkIndex'],
                 csv_text=args['csvText'])
         elif function == 'facts.source.append':
-            raw_rows = args['rows']
-            if not isinstance(raw_rows,list) or not 1 <= len(raw_rows) <= 500:
-                raise ValueError('V2_SOURCE_ROWS_INVALID')
-            rows = []
-            for row in raw_rows:
-                if (not isinstance(row,dict)
-                        or set(row) != {'members','value','sourceRef'}
-                        or not isinstance(row['value'],dict)
-                        or row['value'].get('type') not in
-                            ('AmountLiteral','TextLiteral',
-                             'LineDetailLiteral')):
-                    raise ValueError('V2_SOURCE_ROW_INVALID')
-                literal=row['value']
-                if literal['type']=='AmountLiteral':
-                    if set(literal) != {'type','decimal'}:
-                        raise ValueError('V2_SOURCE_ROW_INVALID')
-                    rows.append({'members':row['members'],
-                                 'amount':literal['decimal'],
-                                 'sourceRef':row['sourceRef']})
-                elif literal['type']=='TextLiteral':
-                    if set(literal) != {'type','text'}:
-                        raise ValueError('V2_SOURCE_ROW_INVALID')
-                    rows.append({'members':row['members'],
-                                 'text':literal['text'],
-                                 'sourceRef':row['sourceRef']})
-                else:
-                    if (set(literal) != {'type','items'}
-                            or not isinstance(literal['items'],list)):
-                        raise ValueError('V2_SOURCE_ROW_INVALID')
-                    items=[]
-                    for item in literal['items']:
-                        if (not isinstance(item,dict)
-                                or set(item) != {'description','decimal'}):
-                            raise ValueError('V2_SOURCE_ROW_INVALID')
-                        items.append({'description':item['description'],
-                                      'amount':item['decimal']})
-                    rows.append({'members':row['members'],
-                                 'detail':items,
-                                 'sourceRef':row['sourceRef']})
-            result = source.append(scope,args['batchId'],
-                                   chunk_index=args['chunkIndex'],
-                                   rows=rows)
+            result = source.append_typed(scope, args['batchId'], chunk_index=args['chunkIndex'],
+                                         rows=args['rows'])
         elif function == 'facts.source.seal':
             result = source.seal(
                 scope,args['batchId'],expected_rows=args['expectedRows'],
@@ -3947,6 +4243,14 @@ class PostgresLanguageV2:
             return {'languageVersion': 2, 'function': program['function'],
                     'result': result}
         function=program.get('function') if isinstance(program,dict) else None
+        if function == _SCENARIO_COMPARE:
+            result = read_comparison(self.dsn, self.identity, scope, program,
+                                     cursor_secret=self.preview_secret)
+            return {'languageVersion': 2, 'function': function, 'result': result}
+        if function == _SLICE_COPY_STATUS_READ:
+            result = PostgresScenarioCopy(
+                self.dsn, identity=self.identity).read_status(scope, program)
+            return {'languageVersion': 2, 'function': function, 'result': result}
         if function in _CALCULATION_INSPECTION_FUNCTIONS:
             result = PostgresCalculationInspection(
                 self.dsn, identity=self.identity).execute(scope, program)
@@ -4069,11 +4373,12 @@ class PostgresLanguageV2:
             return {'languageVersion': 2, 'function': program['function'],
                     'result': result}
         if (isinstance(program, dict)
-                and program.get('function') == _POPULATED_LAYOUT_PREVIEW):
+                and program.get('function') in (_POPULATED_LAYOUT_PREVIEW, _POPULATED_LAYOUT_REVIEW,
+                                                _POPULATED_LAYOUT_SOURCE_READ)):
             result = PostgresPopulatedLayoutPreview(
                 self.dsn, identity=self.identity).read(scope, program)
             return {'languageVersion': 2,
-                    'function': _POPULATED_LAYOUT_PREVIEW, 'result': result}
+                    'function': program['function'], 'result': result}
         if (isinstance(program, dict)
                 and program.get('function') == _STATEMENT_RECONCILIATION_PREVIEW):
             result = PostgresStatementReconciliation(
@@ -4145,9 +4450,7 @@ class PostgresLanguageV2:
                       else registry.list(scope, program))
             return {'languageVersion': 2, 'function': program['function'],
                     'result': result}
-        if (isinstance(program,dict) and program.get('function') in
-                (_PYTHON_SCHEDULE_READ,_PYTHON_SCHEDULE_LIST,
-                 _PYTHON_OCCURRENCE_READ)):
+        if isinstance(program,dict) and program.get('function') in _PYTHON_SCHEDULE_READS:
             result=PostgresPythonSchedules(
                 self.dsn,identity=self.identity).read(scope,program)
             return {'languageVersion':2,'function':program['function'],
@@ -4519,11 +4822,9 @@ class PostgresLanguageV2:
                     'result':result}
         if (isinstance(program,dict) and program.get('function')==
                 _APPLICATION_RULE_RUN_READ):
-            from .postgres_application_rule_workflow import (
-                PostgresApplicationRuleRun,parse_program)
+            from .postgres_application_rule_workflow import PostgresApplicationRuleRun
             result=PostgresApplicationRuleRun(self.dsn,
-                identity=self.identity,language=self).read(
-                    scope,parse_program(program,_APPLICATION_RULE_RUN_READ))
+                identity=self.identity,language=self).read_program(scope, program)
             return {'languageVersion':2,'function':_APPLICATION_RULE_RUN_READ,
                     'result':result}
         if (isinstance(program,dict) and program.get('function')==
@@ -4548,7 +4849,7 @@ class PostgresLanguageV2:
                 _ATTRIBUTE_DEFINITION_USAGE,
                 _ATTRIBUTE_VALUE_READ):
             result = PostgresAttributeCatalog(
-                self.dsn, identity=self.identity).read(scope, program)
+                self.dsn, identity=self.identity, cursor_secret=self.preview_secret).read(scope, program)
             return {'languageVersion': 2, 'function': program['function'],
                     'result': result}
         if isinstance(program, dict) and program.get('function') in (
@@ -4699,7 +5000,8 @@ class PostgresLanguageV2:
             if (set(program) != {'languageVersion', 'function', 'arguments'}
                     or type(program['languageVersion']) is not int or program['languageVersion'] != 2):
                 raise ValueError('V2_READ_FUNCTION_OR_ARGUMENTS_UNSUPPORTED')
-            metadata = PostgresMetadataStore(self.dsn, identity=self.identity)
+            metadata = PostgresMetadataStore(self.dsn, identity=self.identity,
+                                             cursor_secret=self.preview_secret)
             result = metadata.read_hierarchy(scope, program['function'], program['arguments'])
             return {'languageVersion': 2, 'function': program['function'], 'result': result}
         if (isinstance(program, dict) and program.get('function') in
@@ -4708,6 +5010,7 @@ class PostgresLanguageV2:
             function = program['function']
             relationship = function == 'metadata.relationship.list'
             security_tag = function == 'metadata.security-tag.list'
+            directory = function in ('metadata.dimension.list', 'metadata.member.list')
             if relationship and isinstance(program.get('arguments'), dict):
                 fields = set(program['arguments'])
                 valid_relationship_args = (fields == {'cursor'} or
@@ -4727,6 +5030,8 @@ class PostgresLanguageV2:
                 optional.update({'dimension', 'status', 'hierarchyId'})
             if security_tag:
                 optional.add('status')
+            if directory:
+                optional.add('expectedPageToken')
             if (set(program) != {'languageVersion', 'function', 'arguments'}
                     or type(program['languageVersion']) is not int
                     or program['languageVersion'] != 2
@@ -4738,18 +5043,19 @@ class PostgresLanguageV2:
             args = program['arguments']
             metadata = PostgresMetadataStore(
                 self.dsn, identity=self.identity,
-                cursor_secret=self.preview_secret if relationship else None)
+                cursor_secret=self.preview_secret if relationship or directory else None)
             common = {'limit': args.get('limit', 100),
                       'expected_metadata_revision':
                           args.get('expectedMetadataRevision')}
             if function == 'metadata.dimension.list':
                 result = metadata.list_dimensions(
                     scope, after_dimension_id=args.get('afterDimensionId'),
-                    **common)
+                    expected_page_token=args.get('expectedPageToken'), **common)
             elif function == 'metadata.member.list':
                 result = metadata.list_members(
                     scope, args['dimension'],
-                    after_member_id=args.get('afterMemberId'), **common)
+                    after_member_id=args.get('afterMemberId'),
+                    expected_page_token=args.get('expectedPageToken'), **common)
             elif function == 'metadata.security-tag.list':
                 result=metadata.list_security_tags(
                     scope,args['dimension'],status=args.get('status'),
@@ -4807,10 +5113,11 @@ class PostgresLanguageV2:
             return {'languageVersion': 2,
                     'function': 'facts.calculation.read', 'result': result}
         if (isinstance(program,dict) and program.get('function')==
-                'facts.calculation.publication.list'):
+                _CALCULATION_PUBLICATION_LIST):
             args=(program.get('arguments') if
                   set(program)=={'languageVersion','function','arguments'}
-                  and program.get('languageVersion')==2 else None)
+                  and type(program.get('languageVersion')) is int
+                  and program['languageVersion']==2 else None)
             if (not isinstance(args,dict) or set(args)-
                     {'limit','afterResultKey'}):
                 raise ValueError('V2_READ_FUNCTION_OR_ARGUMENTS_UNSUPPORTED')
@@ -4819,7 +5126,7 @@ class PostgresLanguageV2:
                     scope,limit=args.get('limit',100),
                     after_result_key=args.get('afterResultKey'))
             return {'languageVersion':2,
-                    'function':'facts.calculation.publication.list',
+                    'function':_CALCULATION_PUBLICATION_LIST,
                     'result':result}
         if (isinstance(program, dict)
                 and program.get('function') == _CALCULATION_SCAN_FUNCTION):
@@ -4848,7 +5155,7 @@ class PostgresLanguageV2:
                 or set(program) != {'languageVersion', 'function', 'arguments'}
                 or type(program['languageVersion']) is not int
                 or program['languageVersion'] != 2
-                or program['function'] != 'facts.cube.scan'
+                or program['function'] != _RAW_CUBE_SCAN
                 or not isinstance(program['arguments'], dict)
                 or set(program['arguments']) - {'members', 'limit', 'cursor',
                                                  'snapshotRevision',
@@ -4864,7 +5171,7 @@ class PostgresLanguageV2:
                 snapshot_revision=args.get('snapshotRevision'),
                 include_missing=args.get('includeMissing', False),
                 include_zero=args.get('includeZero', True))
-        return {'languageVersion': 2, 'function': 'facts.cube.scan',
+        return {'languageVersion': 2, 'function': _RAW_CUBE_SCAN,
                 'result': result}
 
     @lock_busy_boundary
@@ -5068,7 +5375,7 @@ class PostgresLanguageV2:
                 PostgresNumericFactStore._set_scope(db, scope)
                 PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
                 access = PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'write')
+                    db, self.identity, scope, 'write', function=function, arguments=normalized)
                 state = db.execute('''SELECT a.status,s.processing_mode,
                     s.metadata_revision,s.data_revision,s.policy_revision
                     FROM epm.application_state s JOIN epm.application a
@@ -5101,7 +5408,15 @@ class PostgresLanguageV2:
                             for d, m in pairs]),
                      scope.workspace_id, scope.application_id)).fetchall()
                 if any(not row['active'] for row in found):
+                    if access.authorization_model == 'group_assignments':
+                        from .postgres_access import AccessDenied
+                        raise AccessDenied('DIMENSIONAL_SCOPE_DENIED')
                     raise ValueError('COORDINATE_MEMBER_UNAVAILABLE')
+                from .postgres_dimensional_security_enforcement import authorize_coordinates
+                from .dimensional_security_policy import AccessKind
+                authorize_coordinates(db, self.identity, scope,
+                    (item.coordinate for item in mutations), kind=AccessKind.WRITE,
+                    expected_access=access)
                 current = db.execute('''SELECT input.series_key,c.members,
                     COALESCE(n.change_id,'') AS change_id,
                     COALESCE(t.change_id,'') AS text_change_id,
@@ -5149,23 +5464,16 @@ class PostgresLanguageV2:
                         raise ValueError('COORDINATE_HAS_NUMERIC_VALUE')
                 from .postgres_planning_write_guard import (
                     enforce_active_planning_policy)
-                from .postgres_dimensional_security_enforcement import (
-                    authorize_coordinates)
-                from .dimensional_security_policy import AccessKind
                 actions = ({MutationKind.SET: 'Set', MutationKind.ADD: 'Add',
                             MutationKind.CLEAR: 'Clear'}
                            if function == 'facts.numeric.batch' else
                            {TextMutationKind.SET: 'Set',
                             TextMutationKind.CLEAR: 'Clear'})
-                authorize_coordinates(
-                    db, self.identity, scope,
-                    (item.coordinate for item in mutations),
-                    kind=AccessKind.WRITE)
                 enforce_active_planning_policy(
                     db, scope,
                     writes=tuple((item.coordinate, actions[item.kind])
                                  for item in mutations),
-                    workflow_role=access.role)
+                    workflow_role=access.role, identity=self.identity)
                 revisions = {key: state[key] for key in (
                     'metadata_revision', 'data_revision', 'policy_revision')}
         token, digest = self._sign_preview(
@@ -5174,6 +5482,48 @@ class PostgresLanguageV2:
                 'programDigest': digest,
                 'revisionVector': revisions, 'previewToken': token,
                 'changedCount': len(mutations)}
+
+    @lock_busy_boundary
+    def replay_ordered(self, scope: ApplicationScope, program: dict, *,
+                       idempotency_key: str,
+                       depends_on_job_ids: tuple[str, ...] = (),
+                       _execution_authority=None):
+        """Reconcile retained ordered work without a fresh preview or admission.
+
+        NotImplemented leaves other operation owners on their existing path;
+        None means this supported operation has no accepted original job.
+        """
+        function = program.get('function') if isinstance(program, dict) else None
+        if function in ('facts.numeric.sequence', 'facts.numeric.transform'):
+            from .postgres_numeric_sequence import replay
+        elif function == 'facts.numeric.iterate':
+            from .postgres_numeric_iteration import replay
+        else:
+            return NotImplemented
+        from .postgres_job_origin import bind_public_operation
+        authority = bind_public_operation(_execution_authority, scope, self.identity, program)
+        return replay(self, scope, program, idempotency_key, depends_on_job_ids,
+            execution_authority=authority)
+
+    @lock_busy_boundary
+    def replay_cancelled_python_child(self,scope,program,*,idempotency_key,
+            depends_on_job_ids=(),execution_authority=None):
+        """Exact legacy owner proofs only; never preview or admit new work."""
+        recovered=self.replay_ordered(scope,program,idempotency_key=idempotency_key,
+            depends_on_job_ids=depends_on_job_ids,_execution_authority=execution_authority)
+        if recovered is not NotImplemented:return recovered
+        function=program.get('function') if type(program) is dict else None
+        if function=='facts.numeric.batch':mutations=compile_numeric_program(program)
+        elif function=='facts.text.batch':mutations=compile_text_program(program)
+        elif function=='facts.line-detail.replace':
+            from .postgres_line_detail_job import compile_program
+            mutations=compile_program(program)
+        else:return NotImplemented
+        from .postgres_job_origin import bind_public_operation
+        authority=bind_public_operation(execution_authority,scope,self.identity,program)
+        return PostgresJobQueue(self.dsn,identity=self.identity).replay_batch(scope,
+            idempotency_key=idempotency_key,function_name=function,mutations=mutations,
+            depends_on_job_ids=depends_on_job_ids,execution_authority=authority)
 
     @lock_busy_boundary
     def replay_batch(self, scope: ApplicationScope, program: dict, *,
@@ -5246,7 +5596,15 @@ class PostgresLanguageV2:
                preview_token: str, idempotency_key: str,
                depends_on_job_ids: tuple[str, ...] = (),
                _execution_authority: dict | None = None) -> dict:
-        self._validate_signed_operation_id(scope, program, idempotency_key)
+        try:
+            self._validate_signed_operation_id(scope, program, idempotency_key)
+        except ValueError as error:
+            if str(error) != 'OPERATION_ADMISSION_EXPIRED':
+                raise
+            return self.reconcile_expired_operation(scope, program,
+                idempotency_key=idempotency_key, depends_on_job_ids=depends_on_job_ids,
+                allowed_owners=('batch', 'detail', 'spread', 'calculated-member'),
+                preview_token=preview_token)
         from .postgres_job_origin import bind_public_operation
         _execution_authority = bind_public_operation(
             _execution_authority, scope, self.identity, program)
@@ -5386,6 +5744,13 @@ class PostgresLanguageV2:
         if (isinstance(program, dict)
                 and program.get('function') ==
                 _CALCULATED_MEMBER_MATERIALIZE):
+            original=self.replay_calculated_member(scope,program,
+                preview_token=preview_token,idempotency_key=idempotency_key,
+                depends_on_job_ids=depends_on_job_ids)
+            if original is not None:
+                return original
+            # An expired preview can identify accepted work, never prepare new work.
+            self._unpack_preview(scope,_CALCULATED_MEMBER_MATERIALIZE,preview_token)
             definition, pin = PostgresCalculatedMembers(
                 self.dsn, identity=self.identity).prepare_materialization(
                     scope, program)
@@ -5626,26 +5991,26 @@ class PostgresLanguageV2:
             program, expected_target_state_token=None,
             saved_rule=saved_rule, driver_policy=driver_policy,
             calculated_member=calculated_member)
+        keys = (scope.workspace_id, scope.application_id)
+        state_query = '''SELECT a.status,s.processing_mode,s.metadata_revision,
+            s.data_revision,s.policy_revision,s.commit_revision,s.security_revision
+            FROM epm.application_state s JOIN epm.application a
+            USING (workspace_id,application_id) WHERE s.workspace_id=%s AND s.application_id=%s'''
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
                 PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
-                PostgresAccessChecker.check_in_transaction(
+                access = PostgresAccessChecker.check_in_transaction(
                     db, self.identity, scope, 'write')
                 if saved_rule:
                     PostgresAccessChecker.check_in_transaction(
                         db, self.identity, scope, 'rule_run')
                     verify_published_rule(db, scope, saved_rule, program)
                 if calculated_member:
-                    PostgresAccessChecker.check_in_transaction(
-                        db, self.identity, scope, 'rule_run')
-                state = db.execute('''SELECT a.status,s.processing_mode,
-                    s.metadata_revision,s.data_revision,s.policy_revision
-                    FROM epm.application_state s JOIN epm.application a
-                    USING (workspace_id,application_id)
-                    WHERE s.workspace_id=%s AND s.application_id=%s''',
-                    (scope.workspace_id, scope.application_id)).fetchone()
+                    from .postgres_calculated_members import recheck_materialization_run_access
+                    recheck_materialization_run_access(db, self.identity, scope, access)
+                state = db.execute(state_query, keys).fetchone()
                 if (state is None or state['status'] != 'Active'
                         or state['processing_mode'] != 'Active'):
                     raise ValueError('APPLICATION_NOT_WRITABLE')
@@ -5674,15 +6039,29 @@ class PostgresLanguageV2:
                         db, scope, calculated_member, plan)
                 count = expression_source_count(db, scope, plan,
                     identity=self.identity)
-                enforce_expression_dimensional_security(
-                    db, self.identity, scope, plan, count)
+                if calculated_member:
+                    from .postgres_calculated_members import PREVIEW_SNAPSHOT_STALE, REVIEW_AUTHORIZATION_STALE
+                    from .postgres_dimensional_security import CUBE_READ_AUTHORIZATION_STALE
+                    try:
+                        enforce_expression_dimensional_security(
+                            db, self.identity, scope, plan, count, expected_access=access)
+                    except ValueError as error:
+                        if str(error) == CUBE_READ_AUTHORIZATION_STALE:
+                            raise ValueError(REVIEW_AUTHORIZATION_STALE) from None
+                        raise
+                    recheck_materialization_run_access(db, self.identity, scope, access)
+                    if db.execute(state_query, keys).fetchone() != state:
+                        raise ValueError(PREVIEW_SNAPSHOT_STALE)
+                else:
+                    enforce_expression_dimensional_security(db, self.identity, scope, plan, count)
                 compiler, plan_digest = compiler_for(plan)
                 resource_class = ('medium'
                     if plan.applicability_domain and count > 500 else 'short')
                 revisions = {key: state[key] for key in (
                     'metadata_revision', 'data_revision', 'policy_revision')}
+        normalized = plan.normalized_program
         token, digest = self._sign_preview(
-            scope, preview_function, plan.normalized_program,
+            scope, preview_function, normalized,
             revisions, extra={
                 'expectedTargetStateToken': expected,
                 'resourceClass': resource_class,
@@ -5697,13 +6076,23 @@ class PostgresLanguageV2:
                 'compilerVersion': compiler, 'planDigest': plan_digest,
                 'estimatedRows': count, 'engine': 'postgres_exact_sql',
                 'resourceClass': resource_class,
-                'rounding': 'half-even-final-8', 'previewToken': token,
+                'rounding': normalized['rounding'], 'previewToken': token,
                 'publishedInputs': list(inputs),
                 **({'contextDependencies':list(sealed_context)}
                    if sealed_context else {}),
                 **({'savedRule': saved_rule} if saved_rule else {}),
-                **({'calculatedMember': calculated_member}
+                **({'calculatedMember': calculated_member, 'resultKey': plan.result_key,
+                    'resultUnit': normalized.get('resultUnit', {'type': 'Amount', 'scale': 8})}
                    if calculated_member else {})}
+
+    def replay_calculated_member(self, scope: ApplicationScope, program: dict, *,
+            preview_token: str | None, idempotency_key: str,
+            depends_on_job_ids: tuple[str, ...] = ()) -> dict | None:
+        payload=self._unpack_preview(scope,_CALCULATED_MEMBER_MATERIALIZE,
+            preview_token,allow_expired=True)
+        return PostgresJobQueue(self.dsn,identity=self.identity).replay_calculated_member(
+            scope,idempotency_key=idempotency_key,program=program,preview=payload,
+            depends_on_job_ids=depends_on_job_ids)
 
     def _submit_expression(self, scope: ApplicationScope,
                            program: dict, *, preview_token: str,
@@ -5998,17 +6387,29 @@ class PostgresLanguageV2:
                     for index, item in enumerate((*inputs, *targets), 1)]
                 validate_coordinates(db, scope, declared)
                 authorize_coordinates(db, self.identity, scope, inputs,
-                                      kind=AccessKind.READ)
+                                      kind=AccessKind.READ, expected_access=access)
                 authorize_coordinates(db, self.identity, scope, targets,
-                                      kind=AccessKind.WRITE)
+                                      kind=AccessKind.WRITE, expected_access=access)
                 enforce_active_planning_policy(db, scope,
                     writes=tuple((target, 'Set') for target in targets),
-                    workflow_role=access.role)
+                    workflow_role=access.role, identity=self.identity)
+                current = _current_state(db, scope)
+                if any(current[key] != state[key] for key in (
+                        'metadata_revision', 'data_revision', 'policy_revision', 'schema_epoch')):
+                    raise ValueError('APPORTIONMENT_PREVIEW_INPUT_STALE')
                 normalized = relation_admission_program(request,
                     expected_target_state_token=expected,
                     schema_epoch=state['schema_epoch'])
                 revisions = {key: state[key] for key in (
                     'metadata_revision', 'data_revision', 'policy_revision')}
+                try:
+                    current_access = PostgresAccessChecker.check_in_transaction(
+                        db, self.identity, scope, 'write', function=_EXPRESSION_FUNCTION,
+                        expected_groups=access.groups)
+                except AccessGroupsChanged:
+                    raise ValueError('APPORTIONMENT_PREVIEW_AUTHORIZATION_STALE') from None
+                if current_access != access:
+                    raise ValueError('APPORTIONMENT_PREVIEW_AUTHORIZATION_STALE')
         resource_class = 'medium' if len(targets) > 500 else 'short'
         token, program_digest = self._sign_preview(scope,
             _EXPRESSION_FUNCTION, normalized, revisions,

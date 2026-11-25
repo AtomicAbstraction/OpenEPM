@@ -1,6 +1,7 @@
 """PostgreSQL repository for crash-durable export source checkpoints."""
 from __future__ import annotations
 import json, re, uuid
+from contextlib import contextmanager
 from hashlib import sha256
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -19,28 +20,38 @@ class PostgresExportProducerCheckpoint:
  def __init__(self,dsn,*,identity):
   if not isinstance(identity,VerifiedIdentity): raise ValueError('verified identity required')
   self.dsn,self.identity=dsn,identity
- def _tx(self,scope,permission='read'):
-  db=connect_postgres(self.dsn,row_factory=dict_row);PostgresNumericFactStore._set_scope(db,scope);PostgresAccessChecker.check_in_transaction(db,self.identity,scope,permission);return db
- def _authorization_scope_digest(self,db,scope):
+ @contextmanager
+ def _tx(self,scope,permission='read',*,read_only=False,function='facts.transfer.export.request'):
+  with connect_postgres(self.dsn,row_factory=dict_row) as db:
+   if read_only: db.execute('SET TRANSACTION READ ONLY')
+   PostgresNumericFactStore._set_scope(db,scope)
+   if function is not None:
+    PostgresAccessChecker.lock_directory_membership_for_assignment(db)
+   PostgresAccessChecker.check_in_transaction(db,self.identity,scope,permission,function=function)
+   yield db
+ def _authorization_scope(self,db,scope):
   return resolve_effective_dimensional_scope(
-   db,self.identity,scope,function='facts.transfer.export.request').scope_digest
+   db,self.identity,scope,function='facts.transfer.export.request')
  def _require_current_authorization_scope(self,db,scope,rid):
   row=db.execute('''SELECT authorization_scope_digest
    FROM epm.fact_export_producer_request WHERE workspace_id=%s
-   AND application_id=%s AND request_id=%s''',(
-    scope.workspace_id,scope.application_id,rid)).fetchone()
+   AND application_id=%s AND request_id=%s AND issuer=%s AND subject_id=%s''',(
+    scope.workspace_id,scope.application_id,rid,self.identity.issuer,self.identity.subject_id)).fetchone()
   if (row is None or row['authorization_scope_digest'] is None
       or row['authorization_scope_digest']!=
-      self._authorization_scope_digest(db,scope)):
+      self._authorization_scope(db,scope).scope_digest):
    raise ValueError('EXPORT_PRODUCER_AUTHORIZATION_SCOPE_CHANGED')
  def begin(self,scope,*,idempotency_key,origin,snapshot_revision,
-           metadata_revision,security_revision,expires_at,schema,members):
+           metadata_revision,security_revision,expires_at,schema,members,replay_only=False):
   if not _KEY.fullmatch(idempotency_key): raise ValueError('EXPORT_PRODUCER_REQUEST_INVALID')
   if type(security_revision) is not int or security_revision < 0:
    raise ValueError('EXPORT_PRODUCER_REQUEST_INVALID')
-  with self._tx(scope) as db,db.transaction():
+  with self._tx(scope,read_only=replay_only) as db,db.transaction():
    configure_statement_timeout(db,5000)
-   authorization_scope_digest=self._authorization_scope_digest(db,scope)
+   authorization=self._authorization_scope(db,scope)
+   authorization_scope_digest=authorization.scope_digest
+   # Keep the exact request digest compatible with existing replay records.
+   # The worker receives the effective directory groups, separately.
    request={'scope':[scope.workspace_id,scope.application_id],'origin':origin,'snapshot':snapshot_revision,'metadata':metadata_revision,'security':security_revision,'expires':expires_at,'schema':schema,'members':members,'actor':[self.identity.issuer,self.identity.subject_id],'verifiedGroups':list(self.identity.groups),'authorizationScopeDigest':authorization_scope_digest};digest=_digest(request)
    db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",(
     '|'.join((scope.workspace_id,scope.application_id,self.identity.issuer,
@@ -49,6 +60,7 @@ class PostgresExportProducerCheckpoint:
    if prior:
     if prior['request_digest']!=digest: raise ValueError('EXPORT_PRODUCER_REQUEST_CONFLICT')
     return prior
+   if replay_only: return None
    state=db.execute('''SELECT security_revision FROM epm.application_state
     WHERE workspace_id=%s AND application_id=%s''',(
       scope.workspace_id,scope.application_id)).fetchone()
@@ -56,7 +68,7 @@ class PostgresExportProducerCheckpoint:
     raise ValueError('EXPORT_PRODUCER_SECURITY_STALE')
    rid=uuid.uuid4().hex
    token_issued_at,authority_kind=durable_authority_fields(self.identity)
-   return db.execute("INSERT INTO epm.fact_export_producer_request(workspace_id,application_id,request_id,issuer,subject_id,idempotency_key,request_digest,origin,snapshot_revision,metadata_revision,security_revision,expires_at_epoch,schema_identity,members,status,verified_groups,authorization_scope_digest,token_issued_at,authority_kind) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'Accepted',%s,%s,%s,%s) RETURNING *",(scope.workspace_id,scope.application_id,rid,self.identity.issuer,self.identity.subject_id,idempotency_key,digest,origin,snapshot_revision,metadata_revision,security_revision,expires_at,Jsonb(schema),Jsonb(members or {}),list(self.identity.groups),authorization_scope_digest,token_issued_at,authority_kind)).fetchone()
+   return db.execute("INSERT INTO epm.fact_export_producer_request(workspace_id,application_id,request_id,issuer,subject_id,idempotency_key,request_digest,origin,snapshot_revision,metadata_revision,security_revision,expires_at_epoch,schema_identity,members,status,verified_groups,authorization_scope_digest,token_issued_at,authority_kind) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'Accepted',%s,%s,%s,%s) RETURNING *",(scope.workspace_id,scope.application_id,rid,self.identity.issuer,self.identity.subject_id,idempotency_key,digest,origin,snapshot_revision,metadata_revision,security_revision,expires_at,Jsonb(schema),Jsonb(members or {}),list(authorization.access.groups),authorization_scope_digest,token_issued_at,authority_kind)).fetchone()
  def claim(self,scope,rid,worker,seconds=120):
   with self._tx(scope) as db,db.transaction():
    self._require_current_authorization_scope(db,scope,rid)
@@ -66,11 +78,22 @@ class PostgresExportProducerCheckpoint:
   with self._tx(scope) as db,db.transaction():
    self._require_current_authorization_scope(db,scope,rid)
    return [row['page'] for row in db.execute('SELECT page FROM epm.fact_export_producer_page WHERE workspace_id=%s AND application_id=%s AND request_id=%s ORDER BY page_index',(scope.workspace_id,scope.application_id,rid)).fetchall()]
- def read(self,scope,rid):
-  with self._tx(scope) as db,db.transaction():
-   row=db.execute('SELECT * FROM epm.fact_export_producer_request WHERE workspace_id=%s AND application_id=%s AND request_id=%s AND issuer=%s AND subject_id=%s',(scope.workspace_id,scope.application_id,rid,self.identity.issuer,self.identity.subject_id)).fetchone()
+ def read(self,scope,rid=None,*,operation_id=None):
+  if (rid is None)==(operation_id is None):
+   raise ValueError('EXPORT_REQUEST_ID_INVALID')
+  if operation_id is not None:
+   if not isinstance(operation_id,str) or not _KEY.fullmatch(operation_id):
+    raise ValueError('EXPORT_PRODUCER_OPERATION_ID_INVALID')
+   column,value='idempotency_key',operation_id
+  else:
+   column,value='request_id',rid
+  with self._tx(scope,read_only=True,function='facts.transfer.export.read') as db,db.transaction():
+   configure_statement_timeout(db,5000)
+   row=db.execute(f'''SELECT * FROM epm.fact_export_producer_request
+    WHERE workspace_id=%s AND application_id=%s AND {column}=%s AND issuer=%s AND subject_id=%s''',
+    (scope.workspace_id,scope.application_id,value,self.identity.issuer,self.identity.subject_id)).fetchone()
    if row is None: raise ValueError('EXPORT_PRODUCER_REQUEST_UNAVAILABLE')
-   self._require_current_authorization_scope(db,scope,rid)
+   self._require_current_authorization_scope(db,scope,row['request_id'])
    return row
  def find_by_idempotency(self,scope,key):
   if not isinstance(key,str) or not _KEY.fullmatch(key): raise ValueError('EXPORT_PRODUCER_REQUEST_INVALID')
@@ -97,7 +120,7 @@ class PostgresExportProducerCheckpoint:
         'identity':list(identity),'sourceRequestId':rid,
         'idempotencyKey':idempotency_key}
   new_rid=_digest(seed)[:32]
-  with self._tx(scope) as db,db.transaction():
+  with self._tx(scope,function=None) as db,db.transaction():
    configure_statement_timeout(db,5000);configure_lock_wait(db)
    db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",(
     '|'.join((scope.workspace_id,scope.application_id,*identity,
@@ -129,7 +152,8 @@ class PostgresExportProducerCheckpoint:
    original_ttl=source['expires_at_epoch']-int(source['created_at'].timestamp())
    ttl=max(60,min(86400,original_ttl))
    expires_at=now+ttl
-   authorization_scope_digest=self._authorization_scope_digest(db,scope)
+   authorization=self._authorization_scope(db,scope)
+   authorization_scope_digest=authorization.scope_digest
    request={'scope':[scope.workspace_id,scope.application_id],
     'origin':source['origin'],'snapshot':source['snapshot_revision'],
     'metadata':source['metadata_revision'],'expires':expires_at,
@@ -150,7 +174,7 @@ class PostgresExportProducerCheckpoint:
       source['snapshot_revision'],source['metadata_revision'],
       source['security_revision'],expires_at,
       Jsonb(source['schema_identity']),Jsonb(source['members']),rid,
-      list(self.identity.groups),authorization_scope_digest,token_issued_at,
+      list(authorization.access.groups),authorization_scope_digest,token_issued_at,
       authority_kind)).fetchone()
  def append(self,scope,rid,worker,generation,index,request_cursor,next_cursor,page):
   with self._tx(scope) as db,db.transaction():
@@ -161,9 +185,11 @@ class PostgresExportProducerCheckpoint:
    self._require_current_authorization_scope(db,scope,rid)
    return db.execute('SELECT epm.export_producer_seal(%s,%s,%s,%s,%s,%s) AS result',(scope.workspace_id,scope.application_id,rid,worker,generation,Jsonb(manifest))).fetchone()['result']
  def cancel(self,scope,rid):
-  return self.request_cancel_as_task_controller(scope,rid)
+  return self._cancel(scope,rid,allow_application_admin=False,owner_export=True)
  def request_cancel_as_task_controller(self,scope,rid,*,
                                        allow_application_admin=False):
+  return self._cancel(scope,rid,allow_application_admin=allow_application_admin,owner_export=False)
+ def _cancel(self,scope,rid,*,allow_application_admin,owner_export):
   """Cancel through the native export fence under current authority."""
   if (not isinstance(scope,ApplicationScope) or not isinstance(rid,str)
       or re.fullmatch(r'[0-9a-f]{32}',rid) is None
@@ -172,9 +198,13 @@ class PostgresExportProducerCheckpoint:
   with connect_postgres(self.dsn,row_factory=dict_row) as db,db.transaction():
    configure_statement_timeout(db,5000);configure_lock_wait(db)
    PostgresNumericFactStore._set_scope(db,scope)
+   if owner_export:
+    PostgresAccessChecker.lock_directory_membership_for_assignment(db)
    PostgresAccessChecker.lock_workspace(db,scope.workspace_id)
    PostgresAccessChecker.check_in_transaction(
-    db,self.identity,scope,'read')
+    db,self.identity,scope,'read',function='facts.transfer.export.cancel' if owner_export else None)
+   if owner_export:
+    self._require_current_authorization_scope(db,scope,rid)
    row=db.execute('''SELECT * FROM epm.export_producer_cancel_control(
     %s,%s,%s,%s,%s,%s)''',(scope.workspace_id,scope.application_id,rid,
     self.identity.issuer,self.identity.subject_id,

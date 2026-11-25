@@ -6,6 +6,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .cube_aggregate_lifecycle import AggregateQueryBudgets
+from .cube_aggregate_public_contract import LINEAGE, aggregate_program_contract
 from .cube_aggregate_service import CubeAggregateService
 from .generic_aggregate_contract import FORMAT, compile_generic_aggregate
 from .generic_aggregate_lowering import lower_generic_aggregate
@@ -23,7 +24,6 @@ from .postgres_sealed_selections import PostgresSealedSelections, READ as SELECT
 REQUEST="cube.aggregate.request"
 READ="cube.aggregate.read"
 CANCEL="cube.aggregate.cancel"
-LINEAGE="cube.aggregate.lineage.read"
 
 
 def catalog() -> dict:
@@ -37,21 +37,21 @@ def catalog() -> dict:
                 "membershipSemantics":"unique_member or placement",
                 "memberOperatorPolicy":"configured","missing":"exclude"},
             "optionalArguments":{"limits":"lower aggregate execution budgets"},
-            "result":"durable generic aggregate query identity"},
+            "result":"durable generic aggregate query identity", **aggregate_program_contract(REQUEST)},
         READ:{**common,"mode":"read","workClass":"short",
             "idempotencyRequired":False,
             "arguments":{"queryId":"accepted generic aggregate query"},
             "optionalArguments":{"cursor":"signed continuation cursor",
                                  "pageSize":"1-500"},
-            "result":"durable status or bounded exact result page"},
+            "result":"durable status or bounded exact result page", **aggregate_program_contract(READ)},
         LINEAGE:{**common,"mode":"read","workClass":"short",
             "idempotencyRequired":False,
             "arguments":{"queryId":"accepted placement aggregate query"},
-            "result":"immutable exact placement paths and effective operators"},
+            "result":"immutable exact placement paths and effective operators", **aggregate_program_contract(LINEAGE)},
         CANCEL:{**common,"mode":"technical_control","workClass":"short",
             "idempotencyRequired":False,
             "arguments":{"queryId":"accepted generic aggregate query"},
-            "result":"durable cancellation state"},
+            "result":"durable cancellation state", **aggregate_program_contract(CANCEL)},
     }
 
 
@@ -106,7 +106,7 @@ class PostgresGenericAggregate:
     def execute(self,scope:ApplicationScope,raw:dict)->dict:
         function,args=_program(raw)
         if function==LINEAGE:
-            return self._read_lineage(scope,args["queryId"])
+            return self.aggregate_service.repository.read_placement_lineage(scope,args["queryId"])
         if function==READ:
             return self.aggregate_service.read(scope,args["queryId"],
                 cursor=args.get("cursor"),page_size=args.get("pageSize"))
@@ -129,6 +129,10 @@ class PostgresGenericAggregate:
             "missing":args["missing"]}
         dimensions=sorted(resolved)
         plan=compile_generic_aggregate(intent,active_dimensions=dimensions)
+        if (plan.normalized["membershipSemantics"] == "placement"
+                and set(plan.normalized["reduceDimensions"]).intersection(
+                    sealed["resolvedSelection"].get("placementUnavailableDimensions", ()))):
+            raise ValueError("MEMBER_LIST_PLACEMENT_SELECTOR_UNSUPPORTED")
         requested=[{"dimension_id":dimension,"member_id":member}
             for dimension in dimensions for member in resolved[dimension]]
         all_placement_members={}
@@ -236,23 +240,3 @@ class PostgresGenericAggregate:
             dimension_roles={dimension:None for dimension in dimensions},
             budgets=_budgets(args.get("limits")),
             technical_lineage=(combined if placement_artifacts else None))
-
-    def _read_lineage(self,scope:ApplicationScope,query_id:str)->dict:
-        with connect_postgres(self.dsn,row_factory=dict_row) as db:
-            with db.transaction():
-                db.execute("SET TRANSACTION READ ONLY")
-                configure_statement_timeout(db,5000)
-                PostgresNumericFactStore._set_scope(db,scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db,self.identity,scope,"read",function=LINEAGE)
-                row=db.execute("""SELECT status,placement_lineage,
-                    placement_lineage_digest FROM epm.cube_aggregate_query
-                    WHERE workspace_id=%s AND application_id=%s
-                    AND query_id=%s AND issuer=%s AND subject_id=%s""",(
-                    scope.workspace_id,scope.application_id,query_id,
-                    self.identity.issuer,self.identity.subject_id)).fetchone()
-        if row is None or row["placement_lineage"] is None:
-            raise ValueError("CUBE_AGGREGATE_PLACEMENT_LINEAGE_UNAVAILABLE")
-        return {"queryId":query_id,"status":row["status"],
-                "lineageDigest":row["placement_lineage_digest"],
-                "lineage":row["placement_lineage"]}

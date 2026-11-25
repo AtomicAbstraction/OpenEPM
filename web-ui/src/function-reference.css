@@ -1,0 +1,92 @@
+.function-reference-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.function-reference-list > li {
+  border-top: 1px solid var(--line);
+}
+.function-reference-list summary {
+  cursor: pointer;
+  padding: 12px 0;
+  overflow-wrap: anywhere;
+}
+.function-reference-list summary:focus-visible,
+.function-reference-list pre:focus-visible {
+  outline: 2px solid var(--purple);
+  outline-offset: 2px;
+}
+.function-reference-contract {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr);
+  padding: 0 12px 16px;
+  overflow-wrap: anywhere;
+}
+.function-reference-contract :is(p, dl, dd, h4, pre) {
+  margin: 0;
+}
+.function-reference-contract dl > div {
+  display: grid;
+  grid-template-columns: minmax(8rem, 1fr) minmax(0, 3fr);
+  gap: 8px;
+  padding: 4px 0;
+}
+.function-reference-contract dt {
+  font-weight: 600;
+}
+.function-reference-contract dt span {
+  font-weight: 400;
+}
+.function-reference-contract pre {
+  max-height: 24rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #faf9fd;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.function-reference-example {
+  display: grid;
+  gap: 8px;
+}
+.function-replacement {
+  border-left: 3px solid var(--line);
+  display: grid;
+  gap: 8px;
+  padding-left: 12px;
+}
+.function-replacement summary {
+  padding: 6px 0;
+}
+.function-replacement ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+}
+.function-replacement .secondary {
+  display: inline-block;
+  max-width: 100%;
+  text-align: start;
+  white-space: normal;
+}
+.function-example-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+@media (max-width: 650px) {
+  .function-reference-contract dl > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+}

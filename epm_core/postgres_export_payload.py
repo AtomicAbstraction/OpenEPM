@@ -16,10 +16,11 @@ from psycopg.types.json import Jsonb
 
 from .export_artifact_manifest import export_artifact_manifest_matches
 from .export_payload_chunk import (
-    export_payload_chunk_matches, export_payload_matches)
+    export_payload_chunk_matches, export_payload_matches, payload_chunk_schema)
 from .persistence_contract import ApplicationScope
 from .postgres_access import PostgresAccessChecker, VerifiedIdentity
 from .postgres_dimensional_scope import resolve_effective_dimensional_scope
+from .postgres_fact_export import _EXPORT_SCHEMA
 from .postgres_jobs import _canonical_digest
 from .postgres_numeric_store import PostgresNumericFactStore
 
@@ -30,6 +31,40 @@ _DIGEST = re.compile(r'[0-9a-f]{64}\Z')
 _RETENTION = frozenset(('retained', 'held', 'expired'))
 PAYLOAD_PAGE = 'facts.transfer.export.payload.page'
 PUBLIC_READS = frozenset((PAYLOAD_PAGE,))
+
+
+def payload_page_program_contract() -> dict:
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    identifier = {'type': 'string', 'pattern': r'^[0-9a-f]{32}(?![\s\S])'}
+    digest = {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}
+    count = {'type': 'integer', 'minimum': 0}
+    cursor = {'type': 'string', 'minLength': 1, 'maxLength': 8192}
+    arguments = obj({'artifactId': identifier, 'cursor': cursor}, [])
+    arguments['oneOf'] = [{'required': [key]} for key in arguments['properties']]
+    result = obj({'artifactId': identifier, 'manifestDigest': digest, 'payloadDigest': digest,
+        'schema': {'const': _EXPORT_SCHEMA}, 'snapshotRevision': count, 'metadataRevision': count,
+        'securityRevision': count, 'storageFormat': {'const': 'plaintext_json'},
+        'encryptionClaim': {'const': False}, 'ordinal': count, 'chunk': payload_chunk_schema(),
+        'hasMore': {'type': 'boolean'}, 'nextCursor': {**cursor, 'type': ['string', 'null']},
+        'expiresAt': {'type': 'integer', 'minimum': 1, 'maximum': 2**63 - 1}})
+    contract = read_contract(PAYLOAD_PAGE, arguments, result, owner='PostgresExportPayload', examples=[
+        read_example(PAYLOAD_PAGE, {'artifactId': 'a' * 32}, name='Open the first retained payload chunk',
+            binding='Use the artifactId from the completed export in this application.'),
+        read_example(PAYLOAD_PAGE, {'cursor': 'example-signed-payload-cursor'},
+            name='Continue a retained export payload',
+            binding='Use the exact nextCursor from the previous chunk, by itself.'),
+    ], semantic_rules=[
+        'The fixed core rechecks current READ and dimensional scope and the original caller.',
+        'Only complete, retained and unexpired payloads can be read. Use the sealed manifest for metadata.',
+        'A terminal null nextCursor ends the payload. An empty export has one explicit empty chunk.',
+        'Preserve exact decimal strings, text presence and ordered supporting detail. The chunk is bounded to 500 rows and 8 MiB.',
+    ])
+    contract['programContract']['recovery'] = (
+        'Restart from the original artifactId if the continuation expires while the payload remains retained and authorized. '
+        'Inspect the original request status if the payload is unavailable.')
+    return contract
 
 
 def export_payload_catalog() -> dict:
@@ -44,7 +79,8 @@ def export_payload_catalog() -> dict:
                        'after the first chunk')},
         'result': ('one verified stored plaintext chunk, maximum 500 rows and '
                    '8 MiB, with typed schema/digests and signed continuation; '
-                   'incomplete, held, or expired payloads are unavailable')}}
+                   'incomplete, held, or expired payloads are unavailable'),
+        **payload_page_program_contract()}}
 
 
 def _canonical(value: object, code: str) -> bytes:
@@ -105,14 +141,19 @@ class PostgresExportPayload:
         self.identity = identity
         self.cursor_secret = cursor_secret
 
-    def _require_current_artifact_scope(self, db, scope, artifact_id):
+    def _require_current_artifact_scope(self, db, scope, artifact_id, *, function=PAYLOAD_PAGE, owner_only=True):
+        if function is not None:
+            PostgresAccessChecker.lock_directory_membership_for_assignment(db)
+        access = (PostgresAccessChecker.check_in_transaction(db, self.identity, scope, 'read')
+                  if function is None else None)
         current = resolve_effective_dimensional_scope(
-            db, self.identity, scope,
-            function='facts.transfer.export.payload.page').scope_digest
+            db, self.identity, scope, access=access, function=function).scope_digest
         row = db.execute('''SELECT authorization_scope_digest FROM
             epm.fact_export_artifact WHERE workspace_id=%s
-            AND application_id=%s AND artifact_id=%s''',(
-            scope.workspace_id,scope.application_id,artifact_id)).fetchone()
+            AND application_id=%s AND artifact_id=%s
+            AND (%s OR (issuer=%s AND subject_id=%s))''',(
+            scope.workspace_id,scope.application_id,artifact_id,not owner_only,
+            self.identity.issuer,self.identity.subject_id)).fetchone()
         if (row is None or row['authorization_scope_digest'] is None
                 or row['authorization_scope_digest'] != current):
             raise ValueError('EXPORT_PAYLOAD_AUTHORIZATION_SCOPE_CHANGED')
@@ -136,6 +177,12 @@ class PostgresExportPayload:
           %s,%s,%s,%s,%s,%s)''',(scope.workspace_id,scope.application_id,
           claim[0],claim[1],claim[2],artifact_id))
 
+    def _require_publication_scope(self, db, scope, artifact_id, claim):
+        # Historical technical producers have no group-assigned operation.
+        # The durable producer proves both current authority and its lease.
+        function = PAYLOAD_PAGE if claim not in (None, (None,None,None)) else None
+        self._require_current_artifact_scope(db, scope, artifact_id, function=function)
+
     def begin(self, scope: ApplicationScope, artifact_id: str, *,
               idempotency_key: str, payload: dict,
               producer_claim: tuple | None = None) -> dict:
@@ -147,9 +194,7 @@ class PostgresExportPayload:
             with db.transaction():
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
-                self._require_current_artifact_scope(db,scope,artifact_id)
+                self._require_publication_scope(db,scope,artifact_id,producer_claim)
                 self._claim(db,scope,artifact_id,producer_claim)
                 export = db.execute('''SELECT * FROM epm.fact_export_artifact
                     WHERE workspace_id=%s AND application_id=%s
@@ -227,9 +272,7 @@ class PostgresExportPayload:
             with db.transaction():
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
-                self._require_current_artifact_scope(db,scope,artifact_id)
+                self._require_publication_scope(db,scope,artifact_id,producer_claim)
                 self._claim(db,scope,artifact_id,producer_claim)
                 header = db.execute('''SELECT * FROM epm.fact_export_payload
                     WHERE workspace_id=%s AND application_id=%s
@@ -303,9 +346,7 @@ class PostgresExportPayload:
             with db.transaction():
                 configure_statement_timeout(db, 10000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
-                self._require_current_artifact_scope(db,scope,artifact_id)
+                self._require_publication_scope(db,scope,artifact_id,producer_claim)
                 self._claim(db,scope,artifact_id,producer_claim)
                 header = db.execute('''SELECT p.*,a.manifest FROM
                     epm.fact_export_payload p JOIN epm.fact_export_artifact a
@@ -372,9 +413,7 @@ class PostgresExportPayload:
             with db.transaction():
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
-                self._require_current_artifact_scope(db,scope,artifact_id)
+                self._require_current_artifact_scope(db,scope,artifact_id,function=None,owner_only=False)
                 row = db.execute('''UPDATE epm.fact_export_payload SET
                     retention_status=%s,retention_reason=%s,
                     retention_issuer=%s,retention_subject_id=%s,
@@ -397,8 +436,6 @@ class PostgresExportPayload:
                 db.execute('SET TRANSACTION READ ONLY')
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
                 self._require_current_artifact_scope(db,scope,artifact_id)
                 row = db.execute('''SELECT p.*,
                     count(c.ordinal) AS appended_count,
@@ -486,8 +523,6 @@ class PostgresExportPayload:
                 db.execute('SET TRANSACTION READ ONLY')
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'read')
                 self._require_current_artifact_scope(db,scope,artifact_id)
                 header = db.execute('''SELECT p.*,a.manifest,
                     a.security_revision,

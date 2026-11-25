@@ -14,6 +14,7 @@ from types import MappingProxyType
 from typing import Any,Iterator,Mapping
 
 from .model import Program,_canonical_copy,_identifier
+from .discovery_contract import structural_contract_projection
 
 
 REGISTRY_FORMAT = 'openepm-function-registry-v1'
@@ -87,6 +88,9 @@ class FunctionRegistry(Mapping[str,Function]):
                                              'idempotencyRequired','workClass'))
                         or contract_copy.get('argumentSchema')!=copied.get('arguments')
                         or contract_copy.get('resultSchema')!=copied.get('result')
+                        or 'schemaCoverage' in contract_copy and any(
+                            contract_copy.get(field)!=value for field,value in
+                            structural_contract_projection(copied).items())
                         or not isinstance(contract_copy.get('productPurpose'),str)
                         or not contract_copy.get('productPurpose')
                         or not isinstance(contract_copy.get('effectOwner'),str)

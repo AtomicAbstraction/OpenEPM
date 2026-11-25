@@ -28,10 +28,13 @@ from psycopg.types.json import Jsonb
 
 from .persistence_contract import (ApplicationScope, Coordinate, LineItem,
                                    NumericCell, TextCell)
-from .postgres_access import (AccessDenied, PostgresAccessChecker,
-                              VerifiedIdentity)
+from .postgres_access import (AccessDecision, AccessDenied, AccessGroupsChanged,
+                              PostgresAccessChecker, VerifiedIdentity)
 from .dimensional_security_policy import AccessKind
-from .postgres_dimensional_security_enforcement import authorize_coordinates
+from .postgres_dimensional_security import CUBE_READ_AUTHORIZATION_STALE
+from .postgres_dimensional_security_enforcement import (
+    authorize_coordinates, coordinate_read_allowed)
+from . import postgres_group_source_import as group_import
 from .postgres_jobs import _canonical_digest
 from .postgres_numeric_store import PostgresNumericFactStore
 from .postgres_transfer_artifacts import (PostgresTransferArtifacts,
@@ -45,6 +48,196 @@ _BATCH = re.compile(r'[0-9a-f]{32}\Z')
 _DIGEST = re.compile(r'[0-9a-f]{64}\Z')
 _EMPTY_DIGEST = sha256(b'').hexdigest()
 _PLANNING_POLICY_CHUNK = 10_000
+_REVIEW_SAMPLE_LIMIT = 20
+_REVIEW_SAMPLE_BYTES = 262144
+PREVIEW = 'facts.source.preview'
+CANCEL = 'facts.source.cancel'
+PUBLISH = 'facts.source.publish'
+DIAGNOSTICS_COMPILE = 'facts.source.diagnostics.compile'
+
+
+def source_publication_receipt_schema() -> dict:
+    from .postgres_numeric_catalog import obj
+
+    batch = {'type': 'string', 'pattern': r'^[0-9a-f]{32}(?![\s\S])'}
+    digest = {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}
+    count = {'type': 'integer', 'minimum': 0}
+    base = {'batchId': batch, 'mode': {'enum': ['merge', 'replace']}, 'setCount': count,
+            'clearCount': count, 'changedCount': count, 'committedRevision': count,
+            'contentDigest': digest}
+    return obj({**base, 'impactDigest': digest, 'diagnosticArtifactId': batch,
+                'diagnosticsDigest': digest, 'planningPolicy': {'type': 'object'}}, list(base))
+
+
+def _diagnostic_summary_schema() -> dict:
+    from .postgres_numeric_catalog import obj
+
+    count = {'type': 'integer', 'minimum': 0}
+    flag = {'type': 'boolean'}
+    return obj({'artifactId': {'type': 'string', 'pattern': r'^[0-9a-f]{32}(?![\s\S])'},
+        'diagnosticsDigest': {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'},
+        'diagnosticCount': count, 'errorCount': count, 'warningCount': count, 'accepted': flag,
+        'warningsAllowed': flag, 'admissionAllowed': flag})
+
+
+def source_lifecycle_program_contract(function: str) -> dict:
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    batch = {'type': 'string', 'pattern': r'^[0-9a-f]{32}(?![\s\S])'}
+    flag = {'type': 'boolean'}
+    example = {'batchId': 'a' * 32}
+    if function == CANCEL:
+        arguments = obj({'batchId': batch})
+        result = obj({'batchId': batch, 'status': {'enum': ['cancelled', 'failed', 'published']},
+                      'committedEffectsRemain': flag})
+        name = 'Cancel an uncommitted source batch'
+        binding = 'Use the exact batch ID returned when staging began. The batch owner or a current application administrator may cancel.'
+        rules = ['Staging and ready batches become cancelled. A published batch retains its effects and receipt.',
+                 'Cancellation of an import execution uses its distinct request ID and facts.transfer.import.cancel.']
+        recovery = 'Repeat the cancellation for the same batch to confirm its current terminal status.'
+    elif function == PUBLISH:
+        arguments = obj({'batchId': batch,
+                         'previewToken': {'type': 'string', 'minLength': 1, 'maxLength': 4096}})
+        result = source_publication_receipt_schema()
+        example['previewToken'] = 'example-confirmed-source-preview'
+        name = 'Publish the exact reviewed source batch'
+        binding = 'Use the batch ID and unchanged token from the current authorized facts.source.preview.'
+        rules = ['Publication validates the ready batch, exact token, current grants and pinned scope.',
+                 'Publication writes the facts and receipt atomically. Reconciliation of an owned published batch returns its original result.',
+                 'Use facts.transfer.import.request for a queued import with a separate execution identity.']
+        recovery = ('Use application.operation.receipt.read with the original batch ID after an uncertain publication. '
+                    'Review a fresh preview before starting a changed intent.')
+    elif function == DIAGNOSTICS_COMPILE:
+        arguments = obj({'batchId': batch, 'rows': {'type': 'array', 'maxItems': 100000,
+            'description': 'Raw JSON rows, including invalid rows for the compiler to diagnose.'},
+            'allowWarnings': flag})
+        result = _diagnostic_summary_schema()
+        example.update(rows=[{'members': {'Account': 'Revenue'}, 'sourceRef': 'example-row',
+                              'value': {'type': 'AmountLiteral', 'decimal': '1.00'}}], allowWarnings=False)
+        name = 'Compile diagnostics for a manifest-backed source'
+        binding = 'Use an owned manifest-backed batch and its raw rows. Resolve every active fact axis for a valid full-grain input.'
+        rules = ['The named batch requires current application WRITE and an immutable manifest.',
+                 'The server compiles invalid raw rows into fixed diagnostics. Compilation retains an artifact and does not stage or publish facts.',
+                 'admissionAllowed describes the diagnostic decision only. A ready preview and current authorization govern publication.']
+        recovery = ('Use facts.transfer.import.diagnostics.read with the retained artifactId. '
+                    'For a changed source, review the input and start a new batch with its own manifest.')
+    else:
+        raise ValueError('SOURCE_LIFECYCLE_FUNCTION_INVALID')
+    contract = read_contract(function, arguments, result, owner='PostgresSourceBatch',
+        examples=[read_example(function, example, name=name, binding=binding)], semantic_rules=rules)
+    contract['programContract']['recovery'] = recovery
+    return contract
+
+
+def preview_program_contract() -> dict:
+    from .metadata_read_contract import read_contract, read_example
+    from .postgres_numeric_catalog import obj
+
+    identifier = {'type': 'string', 'minLength': 1}
+    batch = {'type': 'string', 'pattern': r'^[0-9a-f]{32}(?![\s\S])'}
+    digest = {'type': 'string', 'pattern': r'^[0-9a-f]{64}(?![\s\S])'}
+    revision = {'type': 'integer', 'minimum': 0}
+    flag = {'type': 'boolean'}
+    mode = {'enum': ['merge', 'replace']}
+    members = {'type': 'object', 'propertyNames': identifier, 'additionalProperties': identifier}
+    decimal = {'type': 'string', 'description': 'An exact decimal string.'}
+    items = {'type': 'array', 'maxItems': 500,
+             'items': obj({'description': {'type': 'string'}, 'amount': decimal})}
+    present = {kind: obj({'present': {'const': True}, **fields}) for kind, fields in (
+        ('numeric', {'amount': decimal}), ('text', {'text': {'type': 'string'}}),
+        ('detail', {'amount': decimal, 'items': items}))}
+    missing = obj({'present': {'const': False}})
+    state = {kind: {'oneOf': [missing, value]} for kind, value in present.items()}
+    companion = {'type': 'array', 'minItems': 1, 'maxItems': 1, 'items': {'oneOf': [
+        obj({'valueKind': {'const': 'numeric'}, 'before': state['numeric'], 'after': present['numeric']}),
+        obj({'valueKind': {'const': 'detail'}, 'before': present['detail'], 'after': missing}),
+    ]}}
+    review_example_shapes = []
+    example_required = ['members', 'valueKind', 'action', 'sourceRef', 'before', 'after']
+    for kind, value in present.items():
+        fields = {'members': {**members, 'minProperties': 1}, 'valueKind': {'const': kind}}
+        if kind != 'text':
+            fields['companionChanges'] = companion
+        review_example_shapes.append(obj({**fields, 'action': {'const': 'set'},
+            'sourceRef': identifier, 'before': state[kind], 'after': value}, example_required))
+        if kind != 'detail':
+            review_example_shapes.append(obj({**fields, 'action': {'const': 'clear'},
+                'sourceRef': {'type': 'null'}, 'before': value, 'after': missing}, example_required))
+    periods = obj({'yearDimension': identifier, 'periodDimension': identifier,
+        'periods': {'type': 'array', 'minItems': 1, 'maxItems': 36, 'uniqueItems': True,
+                    'items': obj({'year_id': identifier, 'period_id': identifier})}})
+    review = obj({'format': {'const': 'openepm-source-change-review-v1'},
+        'mode': mode, 'scopeMembers': members, 'scopeAll': flag,
+        'periodSelection': {'oneOf': [periods, {'type': 'null'}]},
+        'metadataRevision': revision, 'dataRevision': revision, 'commitRevision': revision,
+        'sampleLimitPerAction': {'const': _REVIEW_SAMPLE_LIMIT},
+        'sampleByteLimit': {'const': _REVIEW_SAMPLE_BYTES}, 'setsComplete': flag,
+        'clearsComplete': flag, 'readRestricted': flag,
+        'examples': {'type': 'array', 'maxItems': 2 * _REVIEW_SAMPLE_LIMIT,
+                     'items': {'oneOf': review_example_shapes}}})
+    result = obj({'batchId': batch, 'mode': mode, 'setCount': revision, 'clearCount': revision,
+        'review': review, 'contentDigest': digest, 'previewToken': {'type': 'string', 'minLength': 1},
+        'diagnostics': _diagnostic_summary_schema()},
+        ['batchId', 'mode', 'setCount', 'clearCount', 'review', 'contentDigest', 'previewToken'])
+    contract = read_contract(PREVIEW, obj({'batchId': batch, 'allowWarnings': flag}, ['batchId']), result,
+        owner='PostgresSourceBatch', examples=[read_example(PREVIEW, {'batchId': 'a' * 32},
+            name='Preview the exact staged source change',
+            binding='Use the batch ID from the acknowledged seal. Review the returned counts and samples before requesting publication.')],
+        semantic_rules=[
+            'Current WRITE and exact preparation revisions are required. Preview examples also require coordinate READ.',
+            'The set and clear counts cover the full intent. The completeness flags describe bounded and read-authorized examples.',
+            'Missing, zero, empty text and ordered supporting detail retain their distinct wire shapes.',
+            'A manifest-backed preview can include diagnostic evidence. Explicit allowWarnings is required to accept warnings.',
+            'The token binds the exact ready batch, observed revisions and identity. Publication rechecks current authority and freshness.',
+            'For a prepared slice copy, the current READ grant must still cover every retained source coordinate.',
+        ])
+    contract['programContract']['recovery'] = ('If a preview becomes stale, inspect the current batch and application revisions. '
+        'Review a current preview before starting a new publication intent. Check the original request if publication was already sent.')
+    return contract
+
+
+def csv_input_rejections() -> dict:
+    """Fixed append refusals raised before any staging connection or write.
+
+    This does not classify arbitrary validation errors or a prior uncertain
+    dispatch. A corrected chunk is a new admitted intent on the same native
+    batch/chunk owner; an accepted prefix is never resubmitted or replaced.
+    """
+    return {
+        'format': 'openepm-csv-input-rejections-v1',
+        'phase': 'before_chunk_write',
+        'httpStatus': 400,
+        'firstDispatchOnly': True,
+        'priorUncertainty': 'retain_original',
+        'changedInput': 'new_admission',
+        'codes': [
+            'SOURCE_CSV_BYTES_INVALID', 'SOURCE_CSV_HEADER_INVALID',
+            'SOURCE_CSV_ROW_INVALID', 'SOURCE_CSV_LITERAL_INVALID',
+            'SOURCE_CSV_INVALID', 'SOURCE_ROW_INVALID',
+            'SOURCE_DETAIL_ROW_INVALID', 'SOURCE_DUPLICATE_COORDINATE',
+            'SOURCE_CHUNK_BYTES_LIMIT', 'SOURCE_AMOUNT_INVALID',
+        ],
+    }
+
+
+def _omitted_source_targets(scope, batch, table, kinds):
+    """One omitted-target predicate for preview counts and change inspection."""
+    if table not in ('numeric_cell_current', 'text_cell_current'):
+        raise ValueError('SOURCE_REVIEW_DOMAIN_INVALID')
+    predicate, params = _scope_predicate(
+        batch['scope_members'], batch['period_selection'])
+    return f''' FROM epm.{table} n JOIN epm.coordinate c
+        ON c.workspace_id=n.workspace_id AND c.application_id=n.application_id
+        AND c.coordinate_id=n.coordinate_id
+        WHERE n.workspace_id=%s AND n.application_id=%s AND n.present
+        {predicate}
+        AND NOT EXISTS (SELECT 1 FROM epm.source_batch_row r
+            WHERE r.workspace_id=n.workspace_id AND r.application_id=n.application_id
+            AND r.batch_id=%s AND r.series_key=c.series_key
+            AND r.value_kind=ANY(%s::text[]))''', (
+                scope.workspace_id, scope.application_id, *params,
+                batch['batch_id'], kinds)
 
 
 class SourceBatchPrepublicationRejection(ValueError):
@@ -85,7 +278,7 @@ def _scope_predicate(members: dict[str, str],
 
 
 def enforce_source_batch_policy(db, scope: ApplicationScope, batch,
-                                workflow_role: str) -> dict | None:
+                                workflow_role: str, *, identity=None) -> dict | None:
     """Guard final ordinary-import, copy and forecast publication targets.
 
     The action query mirrors source publication: staged numeric, text and
@@ -158,7 +351,7 @@ def enforce_source_batch_policy(db, scope: ApplicationScope, batch,
         chunks.append(enforce_active_planning_policy(
             db, scope,
             writes=writes[offset:offset + _PLANNING_POLICY_CHUNK],
-            workflow_role=workflow_role))
+            workflow_role=workflow_role, identity=identity))
     if len(chunks) == 1:
         return chunks[0]
     identity_keys = ('configured', 'allowed', 'reasonCode', 'policyId',
@@ -179,7 +372,8 @@ def enforce_source_batch_policy(db, scope: ApplicationScope, batch,
 
 
 def enforce_source_batch_dimensional_security(
-        db, identity: VerifiedIdentity, scope: ApplicationScope, batch) -> None:
+        db, identity: VerifiedIdentity, scope: ApplicationScope, batch, *,
+        expected_access: AccessDecision | None = None) -> None:
     """Authorize every explicit Set and implicit replacement Clear target.
 
     Source imports may contain 100,000 explicit rows and replacement scopes
@@ -249,7 +443,45 @@ def enforce_source_batch_dimensional_security(
     authorize_coordinates(
         db, identity, scope,
         (Coordinate.from_mapping(row['members']) for row in rows),
-        kind=AccessKind.WRITE)
+        kind=AccessKind.WRITE, expected_access=expected_access)
+
+
+def require_current_copy_groups(db, identity, groups):
+    if (groups is not None
+            and PostgresAccessChecker.current_groups_in_transaction(db, identity) != groups):
+        raise AccessDenied('DIMENSIONAL_SCOPE_DENIED')
+
+
+def authorize_staged_copy_sources(db, identity, scope, batch, origin, *,
+                                  expected_access: AccessDecision, include_targets=False):
+    """Check exact retained coordinates under the opening application decision."""
+    dimension = origin.get('scenarioDimension') if isinstance(origin, dict) else None
+    member = origin.get('sourceMember') if isinstance(origin, dict) else None
+    if not isinstance(dimension, str) or not dimension or not isinstance(member, str) or not member:
+        raise ValueError('SCENARIO_COPY_ORIGIN_INVALID')
+    after = 0
+    seen = 0
+    while True:
+        rows = db.execute('''SELECT row_ordinal,members FROM epm.source_batch_row
+            WHERE workspace_id=%s AND application_id=%s AND batch_id=%s
+            AND row_ordinal>%s ORDER BY row_ordinal LIMIT 1000''',
+            (scope.workspace_id, scope.application_id, batch['batch_id'], after)).fetchall()
+        if not rows:
+            break
+        authorize_coordinates(db, identity, scope,
+            (Coordinate.from_mapping({**row['members'], dimension: member}) for row in rows),
+            kind=AccessKind.READ, expected_access=expected_access)
+        if include_targets:
+            authorize_coordinates(db, identity, scope,
+                (Coordinate.from_mapping(row['members']) for row in rows),
+                kind=AccessKind.READ, expected_access=expected_access)
+        seen += len(rows)
+        if seen > 100000:
+            raise ValueError('SCENARIO_COPY_ROW_LIMIT')
+        after = rows[-1]['row_ordinal']
+    if seen != batch['row_count']:
+        raise ValueError('SCENARIO_COPY_STATUS_INCONSISTENT')
+    return expected_access.groups
 
 
 class PostgresSourceBatch:
@@ -284,8 +516,22 @@ class PostgresSourceBatch:
                 and self.publication_finalizer(db, scope) is not True):
             raise ValueError('SOURCE_PUBLICATION_FINAL_FENCE_FAILED')
 
+    def _authorize_copied_sources(self, db, scope, batch, *, expected_access: AccessDecision):
+        row = db.execute('''SELECT normalized_program,source_row_count
+            FROM epm.planning_copy_origin
+            WHERE workspace_id=%s AND application_id=%s AND batch_id=%s''',
+            (scope.workspace_id, scope.application_id, batch['batch_id'])).fetchone()
+        if row is None:
+            return None
+        if row['source_row_count'] != batch['row_count']:
+            raise ValueError('SCENARIO_COPY_STATUS_INCONSISTENT')
+        origin = row['normalized_program']
+        return authorize_staged_copy_sources(db, self.identity, scope, batch,
+            origin.get('copyProgram', origin), expected_access=expected_access)
+
     def append_csv(self, scope: ApplicationScope, batch_id: str, *,
-                   chunk_index: int, csv_text: str) -> dict:
+                   chunk_index: int, csv_text: str,
+                   replay_only: bool = False) -> dict | None:
         """Parse one bounded stable-ID CSV chunk into ordinary staged rows.
 
         The header has axis.<dimensionId> columns plus literalType, value and
@@ -342,12 +588,30 @@ class PostgresSourceBatch:
                 RecursionError, TypeError) as error:
             raise ValueError('SOURCE_CSV_INVALID') from error
         return self.append(scope, batch_id, chunk_index=chunk_index,
-                           rows=rows)
+                           rows=rows,replay_only=replay_only,csv_source=True)
 
     def begin(self, scope: ApplicationScope, *, idempotency_key: str,
               mode: str, scope_members: dict[str, str], scope_all: bool,
               expected_metadata_revision: int,
               expected_data_revision: int) -> dict:
+        return self._begin(scope, idempotency_key=idempotency_key, mode=mode,
+            scope_members=scope_members, scope_all=scope_all,
+            expected_metadata_revision=expected_metadata_revision,
+            expected_data_revision=expected_data_revision, replay_only=False)
+
+    def replay_begin(self, scope: ApplicationScope, *, idempotency_key: str,
+                     mode: str, scope_members: dict[str, str], scope_all: bool,
+                     expected_metadata_revision: int,
+                     expected_data_revision: int) -> dict | None:
+        return self._begin(scope, idempotency_key=idempotency_key, mode=mode,
+            scope_members=scope_members, scope_all=scope_all,
+            expected_metadata_revision=expected_metadata_revision,
+            expected_data_revision=expected_data_revision, replay_only=True)
+
+    def _begin(self, scope: ApplicationScope, *, idempotency_key: str,
+               mode: str, scope_members: dict[str, str], scope_all: bool,
+               expected_metadata_revision: int,
+               expected_data_revision: int, replay_only: bool) -> dict | None:
         if (not isinstance(scope, ApplicationScope)
                 or not isinstance(idempotency_key, str)
                 or not _KEY.fullmatch(idempotency_key)
@@ -364,20 +628,24 @@ class PostgresSourceBatch:
         })
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
+                if replay_only:
+                    db.execute('SET TRANSACTION READ ONLY')
+                    configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
+                access = group_import.source_access(db,self.identity,scope,'facts.source.begin')
+                grouped = access.authorization_model == 'group_assignments'
+                if grouped and (mode != 'merge' or members or not scope_all):
+                    raise ValueError(group_import.UNSUPPORTED)
                 state = db.execute('''SELECT s.metadata_revision,
                     s.data_revision,s.commit_revision,s.processing_mode,a.status
                     FROM epm.application_state s JOIN epm.application a
                     USING (workspace_id,application_id)
-                    WHERE s.workspace_id=%s AND s.application_id=%s
-                    FOR UPDATE OF s''',
+                    WHERE s.workspace_id=%s AND s.application_id=%s'''
+                    + ('' if replay_only else ' FOR UPDATE OF s'),
                     (scope.workspace_id, scope.application_id)).fetchone()
                 if state is None:
                     raise ValueError('APPLICATION_UNAVAILABLE')
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'write')
-                previous = db.execute('''SELECT batch_id,request_digest,
-                    status,row_count,content_digest FROM epm.source_batch
+                previous = db.execute('''SELECT * FROM epm.source_batch
                     WHERE workspace_id=%s AND application_id=%s
                     AND issuer=%s AND subject_id=%s
                     AND idempotency_key=%s''',
@@ -385,6 +653,7 @@ class PostgresSourceBatch:
                      self.identity.issuer, self.identity.subject_id,
                      idempotency_key)).fetchone()
                 if previous:
+                    group_import.authorize_existing(db,self.identity,scope,access,previous)
                     if previous['request_digest'] != request_digest:
                         raise ValueError('SOURCE_IDEMPOTENCY_CONFLICT')
                     return {'batchId': previous['batch_id'],
@@ -392,6 +661,9 @@ class PostgresSourceBatch:
                             'rowCount': previous['row_count'],
                             'contentDigest': previous['content_digest'],
                             'duplicate': True}
+                if replay_only:
+                    return None
+                group_import.require_supported_policy(db,scope,self.identity,access)
                 if (state['status'] != 'Active'
                         or state['processing_mode'] != 'Active'):
                     raise ValueError('APPLICATION_NOT_WRITABLE')
@@ -405,21 +677,53 @@ class PostgresSourceBatch:
                      idempotency_key,request_digest,mode,scope_members,
                      scope_all,expected_metadata_revision,
                      expected_data_revision,expected_commit_revision,
-                     status,content_digest)
+                     status,content_digest,group_numeric_import)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                            'staging',%s)''',
+                            'staging',%s,%s)''',
                     (scope.workspace_id, scope.application_id,
                      batch_id, self.identity.issuer, self.identity.subject_id,
                      idempotency_key, request_digest, mode, Jsonb(members),
                      scope_all, expected_metadata_revision,
                      expected_data_revision, state['commit_revision'],
-                     _EMPTY_DIGEST))
+                     _EMPTY_DIGEST,grouped))
                 return {'batchId': batch_id, 'status': 'staging',
                         'rowCount': 0, 'contentDigest': _EMPTY_DIGEST,
                         'duplicate': False}
 
+    def append_typed(self, scope: ApplicationScope, batch_id: str, *,
+                     chunk_index: int, rows: list[dict],
+                     replay_only: bool = False) -> dict | None:
+        """Normalize the typed stage and its exact recovery through one owner."""
+        if not isinstance(rows, list) or not 1 <= len(rows) <= 500:
+            raise ValueError('V2_SOURCE_ROWS_INVALID')
+        normalized = []
+        for row in rows:
+            if (not isinstance(row, dict) or set(row) != {'members', 'value', 'sourceRef'}
+                    or not isinstance(row['value'], dict)):
+                raise ValueError('V2_SOURCE_ROW_INVALID')
+            literal = row['value']
+            base = {'members': row['members'], 'sourceRef': row['sourceRef']}
+            kind = literal.get('type')
+            if kind == 'AmountLiteral' and set(literal) == {'type', 'decimal'}:
+                normalized.append({**base, 'amount': literal['decimal']})
+            elif kind == 'TextLiteral' and set(literal) == {'type', 'text'}:
+                normalized.append({**base, 'text': literal['text']})
+            elif (kind == 'LineDetailLiteral' and set(literal) == {'type', 'items'}
+                    and isinstance(literal['items'], list)):
+                items = []
+                for item in literal['items']:
+                    if not isinstance(item, dict) or set(item) != {'description', 'decimal'}:
+                        raise ValueError('V2_SOURCE_ROW_INVALID')
+                    items.append({'description': item['description'], 'amount': item['decimal']})
+                normalized.append({**base, 'detail': items})
+            else:
+                raise ValueError('V2_SOURCE_ROW_INVALID')
+        return self.append(scope, batch_id, chunk_index=chunk_index,
+                           rows=normalized, replay_only=replay_only)
+
     def append(self, scope: ApplicationScope, batch_id: str, *,
-               chunk_index: int, rows: list[dict]) -> dict:
+               chunk_index: int, rows: list[dict],
+               replay_only: bool = False, csv_source: bool = False) -> dict | None:
         self._batch_id(batch_id)
         if (type(chunk_index) is not int or not 0 <= chunk_index < 1000
                 or not isinstance(rows, list) or not 1 <= len(rows) <= 500):
@@ -439,8 +743,11 @@ class PostgresSourceBatch:
                     'members': dict(coordinate.members),
                     'source_ref': row['sourceRef']}
             if 'amount' in row:
-                cell = NumericCell.from_wire(present=True,
-                                             amount=row['amount'])
+                try:
+                    cell = NumericCell.from_wire(present=True,
+                                                 amount=row['amount'])
+                except ValueError as error:
+                    raise ValueError('SOURCE_AMOUNT_INVALID') from error
                 amount = cell.wire_amount()
                 prepared.append({**base, 'value_kind': 'numeric',
                                  'amount': amount, 'text_value': None,
@@ -489,11 +796,17 @@ class PostgresSourceBatch:
         digest = _canonical_digest(digest_rows)
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
+                if replay_only:
+                    db.execute('SET TRANSACTION READ ONLY')
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'write')
-                batch = self._owned_batch(db, scope, batch_id, lock=True)
+                function = 'facts.source.csv.append' if csv_source else 'facts.source.append'
+                access = group_import.source_access(db,self.identity,scope,function)
+                batch = self._owned_batch(db, scope, batch_id, lock=not replay_only)
+                group_import.check_model(access,batch)
+                if batch['group_numeric_import']:
+                    group_import.authorize_rows(db,self.identity,scope,access,prepared)
                 if chunk_index < batch['chunk_count']:
+                    group_import.authorize_existing(db,self.identity,scope,access,batch)
                     previous = db.execute('''SELECT chunk_digest
                         FROM epm.source_batch_chunk WHERE workspace_id=%s
                         AND application_id=%s AND batch_id=%s
@@ -506,12 +819,16 @@ class PostgresSourceBatch:
                                 'contentDigest': batch['content_digest'],
                                 'duplicate': True}
                     raise ValueError('SOURCE_CHUNK_IDEMPOTENCY_CONFLICT')
+                if replay_only:
+                    return None
                 if chunk_index != batch['chunk_count']:
                     raise ValueError('SOURCE_CHUNK_OUT_OF_ORDER')
                 if batch['status'] != 'staging':
                     raise ValueError('SOURCE_BATCH_NOT_STAGING')
                 if batch['row_count'] + len(prepared) > 100000:
                     raise ValueError('SOURCE_BATCH_ROW_LIMIT')
+                if batch['group_numeric_import']:
+                    group_import.require_plannable_rows(db,self.identity,scope,access,prepared)
                 self._validate_rows(db, scope, batch, prepared)
                 staged = [{**row,
                            'row_ordinal': batch['row_count'] + ordinal}
@@ -549,7 +866,8 @@ class PostgresSourceBatch:
                         'duplicate': False}
 
     def seal(self, scope: ApplicationScope, batch_id: str, *,
-             expected_rows: int, expected_content_digest: str) -> dict:
+             expected_rows: int, expected_content_digest: str,
+             replay_only: bool = False) -> dict | None:
         self._batch_id(batch_id)
         if (type(expected_rows) is not int or expected_rows < 0
                 or not isinstance(expected_content_digest, str)
@@ -557,14 +875,18 @@ class PostgresSourceBatch:
             raise ValueError('SOURCE_SEAL_INVALID')
         with connect_postgres(self.dsn, row_factory=dict_row) as db:
             with db.transaction():
+                if replay_only:
+                    db.execute('SET TRANSACTION READ ONLY')
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'write')
-                batch = self._owned_batch(db, scope, batch_id, lock=True)
+                access = group_import.source_access(db,self.identity,scope,'facts.source.seal')
+                batch = self._owned_batch(db, scope, batch_id, lock=not replay_only)
+                group_import.authorize_existing(db,self.identity,scope,access,batch)
                 if (batch['row_count'] != expected_rows
                         or batch['content_digest'] != expected_content_digest):
                     raise ValueError('SOURCE_BATCH_CONTENT_MISMATCH')
                 if batch['status'] == 'staging':
+                    if replay_only:
+                        return None
                     db.execute('''UPDATE epm.source_batch SET status='ready',
                         updated_at=transaction_timestamp()
                         WHERE workspace_id=%s AND application_id=%s
@@ -615,9 +937,12 @@ class PostgresSourceBatch:
             with db.transaction():
                 configure_statement_timeout(db, 5000)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'write')
+                opening_access = group_import.source_access(db,self.identity,scope,PREVIEW)
                 batch = self._owned_batch(db, scope, batch_id)
+                group_import.check_model(opening_access,batch)
+                if batch['group_numeric_import'] and allow_warnings:
+                    raise ValueError(group_import.UNSUPPORTED)
+                group_import.require_supported_policy(db,scope,self.identity,opening_access)
                 if batch['status'] != 'ready':
                     raise ValueError('SOURCE_BATCH_NOT_READY')
                 state = self._state(db, scope)
@@ -625,14 +950,28 @@ class PostgresSourceBatch:
                         or state['processing_mode'] != 'Active'):
                     raise ValueError('APPLICATION_NOT_WRITABLE')
                 self._check_preparation_revisions(batch, state)
+                copy_groups = self._authorize_copied_sources(
+                    db, scope, batch, expected_access=opening_access)
+                copy_access = opening_access if copy_groups is not None else None
+                if copy_groups is not None:
+                    # A copy stages live application facts at the admitted
+                    # data revision, including the source of a replacement.
+                    self._check_revisions(batch, state)
+                if batch['group_numeric_import']:
+                    group_import.authorize_existing(db,self.identity,scope,opening_access,batch,check_planning=True)
                 self._validate_staged(db, scope, batch)
-                enforce_source_batch_dimensional_security(
-                    db, self.identity, scope, batch)
+                if not batch['group_numeric_import']:
+                    enforce_source_batch_dimensional_security(
+                        db, self.identity, scope, batch, expected_access=copy_access)
                 self._check_conflicts(db, scope, batch)
                 self._check_locks(db, scope, batch)
                 clears = self._clear_count(db, scope, batch)
                 if batch['row_count'] + clears > 100000:
                     raise ValueError('SOURCE_PUBLICATION_ROW_LIMIT')
+                if batch['expected_data_revision'] != state['data_revision']:
+                    self._checked_replace_scope_digest(db, scope, batch, state)
+                review = self._change_review(db, scope, batch, state, clears,
+                                             expected_access=opening_access)
                 if batch['manifest_digest'] is not None:
                     existing = self._diagnostic_artifact(db, scope, batch)
                     if existing is None:
@@ -645,6 +984,7 @@ class PostgresSourceBatch:
                         diagnostic = self._diagnostic_result(
                             existing, allow_warnings=allow_warnings)
                         self._check_diagnostic_content(batch, existing)
+                self._check_preview_cut(db, scope, state, opening_access, copy_groups)
         if compiled is not None:
             artifact, expiry = compiled
             saved = PostgresTransferArtifacts(
@@ -655,6 +995,13 @@ class PostgresSourceBatch:
             diagnostic = self._diagnostic_result(
                 saved, allow_warnings=allow_warnings)
             self._check_diagnostic_content(batch, saved)
+            # Diagnostic retention uses a separate transaction. Recheck the
+            # reviewed state again before returning examples or a signed token.
+            with connect_postgres(self.dsn, row_factory=dict_row) as db:
+                with db.transaction():
+                    configure_statement_timeout(db, 5000)
+                    PostgresNumericFactStore._set_scope(db, scope)
+                    self._check_preview_cut(db, scope, state, opening_access, copy_groups)
         payload = {'scope': [scope.workspace_id, scope.application_id],
                    'identity': [self.identity.issuer,self.identity.subject_id],
                    'batchId': batch_id,
@@ -673,12 +1020,183 @@ class PostgresSourceBatch:
         signature = hmac.new(self.preview_secret,raw,sha256).digest()
         result = {'batchId': batch_id, 'mode': batch['mode'],
                 'setCount': batch['row_count'], 'clearCount': clears,
+                'review': review,
                 'contentDigest': batch['content_digest'],
                 'previewToken': base64.urlsafe_b64encode(
                     raw + signature).decode('ascii')}
         if batch['manifest_digest'] is not None:
             result['diagnostics'] = diagnostic
         return result
+
+    def _check_preview_cut(self, db, scope, state, opening_access, copy_groups):
+        """Bind the examples and token to one business state and current authority."""
+        require_current_copy_groups(db, self.identity, copy_groups)
+        try:
+            current = group_import.source_access(db,self.identity,scope,PREVIEW,expected_groups=opening_access.groups)
+        except AccessGroupsChanged:
+            raise ValueError('SOURCE_PREVIEW_AUTHORIZATION_STALE') from None
+        if current != opening_access:
+            raise ValueError('SOURCE_PREVIEW_AUTHORIZATION_STALE')
+        latest = self._state(db, scope)
+        if any(latest[key] != state[key] for key in (
+                'metadata_revision', 'data_revision', 'commit_revision', 'security_revision',
+                'processing_mode', 'application_status')):
+            raise ValueError('STALE_SOURCE_BATCH_REVISION')
+
+    def _change_review(self, db, scope, batch, state, clear_count, *,
+                       expected_access: AccessDecision | None = None):
+        """Bounded, read-authorized examples of this already validated intent.
+
+        Examples explain the exact typed operation; they do not grant publish
+        authority or replace the signed preview, current fences or full counts.
+        Unreadable coordinates and their values are never returned.
+        """
+        rows = db.execute('''WITH staged AS MATERIALIZED (
+            SELECT * FROM epm.source_batch_row WHERE workspace_id=%s
+            AND application_id=%s AND batch_id=%s ORDER BY row_ordinal LIMIT %s)
+            SELECT r.members,r.value_kind,r.amount,r.text_value,r.detail_items,
+              r.source_ref,n.present AS numeric_present,n.amount AS numeric_before,
+              t.present AS text_present,t.text_value AS text_before,
+              d.items AS detail_before,d.total AS detail_total_before
+            FROM staged r LEFT JOIN epm.coordinate c
+              ON c.workspace_id=r.workspace_id AND c.application_id=r.application_id
+              AND c.series_key=r.series_key
+            LEFT JOIN epm.numeric_cell_current n ON n.workspace_id=c.workspace_id
+              AND n.application_id=c.application_id AND n.coordinate_id=c.coordinate_id
+            LEFT JOIN epm.text_cell_current t ON t.workspace_id=c.workspace_id
+              AND t.application_id=c.application_id AND t.coordinate_id=c.coordinate_id
+            LEFT JOIN epm.line_detail_current d ON d.workspace_id=c.workspace_id
+              AND d.application_id=c.application_id AND d.coordinate_id=c.coordinate_id
+            ORDER BY r.row_ordinal''', (scope.workspace_id, scope.application_id,
+                batch['batch_id'], _REVIEW_SAMPLE_LIMIT)).fetchall()
+        examples, restricted = [], False
+        for row in rows:
+            if not coordinate_read_allowed(db, self.identity, scope,
+                                           Coordinate.from_mapping(row['members']),
+                                           expected_access=expected_access):
+                restricted = True
+                continue
+            kind = row['value_kind']
+            before = {'present': bool(row[f'{kind}_present'])} if kind != 'detail' else {
+                'present': row['detail_before'] is not None}
+            after = {'present': True}
+            if kind == 'numeric':
+                if before['present']:
+                    before['amount'] = format(row['numeric_before'], 'f')
+                after['amount'] = format(row['amount'], 'f')
+            elif kind == 'text':
+                if before['present']:
+                    before['text'] = row['text_before']
+                after['text'] = row['text_value']
+            else:
+                if before['present']:
+                    before.update(items=row['detail_before'],
+                                  amount=format(row['detail_total_before'], 'f'))
+                after.update(items=row['detail_items'], amount=format(row['amount'], 'f'))
+            example = {'action': 'set', 'members': row['members'],
+                'valueKind': kind, 'sourceRef': row['source_ref'],
+                'before': before, 'after': after}
+            if kind == 'detail':
+                numeric_before = {'present': bool(row['numeric_present'])}
+                if numeric_before['present']:
+                    numeric_before['amount'] = format(row['numeric_before'], 'f')
+                example['companionChanges'] = [{'valueKind': 'numeric',
+                    'before': numeric_before,
+                    'after': {'present': True, 'amount': format(row['amount'], 'f')}}]
+            elif kind == 'numeric' and row['detail_before'] is not None:
+                # Only an already permitted replacement can reach this branch;
+                # the review does not relax _check_conflicts.
+                example['companionChanges'] = [{'valueKind': 'detail',
+                    'before': {'present': True, 'items': row['detail_before'],
+                               'amount': format(row['detail_total_before'], 'f')},
+                    'after': {'present': False}}]
+            examples.append(example)
+        clear_examples = []
+        if batch['mode'] == 'replace':
+            for table, kinds, kind, column in (
+                    ('numeric_cell_current', ['numeric', 'detail'], 'numeric', 'amount'),
+                    ('text_cell_current', ['text'], 'text', 'text_value')):
+                fragment, params = _omitted_source_targets(scope, batch, table, kinds)
+                # A numeric omission also removes any supporting detail. Use
+                # exact coordinate-correlated lookups without changing the
+                # shared omitted-target predicate or its fact counts.
+                detail = (''' ,(SELECT d.items FROM epm.line_detail_current d
+                    WHERE d.workspace_id=n.workspace_id AND d.application_id=n.application_id
+                    AND d.coordinate_id=n.coordinate_id) AS detail_items,
+                    (SELECT d.total FROM epm.line_detail_current d
+                    WHERE d.workspace_id=n.workspace_id AND d.application_id=n.application_id
+                    AND d.coordinate_id=n.coordinate_id) AS detail_total'''
+                    if kind == 'numeric' else '')
+                omitted = db.execute(f'SELECT c.members,n.{column} AS value' + detail + fragment +
+                    ' ORDER BY c.series_key COLLATE "C" LIMIT %s',
+                    (*params, _REVIEW_SAMPLE_LIMIT)).fetchall()
+                for row in omitted:
+                    if not coordinate_read_allowed(db, self.identity, scope,
+                                                   Coordinate.from_mapping(row['members']),
+                                                   expected_access=expected_access):
+                        restricted = True
+                        continue
+                    before = {'present': True, ('amount' if kind == 'numeric' else 'text'):
+                              format(row['value'], 'f') if kind == 'numeric' else row['value']}
+                    example = {'action': 'clear', 'members': row['members'],
+                        'valueKind': kind, 'sourceRef': None,
+                        'before': before, 'after': {'present': False}}
+                    if kind == 'numeric' and row['detail_items'] is not None:
+                        example['companionChanges'] = [{'valueKind': 'detail',
+                            'before': {'present': True, 'items': row['detail_items'],
+                                       'amount': format(row['detail_total'], 'f')},
+                            'after': {'present': False}}]
+                    clear_examples.append(example)
+        clear_examples.sort(key=lambda item: (sorted(item['members'].items()), item['valueKind']))
+        clear_examples = clear_examples[:_REVIEW_SAMPLE_LIMIT]
+        bounded = []
+        used = 2
+        for example in examples + clear_examples:
+            size = len(json.dumps(example, ensure_ascii=False, separators=(',', ':')).encode()) + 1
+            if used + size > _REVIEW_SAMPLE_BYTES:
+                continue
+            bounded.append(example)
+            used += size
+        return {'format': 'openepm-source-change-review-v1',
+            'mode': batch['mode'], 'scopeMembers': batch['scope_members'],
+            'scopeAll': batch['scope_all'], 'periodSelection': batch['period_selection'],
+            'metadataRevision': state['metadata_revision'],
+            'dataRevision': state['data_revision'], 'commitRevision': state['commit_revision'],
+            'sampleLimitPerAction': _REVIEW_SAMPLE_LIMIT,
+            'sampleByteLimit': _REVIEW_SAMPLE_BYTES,
+            'setsComplete': sum(item['action'] == 'set' for item in bounded) == batch['row_count'],
+            'clearsComplete': sum(item['action'] == 'clear' for item in bounded) == clear_count,
+            'readRestricted': restricted, 'examples': bounded}
+
+    @staticmethod
+    def _require_exact_group_preview(batch, token):
+        if not hmac.compare_digest(group_import.preview_digest(token),batch['publication_preview_digest']):
+            raise ValueError('SOURCE_PREVIEW_STALE_OR_MISMATCHED')
+
+    @staticmethod
+    def _published_result(db, scope, batch):
+        digest = (batch['result'] or {}).get('impactDigest')
+        if digest is not None:
+            from .postgres_calculation_impact import require_recorded_impact
+            require_recorded_impact(db, scope, operation_id=batch['batch_id'],
+                                   expected_digest=digest)
+        return batch['result']
+
+    def replay_publication(self, scope: ApplicationScope, batch_id: str, *, preview_token: str | None = None) -> dict | None:
+        """Reconcile the owned batch receipt; never consume or renew a preview."""
+        self._batch_id(batch_id)
+        with connect_postgres(self.dsn, row_factory=dict_row) as db:
+            with db.transaction():
+                configure_statement_timeout(db, 5000)
+                PostgresNumericFactStore._set_scope(db, scope)
+                access = group_import.source_access(db,self.identity,scope,PUBLISH)
+                self._authorize_publication(db, scope)
+                batch = self._owned_batch(db, scope, batch_id)
+                group_import.authorize_existing(db,self.identity,scope,access,batch)
+                if batch['group_numeric_import'] and batch['status']=='published':
+                    self._require_exact_group_preview(batch,preview_token)
+                return (self._published_result(db, scope, batch)
+                        if batch['status'] == 'published' else None)
 
     def publish(self, scope: ApplicationScope, batch_id: str, *,
                 preview_token: str) -> dict:
@@ -687,6 +1205,7 @@ class PostgresSourceBatch:
             with db.transaction():
                 configure_statement_timeout(db, 10000)
                 PostgresNumericFactStore._set_scope(db, scope)
+                opening_access = group_import.source_access(db,self.identity,scope,PUBLISH)
                 state = db.execute('''SELECT s.metadata_revision,
                     s.data_revision,s.commit_revision,s.security_revision,
                     s.processing_mode,
@@ -698,18 +1217,14 @@ class PostgresSourceBatch:
                     (scope.workspace_id,scope.application_id)).fetchone()
                 if state is None:
                     raise ValueError('APPLICATION_UNAVAILABLE')
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'write')
                 self._authorize_publication(db, scope)
                 batch = self._owned_batch(db, scope, batch_id, lock=True)
+                group_import.check_model(opening_access,batch)
                 if batch['status'] == 'published':
-                    digest=(batch['result'] or {}).get('impactDigest')
-                    if digest is not None:
-                        from .postgres_calculation_impact import (
-                            require_recorded_impact)
-                        require_recorded_impact(db,scope,
-                            operation_id=batch_id,expected_digest=digest)
-                    return batch['result']
+                    if batch['group_numeric_import']:
+                        self._require_exact_group_preview(batch,preview_token)
+                        group_import.authorize_existing(db,self.identity,scope,opening_access,batch)
+                    return self._published_result(db, scope, batch)
                 diagnostic = (self._diagnostic_artifact(db, scope, batch)
                               if batch['manifest_digest'] is not None else None)
                 self._verify_token(
@@ -723,10 +1238,18 @@ class PostgresSourceBatch:
                 if (state['application_status'] != 'Active'
                         or state['processing_mode'] != 'Active'):
                     raise ValueError('APPLICATION_NOT_WRITABLE')
-                self._check_revisions(batch, state)
+                self._check_preparation_revisions(batch, state)
+                copy_groups = self._authorize_copied_sources(
+                    db, scope, batch, expected_access=opening_access)
+                copy_access = opening_access if copy_groups is not None else None
+                if copy_groups is not None:
+                    self._check_revisions(batch, state)
+                if batch['group_numeric_import']:
+                    group_import.authorize_existing(db,self.identity,scope,opening_access,batch)
                 self._validate_staged(db, scope, batch)
-                enforce_source_batch_dimensional_security(
-                    db, self.identity, scope, batch)
+                if not batch['group_numeric_import']:
+                    enforce_source_batch_dimensional_security(
+                        db, self.identity, scope, batch, expected_access=copy_access)
                 self._check_locks(db, scope, batch)
                 clears = self._clear_count(db, scope, batch)
                 total = batch['row_count'] + clears
@@ -740,8 +1263,8 @@ class PostgresSourceBatch:
                 # application publication row remains free.  Disjoint merges
                 # can perform validation together; overlapping merges share a
                 # shard and cannot both prepare from the same target state.
-                # Replace remains revision-serialized because its implicit
-                # Clear scope can contain rows absent from the staged batch.
+                # Replace fences the full scope because implicit clears can
+                # target coordinates absent from the staged batch.
                 target_digest = None
                 if batch['mode'] == 'merge':
                     before_target_lock = self._merge_target_digest(
@@ -752,12 +1275,8 @@ class PostgresSourceBatch:
                     if target_digest != before_target_lock:
                         raise ValueError('STALE_SOURCE_BATCH_REVISION')
                 elif batch['expected_commit_revision'] is not None:
-                    target_digest = self._replace_scope_digest(
-                        db, scope, batch,
-                        batch['expected_commit_revision'])
-                    if target_digest != self._replace_scope_digest(
-                            db, scope, batch, state['commit_revision']):
-                        raise ValueError('STALE_SOURCE_BATCH_REVISION')
+                    target_digest = self._checked_replace_scope_digest(
+                        db, scope, batch, state)
 
                 state = db.execute('''SELECT s.metadata_revision,
                     s.data_revision,s.commit_revision,s.security_revision,
@@ -777,23 +1296,34 @@ class PostgresSourceBatch:
                 self._verify_token(
                     preview_token, scope, batch, diagnostic,
                     security_revision=state['security_revision'])
-                self._check_publication_revisions(
-                    db, scope, batch, state, target_digest)
+                if copy_groups is not None:
+                    # An unchanged destination cannot prove that the staged
+                    # copy still reflects its source. Keep the admitted data
+                    # revision pinned until this transaction commits.
+                    self._check_revisions(batch, state)
+                else:
+                    self._check_publication_revisions(
+                        db, scope, batch, state, target_digest)
                 if (state['application_status'] != 'Active'
                         or state['processing_mode'] != 'Active'):
                     raise ValueError('APPLICATION_NOT_WRITABLE')
                 # Preparation can outlive a grant, public worker fence,
                 # planning lock or target-family change.  Repeat all mutable
                 # publication controls under the short application fence.
-                access = PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'write')
+                access = group_import.source_access(db,self.identity,scope,PUBLISH)
+                if copy_access is not None and access != copy_access:
+                    raise ValueError(CUBE_READ_AUTHORIZATION_STALE)
                 self._authorize_publication(db, scope)
-                enforce_source_batch_dimensional_security(
-                    db, self.identity, scope, batch)
+                require_current_copy_groups(db, self.identity, copy_groups)
+                if batch['group_numeric_import']:
+                    group_import.authorize_existing(db,self.identity,scope,access,batch)
+                else:
+                    enforce_source_batch_dimensional_security(
+                        db, self.identity, scope, batch, expected_access=copy_access)
                 self._check_locks(db, scope, batch)
                 self._check_conflicts(db, scope, batch)
                 policy_evidence = enforce_source_batch_policy(
-                    db, scope, batch, access.role)
+                    db, scope, batch, access.role, identity=self.identity)
                 self._ensure_coordinates(db, scope, batch_id)
                 revision = state['commit_revision'] + 1
                 source_kinds=db.execute('''SELECT value_kind,count(*) n
@@ -888,15 +1418,16 @@ class PostgresSourceBatch:
                 record_calculation_impact(db,scope,operation_id=batch_id,
                                           impact=impact)
                 db.execute('''UPDATE epm.source_batch SET
-                    status='published',receipt_revision=%s,result=%s,
+                    status='published',receipt_revision=%s,result=%s,publication_preview_digest=%s,
                     updated_at=transaction_timestamp()
                     WHERE workspace_id=%s AND application_id=%s
                     AND batch_id=%s''',
-                    (revision,Jsonb(result),scope.workspace_id,
-                     scope.application_id,batch_id))
+                    (revision,Jsonb(result), group_import.preview_digest(preview_token) if batch['group_numeric_import'] else None,
+                     scope.workspace_id,scope.application_id,batch_id))
                 # This is intentionally the last effect-boundary statement.
                 # A stale external worker claim raises here and rolls the
                 # source events, projections, receipt, lineage and batch back.
+                require_current_copy_groups(db, self.identity, copy_groups)
                 self._finalize_publication(db, scope)
                 return result
 
@@ -1002,10 +1533,8 @@ class PostgresSourceBatch:
                 configure_statement_timeout(db, 5000)
                 configure_lock_wait(db)
                 PostgresNumericFactStore._set_scope(db, scope)
-                PostgresAccessChecker.lock_workspace(db, scope.workspace_id)
-                PostgresAccessChecker.check_in_transaction(
-                    db, self.identity, scope, 'write')
-                batch = db.execute('''SELECT issuer,subject_id,status
+                access = group_import.source_access(db,self.identity,scope,CANCEL)
+                batch = db.execute('''SELECT issuer,subject_id,status,group_numeric_import
                     FROM epm.source_batch WHERE workspace_id=%s
                     AND application_id=%s AND batch_id=%s FOR UPDATE''',
                     (scope.workspace_id, scope.application_id,
@@ -1014,6 +1543,9 @@ class PostgresSourceBatch:
                     raise ValueError('SOURCE_BATCH_UNAVAILABLE')
                 owner = (batch['issuer'], batch['subject_id']) == (
                     self.identity.issuer, self.identity.subject_id)
+                group_import.check_model(access,batch)
+                if not owner and batch['group_numeric_import']:
+                    raise ValueError('SOURCE_BATCH_UNAVAILABLE')
                 if not owner:
                     try:
                         PostgresAccessChecker.check_in_transaction(
@@ -1190,12 +1722,21 @@ class PostgresSourceBatch:
         if batch['expected_data_revision'] == state['data_revision']:
             return
         # A new replace batch retains the immutable commit boundary captured
-        # when its caller-supplied data revision was admitted.  Its complete
-        # declared effect scope is compared below.  Historical batches without
-        # that pin retain the original strict global-revision behavior.
+        # when its caller-supplied data revision was admitted. Preview and
+        # publication check its complete effect scope against that boundary.
+        # Historical batches without that pin keep the exact revision check.
         if (batch['mode'] != 'replace'
                 or batch['expected_commit_revision'] is None):
             raise ValueError('STALE_SOURCE_BATCH_REVISION')
+
+    def _checked_replace_scope_digest(self, db, scope, batch, state):
+        expected = batch['expected_commit_revision']
+        digest = self._replace_scope_digest(db, scope, batch, expected)
+        if (state['commit_revision'] != expected
+                and self._replace_scope_digest(
+                    db, scope, batch, state['commit_revision']) != digest):
+            raise ValueError('STALE_SOURCE_BATCH_REVISION')
+        return digest
 
     @staticmethod
     def _check_publication_revisions(db, scope, batch, state,
@@ -1468,25 +2009,12 @@ class PostgresSourceBatch:
     def _clear_count(db, scope, batch):
         if batch['mode'] != 'replace':
             return 0
-        predicate, params = _scope_predicate(
-            batch['scope_members'], batch['period_selection'])
         total = 0
         for table, kinds in (('numeric_cell_current', ['numeric','detail']),
                              ('text_cell_current', ['text'])):
-            total += db.execute(f'''SELECT count(*) AS total FROM
-                epm.{table} n JOIN epm.coordinate c
-                ON c.workspace_id=n.workspace_id
-                AND c.application_id=n.application_id
-                AND c.coordinate_id=n.coordinate_id
-                WHERE n.workspace_id=%s AND n.application_id=%s
-                AND n.present {predicate}
-                AND NOT EXISTS (SELECT 1 FROM epm.source_batch_row r
-                    WHERE r.workspace_id=n.workspace_id
-                    AND r.application_id=n.application_id
-                    AND r.batch_id=%s AND r.series_key=c.series_key
-                    AND r.value_kind=ANY(%s::text[]))''',
-                (scope.workspace_id,scope.application_id,*params,
-                 batch['batch_id'],kinds)).fetchone()['total']
+            fragment, params = _omitted_source_targets(scope, batch, table, kinds)
+            total += db.execute('SELECT count(*) AS total' + fragment,
+                                params).fetchone()['total']
         return total
 
     @staticmethod
